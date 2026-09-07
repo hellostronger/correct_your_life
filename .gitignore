@@ -1,0 +1,14 @@
+# 环境变量 / 密钥
+.env
+
+# Python 运行产物
+__pycache__/
+*.py[cod]
+*.log
+
+# 运行时数据
+stock-advisor/data/
+stock-advisor/reports/
+
+# 内嵌的独立 git 仓库（MediaCrawler 自身已推送到 hellostronger/MediaCrawler）
+MediaCrawler/

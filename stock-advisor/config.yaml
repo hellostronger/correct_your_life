@@ -1,0 +1,40 @@
+# Stock Advisor 新闻抓取配置
+# 网页「新闻」标签页也可修改以下配置（保存后下一轮抓取生效）
+
+news:
+  channels:
+    eastmoney: {enabled: true, min_interval: 1.0}
+    baidu: {enabled: true, min_interval: 3.0}
+    sina: {enabled: true, min_interval: 2.0}
+    duckduckgo: {enabled: true, min_interval: 5.0, timeout: 30}
+  fetch_interval_minutes: 30
+  items_per_query: 10
+  keywords_extra: []
+
+# B站UP主动态监听（调 MediaCrawler 抓取，见 bili_monitor.py）
+# interval_minutes: 自动抓取周期（分钟），0 = 关闭
+# fetch_timeout_minutes: 单轮爬虫子进程超时（分钟）
+bili:
+  enabled: true
+  interval_minutes: 30
+  fetch_timeout_minutes: 10
+
+# 微博博主动态监听（调 MediaCrawler 抓取，见 wb_monitor.py）
+# interval_minutes: 自动抓取周期（分钟），0 = 关闭；微博风控较严，周期别设太短
+wb:
+  enabled: true
+  interval_minutes: 60
+  fetch_timeout_minutes: 15
+
+# 通知配置（微信走腾讯官方 iLink Bot，凭据存云库；邮件走 SMTP）
+# 网页「通知」标签页可改；auth_code 是邮箱授权码，注意保管
+notify:
+  wx:
+    enabled: true
+  email:
+    smtp_host: 
+    smtp_port: 0
+    from_addr: 
+    auth_code: 
+    to_addr: 
+    enabled: false
