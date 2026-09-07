@@ -1,0 +1,3 @@
+[submodule "MediaCrawler"]
+	path = MediaCrawler
+	url = https://github.com/hellostronger/MediaCrawler.git

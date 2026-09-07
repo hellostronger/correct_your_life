@@ -10,5 +10,5 @@ __pycache__/
 stock-advisor/data/
 stock-advisor/reports/
 
-# 内嵌的独立 git 仓库（MediaCrawler 自身已推送到 hellostronger/MediaCrawler）
-MediaCrawler/
+# MediaCrawler 以 git submodule 跟踪（指向 hellostronger/MediaCrawler，锁定补丁版）
+# 注意：MediaCrawler 内部的运行产物由其自己的 .gitignore 管理
