@@ -34,6 +34,17 @@ sector:
   interval_minutes: 5
   alert_notify: true
 
+# 提款计划（app.py _withdrawal_loop）
+# 交易日 15:10 起每半小时检查一次达标/临期状态，里程碑（可提/剩10·5·1交易日/逾期）推微信
+withdrawal:
+  enabled: true
+
+# 财经日历盘前提醒（econ_calendar.py + app.py _calendar_loop）
+# 交易日早 8-12 点窗口检查：今明两日事件（非农/交割/四巫/LPR/手动 FOMC 等）推一条，
+# 重要事件（非农/四巫日）另提前 3 天预告一次；去重状态存 data/calendar_state.json
+calendar:
+  enabled: true
+
 # 通知配置（微信走腾讯官方 iLink Bot，凭据存云库；邮件走 SMTP）
 # 网页「通知」标签页可改；auth_code 是邮箱授权码，注意保管
 notify:

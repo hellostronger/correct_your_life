@@ -233,6 +233,47 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_sa_wb_post_pub ON sa_wb_posts (pub_ts DESC);
     CREATE INDEX IF NOT EXISTS idx_sa_wb_post_uid ON sa_wb_posts (uid);
     CREATE INDEX IF NOT EXISTS idx_sa_wb_cmt_post ON sa_wb_comments (note_id);
+    -- 提款计划：某日期前要从账户提取多少现金；提款流水累计记进度。
+    -- notified 记录已推送过的里程碑键（ready/d10/d5/d1/deadline），防重复轰炸
+    CREATE TABLE IF NOT EXISTS sa_withdrawal_plans (
+        id            BIGSERIAL PRIMARY KEY,
+        target_date   DATE NOT NULL,
+        target_amount NUMERIC(14,2) NOT NULL CHECK (target_amount > 0),
+        note          VARCHAR(255) NOT NULL DEFAULT '',
+        status        VARCHAR(8) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'done')),
+        notified      JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS sa_withdrawals (
+        id          BIGSERIAL PRIMARY KEY,
+        plan_id     BIGINT NOT NULL REFERENCES sa_withdrawal_plans(id) ON DELETE CASCADE,
+        wd_date     DATE NOT NULL,
+        amount      NUMERIC(14,2) NOT NULL CHECK (amount > 0),
+        note        VARCHAR(255) NOT NULL DEFAULT '',
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_sa_withdrawals_plan ON sa_withdrawals (plan_id);
+    -- 整仓级策略关联：直接给持仓（代码粒度）挂策略，不必逐笔买入引用
+    CREATE TABLE IF NOT EXISTS sa_position_strategies (
+        id            BIGSERIAL PRIMARY KEY,
+        code          VARCHAR(8) NOT NULL,
+        strategy_id   BIGINT NOT NULL,
+        triggered_at  TIMESTAMPTZ,
+        peak_price    NUMERIC(12,4),
+        ladder_step   INTEGER NOT NULL DEFAULT 0,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (code, strategy_id)
+    );
+    -- 财经日历手动事件（FOMC/CPI 等非规则日期；规则事件由 econ_calendar 本地生成）
+    CREATE TABLE IF NOT EXISTS sa_calendar_events (
+        id          BIGSERIAL PRIMARY KEY,
+        event_date  DATE NOT NULL,
+        time_hint   VARCHAR(16) NOT NULL DEFAULT '',
+        title       VARCHAR(128) NOT NULL,
+        note        VARCHAR(255) NOT NULL DEFAULT '',
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_sa_calendar_date ON sa_calendar_events (event_date);
     -- 板块轮动快照（建表 DDL 以 sector.py 的 SNAPSHOT_TABLE_DDL 为准，那里也幂等）
     """
     last_exc: Exception | None = None
@@ -802,14 +843,49 @@ def _stock_names(codes: list[str]) -> dict[str, str]:
     return {c: names.get(c, c) for c in codes}
 
 
+# ---------------- 港币->人民币折算 ----------------
+# 持仓/盈亏的汇总口径统一成人民币：港股行情与成本都是 HKD，市值/盈亏/已实现
+# 全要乘汇率再合计，否则「总市值」是 CNY+HKD 直接相加的错数。
+# 数据源腾讯外汇 whHKDCNY（2026-09-10 实测 0.8551），缓存 10 分钟；
+# 接口失败时沿用旧值，从未成功过则不折算（*_cny 字段=原币值，前端会标注）。
+
+_FX_CACHE: dict = {"rate": None, "ts": 0.0}
+
+
+def _hkd_cny_rate() -> float | None:
+    import time as _time
+    now = _time.time()
+    if _FX_CACHE["rate"] and now - _FX_CACHE["ts"] < 600:
+        return _FX_CACHE["rate"]
+    try:
+        resp = requests.get("https://qt.gtimg.cn/q=whHKDCNY", headers=HEADERS, timeout=10)
+        m = re.search(r'="([^"]*)"', resp.text)
+        f = m.group(1).split("~") if m else []
+        rate = _to_float(f[3]) if len(f) > 3 else None
+        if rate and 0.5 < rate < 1.5:  # 合理性护栏，脏数据宁可不折
+            _FX_CACHE["rate"], _FX_CACHE["ts"] = rate, now
+            return rate
+    except Exception:
+        pass
+    return _FX_CACHE["rate"]  # 失败给旧缓存值（可能 None）
+
+
 def _holdings_with_pnl(positions: list[dict]) -> list[dict]:
-    """给持仓汇总挂实时行情，算浮动盈亏与累计总盈亏（浮动 + 已实现）。"""
+    """给持仓汇总挂实时行情，算浮动盈亏与累计总盈亏（浮动 + 已实现）。
+
+    汇总口径：_cny 后缀字段一律人民币（港股按 _hkd_cny_rate 折算，A股=原值），
+    无后缀字段保持原币（港股为 HKD）。
+    """
     held = [p for p in positions if p["net_shares"] > 0]
     quotes = fetch_quotes([p["code"] for p in held]) if held else {}
+    any_hk = any(q.get("market") == "hk" for q in quotes.values())
+    rate = _hkd_cny_rate() if any_hk else None
     for p in positions:
         q = quotes.get(p["code"], {}) if p["net_shares"] > 0 else {}
         p["quote"] = q
         price = q.get("price")
+        is_hk = q.get("market") == "hk" and rate
+        p["fx_rate"] = rate if is_hk else None
         if p["net_shares"] > 0 and isinstance(price, (int, float)) and price > 0:
             p["price"] = price
             p["market_value"] = round(price * p["net_shares"], 2)
@@ -822,6 +898,13 @@ def _holdings_with_pnl(positions: list[dict]) -> list[dict]:
             p["pnl"] = 0.0                                                    # 已清仓无浮动
             p["pnl_pct"] = None
         p["total_pnl"] = round(p["pnl"] + p["realized_pnl"], 2)               # 累计总盈亏
+        k = rate or 1.0
+        p["price_cny"] = round(price * k, 4) if p.get("price") else p.get("price")
+        p["market_value_cny"] = round(p["market_value"] * k, 2)
+        p["cost_value_cny"] = round(p["cost_value"] * k, 2) if p.get("cost_value") is not None else None
+        p["pnl_cny"] = round(p["pnl"] * k, 2)
+        p["realized_pnl_cny"] = round(p["realized_pnl"] * k, 2)
+        p["total_pnl_cny"] = round(p["total_pnl"] * k, 2)
     return positions
 
 
@@ -839,7 +922,17 @@ def _query_holdings() -> list[dict]:
 
 @app.get("/api/holdings")
 def list_holdings():
-    return _holdings_with_pnl(_derive_holdings())
+    rows = _holdings_with_pnl(_derive_holdings())
+    # 附带整仓级策略关联（每股可能挂多个），供持仓页直接展示/解绑
+    by_code: dict[str, list] = {}
+    try:
+        for ps in _position_strategies_rows():
+            by_code.setdefault(ps["code"], []).append(ps)
+    except Exception:
+        pass
+    for r in rows:
+        r["position_strategies"] = by_code.get(r["code"], [])
+    return rows
 
 
 @app.get("/api/trades")
@@ -967,10 +1060,13 @@ class StrategyIn(BaseModel):
 
 @app.get("/api/strategies")
 def list_strategies():
-    """止盈策略模板列表（新→旧），附引用它们的交易数。"""
-    sql = ("SELECT s.*, COUNT(t.id) FILTER (WHERE t.id IS NOT NULL) AS used_count, "
-           "COUNT(t.id) FILTER (WHERE t.strategy_triggered_at IS NOT NULL) AS triggered_count "
-           "FROM sa_strategies s LEFT JOIN sa_trades t ON t.strategy_id = s.id "
+    """止盈策略模板列表（新→旧），附引用它们的交易数与整仓持仓数。"""
+    sql = ("SELECT s.*, COUNT(DISTINCT t.id) FILTER (WHERE t.id IS NOT NULL) AS used_count, "
+           "COUNT(DISTINCT t.id) FILTER (WHERE t.strategy_triggered_at IS NOT NULL) AS triggered_count, "
+           "COUNT(DISTINCT ps.id) AS pos_count "
+           "FROM sa_strategies s "
+           "LEFT JOIN sa_trades t ON t.strategy_id = s.id "
+           "LEFT JOIN sa_position_strategies ps ON ps.strategy_id = s.id "
            "GROUP BY s.id ORDER BY s.created_at DESC, s.id DESC")
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(sql)
@@ -1024,16 +1120,115 @@ def create_strategy(s: StrategyIn):
 
 @app.delete("/api/strategies/{strategy_id}")
 def delete_strategy(strategy_id: int):
-    """删除策略模板。若已有交易引用则拒绝（先删/改那些交易），避免流水历史悬空。"""
+    """删除策略模板。若已有交易/持仓引用则拒绝（先解绑），避免历史悬空。"""
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM sa_trades WHERE strategy_id = %s", (strategy_id,))
         used = cur.fetchone()[0]
-        if used:
-            raise HTTPException(400, f"该策略已被 {used} 笔交易引用，不能删除（可先删对应交易）")
+        cur.execute("SELECT COUNT(*) FROM sa_position_strategies WHERE strategy_id = %s",
+                    (strategy_id,))
+        used_pos = cur.fetchone()[0]
+        if used or used_pos:
+            raise HTTPException(
+                400, f"该策略被 {used} 笔交易、{used_pos} 个持仓引用，不能删除（可先解绑）")
         cur.execute("DELETE FROM sa_strategies WHERE id = %s RETURNING id", (strategy_id,))
         if cur.rowcount == 0:
             raise HTTPException(404, f"策略 #{strategy_id} 不存在")
     return {"ok": True, "removed": strategy_id}
+
+
+# ---------------- 持仓（整仓级）关联策略 ----------------
+# 一笔一笔引用太繁琐：直接给某只股票的当前持仓挂一个策略，按整仓摊薄成本判定，
+# 触发状态记在 sa_position_strategies 行上（peak_price/ladder_step/triggered_at）。
+
+class PositionStrategyIn(BaseModel):
+    strategy_id: int = Field(description="要关联的策略模板 id")
+
+
+def _position_strategies_rows() -> list[dict]:
+    """全部持仓级策略关联（join 策略模板），NUMERIC/JSONB 已转 python 类型。"""
+    sql = ("SELECT ps.id, ps.code, ps.strategy_id, ps.triggered_at, ps.peak_price, "
+           "ps.ladder_step, s.name AS strategy_name, s.kind, s.target_pct, "
+           "s.drawdown_pct, s.config "
+           "FROM sa_position_strategies ps JOIN sa_strategies s ON s.id = ps.strategy_id")
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(sql)
+        rows = [dict(r) for r in cur.fetchall()]
+    for r in rows:
+        r["peak_price"] = float(r["peak_price"]) if r.get("peak_price") is not None else None
+        r["target_pct"] = float(r["target_pct"])
+        r["drawdown_pct"] = float(r["drawdown_pct"]) if r.get("drawdown_pct") else None
+        cfg = r.get("config")
+        r["config"] = cfg if isinstance(cfg, dict) else (json.loads(cfg or "{}"))
+        if r.get("triggered_at"):
+            r["triggered_at"] = r["triggered_at"].isoformat(timespec="seconds")
+    return rows
+
+
+@app.get("/api/position-strategies")
+def list_position_strategies():
+    return _position_strategies_rows()
+
+
+@app.post("/api/holdings/{code}/strategies")
+def add_position_strategy(code: str, body: PositionStrategyIn):
+    """给持仓整仓挂策略。要求：当前有持股、策略存在、同股同策略不重复。"""
+    normalized = _normalize_code(code)
+    held = {p["code"]: p for p in _derive_holdings()}
+    pos = held.get(normalized)
+    if not pos or pos["net_shares"] <= 0:
+        raise HTTPException(400, f"{normalized} 当前无持股，不能挂策略")
+    with LOCK, get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id, name FROM sa_strategies WHERE id = %s", (body.strategy_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"止盈策略 #{body.strategy_id} 不存在")
+        try:
+            cur.execute(
+                "INSERT INTO sa_position_strategies (code, strategy_id) VALUES (%s,%s)",
+                (normalized, body.strategy_id))
+        except psycopg2.IntegrityError:
+            raise HTTPException(400, f"该持仓已关联策略「{row[1]}」")
+    return {"ok": True, "code": normalized, "strategy_id": body.strategy_id,
+            "strategy_name": row[1]}
+
+
+@app.delete("/api/position-strategies/{ps_id}")
+def remove_position_strategy(ps_id: int):
+    """解绑持仓级策略（含已触发的，触发历史随关联行一起删除——通知已发过，不留悬档）。"""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM sa_position_strategies WHERE id = %s RETURNING id", (ps_id,))
+        if cur.rowcount == 0:
+            raise HTTPException(404, f"持仓策略关联 #{ps_id} 不存在")
+    return {"ok": True, "removed": ps_id}
+
+
+def _eval_strategy(kind: str, target_pct: float, drawdown_pct, cfg: dict,
+                   base: float, price: float, peak, gain_pct: float,
+                   held_days) -> tuple[bool, str, float]:
+    """按策略类型判定一次。返回 (hit终结, note_extra, 新峰值)。
+
+    hit=True 表示本轮触发且策略终结（记 triggered_at）；ladder 到档不终结，
+    由调用方处理档位推进。peak 未被该类型使用时原样返回。
+    """
+    if kind == "pct":
+        return price >= base * (1 + target_pct / 100), "", peak
+    if kind == "stop_loss":
+        return price <= base * (1 - target_pct / 100), "", peak
+    if kind == "time_stop":
+        need = cfg.get("hold_days") or 10**9
+        if held_days is not None and held_days >= need:
+            return True, f"已持有 {held_days} 个交易日", peak
+        return False, "", peak
+    if kind in ("drawdown", "trailing"):
+        armed = peak is not None or (kind == "trailing" or gain_pct >= target_pct)
+        if not armed:
+            return False, "", peak
+        new_peak = max(price, peak or price)
+        dd = (new_peak - price) / new_peak * 100 if new_peak > 0 else 0
+        if peak is not None and dd > drawdown_pct:
+            return True, f"较峰值 {new_peak:g} 回撤超 {drawdown_pct:g}%", new_peak
+        return False, "", new_peak
+    return False, "", peak
 
 
 def _trading_days_between(start: str, end: datetime) -> int:
@@ -1195,6 +1390,89 @@ def check_strategies_once() -> list[dict]:
     return triggered
 
 
+def check_position_strategies_once() -> list[dict]:
+    """扫一遍持仓级（整仓）策略关联，判定逻辑与逐笔一致，基准=整仓摊薄成本。
+
+    触发状态（peak_price/ladder_step/triggered_at）记在 sa_position_strategies 行上。
+    已清仓的股票跳过判定（关联保留，回补后自动继续跟踪；列表里会标记）。
+    """
+    pending = [r for r in _position_strategies_rows() if r["triggered_at"] is None]
+    if not pending:
+        return []
+    positions = {p["code"]: p for p in _derive_holdings() if p["net_shares"] > 0}
+    quotes = fetch_quotes(sorted({r["code"] for r in pending}))
+    triggered: list[dict] = []
+    for r in pending:
+        pos = positions.get(r["code"])
+        price = quotes.get(r["code"], {}).get("price")
+        if not pos or not isinstance(price, (int, float)) or price <= 0:
+            continue
+        base = pos["avg_cost"]
+        if not base:
+            continue
+        gain_pct = (price / base - 1) * 100
+        held_days = _trading_days_between(str(pos["first_date"]), datetime.now()) \
+            if pos.get("first_date") else None
+        kind, peak = r["kind"], r["peak_price"]
+
+        if kind == "ladder":
+            steps = r["config"].get("steps") or []
+            done = r.get("ladder_step") or 0
+            for i, st in enumerate(steps[done:], start=done):
+                if price >= base * (1 + float(st["pct"]) / 100):
+                    with get_conn() as conn, conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE sa_position_strategies SET ladder_step = %s "
+                            "WHERE id = %s AND triggered_at IS NULL", (i + 1, r["id"]))
+                    if cur.rowcount:
+                        triggered.append({**r, "triggered_price": price, "cost": base,
+                                          "shares": pos["net_shares"], "peak_price": peak,
+                                          "ladder_hit": {"step": i + 1},
+                                          "note_extra": (f"到第 {i + 1} 档（涨幅 "
+                                                         f"{float(st['pct']):g}%），建议卖出 "
+                                                         f"{float(st['ratio']) * 100:g}% 仓位")})
+                    if i + 1 >= len(steps):  # 最后一档：终结
+                        with get_conn() as conn, conn.cursor() as cur:
+                            cur.execute("UPDATE sa_position_strategies SET triggered_at = now() "
+                                        "WHERE id = %s AND triggered_at IS NULL", (r["id"],))
+                    break
+            continue
+        hit, note_extra, new_peak = _eval_strategy(
+            kind, r["target_pct"], r["drawdown_pct"], r["config"],
+            base, price, peak, gain_pct, held_days)
+        if new_peak != peak and new_peak is not None:  # 峰值推进持久化
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE sa_position_strategies SET peak_price = %s "
+                    "WHERE id = %s AND triggered_at IS NULL "
+                    "AND (peak_price IS NULL OR peak_price < %s)",
+                    (new_peak, r["id"], new_peak))
+            peak = new_peak
+        if hit:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute("UPDATE sa_position_strategies SET triggered_at = now() "
+                            "WHERE id = %s AND triggered_at IS NULL", (r["id"],))
+            if cur.rowcount:
+                triggered.append({**r, "triggered_price": price, "cost": base,
+                                  "shares": pos["net_shares"], "peak_price": peak,
+                                  "note_extra": note_extra})
+    if triggered:
+        lines = []
+        for t in triggered:
+            tag = f"{t['strategy_name']}（{t['code']}，整仓 {t['shares']}股）"
+            lines.append(f"• {tag} 现价 {t['triggered_price']:g}，"
+                         f"成本 {t['cost']:g}，{t.get('note_extra') or '触发条件达成，请处理'}")
+        try:
+            notifier.notify(
+                "🎯 持仓策略触发提醒",
+                "以下持仓的整仓策略触发条件，请处理：\n\n" + "\n".join(lines) + "\n\n"
+                f"（来自 stock-advisor 策略监控，触发时间 "
+                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}）")
+        except Exception as exc:
+            print(f"[strategy] 持仓策略通知失败: {exc}", flush=True)
+    return triggered
+
+
 def _strategy_loop():
     """止盈监控守护线程：交易时段（9:15-15:05 工作日）每 60s 扫一次，其余时段 5 分钟一扫。"""
     while True:
@@ -1206,8 +1484,10 @@ def _strategy_loop():
             ) and (now.hour < 15 or (now.hour == 15 and now.minute <= 5))
             if in_session:
                 check_strategies_once()
+                check_position_strategies_once()
                 time.sleep(60)
             else:
+                check_position_strategies_once()  # 非交易时段也扫（time_stop/补触发）
                 time.sleep(300)
         except Exception as exc:
             print(f"[strategy] loop error: {exc}", flush=True)
@@ -1216,8 +1496,364 @@ def _strategy_loop():
 
 @app.post("/api/strategies/check")
 def strategies_check():
-    """手动触发一次止盈检查（也供 Claude 定时任务调用）。"""
-    return {"ok": True, "triggered": check_strategies_once()}
+    """手动触发一次止盈检查（逐笔 + 整仓；也供 Claude 定时任务调用）。"""
+    return {"ok": True,
+            "triggered": check_strategies_once() + check_position_strategies_once()}
+
+
+# ---------------- 提款计划（某日期前提出多少钱，系统给达成路径） ----------------
+# 思路：目标金额 - 已提款 = 还需要的现金；拿它对比当前持仓总市值：
+#   市值够        -> 直接按建议卖出凑钱（按浮盈排序，优先兑现赚得多的）
+#   市值不够      -> 算缺口、所需总收益率、剩余交易日、复合日收益率，分级判定难度
+#      （轻松/正常/积极/风险极高/不可能），提醒「要么降目标、要么延日期、要么补本金」
+# 每日收盘后检查一次：达标/临近截止(10/5/1交易日)/逾期 推微信，里程碑键记在
+# notified JSONB 里防重复轰炸。提款流水（sa_withdrawals）累计记进度。
+
+class PlanIn(BaseModel):
+    target_date: str = Field(description="截止日期 YYYY-MM-DD")
+    target_amount: float = Field(gt=0, description="目标提款金额（元）")
+    note: str = Field(default="", max_length=255)
+
+
+class WithdrawalIn(BaseModel):
+    amount: float = Field(gt=0, description="本次提款金额（元）")
+    wd_date: str = Field(default="", description="提款日期 YYYY-MM-DD，空=今天")
+    note: str = Field(default="", max_length=255)
+
+
+def _trading_days_until(end_date: str) -> int:
+    """今天到 end_date(YYYY-MM-DD) 之间还剩多少个交易日（粗算跳过周末，含当日不算）。"""
+    try:
+        d1 = datetime.strptime(str(end_date)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return 0
+    today = datetime.now().date()
+    days, d = 0, today
+    while d < d1:
+        d = d.fromordinal(d.toordinal() + 1)
+        if d.weekday() < 5:
+            days += 1
+    return days
+
+
+def _sell_suggestion(held: list[dict], need: float) -> list[dict]:
+    """按浮盈收益率降序给出「卖哪些、卖多少」凑钱建议，直到凑满 need（人民币口径）。
+
+    need 与累计都用 *_cny；港股回笼资金同时给出原币（HKD）金额。
+    """
+    ranked = sorted(held, key=lambda h: (h.get("pnl_pct") is None,
+                                         -(h.get("pnl_pct") or 0)))
+    out, acc = [], 0.0
+    for h in ranked:
+        if acc >= need:
+            break
+        mv_cny = h.get("market_value_cny", h["market_value"])
+        take = min(mv_cny, need - acc)
+        rate = h.get("fx_rate") or 1.0
+        out.append({"code": h["code"], "name": h["name"],
+                    "pnl_pct": h.get("pnl_pct"), "price": h.get("price"),
+                    "currency": "HKD" if rate != 1.0 else "CNY",
+                    "sell_value": round(take, 2),                    # 折人民币
+                    "sell_value_hkd": round(take / rate, 2) if rate != 1.0 else None,
+                    "sell_shares": int(take / rate / h["price"]) if h.get("price") else None,
+                    "held_value": mv_cny})
+        acc += take
+    return out
+
+
+def _plan_view(plan: dict, held_mv: float, held: list[dict]) -> dict:
+    """把一个计划行 + 当前持仓汇总成「达成路径」视图（列表/详情共用）。"""
+    need = float(plan["target_amount"]) - plan["withdrawn"]   # 还需要提的钱
+    gap = round(need - held_mv, 2)                           # >0 = 市值不够
+    tdays = _trading_days_until(plan["target_date"])
+    deadline_passed = plan["target_date"] < datetime.now().strftime("%Y-%m-%d")
+    view = {**{k: plan[k] for k in ("id", "target_date", "target_amount", "note", "status")},
+            "withdrawn": plan["withdrawn"], "need_now": round(need, 2),
+            "holdings_mv": round(held_mv, 2), "gap": gap,
+            "trading_days_left": tdays, "deadline_passed": deadline_passed,
+            "required_total_pct": None, "required_daily_pct": None,
+            "difficulty": None, "sell_plan": []}
+    if need <= 0:
+        view["difficulty"] = "✅ 已完成"
+        return view
+    if held_mv <= 0:
+        view["difficulty"] = "🚫 无持仓可变现"
+        return view
+    need_ratio = need / held_mv
+    view["required_total_pct"] = round((need_ratio - 1) * 100, 2)
+    if need_ratio <= 1:  # 市值够：直接卖就行
+        view["difficulty"] = "💰 现在就能提"
+        view["required_daily_pct"] = 0.0
+        view["sell_plan"] = _sell_suggestion(held, need)
+        return view
+    # 市值不够：需要组合整体涨 need_ratio-1。按剩余交易日折算复合日收益率
+    if tdays <= 0:
+        view["difficulty"] = "⛔ 已逾期，市值仍不足"
+        return view
+    r = need_ratio ** (1 / tdays) - 1
+    view["required_daily_pct"] = round(r * 100, 4)
+    tot = view["required_total_pct"]
+    if tot <= 10:
+        view["difficulty"] = "🟢 轻松（涨幅要求 ≤10%）"
+    elif tot <= 30:
+        view["difficulty"] = "🟡 正常（需涨 ≤30%，一两个月牛熊转换级别）"
+    elif tot <= 100:
+        view["difficulty"] = "🟠 积极（需翻倍以内，要踩对主线）"
+    elif tdays < 60:
+        view["difficulty"] = "🔴 风险极高（短期翻倍以上不现实，建议降目标/延日期/补本金）"
+    else:
+        view["difficulty"] = "🟠 积极（时间换空间，需持续复利）"
+    return view
+
+
+def _query_plans(withdrawn_map: dict | None = None) -> list[dict]:
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM sa_withdrawal_plans ORDER BY status, target_date, id")
+        rows = [dict(r) for r in cur.fetchall()]
+    for r in rows:
+        r["target_date"] = r["target_date"].isoformat()
+        r["target_amount"] = float(r["target_amount"])
+        r["withdrawn"] = (withdrawn_map or {}).get(r["id"], 0.0)
+        cfg = r.get("notified")
+        r["notified"] = cfg if isinstance(cfg, dict) else (json.loads(cfg or "{}"))
+    return rows
+
+
+def _withdrawn_totals() -> dict[int, float]:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT plan_id, COALESCE(SUM(amount),0) FROM sa_withdrawals "
+                    "GROUP BY plan_id")
+        return {pid: float(v) for pid, v in cur.fetchall()}
+
+
+def _active_held():
+    """当前持仓（有股且有有效市值）：返回 held 列表与总市值（统一人民币口径）。"""
+    held = [p for p in _holdings_with_pnl(_derive_holdings())
+            if p["net_shares"] > 0 and p.get("market_value_cny", p["market_value"]) > 0]
+    return held, sum(p.get("market_value_cny", p["market_value"]) for p in held)
+
+
+@app.get("/api/plans")
+def list_plans():
+    held, mv = _active_held()
+    return [_plan_view(p, mv, held) for p in _query_plans(_withdrawn_totals())]
+
+
+@app.post("/api/plans")
+def create_plan(plan: PlanIn):
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", plan.target_date.strip()):
+        raise HTTPException(400, "截止日期格式应为 YYYY-MM-DD")
+    if plan.target_date < datetime.now().strftime("%Y-%m-%d"):
+        raise HTTPException(400, "截止日期不能是过去的日期")
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO sa_withdrawal_plans (target_date, target_amount, note) "
+            "VALUES (%s,%s,%s) RETURNING id",
+            (plan.target_date, plan.target_amount, plan.note.strip()))
+        pid = cur.fetchone()[0]
+    return {"ok": True, "id": pid}
+
+
+@app.delete("/api/plans/{plan_id}")
+def delete_plan(plan_id: int):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM sa_withdrawal_plans WHERE id = %s RETURNING id", (plan_id,))
+        if cur.rowcount == 0:
+            raise HTTPException(404, f"计划 #{plan_id} 不存在")  # 提款流水随外键级联删
+    return {"ok": True, "removed": plan_id}
+
+
+@app.post("/api/plans/{plan_id}/withdrawals")
+def add_withdrawal(plan_id: int, w: WithdrawalIn):
+    """记一笔已提款。提满目标金额自动把计划置为 done。"""
+    wd_date = w.wd_date.strip() or datetime.now().strftime("%Y-%m-%d")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", wd_date):
+        raise HTTPException(400, "提款日期格式应为 YYYY-MM-DD")
+    with LOCK, get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id, target_amount FROM sa_withdrawal_plans WHERE id = %s",
+                    (plan_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"计划 #{plan_id} 不存在")
+        cur.execute("INSERT INTO sa_withdrawals (plan_id, wd_date, amount, note) "
+                    "VALUES (%s,%s,%s,%s) RETURNING id",
+                    (plan_id, wd_date, w.amount, w.note.strip()))
+        wid = cur.fetchone()[0]
+        cur.execute("SELECT COALESCE(SUM(amount),0) FROM sa_withdrawals WHERE plan_id = %s",
+                    (plan_id,))
+        total = float(cur.fetchone()[0])
+        if total >= float(row[1]):
+            cur.execute("UPDATE sa_withdrawal_plans SET status = 'done' WHERE id = %s",
+                        (plan_id,))
+    return {"ok": True, "id": wid, "withdrawn_total": total,
+            "completed": total >= float(row[1])}
+
+
+@app.get("/api/plans/{plan_id}/detail")
+def plan_detail(plan_id: int):
+    """计划详情：达成路径 + 卖出凑钱建议 + 提款流水。"""
+    totals = _withdrawn_totals()
+    plans = [p for p in _query_plans(totals) if p["id"] == plan_id]
+    if not plans:
+        raise HTTPException(404, f"计划 #{plan_id} 不存在")
+    held, mv = _active_held()
+    view = _plan_view(plans[0], mv, held)
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT id, wd_date, amount, note FROM sa_withdrawals "
+                    "WHERE plan_id = %s ORDER BY wd_date DESC, id DESC", (plan_id,))
+        view["withdrawals"] = [
+            {**{k: r[k] for k in ("id", "note")},
+             "wd_date": r["wd_date"].isoformat(), "amount": float(r["amount"])}
+            for r in cur.fetchall()]
+    return view
+
+
+def check_withdrawal_once(notify: bool = True) -> list[dict]:
+    """每日盘后跑一次：给每个 active 计划算达标状态，推里程碑提醒。
+
+    里程碑键：ready（现在就能提）/ d10 d5 d1（剩余交易日首次 ≤N）/ deadline（逾期）。
+    同键只推一次（记在 notified JSONB）；「现在就能提」回落后再次达标会重新推
+    （键带日期后缀）。
+    """
+    alerts: list[dict] = []
+    totals = _withdrawn_totals()
+    held, mv = _active_held()
+    today = datetime.now().strftime("%Y-%m-%d")
+    for p in _query_plans(totals):
+        if p["status"] != "active":
+            continue
+        v = _plan_view(p, mv, held)
+        milestones = []
+        if v["need_now"] <= 0:
+            milestones.append(("done", "已提满目标金额，计划完成"))
+        elif v["gap"] <= 0:
+            milestones.append((f"ready:{today}",
+                               f"市值已够（{v['holdings_mv']:,.0f} ≥ {v['need_now']:,.0f}），可着手卖出提款"))
+        tleft = v["trading_days_left"]
+        if not v["deadline_passed"] and v["gap"] > 0:
+            for n in (10, 5, 1):
+                if tleft <= n:
+                    milestones.append((f"d{n}", f"距截止仅剩 {tleft} 个交易日且市值不足"))
+                    break
+        if v["deadline_passed"]:
+            milestones.append(("deadline", "已过截止日仍未提满"))
+        for key, msg in milestones:
+            if p["notified"].get(key):
+                continue
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE sa_withdrawal_plans SET notified = notified || %s::jsonb "
+                    "WHERE id = %s",
+                    (json.dumps({key: today}), p["id"]))
+            alerts.append({"plan_id": p["id"], "milestone": key, "message": msg, **v})
+            if notify:
+                try:
+                    notifier.notify(
+                        "🏧 提款计划提醒",
+                        f"计划 #{p['id']}（{p['target_date']} 前提取 "
+                        f"{p['target_amount']:,.0f} 元）\n\n• {msg}\n"
+                        f"• 还需 {v['need_now']:,.0f} 元，当前持仓市值 {v['holdings_mv']:,.0f} 元\n"
+                        f"• 状态：{v['difficulty'] or '—'}"
+                        + (f"\n• 需涨 {v['required_total_pct']:g}%（剩 {tleft} 个交易日）"
+                           if v.get("required_total_pct") and v["gap"] > 0 else ""))
+                except Exception as exc:
+                    print(f"[withdrawal] 通知失败: {exc}", flush=True)
+    return alerts
+
+
+def _withdrawal_loop():
+    """提款计划守护线程：每天 15:10 之后每半小时查一次达标/临期状态（当日只推一次）。"""
+    while True:
+        try:
+            now = datetime.now()
+            if (_conf_enabled("withdrawal", True)
+                    and now.weekday() < 5
+                    and (now.hour > 15 or (now.hour == 15 and now.minute >= 10))):
+                check_withdrawal_once()
+            time.sleep(1800)
+        except Exception as exc:
+            print(f"[withdrawal] loop error: {exc}", flush=True)
+            time.sleep(300)
+
+
+@app.post("/api/plans/check")
+def plans_check():
+    """手动跑一次提款计划检查（也供 Claude 定时任务调用）。"""
+    return {"ok": True, "alerts": check_withdrawal_once()}
+
+
+# ---------------- 财经日历（econ_calendar.py：规则事件 + 手动事件 + 盘前提醒） ----------------
+
+import econ_calendar
+
+
+class CalendarEventIn(BaseModel):
+    event_date: str = Field(description="日期 YYYY-MM-DD")
+    title: str = Field(min_length=1, max_length=128, description="事件名，如：美联储议息 FOMC")
+    time_hint: str = Field(default="", max_length=16, description="北京时间提示，如 02:00")
+    note: str = Field(default="", max_length=255)
+
+
+@app.get("/api/calendar")
+def calendar_upcoming(months: int = 3):
+    """未来 N 个月的财经日历（规则事件自动生成 + 手动事件合并，按日期排序）。"""
+    months = max(1, min(months, 6))
+    with get_conn() as conn:
+        return {"events": econ_calendar.upcoming_events(conn, months=months)}
+
+
+@app.post("/api/calendar/events")
+def calendar_add_event(e: CalendarEventIn):
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", e.event_date.strip()):
+        raise HTTPException(400, "日期格式应为 YYYY-MM-DD")
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO sa_calendar_events (event_date, time_hint, title, note) "
+            "VALUES (%s,%s,%s,%s) RETURNING id",
+            (e.event_date, e.time_hint.strip(), e.title.strip(), e.note.strip()))
+        return {"ok": True, "id": cur.fetchone()[0]}
+
+
+@app.delete("/api/calendar/events/{event_id}")
+def calendar_del_event(event_id: int):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM sa_calendar_events WHERE id = %s RETURNING id", (event_id,))
+        if cur.rowcount == 0:
+            raise HTTPException(404, f"事件 #{event_id} 不存在")
+    return {"ok": True, "removed": event_id}
+
+
+@app.post("/api/calendar/check")
+def calendar_check():
+    """手动跑一次日历盘前提醒（同键只推一次，重复调用不会轰炸）。"""
+    with get_conn() as conn:
+        return {"alerts": econ_calendar.check_calendar_once(conn, notify_fn=notifier.notify)}
+
+
+def _calendar_loop():
+    """财经日历守护线程：交易日早 8:00–12:00 窗口内每 5 分钟查一次（同键只推一次，
+    实际每天只会推一条今明事件/重要预告），盘前及时推微信。"""
+    while True:
+        try:
+            now = datetime.now()
+            if now.weekday() < 5 and 8 <= now.hour < 12 \
+                    and _conf_enabled("calendar", True):
+                with get_conn() as conn:
+                    econ_calendar.check_calendar_once(conn, notify_fn=notifier.notify)
+            time.sleep(300)
+        except Exception as exc:
+            print(f"[calendar] loop error: {exc}", flush=True)
+            time.sleep(600)
+
+
+def _conf_enabled(section: str, default: bool) -> bool:
+    """config.yaml 某段的 enabled 开关读取（calendar/withdrawal 等轻量段共用）。"""
+    try:
+        import yaml
+        data = yaml.safe_load(CONFIG_FILE.read_text(encoding="utf-8")) or {}
+        return bool((data.get(section) or {}).get("enabled", default))
+    except Exception:
+        return default
 
 
 # ---------------- 新闻（多渠道免费抓取，见 news_fetcher.py） ----------------
@@ -2035,6 +2671,12 @@ threading.Thread(target=sector_mod._sector_auto_loop, daemon=True).start()
 
 # 板块盘中监控线程（交易时段每 5 分钟采样 + 急拉/涨停骤增预警；config.yaml sector 段可配）
 threading.Thread(target=sector_mod._intraday_loop, daemon=True).start()
+
+# 提款计划检查线程（交易日 15:10 起半小时查达标/临期，里程碑推微信）
+threading.Thread(target=_withdrawal_loop, daemon=True).start()
+
+# 财经日历盘前提醒线程（交易日早 8–12 点窗口，今明事件/重要预告推微信）
+threading.Thread(target=_calendar_loop, daemon=True).start()
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8686)

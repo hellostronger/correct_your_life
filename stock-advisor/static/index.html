@@ -15,9 +15,9 @@
   .wrap { max-width: 860px; margin: 0 auto; padding: 20px 16px 60px; }
   h1 { font-size: 20px; margin-bottom: 4px; }
   .sub { color: var(--muted); font-size: 12px; margin-bottom: 16px; }
-  .tabs { display: flex; gap: 6px; margin-bottom: 16px; }
-  .tabs button { flex: 1; padding: 9px 0; border: 1px solid var(--border);
-    background: var(--card); border-radius: 8px; cursor: pointer; color: var(--muted); font-size: 14px; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 16px; flex-wrap: wrap; }
+  .tabs button { flex: 1 0 auto; min-width: 84px; padding: 9px 8px; border: 1px solid var(--border);
+    background: var(--card); border-radius: 8px; cursor: pointer; color: var(--muted); font-size: 13px; }
   .tabs button.active { color: var(--accent); border-color: var(--accent); font-weight: 600; }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px;
           padding: 14px; margin-bottom: 14px; }
@@ -78,6 +78,8 @@
   .tab-badge { display: inline-block; min-width: 18px; padding: 0 5px; margin-left: 4px;
                border-radius: 9px; background: var(--up); color: #fff; font-size: 11px;
                line-height: 18px; }
+  .hold-sort { padding: 4px 10px; font-size: 12px; }
+  .hold-sort.on { background: var(--accent); color: #fff; }
 </style>
 </head>
 <body>
@@ -91,6 +93,8 @@
     <button data-tab="sector">🔄 板块轮动</button>
     <button data-tab="holdings">我的持仓</button>
     <button data-tab="strategies">🎯 止盈策略<span id="strategy-tab-badge" class="tab-badge hide">0</span></button>
+    <button data-tab="plans">🏧 提款计划</button>
+    <button data-tab="calendar">📅 财经日历</button>
     <button data-tab="news">📰 新闻</button>
     <button data-tab="bili">📺 B站动态<span id="bili-tab-badge" class="tab-badge hide">0</span></button>
     <button data-tab="wb">🔥 微博<span id="wb-tab-badge" class="tab-badge hide">0</span></button>
@@ -213,10 +217,17 @@
     </div>
     <div class="card">
       <div class="pnl-summary" id="pnl-summary"></div>
+      <div class="muted" id="holdings-fx-note" style="margin-bottom:4px"></div>
+      <div class="row" style="margin:6px 0">
+        <span class="muted">排序：</span>
+        <button class="btn ghost hold-sort" data-sort="default" onclick="setHoldSort('default')">默认</button>
+        <button class="btn ghost hold-sort" data-sort="loss" onclick="setHoldSort('loss')">📉 亏损最多在前</button>
+        <button class="btn ghost hold-sort" data-sort="gain" onclick="setHoldSort('gain')">📈 盈利最多在前</button>
+      </div>
       <table>
         <thead><tr>
-          <th>代码</th><th>名称</th><th>持股</th><th>摊薄成本</th><th>现价</th>
-          <th>市值</th><th>浮动盈亏</th><th>已实现盈亏</th><th>累计总盈亏</th><th>笔数</th><th></th>
+          <th>代码</th><th>名称</th><th>持股</th><th>摊薄成本</th><th>现价(¥)</th>
+          <th>市值(¥)</th><th>浮动盈亏(¥)</th><th>已实现盈亏(¥)</th><th>累计总盈亏(¥)</th><th>笔数</th><th></th>
         </tr></thead>
         <tbody id="holdings-body"></tbody>
       </table>
@@ -253,7 +264,8 @@
       <div class="muted" style="margin-top:6px" id="s-kind-hint"></div>
       <div class="muted" style="margin-top:6px">
         策略与具体股票无关，任何买入笔都可引用；交易时段（9:15–15:05）每分钟检查一次，
-        触发即微信/邮件通知。在「我的持仓 → 记一笔」里引用。</div>
+        触发即微信/邮件通知。两种挂法：①「我的持仓 → 记一笔」里逐笔引用；
+        ②「我的持仓 → 点开某只股票 → 整仓策略」直接挂到整仓（按摊薄成本判定，推荐）。</div>
     </div>
     <div class="card">
       <div class="row" style="justify-content:space-between;margin-bottom:6px">
@@ -262,11 +274,68 @@
       </div>
       <table>
         <thead><tr>
-          <th>ID</th><th>名称</th><th>类型</th><th>止盈线</th><th>备注</th><th>引用笔数</th><th>已触发</th><th>创建时间</th><th></th>
+          <th>ID</th><th>名称</th><th>类型</th><th>止盈线</th><th>备注</th><th>引用笔数</th><th>整仓</th><th>已触发</th><th>创建时间</th><th></th>
         </tr></thead>
         <tbody id="strategies-body"></tbody>
       </table>
       <div id="strategies-empty" class="empty hide">还没有止盈策略。先创建一个（如 +10%），再在「我的持仓 → 记一笔」里引用。</div>
+    </div>
+  </section>
+
+  <!-- 提款计划 -->
+  <section id="tab-plans" class="hide">
+    <div class="card">
+      <b style="font-size:13px">新建提款计划（在截止日前提出目标金额）</b>
+      <div class="row" style="margin-top:8px">
+        <input id="p-date" placeholder="截止日期" style="width:140px"
+               onfocus="this.type='date'" onblur="if(!this.value)this.type='text'">
+        <input id="p-amount" placeholder="目标金额（元），如 50000" type="number" min="1" style="width:200px">
+        <input id="p-note" placeholder="备注（可选），如：交房租 / 旅游基金" style="flex:1;min-width:150px">
+        <button class="btn" onclick="addPlan()">创建计划</button>
+      </div>
+      <div class="muted" style="margin-top:6px">
+        创建后自动对比当前持仓总市值，给出达成路径：市值够 → 按浮盈排序的卖出凑钱建议；
+        不够 → 需要涨多少 / 剩多少交易日 / 难度分级。交易日 15:10 后每日检查，
+        达标、临近截止（剩 10/5/1 个交易日）、逾期都会推微信提醒。</div>
+    </div>
+    <div class="card">
+      <div class="row" style="justify-content:space-between;margin-bottom:6px">
+        <b style="font-size:13px">我的计划</b>
+        <button class="btn ghost" onclick="loadPlans()">刷新</button>
+      </div>
+      <div id="plans-list"></div>
+      <div id="plans-empty" class="empty hide">还没有提款计划。定一个「日期 + 金额」，看看到底怎么提出来。</div>
+    </div>
+  </section>
+
+  <!-- 财经日历 -->
+  <section id="tab-calendar" class="hide">
+    <div class="card">
+      <b style="font-size:13px">手动添加事件（非农/交割/LPR 已自动生成，这里补充 FOMC 议息、美国 CPI 等）</b>
+      <div class="row" style="margin-top:8px">
+        <input id="c-date" placeholder="日期" style="width:130px"
+               onfocus="this.type='date'" onblur="if(!this.value)this.type='text'">
+        <input id="c-title" placeholder="事件名，如：美联储议息 FOMC" style="width:220px">
+        <input id="c-time" placeholder="北京时间（可选）如 02:00" style="width:170px">
+        <input id="c-note" placeholder="备注（可选）" style="flex:1;min-width:120px">
+        <button class="btn" onclick="addCalendarEvent()">添加</button>
+      </div>
+      <div class="muted" style="margin-top:6px">
+        规则事件本地推算：每月第 1 个周五<b>非农</b>、第 3 个周五<b>股指期货交割</b>（季月升级<b>四巫日</b>=富时罗素/标普季调生效）、
+        第 4 个周五 ETF 期权到期、每月 20 日 <b>LPR</b>。交易日早 8 点起盘前自动推微信：今明两日事件一条，
+        ⚡重要事件（非农/四巫）另提前 3 天预告一次。
+      </div>
+    </div>
+    <div class="card">
+      <div class="row" style="justify-content:space-between;margin-bottom:6px">
+        <b style="font-size:13px">未来 3 个月</b>
+        <div class="row">
+          <button class="btn ghost" onclick="calendarCheck()" title="按当前日期跑一次盘前提醒逻辑">模拟提醒</button>
+          <button class="btn ghost" onclick="loadCalendar()">刷新</button>
+        </div>
+      </div>
+      <div id="calendar-list"></div>
+      <div id="calendar-empty" class="empty hide">加载中…</div>
     </div>
   </section>
 
@@ -479,13 +548,15 @@ document.querySelectorAll('.tabs button').forEach(btn => {
   btn.onclick = () => {
     document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
-    ['market', 'sector', 'holdings', 'strategies', 'news', 'bili', 'wb', 'reports', 'notify'].forEach(t =>
+    ['market', 'sector', 'holdings', 'strategies', 'plans', 'calendar', 'news', 'bili', 'wb', 'reports', 'notify'].forEach(t =>
       $('tab-' + t).classList.toggle('hide', t !== btn.dataset.tab));
     if (btn.dataset.tab === 'market') loadWatch();
     if (btn.dataset.tab === 'sector') { loadSector(); loadIntraday(); startIntradayAuto(); }
     if (btn.dataset.tab === 'holdings') loadHoldings();
     if (btn.dataset.tab === 'strategies') loadStrategies();
     if (btn.dataset.tab === 'holdings' || btn.dataset.tab === 'strategies') refreshTradeStrategyOptions();
+    if (btn.dataset.tab === 'plans') loadPlans();
+    if (btn.dataset.tab === 'calendar') loadCalendar();
     if (btn.dataset.tab === 'news') { loadNews(); loadConfig(); }
     if (btn.dataset.tab === 'bili') { loadBiliCreators(); loadBiliDynamics(); loadBiliStatus(); }
     if (btn.dataset.tab === 'wb') { loadWbCreators(); loadWbPosts(); loadWbStatus(); }
@@ -746,38 +817,56 @@ async function delWatch(code) {
 
 // ---- 持仓（流水账） ----
 let _openTradeCode = null;   // 当前展开流水的股票代码
-let _holdingsCache = [];     // 供总计行与清账确认用
 
+// ---- 持仓 ----
+let _holdingsCache = [];     // 供总计行与清账确认用
+let _holdSort = 'default';   // default=持仓在前 | loss=按浮动亏损 | gain=按浮动盈利
 async function loadHoldings() {
   try {
     const items = await api('/api/holdings');
     _holdingsCache = items;
     const tbody = $('holdings-body');
     $('holdings-empty').classList.toggle('hide', items.length > 0);
-    let mv = 0, floatPnl = 0, realized = 0, total = 0;
+    let mv = 0, floatPnl = 0, realized = 0, total = 0;   // 统一人民币口径（港股已折算）
     items.forEach(i => {
-      mv += i.market_value || 0;
-      floatPnl += i.pnl || 0;
-      realized += i.realized_pnl || 0;
-      total += i.total_pnl || 0;
+      mv += i.market_value_cny ?? i.market_value ?? 0;
+      floatPnl += i.pnl_cny ?? i.pnl ?? 0;
+      realized += i.realized_pnl_cny ?? i.realized_pnl ?? 0;
+      total += i.total_pnl_cny ?? i.total_pnl ?? 0;
     });
     $('pnl-summary').innerHTML = items.length ? `
-      <span class="muted">总市值</span><b>${mv.toLocaleString('zh-CN', {maximumFractionDigits: 2})}</b>
+      <span class="muted">总市值(¥)</span><b>${mv.toLocaleString('zh-CN', {maximumFractionDigits: 2})}</b>
       <span class="muted">总浮动盈亏</span><b class="${cls(floatPnl)}">${signed(+floatPnl.toFixed(2))}</b>
       <span class="muted">总已实现盈亏</span><b class="${cls(realized)}">${signed(+realized.toFixed(2))}</b>
       <span class="muted">累计总盈亏</span><b class="${cls(total)}">${signed(+total.toFixed(2))}</b>` : '';
-    tbody.innerHTML = items.map(i => {
+    const held = items.filter(i => i.net_shares > 0), cleared = items.filter(i => i.net_shares === 0);
+    if (_holdSort !== 'default') {
+      held.sort((a, b) => (_holdSort === 'loss'
+        ? (a.pnl_cny ?? a.pnl ?? 0) - (b.pnl_cny ?? b.pnl ?? 0)
+        : (b.pnl_cny ?? b.pnl ?? 0) - (a.pnl_cny ?? a.pnl ?? 0)));
+    }
+    const shown = [...held, ...cleared];
+    document.querySelectorAll('.hold-sort').forEach(b =>
+      b.classList.toggle('on', b.dataset.sort === _holdSort));
+    const fxItems = items.filter(i => i.fx_rate);
+    $('holdings-fx-note').textContent = fxItems.length
+      ? `港股已按 1 HKD ≈ ${fxItems[0].fx_rate} CNY 折算为人民币汇总（成本列 ₸ 标记=港币原币，个股行可看原 HKD 市值）` : '';
+    tbody.innerHTML = shown.map(i => {
       const dim = i.net_shares === 0 ? ' style="opacity:.55"' : '';
-      const priceCell = i.net_shares === 0 ? '<span class="muted">已清仓</span>'
-        : `<td class="${cls(i.price)}">${fmt(i.price)}</td>`;
+      const isHK = i.fx_rate;   // 有汇率标记=港股，金额列显示折算后人民币，悬浮看原币
+      const hkTag = isHK ? '<span class="muted" style="font-size:10px"> ₸</span>' : '';
+      const priceCell = i.net_shares === 0 ? '<td class="muted">—</td>'
+        : `<td class="${cls(i.price)}">${fmt(i.price_cny ?? i.price)}${isHK ? `<div class="muted" style="font-size:10px">原${fmt(i.price)}HKD</div>` : ''}</td>`;
+      const mvCny = i.market_value_cny ?? i.market_value;
       return `<tr${dim} onclick="toggleTrades('${i.code}')" title="点击查看交易流水">
-        <td>${i.code}</td><td>${esc(i.name)}</td>
-        <td>${fmt(i.net_shares)}</td><td>${fmt(i.avg_cost)}</td>
-        ${i.net_shares === 0 ? '<td class="muted">—</td>' : priceCell}
-        <td>${fmt(i.market_value)}</td>
-        <td class="${cls(i.pnl)}">${signed(i.pnl)}</td>
-        <td class="${cls(i.realized_pnl)}">${signed(i.realized_pnl)}</td>
-        <td class="${cls(i.total_pnl)}"><b>${signed(i.total_pnl)}</b></td>
+        <td>${i.code}</td><td>${esc(i.name)}${(i.position_strategies || []).length
+          ? ` <span class="muted" title="已挂整仓策略">🎯${i.position_strategies.filter(s => !s.triggered_at).length ? '监控中' : '已触发'}</span>` : ''}${isHK ? ' <span class="muted" style="font-size:10px">港</span>' : ''}</td>
+        <td>${fmt(i.net_shares)}</td><td>${fmt(i.avg_cost)}${hkTag}</td>
+        ${priceCell}
+        <td>${fmt(mvCny)}${isHK ? `<div class="muted" style="font-size:10px">${fmt(i.market_value)}HKD</div>` : ''}</td>
+        <td class="${cls(i.pnl)}">${signed(i.pnl_cny ?? i.pnl)}</td>
+        <td class="${cls(i.realized_pnl)}">${signed(i.realized_pnl_cny ?? i.realized_pnl)}</td>
+        <td class="${cls(i.total_pnl)}"><b>${signed(i.total_pnl_cny ?? i.total_pnl)}</b></td>
         <td class="muted">${i.trade_count}</td>
         <td><button class="del" onclick="event.stopPropagation();clearTrades('${i.code}',${i.trade_count})" title="清账：删除该股全部流水">×</button></td>
       </tr>`;
@@ -785,6 +874,7 @@ async function loadHoldings() {
     if (_openTradeCode) { if (items.some(i => i.code === _openTradeCode)) await showTrades(_openTradeCode); else hideTrades(); }
   } catch (e) { toast('加载持仓失败: ' + e.message); }
 }
+function setHoldSort(mode) { _holdSort = mode; loadHoldings(); }
 
 async function addTrade() {
   const code = $('t-code').value.trim();
@@ -830,6 +920,7 @@ async function showTrades(code) {
         <b class="muted" style="font-size:12px">${code} 交易流水（新→旧）</b>
         <button class="del" onclick="hideTrades()" title="收起">收起 ↑</button>
       </div>
+      <div id="pos-strat-${code}" style="margin-bottom:8px"></div>
       <table><tbody>${rows.map(t => {
         // 每笔盈亏：卖出=已实现；买入=现价对买入时点成本的浮动（已清仓则为空）
         let pnlCell = '<span class="muted">—</span>';
@@ -856,7 +947,58 @@ async function showTrades(code) {
         <td class="muted">${esc(t.note || '')}${strat}</td>
         <td><button class="del" onclick="event.stopPropagation();delTrade(${t.id},'${code}')" title="删除该笔">×</button></td>
       </tr>`;}).join('')}</tbody></table>`;
+    renderPosStrategies(code);
   } catch (e) { toast('加载流水失败: ' + e.message); }
+}
+
+// ---- 整仓级策略：直接给某只股票的当前持仓挂策略（不必逐笔引用） ----
+let _allStrategiesCache = [];
+async function renderPosStrategies(code) {
+  const box = $('pos-strat-' + code);
+  if (!box) return;
+  const pos = (_holdingsCache || []).find(h => h.code === code);
+  if (!pos) return;
+  try {
+    if (!_allStrategiesCache.length) _allStrategiesCache = await api('/api/strategies');
+  } catch (e) { /* 无策略模板也可查看已挂的 */ }
+  const linked = pos.position_strategies || [];
+  const held = pos.net_shares > 0;
+  const opts = _allStrategiesCache
+    .filter(s => !linked.some(l => l.strategy_id === s.id))
+    .map(s => `<option value="${s.id}">🎯 ${esc(s.name)}（${s.target_display}）</option>`)
+    .join('');
+  box.innerHTML = `<div class="muted" style="font-size:12px;margin-bottom:4px"><b>整仓策略</b>（按摊薄成本 ${fmt(pos.avg_cost)} 判定，触发推微信）</div>` +
+    (linked.length ? linked.map(l => `<div class="row" style="gap:6px;margin-bottom:3px">
+        <span style="font-size:12px">🎯 ${esc(l.strategy_name || '')}
+          ${l.triggered_at ? '<b class="up">✓已触发</b>' : '<span class="muted">监控中</span>'}
+          ${l.kind === 'ladder' && l.ladder_step ? `<span class="muted">已到${l.ladder_step}档</span>` : ''}
+          ${(['drawdown','trailing'].includes(l.kind) && l.peak_price) ? `<span class="muted">峰值${(+l.peak_price).toFixed(2)}</span>` : ''}
+          ${!held ? '<span class="badge" style="background:#e2ecff;color:#2456b3">清仓暂停</span>' : ''}</span>
+        <button class="del" style="font-size:12px" onclick="unbindPosStrategy(${l.id},'${code}')" title="解绑">×</button>
+      </div>`).join('') : '<div class="muted" style="font-size:12px;margin-bottom:4px">未挂策略</div>') +
+    (held ? `<div class="row" style="gap:6px">
+        <select id="ps-sel-${code}" style="padding:5px 8px;border:1px solid var(--border);border-radius:6px;font-size:12px;max-width:260px">
+          ${opts || '<option value="">（先去止盈策略页创建）</option>'}</select>
+        <button class="btn" style="font-size:12px;padding:5px 10px" onclick="bindPosStrategy('${code}')">挂到整仓</button>
+      </div>` : '');
+}
+async function bindPosStrategy(code) {
+  const sel = $('ps-sel-' + code);
+  if (!sel || !sel.value) { toast('请先创建策略模板'); return; }
+  try {
+    await api(`/api/holdings/${code}/strategies`, { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ strategy_id: +sel.value }) });
+    toast('已挂到整仓'); _holdingsCache = await api('/api/holdings');
+    showTrades(code); loadHoldings();
+  } catch (e) { toast(e.message); }
+}
+async function unbindPosStrategy(psId, code) {
+  try {
+    await api('/api/position-strategies/' + psId, { method: 'DELETE' });
+    _holdingsCache = await api('/api/holdings');
+    showTrades(code); loadHoldings();
+  } catch (e) { toast(e.message); }
 }
 
 function hideTrades() {
@@ -960,9 +1102,10 @@ async function loadStrategies() {
         <td><b class="up">${s.target_display}</b></td>
         <td class="muted">${esc(s.note || '')}</td>
         <td>${s.used_count}</td>
+        <td>${s.pos_count ? `<span title="整仓策略关联数">🏦${s.pos_count}</span>` : '0'}</td>
         <td>${s.triggered_count ? `<b class="up">${s.triggered_count}</b>` : '0'}</td>
         <td class="muted">${(s.created_at || '').replace('T', ' ').slice(0, 16)}</td>
-        <td>${s.used_count === 0
+        <td>${(s.used_count + (s.pos_count || 0)) === 0
           ? `<button class="del" onclick="delStrategy(${s.id})" title="删除策略">×</button>` : ''}</td>
       </tr>`).join('');
   } catch (e) { toast('加载策略失败: ' + e.message); }
@@ -976,6 +1119,165 @@ function updateStrategyBadge() {
   // 策略与股票无关，徽标无「待触发」语义，隐藏
   const b = $('strategy-tab-badge');
   if (b) b.classList.add('hide');
+}
+
+// ---- 提款计划 ----
+let _openPlanId = null;
+async function addPlan() {
+  const date = $('p-date').value, amount = $('p-amount').value;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) { toast('请选择截止日期'); return; }
+  if (!amount || +amount <= 0) { toast('请输入目标金额（>0）'); return; }
+  try {
+    await api('/api/plans', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target_date: date, target_amount: +amount, note: $('p-note').value.trim() }) });
+    $('p-date').value = ''; $('p-date').type = 'text'; $('p-amount').value = ''; $('p-note').value = '';
+    toast('计划已创建'); loadPlans();
+  } catch (e) { toast('创建失败: ' + e.message); }
+}
+async function loadPlans() {
+  try {
+    const items = await api('/api/plans');
+    $('plans-empty').classList.toggle('hide', items.length > 0);
+    $('plans-list').innerHTML = items.map(p => {
+      const pct = p.target_amount > 0
+        ? Math.min(100, Math.round(p.withdrawn / p.target_amount * 100)) : 0;
+      const urgent = !p.deadline_passed && p.trading_days_left <= 5 && p.status === 'active';
+      return `<div class="card" style="margin:8px 0;background:var(--bg);${urgent ? 'border-color:var(--up)' : ''}">
+        <div class="row" style="justify-content:space-between">
+          <span><b>${p.target_date} 前提出 ${fmt(p.target_amount)} 元</b>
+            ${p.status === 'done' ? '<span class="badge" style="background:#e5f3e2;color:#2e7d32">已完成</span>'
+              : p.deadline_passed ? '<span class="badge" style="background:#ffe2e2;color:#b32424">已逾期</span>'
+              : `<span class="muted">剩 ${p.trading_days_left} 个交易日</span>`}</span>
+          <span>
+            <button class="btn ghost" style="font-size:12px" onclick="togglePlanDetail(${p.id})">详情/记提款</button>
+            <button class="del" onclick="delPlan(${p.id})" title="删除计划">×</button></span>
+        </div>
+        <div style="margin-top:6px">
+          <div style="background:var(--border);border-radius:5px;height:8px;overflow:hidden">
+            <div style="width:${pct}%;height:100%;background:var(--accent)"></div></div>
+          <div class="row" style="justify-content:space-between;margin-top:4px">
+            <span class="muted">已提款 ${fmt(p.withdrawn)}（${pct}%）</span>
+            <span class="muted">还需 <b>${fmt(p.need_now)}</b> · 持仓市值 ${fmt(p.holdings_mv)}</span>
+          </div>
+        </div>
+        <div class="row" style="margin-top:4px;justify-content:space-between">
+          <span><b>${p.difficulty || '—'}</b></span>
+          ${p.gap > 0 && p.required_total_pct != null
+            ? `<span class="muted">需涨 <b class="up">${signed(p.required_total_pct)}%</b> · 日均 ${p.required_daily_pct ?? '—'}%</span>`
+            : ''}
+        </div>
+        ${p.note ? `<div class="muted">📝 ${esc(p.note)}</div>` : ''}
+        <div id="plan-detail-${p.id}" class="hide" style="margin-top:8px;border-top:1px dashed var(--border);padding-top:8px"></div>
+      </div>`;
+    }).join('');
+    if (_openPlanId != null && items.some(p => p.id === _openPlanId)) showPlanDetail(_openPlanId);
+  } catch (e) { toast('加载计划失败: ' + e.message); }
+}
+function togglePlanDetail(id) {
+  if (_openPlanId === id) { _openPlanId = null; $('plan-detail-' + id).classList.add('hide'); return; }
+  _openPlanId = id; showPlanDetail(id);
+}
+async function showPlanDetail(id) {
+  try {
+    const p = await api('/api/plans/' + id + '/detail');
+    const box = $('plan-detail-' + id);
+    box.classList.remove('hide');
+    const sellRows = (p.sell_plan || []).map(s => `<tr>
+        <td>${s.code} ${esc(s.name)}${s.currency === 'HKD' ? ' <span class="muted" style="font-size:10px">港</span>' : ''}</td>
+        <td class="${cls(s.pnl_pct)}">${s.pnl_pct != null ? signed(s.pnl_pct) + '%' : '—'}</td>
+        <td>${s.sell_shares != null ? fmt(s.sell_shares) + ' 股' : '—'}</td>
+        <td><b>${fmt(s.sell_value)}</b> 元${s.sell_value_hkd ? `<div class="muted" style="font-size:10px">${fmt(s.sell_value_hkd)} HKD</div>` : ''}</td>
+        <td class="muted">持有 ${fmt(s.held_value)}</td></tr>`).join('');
+    const wdRows = (p.withdrawals || []).map(w => `<tr>
+        <td class="muted">${w.wd_date}</td><td class="up">${fmt(w.amount)}</td>
+        <td class="muted">${esc(w.note || '')}</td>
+        <td class="muted">#${w.id}</td></tr>`).join('');
+    box.innerHTML = `
+      <div class="row">
+        <input id="pw-amount" placeholder="本次提款金额" type="number" min="0.01" step="0.01" style="width:140px">
+        <input id="pw-date" placeholder="日期（默认今天）" style="width:150px"
+               onfocus="this.type='date'" onblur="if(!this.value)this.type='text'">
+        <input id="pw-note" placeholder="备注" style="flex:1;min-width:80px">
+        <button class="btn" onclick="addWithdrawal(${id})">记一笔提款</button>
+      </div>
+      ${p.sell_plan && p.sell_plan.length ? `
+        <div class="muted" style="margin-top:8px"><b>💡 卖出凑钱建议</b>（优先兑现浮盈高的，凑 ${fmt(p.need_now)} 元）：</div>
+        <table><thead><tr><th>股票</th><th>浮动</th><th>建议卖出</th><th>回笼资金</th><th></th></tr></thead>
+        <tbody>${sellRows}</tbody></table>` : ''}
+      ${p.gap > 0 ? `<div class="muted" style="margin-top:6px">⚠️ 市值缺口 ${fmt(p.gap)} 元——
+        完成目标需组合上涨 ${p.required_total_pct != null ? signed(p.required_total_pct) + '%' : '—'}；
+        不现实的话考虑降目标、延日期或场外补本金。</div>` : ''}
+      ${wdRows ? `<div class="muted" style="margin-top:8px"><b>提款流水</b>：</div>
+        <table><tbody>${wdRows}</tbody></table>`
+        : '<div class="muted" style="margin-top:6px">还没有提款记录。</div>'}`;
+  } catch (e) { toast(e.message); }
+}
+async function addWithdrawal(id) {
+  const amount = $('pw-amount').value;
+  if (!amount || +amount <= 0) { toast('请输入提款金额'); return; }
+  try {
+    const r = await api(`/api/plans/${id}/withdrawals`, { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ amount: +amount, wd_date: $('pw-date').value, note: $('pw-note').value.trim() }) });
+    toast(r.completed ? '🎉 已提满目标，计划完成！' : '已记录提款');
+    loadPlans();
+  } catch (e) { toast(e.message); }
+}
+async function delPlan(id) {
+  if (!confirm('删除该提款计划？提款流水会一并删除。')) return;
+  try { await api('/api/plans/' + id, { method: 'DELETE' }); loadPlans(); }
+  catch (e) { toast(e.message); }
+}
+
+// ---- 财经日历 ----
+const CAL_LEVEL = { high: { t: '⚡ 重要', s: 'background:#ffe2e2;color:#b32424' },
+                    mid: { t: '关注', s: 'background:#ffe9d6;color:#b25f00' },
+                    low: { t: '一般', s: 'background:#e5f3e2;color:#2e7d32' } };
+async function loadCalendar() {
+  try {
+    const d = await api('/api/calendar');
+    const evs = d.events || [];
+    $('calendar-empty').classList.toggle('hide', evs.length > 0);
+    const today = new Date().toISOString().slice(0, 10);
+    $('calendar-list').innerHTML = evs.map(e => {
+      const lv = CAL_LEVEL[e.level] || CAL_LEVEL.low;
+      const isPast = e.date < today;
+      const wd = ['日', '一', '二', '三', '四', '五', '六'][new Date(e.date).getDay()];
+      const srcBadge = e.source === 'manual'
+        ? `<button class="del" style="font-size:12px" onclick="delCalendarEvent(${e.id})" title="删除手动事件">×</button>` : '';
+      return `<div class="row" style="justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--border);${isPast ? 'opacity:.5' : ''}">
+        <span><b>${e.date}</b> <span class="muted">周${wd}</span>
+          <span class="badge" style="${lv.s}">${lv.t}</span>
+          <span style="margin-left:6px">${esc(e.title)}</span>
+          ${e.time ? `<span class="muted"> · ${esc(e.time)}</span>` : ''}
+          ${e.market === 'us' ? '<span class="muted"> · 美</span>' : '<span class="muted"> · A/港</span>'}
+          ${e.note ? `<div class="muted" style="margin-top:2px">${esc(e.note)}</div>` : ''}</span>
+        ${srcBadge}</div>`;
+    }).join('');
+  } catch (e) { toast('加载日历失败: ' + e.message); }
+}
+async function addCalendarEvent() {
+  const date = $('c-date').value, title = $('c-title').value.trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) { toast('请选择日期'); return; }
+  if (!title) { toast('请输入事件名'); return; }
+  try {
+    await api('/api/calendar/events', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ event_date: date, title, time_hint: $('c-time').value.trim(), note: $('c-note').value.trim() }) });
+    ['c-date', 'c-title', 'c-time', 'c-note'].forEach(id => $(id).value = '');
+    $('c-date').type = 'text';
+    toast('已添加'); loadCalendar();
+  } catch (e) { toast('添加失败: ' + e.message); }
+}
+async function delCalendarEvent(id) {
+  if (!confirm('删除该手动事件？')) return;
+  try { await api('/api/calendar/events/' + id, { method: 'DELETE' }); loadCalendar(); }
+  catch (e) { toast(e.message); }
+}
+async function calendarCheck() {
+  try {
+    const r = await api('/api/calendar/check', { method: 'POST' });
+    toast(r.alerts.length ? `已触发 ${r.alerts.length} 条提醒（推微信/邮件）` : '今明无事件，无提醒');
+  } catch (e) { toast(e.message); }
 }
 
 // ---- 报告 ----
