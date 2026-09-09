@@ -1,0 +1,36 @@
+# Stock Advisor 本地一键运行（含 MediaCrawler 抓取能力）
+#
+# 首次：  git submodule update --init   （MediaCrawler 是 submodule）
+# 构建：  docker compose build
+# 运行：  docker compose up -d          页面 http://127.0.0.1:8686/
+# 扫码：  登录二维码写到 ./mediacrawler-browser/bili_login_qrcode.png，
+#         见 README「Docker 运行」一节services:
+  stock-advisor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: stock-advisor:latest
+    container_name: stock-advisor
+    restart: unless-stopped
+    ports:
+      - "8686:8686"
+    env_file:
+      - .env            # 只用到 DB_*（云 PostgreSQL）；app.py 启动时解析
+    environment:
+      UV_BIN: /usr/local/bin/uv
+      PYTHONUNBUFFERED: "1"
+      # .env 里 DB_HOST 若是 127.0.0.1（宿主机回环），容器内不通，这里覆盖为宿主机；
+      # 若 .env 里已是公网/局域网地址，删除本行即可
+      DB_HOST: host.docker.internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # .env 挂载；Dockerfile 里会把它符号链接到 /app/.env（app.py 读 BASE_DIR.parent/.env）
+      - ./.env:/correct_your_life/.env:ro
+      # stock-advisor 运行数据
+      - ./stock-advisor/reports:/app/stock-advisor/reports
+      # config.yaml 挂载使网页改配置直接落到宿主文件
+      - ./stock-advisor/config.yaml:/app/stock-advisor/config.yaml
+      # MediaCrawler 运行数据（登录态必须持久化，否则每次重启都要扫码）
+      - ./mediacrawler-browser:/srv/MediaCrawler/browser_data
+      - ./mediacrawler-data:/srv/MediaCrawler/data

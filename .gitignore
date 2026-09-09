@@ -10,5 +10,9 @@ __pycache__/
 stock-advisor/data/
 stock-advisor/reports/
 
+# Docker 运行时卷（browser_data 登录态、爬虫产出 jsonl）
+mediacrawler-browser/
+mediacrawler-data/
+
 # MediaCrawler 以 git submodule 跟踪（指向 hellostronger/MediaCrawler，锁定补丁版）
 # 注意：MediaCrawler 内部的运行产物由其自己的 .gitignore 管理

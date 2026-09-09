@@ -12,7 +12,9 @@
 """
 
 import json
+import os
 import re
+import signal
 import subprocess
 import threading
 from datetime import datetime
@@ -51,7 +53,7 @@ def run_crawl(creator_ids: list[str], headless: bool, timeout_min: int) -> bool:
         raise FileNotFoundError(f"MediaCrawler 目录不存在: {MC_DIR}")
     log_path = MC_DIR / "wb_crawl_last.log"
     cmd = [
-        "uv", "run", "python", "main.py",
+        os.environ.get("UV_BIN", "uv"), "run", "python", "main.py",
         "--platform", "wb",
         "--type", "creator",
         "--creator_id", ",".join(creator_ids),
@@ -60,21 +62,30 @@ def run_crawl(creator_ids: list[str], headless: bool, timeout_min: int) -> bool:
         "--get_comment", "true",
     ]
     # 同 bili_monitor：输出写文件，不用 PIPE（防日志写满阻塞子进程）
+    # start_new_session 仅 POSIX 生效：子进程自成进程组，超时可整组杀掉。
     with open(log_path, "w", encoding="utf-8", errors="replace") as log_f:
         proc = subprocess.Popen(
             cmd, cwd=str(MC_DIR),
             stdout=log_f, stderr=subprocess.STDOUT,
             creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+            start_new_session=not hasattr(subprocess, "CREATE_NO_WINDOW"),
         )
         try:
             proc.wait(timeout=timeout_min * 60)
         except subprocess.TimeoutExpired:
             # Windows 上必须整棵进程树杀掉，否则 python/chrome 孤儿锁住 browser_data
-            subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                capture_output=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
-            )
+            if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    capture_output=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+            else:
+                # POSIX（Docker/Linux）：整组杀掉 uv→python→chrome
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             raise TimeoutError(f"MediaCrawler 超时（{timeout_min} 分钟），已终止")
         if proc.returncode != 0:
             tail = ""
