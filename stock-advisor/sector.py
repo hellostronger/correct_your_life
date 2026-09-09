@@ -23,6 +23,7 @@
 """
 
 import json
+import re
 import threading
 import time
 from collections import Counter
@@ -255,6 +256,42 @@ def fetch_board_constituents(bk_code: str, limit: int = 20) -> list[dict]:
              "price": x.get("f2"), "pct": x.get("f3"),
              "main_inflow": x.get("f62") if isinstance(x.get("f62"), (int, float)) else None}
             for x in diff]
+
+
+def _em_secid(code: str) -> str | None:
+    """腾讯式代码 → 东财 secid 市场前缀（实测映射）：沪 1.x / 深 0.x / 港股 116.x。"""
+    code = code.strip()
+    if re.fullmatch(r"\d{5}", code):
+        return f"116.{code}"
+    if re.fullmatch(r"\d{6}", code):
+        return ("1." if code[0] in "5689" else "0.") + code
+    return None
+
+
+def fetch_stock_boards(code: str, retries: int = 2) -> list[dict]:
+    """个股所属板块（东财 slist，spt=3）。返回 [{code, name, pct}]，按关联度排（行业在前）。
+
+    涨跌幅 f3 顺手带上，前端能直接标注板块红绿。失败重试 2 次后返回 []。
+    """
+    secid = _em_secid(code)
+    if not secid:
+        return []
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(
+                "https://push2delay.eastmoney.com/api/qt/slist/get",
+                params={"spt": "3", "fltt": 2, "invt": 2, "secid": secid,
+                        "fields": "f12,f14,f3", "pn": 1, "pz": 40, "po": 1, "np": 1},
+                headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            diff = (resp.json().get("data") or {}).get("diff") or []
+            return [{"code": x.get("f12"), "name": x.get("f14"),
+                     "pct": x.get("f3") if isinstance(x.get("f3"), (int, float)) else None}
+                    for x in diff]
+        except Exception:
+            if attempt < retries:
+                time.sleep(1 + attempt)
+    return []
 
 
 # ---------------- 存储：云库 ----------------
@@ -518,6 +555,126 @@ def digest(hours: int = 24) -> str:
     return "\n".join(lines)
 
 
+# ---------------- 个股 ↔ 板块联动 ----------------
+
+def stock_board_exposure(codes: list[str]) -> dict[str, dict]:
+    """批量查个股所属板块，并标注每个板块在最新快照中的当日表现/评分排位。
+
+    返回 {code: {"boards": [{code, name, pct, snap_pct, kind, score, zt_count}], "industry": 名称}}
+
+    快照里查不到的板块（slist 可能有快照之外的板块，理论上不应发生）不标 snap 字段。
+    """
+    if not codes:
+        return {}
+    out: dict[str, dict] = {}
+    # 最新快照日全量板块 → code: row（一次查库，所有股票共用）
+    with _get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """SELECT s.code, s.name, s.kind, s.pct, s.main_inflow
+               FROM sa_sector_snapshots s
+               JOIN (SELECT MAX(snap_date) AS d FROM sa_sector_snapshots) m
+                 ON s.snap_date = m.d""")
+        snap_by_code = {r[0]: {"code": r[0], "name": r[1], "kind": r[2],
+                               "snap_pct": (float(r[3]) if r[3] is not None else None),
+                               "main_inflow": (float(r[4]) if r[4] is not None else None)}
+                        for r in cur.fetchall()}
+        # 评分需要 zt_count —— 从 overview 的口径重算太重，这里只做涨幅排位近似：
+        pcts = sorted(v["snap_pct"] for v in snap_by_code.values()
+                      if v["snap_pct"] is not None)
+        for code in codes:
+            boards = fetch_stock_boards(code)
+            enriched = []
+            industry = ""
+            for b in boards:
+                snap = snap_by_code.get(b["code"])
+                row = {**b}
+                if snap:
+                    row.update({"kind": snap["kind"],
+                                "snap_pct": snap["snap_pct"]})
+                    if pcts and snap["snap_pct"] is not None:
+                        below = sum(1 for x in pcts if x < snap["snap_pct"])
+                        row["pct_rank"] = round(below / len(pcts) * 100)
+                    if snap["kind"] == "industry" and not industry:
+                        industry = snap["name"]
+                enriched.append(row)
+            out[code] = {"boards": enriched, "industry": industry}
+    return out
+
+
+# ---------------- 板块轮动预警（评分骤升 / 新高上榜 / 涨停聚集） ----------------
+
+ALERT_STATE_FILE = BASE_DIR / "data" / "sector_alert_state.json"
+
+
+def _load_alert_state() -> dict:
+    try:
+        return json.loads(ALERT_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_alert_state(state: dict) -> None:
+    ALERT_STATE_FILE.parent.mkdir(exist_ok=True)
+    ALERT_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1),
+                                encoding="utf-8")
+
+
+def check_rotation_alerts(top_n: int = 10, score_jump: float = 15.0,
+                          zt_surge: int = 5) -> list[str]:
+    """盘后跑一次轮动预警，返回本次触发的提醒文本列表（调用方决定是否推送）。
+
+    触发条件（相对上次快照日）：
+    - 新主线候选：评分 Top N 里出现了上轮不在 Top N 的板块
+    - 涨停聚集：单板块涨停家数 ≥ zt_surge 且较上轮增加
+    阈值内不打扰。状态存本地 JSON（重跑同一天不重复报）。
+    """
+    ov = build_overview(with_details=False)
+    if ov.get("empty") or not ov.get("snap_date"):
+        return []
+    today = ov["snap_date"]
+    boards = ov.get("boards") or []
+    if not boards:
+        return []
+    top_now = {b["code"]: b for b in boards[:top_n]}
+    zt_by_board = ov.get("zt", {}).get("by_board") or {}
+
+    state = _load_alert_state()
+    alerts: list[str] = []
+    new_key = f"top_{today}"
+    prev_key = f"top_{state.get('last_date')}" if state.get("last_date") else None
+    prev_top = (state.get(prev_key) or {}) if prev_key else {}
+
+    # 1) 新主线候选
+    entered = [b for code, b in top_now.items() if code not in prev_top]
+    if entered:
+        lines = [f"• {b['name']}（{b['kind']}，{b.get('pct') or 0:+.2f}%，评分 {b['score']}）"
+                 for b in entered[:5]]
+        alerts.append("🧭 新进主线候选（评分 Top%d）：\n%s" % (top_n, "\n".join(lines)))
+
+    # 2) 涨停聚集（今日 zt_by_board 里家数 ≥ 阈值；与上轮比增量）
+    zt_prev = state.get(f"zt_{today}") or {}
+    surged = []
+    for name, cnt in zt_by_board.items():
+        if cnt >= zt_surge and cnt > (zt_prev.get(name) or 0):
+            surged.append((name, cnt, cnt - (zt_prev.get(name) or 0)))
+    if surged:
+        surged.sort(key=lambda x: -x[1])
+        alerts.append("🔥 板块涨停聚集：\n" + "\n".join(
+            f"• {name}：涨停 {cnt} 家（较昨日 +{inc}）" for name, cnt, inc in surged[:5]))
+
+    # 更新状态（只保留最近 3 天，防文件膨胀）
+    new_state = {"last_date": today}
+    dates = sorted({k.split("_", 1)[1] for k in
+                    [*(state.keys()), new_key, f"zt_{today}"] if "_" in k})
+    for d in dates[-3:]:
+        if f"top_{d}" in state or d == today:
+            new_state[f"top_{d}"] = state.get(f"top_{d}") or {c: b.get("score") for c, b in top_now.items()}
+        if f"zt_{d}" in state or d == today:
+            new_state[f"zt_{d}"] = state.get(f"zt_{d}") or zt_by_board
+    _save_alert_state(new_state)
+    return alerts
+
+
 # ---------------- 自动采集线程 ----------------
 
 def _is_after_close(now: datetime) -> bool:
@@ -544,6 +701,18 @@ def _sector_auto_loop():
                     try:
                         result = collect_once()
                         print(f"[sector] auto snapshot: {result}", flush=True)
+                        # 盘后预警：新主线候选 / 涨停聚集 → 微信/邮件
+                        try:
+                            alerts = check_rotation_alerts()
+                            if alerts:
+                                import notifier
+                                notifier.notify(
+                                    "🧭 板块轮动预警",
+                                    "\n\n".join(alerts) + f"\n\n（快照 {result.get('date')}，"
+                                    "来自 stock-advisor 板块监控）")
+                                print(f"[sector] alerts sent: {len(alerts)}", flush=True)
+                        except Exception as exc:
+                            print(f"[sector] alert failed: {exc}", flush=True)
                         time.sleep(600)  # 采完歇 10 分钟再回主循环
                     except Exception as exc:
                         print(f"[sector] auto snapshot failed: {exc}", flush=True)

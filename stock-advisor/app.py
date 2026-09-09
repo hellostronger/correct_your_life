@@ -1920,6 +1920,25 @@ def sector_digest(hours: int = 24):
     return {"digest": sector_mod.digest(hours=hours)}
 
 
+@app.get("/api/sector/stock-boards")
+def sector_stock_boards(codes: str):
+    """个股所属板块 + 板块当日表现（codes 逗号分隔，如 600519,000665）。
+
+    自选/持仓页展开行时调；也用于看持仓的板块暴露。
+    """
+    code_list = [c.strip() for c in codes.split(",") if c.strip()][:30]
+    if not code_list:
+        raise HTTPException(400, "codes 参数为空")
+    return sector_mod.stock_board_exposure(code_list)
+
+
+@app.post("/api/sector/alerts/check")
+def sector_alerts_check():
+    """手动跑一次轮动预警（自动版在每日盘后快照后跑）。返回本次触发的提醒。"""
+    alerts = sector_mod.check_rotation_alerts()
+    return {"alerts": alerts, "count": len(alerts)}
+
+
 # ---------------- 报告 ----------------
 
 @app.get("/api/reports")

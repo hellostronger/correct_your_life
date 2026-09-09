@@ -157,6 +157,14 @@
         （行业 496 + 概念 504 + 地域 31），每天收盘后也会自动采集；积累 3 个交易日后动量信号完整。</div>
       <div id="sector-board-detail" class="hide" style="margin-top:10px;border-top:1px dashed var(--border);padding-top:10px"></div>
     </div>
+    <div class="card">
+      <div class="row" style="justify-content:space-between;margin-bottom:6px">
+        <b style="font-size:13px">🧩 自选/持仓的板块归属</b>
+        <button class="btn ghost" onclick="loadStockBoards()">查询</button>
+      </div>
+      <div id="stock-boards-box" class="muted">点「查询」：拉自选股+持仓股各自所属的板块，
+        并标注板块在最新快照中的当日表现（排位=涨幅在全市场板块的百分位）。港股板块不参与评分联动。</div>
+    </div>
   </section>
 
   <!-- 持仓 -->
@@ -549,6 +557,41 @@ async function toggleBoardDetail(bk) {
       </tr>`).join('')}</tbody></table>`;
   } catch (e) { box.innerHTML = `<span class="muted">加载失败：${e.message}</span>`; }
 }
+// 自选+持仓股的板块归属：一列一只股，板块胶囊按 kind 着色，行业板块带当日表现
+const _kindStyle = { industry: ['background:#ffe9d6;color:#b25f00', '行业'],
+                     concept:  ['background:#e2ecff;color:#2456b3', '概念'],
+                     region:   ['background:#e5f3e2;color:#2e7d32', '地域'] };
+async function loadStockBoards() {
+  const box = $('stock-boards-box');
+  box.classList.remove('muted');
+  box.innerHTML = '<span class="muted">查询中…（每只股一个请求，稍等）</span>';
+  try {
+    const [watch, holdings] = await Promise.all([
+      api('/api/watchlist?with_quotes=false'), api('/api/holdings')]);
+    const codes = [...new Set([...watch.map(i => i.code),
+                               ...holdings.map(h => h.code)])];
+    if (!codes.length) { box.innerHTML = '<span class="muted">还没有自选股或持仓</span>'; return; }
+    const exposure = await api('/api/sector/stock-boards?codes=' + codes.join(','));
+    box.innerHTML = codes.map(code => {
+      const d = exposure[code] || { boards: [] };
+      const name = (watch.find(i => i.code === code) || holdings.find(h => h.code === code) || {}).name || '';
+      const pills = d.boards.map(b => {
+        const [style, kindLabel] = _kindStyle[b.kind] || ['', ''];
+        const perf = b.snap_pct != null
+          ? ` <span class="${cls(b.snap_pct)}">${signed(b.snap_pct)}%</span>`
+            + (b.pct_rank != null ? `<span class="muted">前${100 - b.pct_rank}%</span>` : '')
+          : '';
+        return `<span class="badge" style="${style || 'background:var(--bg);color:var(--muted)'}"
+          title="${kindLabel || '板块'}（点击看成分股）" ${b.code && b.code.startsWith('BK')
+            ? `onclick="switchToBoard('${b.code}')"` : ''}>${b.name}${perf}</span>`;
+      }).join(' ');
+      return `<div style="padding:6px 0;border-bottom:1px dashed var(--border)">
+        <b>${code}</b> <span class="muted">${name}</span><div style="margin-top:3px">${pills || '<span class="muted">无板块数据</span>'}</div>
+      </div>`;
+    }).join('');
+  } catch (e) { box.innerHTML = `<span class="muted">查询失败：${e.message}</span>`; }
+}
+function switchToBoard(bk) { toggleBoardDetail(bk); window.scrollTo({ top: 0, behavior: 'smooth' }); }
 
 // ---- 自选 ----
 // 量能标签：ratio 是「最新日成交量 / 前5日均量」；>1.15 放量，<0.9 缩量，其余平量
