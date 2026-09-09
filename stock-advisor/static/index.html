@@ -142,6 +142,26 @@
       <div id="sector-sentiment" class="row" style="margin-top:6px;gap:16px;flex-wrap:wrap"></div>
       <div class="muted" style="margin-top:6px" id="sector-collect-note"></div>
     </div>
+    <div class="card" id="intraday-card">
+      <div class="row" style="justify-content:space-between">
+        <b style="font-size:13px">⏱️ 盘中实时榜（涨幅 Top50）</b>
+        <div class="row">
+          <span class="muted" id="intraday-meta" style="font-size:12px"></span>
+          <label class="muted"><input type="checkbox" id="intraday-auto" checked> 自动刷新</label>
+          <button class="btn ghost" onclick="loadIntraday(true)">手动刷新</button>
+        </div>
+      </div>
+      <div style="overflow-x:auto">
+      <table style="margin-top:6px">
+        <thead><tr>
+          <th>板块</th><th>类型</th><th>涨幅</th><th>较上次采样</th><th>主力净流入</th><th>领涨股</th><th></th>
+        </tr></thead>
+        <tbody id="intraday-body"></tbody>
+      </table>
+      </div>
+      <div id="intraday-empty" class="empty hide">还没有盘中采样数据。交易时段（9:15–15:05）后台每 5 分钟自动采样；
+        也可点「手动刷新」立即采一次。</div>
+    </div>
     <div class="card">
       <b style="font-size:13px">🔥 轮动评分榜（主线候选：涨幅+主力资金+涨停+动量综合）</b>
       <div style="overflow-x:auto">
@@ -462,7 +482,7 @@ document.querySelectorAll('.tabs button').forEach(btn => {
     ['market', 'sector', 'holdings', 'strategies', 'news', 'bili', 'wb', 'reports', 'notify'].forEach(t =>
       $('tab-' + t).classList.toggle('hide', t !== btn.dataset.tab));
     if (btn.dataset.tab === 'market') loadWatch();
-    if (btn.dataset.tab === 'sector') loadSector();
+    if (btn.dataset.tab === 'sector') { loadSector(); loadIntraday(); startIntradayAuto(); }
     if (btn.dataset.tab === 'holdings') loadHoldings();
     if (btn.dataset.tab === 'strategies') loadStrategies();
     if (btn.dataset.tab === 'holdings' || btn.dataset.tab === 'strategies') refreshTradeStrategyOptions();
@@ -473,6 +493,58 @@ document.querySelectorAll('.tabs button').forEach(btn => {
     if (btn.dataset.tab === 'notify') loadNotifyConf();
   };
 });
+
+// ---- 盘中实时榜 ----
+let _intradayTimer = null, _prevIntradayPct = {};  // 上次采样涨幅，算「较上次采样」
+async function loadIntraday(fetchFresh = false) {
+  try {
+    if (fetchFresh) {
+      const btns = document.querySelectorAll('#intraday-card button.btn.ghost');
+      const btn = btns[btns.length - 1];
+      if (btn) { btn.textContent = '采样中…'; btn.disabled = true; }
+      try { await api('/api/sector/intraday/collect', { method: 'POST' }); }
+      finally { if (btn) { btn.textContent = '手动刷新'; btn.disabled = false; } }
+    }
+    const d = await api('/api/sector/intraday');
+    $('intraday-empty').classList.toggle('hide', (d.boards || []).length > 0);
+    const staleness = d.in_session ? '' :
+      (d.updated_at ? '（非交易时段，显示最后采样）' : '');
+    $('intraday-meta').textContent =
+      (d.updated_at ? `采样 ${d.updated_at.replace('T', ' ').slice(5, 16)}` : '')
+      + (d.quote_ts ? ` · 行情 ${d.quote_ts.replace('T', ' ').slice(11, 16)}` : '')
+      + staleness;
+    $('intraday-body').innerHTML = (d.boards || []).map(b => {
+      const kindName = { industry: '行业', concept: '概念', region: '地域' }[b.kind] || '';
+      const prev = _prevIntradayPct[b.code];
+      const delta = (prev != null && b.pct != null) ? b.pct - prev : null;
+      _prevIntradayPct[b.code] = b.pct;
+      return `<tr data-bk="${b.code}" style="cursor:pointer" onclick="toggleBoardDetail('${b.code}')">
+        <td><b>${b.name}</b></td>
+        <td class="muted">${kindName}</td>
+        <td class="${cls(b.pct)}"><b>${b.pct != null ? signed(b.pct) + '%' : '—'}</b></td>
+        <td class="${cls(delta)}">${delta != null && Math.abs(delta) >= 0.01 ? (delta > 0 ? '▲' : '▼') + Math.abs(delta).toFixed(2) : '<span class="muted">—</span>'}</td>
+        <td class="${cls(b.main_inflow)}">${b.main_inflow != null ? yi(b.main_inflow) : '—'}</td>
+        <td class="muted">${b.lead_stock || '—'}</td>
+        <td class="muted">▾</td>
+      </tr>`;
+    }).join('');
+  } catch (e) { toast('盘中数据加载失败: ' + e.message); }
+}
+function startIntradayAuto() {
+  // 勾选了自动刷新：交易时段 60s 轮询盘中榜（采样由后台线程做，这里只拉缓存）
+  clearInterval(_intradayTimer);
+  _intradayTimer = setInterval(() => {
+    if ($('tab-sector').classList.contains('hide')) return;          // 页面不在板块页
+    if (!$('intraday-auto').checked) return;                          // 用户关了自动
+    const now = new Date(), h = now.getHours(), m = now.getMinutes(), wd = now.getDay();
+    const hm = h * 60 + m;
+    const inSession = wd >= 1 && wd <= 5 &&
+      ((hm >= 9 * 60 + 15 && hm <= 11 * 60 + 35) ||
+       (hm >= 12 * 60 + 55 && hm <= 15 * 60 + 5));
+    if (!inSession) return;                                           // 非交易时段不刷
+    loadIntraday();
+  }, 60000);
+}
 
 // ---- 板块轮动 ----
 let _sectorBoards = [];  // 评分榜缓存，点行展开成分股

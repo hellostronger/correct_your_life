@@ -675,6 +675,167 @@ def check_rotation_alerts(top_n: int = 10, score_jump: float = 15.0,
     return alerts
 
 
+# ---------------- 盘中实时监控（内存缓存，不落库） ----------------
+# 交易时段每几分钟采样一次全量板块，供前端轮询 + 急拉/涨停骤增预警。
+# 盘中数据只存内存（重启丢失无妨，下一轮采样即恢复）；正式历史以收盘快照为准。
+
+_intraday: dict = {
+    "updated_at": None,     # 本次采样完成时间
+    "quote_ts": None,       # 数据源行情时间（f124 最大值，判断延迟）
+    "boards": [],           # 全量板块 [{code,name,kind,pct,main_inflow,zt_count}]
+    "zt": {},               # 涨停池摘要
+    "indexes": [],
+    "breadth": {},          # 盘中宽度（低频刷新，见 _intraday_loop）
+    "prev_boards_pct": {},  # 上次采样涨幅 {code: pct}（算急拉用）
+    "prev_zt_by_board": {}, # 上次采样涨停分布
+}
+_intraday_lock = threading.Lock()
+_intraday_alert_cool: dict[str, float] = {}   # 板块名 -> 上次预警时间戳（冷却 10 分钟）
+
+
+def _in_trading_session(now: datetime) -> bool:
+    """A 股交易时段（含集合竞价 9:15 起、收盘 15:05 止；午休不算）。"""
+    if now.weekday() >= 5:
+        return False
+    hm = (now.hour, now.minute)
+    if (9, 15) <= hm <= (11, 35) or (12, 55) <= hm <= (15, 5):
+        return True
+    return False
+
+
+def _intraday_collect() -> dict:
+    """采样一轮盘中数据写入缓存；返回摘要。异常时缓存保持上次内容。"""
+    boards = fetch_all_boards()
+    zt = fetch_zt_pool()
+    indexes = fetch_index_overview()
+    now = datetime.now()
+    with _intraday_lock:
+        prev_pct = {b["code"]: b.get("pct") for b in _intraday["boards"]}
+        prev_zt = _intraday["zt"].get("by_board") or {}
+        quote_ts = max((b["quote_ts"] for b in boards if b.get("quote_ts")), default=None)
+        _intraday.update({
+            "updated_at": now.isoformat(timespec="seconds"),
+            "quote_ts": quote_ts,
+            "boards": boards,
+            "zt": {k: zt[k] for k in ("qdate", "total", "max_lb", "sum_zbc", "by_board")},
+            "indexes": indexes,
+            "prev_boards_pct": prev_pct,
+            "prev_zt_by_board": prev_zt,
+        })
+    return {"boards": len(boards), "zt_total": zt.get("total")}
+
+
+def _intraday_breadth_refresh() -> None:
+    """盘中宽度单独低频刷新（全扫 ~20s，不该跟板块采样一个频率）。"""
+    try:
+        breadth = fetch_market_breadth()
+        with _intraday_lock:
+            _intraday["breadth"] = breadth
+    except Exception as exc:
+        print(f"[sector] intraday breadth failed: {exc}", flush=True)
+
+
+def _intraday_check_alerts() -> list[tuple[str, str]]:
+    """对比上次采样找急拉/涨停骤增。返回 [(板块名, 文本)]，带冷却。"""
+    with _intraday_lock:
+        boards = list(_intraday["boards"])
+        prev_pct = dict(_intraday["prev_boards_pct"])
+        zt_by_board = dict((_intraday["zt"] or {}).get("by_board") or {})
+        prev_zt = dict(_intraday.get("prev_zt_by_board") or {})
+    now_ts = time.time()
+    cooldown = 600  # 同板块 10 分钟冷却
+    alerts: list[tuple[str, str]] = []
+    has_prev = bool(prev_pct)  # 冷启动首次采样没有基准，不产预警（防误报）
+    if has_prev:
+        for b in boards:
+            pct, prev = b.get("pct"), prev_pct.get(b["code"])
+            if pct is None or prev is None:
+                continue
+            delta = pct - prev
+            # 急拉：采样间隔内涨幅跳升 ≥1.5 个点且当前 ≥3%
+            if delta >= 1.5 and pct >= 3:
+                if now_ts - _intraday_alert_cool.get(b["name"], 0) >= cooldown:
+                    _intraday_alert_cool[b["name"]] = now_ts
+                    alerts.append((b["name"],
+                                   f"⚡ {b['name']} 急拉：{prev:+.2f}% → {pct:+.2f}%"
+                                   f"（{delta:+.2f} 个点）"))
+        # 涨停骤增：本采样窗口某板块涨停 +3 家以上
+        for name, cnt in zt_by_board.items():
+            inc = cnt - (prev_zt.get(name) or 0)
+            if inc >= 3 and now_ts - _intraday_alert_cool.get(f"zt:{name}", 0) >= cooldown:
+                _intraday_alert_cool[f"zt:{name}"] = now_ts
+                alerts.append((name, f"🔥 {name} 涨停骤增：+{inc} 家（现 {cnt} 家）"))
+    return alerts
+
+
+def get_intraday() -> dict:
+    """给 API 的盘中缓存视图（top50 已排好序）。"""
+    with _intraday_lock:
+        boards = list(_intraday["boards"])
+        out = {k: v for k, v in _intraday.items() if k != "boards"}
+    if boards:
+        boards.sort(key=lambda b: b.get("pct") if b.get("pct") is not None else -999,
+                    reverse=True)
+    out["boards"] = boards[:50]
+    out["total_boards"] = len(boards)
+    out["in_session"] = _in_trading_session(datetime.now())
+    return out
+
+
+def load_intraday_conf() -> dict:
+    """config.yaml 的 sector 段；缺失用默认。"""
+    defaults = {"enabled": True, "interval_minutes": 5,
+                "alert_notify": True, "alert_min_delta": 1.5}
+    try:
+        text = (BASE_DIR / "config.yaml").read_text(encoding="utf-8")
+        import yaml
+        data = yaml.safe_load(text) or {}
+        conf = dict(data.get("sector") or {})
+    except Exception:
+        conf = {}
+    defaults.update({k: v for k, v in conf.items() if v is not None})
+    return defaults
+
+
+def _intraday_loop():
+    """盘中监控线程：交易时段每 interval_minutes 采样一次 + 急拉/涨停骤增预警。
+
+    预警通过 notifier 推送（可配 alert_notify=False 关）。宽度低频（每 30 分钟）刷新。
+    """
+    last_breadth = 0.0
+    while True:
+        try:
+            conf = load_intraday_conf()
+            interval = max(int(conf.get("interval_minutes") or 5), 1)
+            if conf.get("enabled", True) and _in_trading_session(datetime.now()):
+                try:
+                    result = _intraday_collect()
+                    print(f"[sector] intraday: {result}", flush=True)
+                except Exception as exc:
+                    print(f"[sector] intraday collect failed: {exc}", flush=True)
+                if conf.get("alert_notify", True):
+                    try:
+                        alerts = _intraday_check_alerts()
+                        if alerts:
+                            import notifier
+                            notifier.notify(
+                                "⚡ 板块盘中异动",
+                                "\n\n".join(a[1] for a in alerts[:6])
+                                + f"\n\n（{datetime.now().strftime('%H:%M')} 采样，"
+                                  "来自 stock-advisor 盘中板块监控）")
+                    except Exception as exc:
+                        print(f"[sector] intraday alert failed: {exc}", flush=True)
+                if time.time() - last_breadth >= 1800:
+                    last_breadth = time.time()
+                    _intraday_breadth_refresh()
+                time.sleep(interval * 60)
+            else:
+                time.sleep(300)  # 非交易时段 5 分钟一查（等开盘）
+        except Exception as exc:
+            print(f"[sector] intraday loop error: {exc}", flush=True)
+            time.sleep(120)
+
+
 # ---------------- 自动采集线程 ----------------
 
 def _is_after_close(now: datetime) -> bool:

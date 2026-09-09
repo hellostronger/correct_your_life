@@ -1939,6 +1939,22 @@ def sector_alerts_check():
     return {"alerts": alerts, "count": len(alerts)}
 
 
+@app.get("/api/sector/intraday")
+def sector_intraday():
+    """盘中实时板块视图（内存缓存，交易时段后台线程定时采样）。
+
+    交易时段前端 60s 轮询；非交易时段返回的仍是最后一次盘中采样（updated_at 可判新旧）。
+    """
+    return sector_mod.get_intraday()
+
+
+@app.post("/api/sector/intraday/collect")
+def sector_intraday_collect():
+    """手动采样一轮盘中数据（平时用不到，主要给测试/补采）。"""
+    result = sector_mod._intraday_collect()
+    return {"ok": True, **result}
+
+
 # ---------------- 报告 ----------------
 
 @app.get("/api/reports")
@@ -2016,6 +2032,9 @@ threading.Thread(target=_strategy_loop, daemon=True).start()
 
 # 板块轮动快照后台线程（交易日收盘后自动采集当日板块全量，供轮动分析）
 threading.Thread(target=sector_mod._sector_auto_loop, daemon=True).start()
+
+# 板块盘中监控线程（交易时段每 5 分钟采样 + 急拉/涨停骤增预警；config.yaml sector 段可配）
+threading.Thread(target=sector_mod._intraday_loop, daemon=True).start()
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8686)

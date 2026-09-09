@@ -26,6 +26,14 @@ wb:
   interval_minutes: 60
   fetch_timeout_minutes: 15
 
+# 板块轮动监控（sector.py + sector_intraday）
+# 盘中：交易时段每 interval_minutes 采样一次全量板块，急拉/涨停骤增即时推微信
+# alert_notify: 盘中异动推送开关（盘后轮动预警不受此开关控制，始终推送）
+sector:
+  enabled: true
+  interval_minutes: 5
+  alert_notify: true
+
 # 通知配置（微信走腾讯官方 iLink Bot，凭据存云库；邮件走 SMTP）
 # 网页「通知」标签页可改；auth_code 是邮箱授权码，注意保管
 notify:
