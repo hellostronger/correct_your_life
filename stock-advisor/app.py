@@ -233,9 +233,14 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_sa_wb_post_pub ON sa_wb_posts (pub_ts DESC);
     CREATE INDEX IF NOT EXISTS idx_sa_wb_post_uid ON sa_wb_posts (uid);
     CREATE INDEX IF NOT EXISTS idx_sa_wb_cmt_post ON sa_wb_comments (note_id);
+    -- 板块轮动快照（建表 DDL 以 sector.py 的 SNAPSHOT_TABLE_DDL 为准，那里也幂等）
     """
     last_exc: Exception | None = None
     for stmt in [s.strip() for s in ddl.split(";") if s.strip()]:
+        if stmt.startswith("--"):  # 纯注释段（split 后残留）没有可执行语句
+            stmt = "\n".join(l for l in stmt.splitlines() if not l.strip().startswith("--"))
+        if not stmt:
+            continue
         ok = False
         for attempt in range(3):
             try:
@@ -334,14 +339,33 @@ def _fmt_quote_time(raw: str):
 
 
 def fetch_quotes(codes: list[str]) -> dict[str, dict]:
-    """批量抓取腾讯实时行情快照。失败时返回的条目带 error 字段。
+    """批量抓取实时行情快照。失败时返回的条目带 error 字段。
 
-    响应形如 v_sh600519="1~贵州茅台~600519~1330.00~1298.88~...~";
-    用 ~ 分隔后取数（索引依据腾讯接口固定字段顺序）。
+    A股走腾讯 qt.gtimg.cn（实测 0 延迟）；港股走新浪 rt_hk 接口 —— 腾讯对港股
+    是 15 分钟延迟数据（2026-09-08 实测 quote_time 恒落后本机 ~900s，而 A股同
+    接口 0 延迟），新浪 rt_hk 实测 0 延迟。两个市场分开请求后合并。
+
+    腾讯响应形如 v_sh600519="1~贵州茅台~600519~1330.00~1298.88~...~"；
+    新浪 rt_hk 响应形如 var hq_str_rt_hk00700="TENCENT,腾讯控股,437.0,438.4,..."。
     """
     result: dict[str, dict] = {}
     if not codes:
         return result
+    hk_codes = [c for c in codes if _market_of(c) == "hk"]
+    a_codes = [c for c in codes if _market_of(c) != "hk"]
+    if a_codes:
+        result.update(_fetch_quotes_tencent(a_codes))
+    if hk_codes:
+        result.update(_fetch_quotes_sina_hk(hk_codes))
+    # 保证顺序与请求一致，未返回的补占位
+    for c in codes:
+        result.setdefault(c, {"code": c, "error": "行情未返回"})
+    return result
+
+
+def _fetch_quotes_tencent(codes: list[str]) -> dict[str, dict]:
+    """腾讯接口抓 A股行情（~ 分隔，索引依据其固定字段顺序）。"""
+    result: dict[str, dict] = {}
     symbols = {c: _tx_symbol(c) for c in codes}
     try:
         resp = requests.get(TENCENT_QUOTE_URL + ",".join(symbols.values()),
@@ -361,24 +385,69 @@ def fetch_quotes(codes: list[str]) -> dict[str, dict]:
                 "code": code,
                 "name": f[1],
                 "market": _market_of(code),
-                "currency": "HKD" if _market_of(code) == "hk" else "CNY",
+                "currency": "CNY",
                 "price": _to_float(f[3]),        # 现价
                 "prev_close": _to_float(f[4]),   # 昨收
                 "open": _to_float(f[5]),         # 今开
-                "volume": _to_float(f[6]),       # 成交量(股，港股) / 手(A股)
+                "volume": _to_float(f[6]),       # 成交量(手)
                 "change": _to_float(f[31]),      # 涨跌额
                 "change_pct": _to_float(f[32]),  # 涨跌幅 %
                 "high": _to_float(f[33]),        # 最高
                 "low": _to_float(f[34]),         # 最低
-                "amount": _quote_amount(f[37], _market_of(code)),  # 成交额（统一为元/港元）
+                "amount": _quote_amount(f[37], "a"),  # 成交额（统一为元）
                 "updated_at": _fmt_quote_time(f[30]),  # 行情快照时间（交易所侧）
             }
     except Exception as exc:  # 行情抓取失败不影响 CRUD
         for c in codes:
             result.setdefault(c, {"code": c, "error": str(exc)})
-    # 保证顺序与请求一致，未返回的补占位
-    for c in codes:
-        result.setdefault(c, {"code": c, "error": "行情未返回"})
+    return result
+
+
+SINA_HK_URL = "https://hq.sinajs.cn/list="
+SINA_HK_HEADERS = {"Referer": "https://finance.sina.com.cn", **HEADERS}
+
+
+def _fetch_quotes_sina_hk(codes: list[str]) -> dict[str, dict]:
+    """新浪 rt_hk 接口抓港股行情（逗号分隔，字段序：英文名,中文名,今开,昨收,
+    最高,最低,现价,涨跌额,涨跌%,买一,卖一,成交额,成交量,...,日期,时间）。
+
+    港股成交量单位是股；成交额是绝对港元。无效代码返回空串 -> error 条目。
+    """
+    result: dict[str, dict] = {}
+    try:
+        url = SINA_HK_URL + ",".join(f"rt_hk{c}" for c in codes)
+        resp = requests.get(url, headers=SINA_HK_HEADERS, timeout=20)
+        resp.raise_for_status()
+        resp.encoding = "gbk"
+        text = resp.text
+        for code in codes:
+            m = re.search(rf'rt_hk{code}="([^"]*)"', text)
+            if not m or not m.group(1):
+                result[code] = {"code": code, "error": "行情未返回"}
+                continue
+            f = m.group(1).split(",")
+            if len(f) < 19 or not f[6]:
+                result[code] = {"code": code, "error": "行情数据异常"}
+                continue
+            result[code] = {
+                "code": code,
+                "name": f[1],
+                "market": "hk",
+                "currency": "HKD",
+                "price": _to_float(f[6]),         # 现价
+                "prev_close": _to_float(f[3]),    # 昨收
+                "open": _to_float(f[2]),          # 今开
+                "volume": _to_float(f[12]),       # 成交量(股)
+                "change": _to_float(f[7]),        # 涨跌额
+                "change_pct": _to_float(f[8]),    # 涨跌幅 %
+                "high": _to_float(f[4]),          # 最高
+                "low": _to_float(f[5]),           # 最低
+                "amount": _to_float(f[11]),       # 成交额（绝对港元）
+                "updated_at": _fmt_quote_time(f"{f[17]} {f[18]}"),  # 快照时间
+            }
+    except Exception as exc:
+        for c in codes:
+            result.setdefault(c, {"code": c, "error": str(exc)})
     return result
 
 
@@ -390,11 +459,10 @@ def _to_float(v: str):
 
 
 def _quote_amount(raw: str, market: str):
-    """腾讯 f[37] 成交额统一成绝对金额（元/港元）。
+    """腾讯 f[37] 成交额统一成绝对金额（元）。
 
-    A股该字段单位是万元（600519 返回 602259 = 60.2 亿元），港股是绝对港元
-    （00700 返回 10664922337 = 106.6 亿），必须分别换算，否则前端除以 1e8
-    后 A股成交额会小一万倍。
+    A股该字段单位是万元（600519 返回 602259 = 60.2 亿元），必须换算；
+    港股已改走新浪接口（成交额本身就是绝对港元），此处只剩 A股路径。
     """
     v = _to_float(raw)
     if v is None:
@@ -1812,6 +1880,46 @@ def _wb_auto_loop():
             time.sleep(300)  # 配置读取失败等异常，5 分钟后重试
 
 
+# ---------------- 板块轮动监控（sector.py） ----------------
+
+import sector as sector_mod
+
+
+@app.get("/api/sector/overview")
+def sector_overview(details: bool = True):
+    """板块轮动总览：当日榜 + 轮动评分 + 市场情绪（指数/宽度/涨停）。"""
+    return sector_mod.build_overview(with_details=details)
+
+
+@app.get("/api/sector/board/{bk_code}")
+def sector_board(bk_code: str):
+    """板块详情：成分股（按涨幅前 30）。"""
+    items = sector_mod.fetch_board_constituents(bk_code, limit=30)
+    if not items:
+        raise HTTPException(404, f"板块 {bk_code} 无成分股数据")
+    return {"code": bk_code, "items": items}
+
+
+@app.post("/api/sector/snapshot")
+def sector_snapshot():
+    """手动采集一轮板块快照（平时也可用；自动采集在交易日收盘后）。"""
+    result = sector_mod.collect_once()
+    if result.get("skipped"):
+        raise HTTPException(409, result.get("reason", "已有采集在进行"))
+    return result
+
+
+@app.get("/api/sector/status")
+def sector_status():
+    return {**sector_mod.get_status(), "auto": "交易日收盘后自动采集（15:10 起，半小时一查）"}
+
+
+@app.get("/api/sector/digest")
+def sector_digest(hours: int = 24):
+    """供 Claude 定时报告引用的板块轮动 markdown 摘要。"""
+    return {"digest": sector_mod.digest(hours=hours)}
+
+
 # ---------------- 报告 ----------------
 
 @app.get("/api/reports")
@@ -1886,6 +1994,9 @@ threading.Thread(target=_wb_auto_loop, daemon=True).start()
 
 # 止盈策略监控后台线程（交易时段每 60s 扫一次，触发即通知）
 threading.Thread(target=_strategy_loop, daemon=True).start()
+
+# 板块轮动快照后台线程（交易日收盘后自动采集当日板块全量，供轮动分析）
+threading.Thread(target=sector_mod._sector_auto_loop, daemon=True).start()
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8686)

@@ -88,6 +88,7 @@
 
   <div class="tabs">
     <button data-tab="market" class="active">自选行情</button>
+    <button data-tab="sector">🔄 板块轮动</button>
     <button data-tab="holdings">我的持仓</button>
     <button data-tab="strategies">🎯 止盈策略<span id="strategy-tab-badge" class="tab-badge hide">0</span></button>
     <button data-tab="news">📰 新闻</button>
@@ -123,6 +124,38 @@
         <tbody id="watch-body"></tbody>
       </table>
       <div id="watch-empty" class="empty hide">还没有自选股，输入代码添加吧</div>
+    </div>
+  </section>
+
+  <!-- 板块轮动 -->
+  <section id="tab-sector" class="hide">
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <b style="font-size:13px">🧭 市场情绪</b>
+        <div class="row">
+          <span class="muted" id="sector-meta" style="font-size:12px"></span>
+          <button class="btn ghost" onclick="loadSector(true)">刷新</button>
+          <button class="btn ghost" id="sector-snap-btn" onclick="sectorSnapshot()">立即采集</button>
+        </div>
+      </div>
+      <div id="sector-indexes" class="pnl-summary" style="margin-top:8px"></div>
+      <div id="sector-sentiment" class="row" style="margin-top:6px;gap:16px;flex-wrap:wrap"></div>
+      <div class="muted" style="margin-top:6px" id="sector-collect-note"></div>
+    </div>
+    <div class="card">
+      <b style="font-size:13px">🔥 轮动评分榜（主线候选：涨幅+主力资金+涨停+动量综合）</b>
+      <div style="overflow-x:auto">
+      <table style="margin-top:6px">
+        <thead><tr>
+          <th>板块</th><th>类型</th><th>今日</th><th>排位</th><th>主力净流入</th>
+          <th>3日动量</th><th>涨停</th><th>评分</th><th>领涨股</th><th></th>
+        </tr></thead>
+        <tbody id="sector-boards-body"></tbody>
+      </table>
+      </div>
+      <div id="sector-empty" class="empty hide">还没有板块快照。点「立即采集」抓取全市场板块数据
+        （行业 496 + 概念 504 + 地域 31），每天收盘后也会自动采集；积累 3 个交易日后动量信号完整。</div>
+      <div id="sector-board-detail" class="hide" style="margin-top:10px;border-top:1px dashed var(--border);padding-top:10px"></div>
     </div>
   </section>
 
@@ -418,9 +451,10 @@ document.querySelectorAll('.tabs button').forEach(btn => {
   btn.onclick = () => {
     document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
-    ['market', 'holdings', 'strategies', 'news', 'bili', 'wb', 'reports', 'notify'].forEach(t =>
+    ['market', 'sector', 'holdings', 'strategies', 'news', 'bili', 'wb', 'reports', 'notify'].forEach(t =>
       $('tab-' + t).classList.toggle('hide', t !== btn.dataset.tab));
     if (btn.dataset.tab === 'market') loadWatch();
+    if (btn.dataset.tab === 'sector') loadSector();
     if (btn.dataset.tab === 'holdings') loadHoldings();
     if (btn.dataset.tab === 'strategies') loadStrategies();
     if (btn.dataset.tab === 'holdings' || btn.dataset.tab === 'strategies') refreshTradeStrategyOptions();
@@ -431,6 +465,90 @@ document.querySelectorAll('.tabs button').forEach(btn => {
     if (btn.dataset.tab === 'notify') loadNotifyConf();
   };
 });
+
+// ---- 板块轮动 ----
+let _sectorBoards = [];  // 评分榜缓存，点行展开成分股
+async function loadSector(forceFetch = false) {
+  if (forceFetch) {  // 「刷新」= 强制从后端重算（后端涨停池等实时拉）
+    try { $('sector-snap-btn').disabled = true; await loadSectorRender(); }
+    finally { $('sector-snap-btn').disabled = false; }
+    return;
+  }
+  loadSectorRender();
+}
+async function loadSectorRender() {
+  try {
+    const ov = await api('/api/sector/overview');
+    renderSector(ov);
+  } catch (e) { toast('加载板块数据失败: ' + e.message); }
+}
+async function sectorSnapshot() {
+  const btn = $('sector-snap-btn');
+  btn.disabled = true; btn.textContent = '采集中…';
+  try {
+    await api('/api/sector/snapshot', { method: 'POST' });
+    toast('采集完成');
+    await loadSectorRender();
+  } catch (e) { toast(e.message); }
+  finally { btn.disabled = false; btn.textContent = '立即采集'; }
+}
+function renderSector(ov) {
+  const idxBox = $('sector-indexes');
+  const idxs = ov.indexes || [];
+  idxBox.innerHTML = idxs.map(i =>
+    `<span class="muted">${i.name}</span><b class="${cls(i.pct)}">${i.pct !== null && i.pct !== undefined ? signed(i.pct) + '%' : '—'}</b>`
+  ).join('');
+  // 情绪区：宽度 + 涨停/炸板/连板高度
+  const br = ov.breadth || {}, zt = ov.zt || {};
+  const sent = [];
+  if (br.up !== undefined && br.up !== null)
+    sent.push(`<span>市场宽度：上涨 <b class="up">${br.up}</b> / 下跌 <b class="down">${br.down}</b>`
+      + (br.up_ratio != null ? `（红盘占比 <b>${br.up_ratio}%</b>）` : '') + '</span>');
+  if (zt.total !== undefined && zt.total !== null)
+    sent.push(`<span>涨停 <b class="up">${zt.total}</b> 家 · 最高 <b>${zt.max_lb}</b> 连板 · 炸板 <b class="down">${zt.sum_zbc}</b> 次</span>`);
+  $('sector-sentiment').innerHTML = sent.join('');
+  $('sector-meta').textContent = ov.snap_date ? `快照 ${ov.snap_date}` : '';
+  $('sector-collect-note').textContent = ov.empty ? (ov.message || '') : (ov.momentum_note || '');
+  $('sector-empty').classList.toggle('hide', !ov.empty);
+  _sectorBoards = ov.boards || [];
+  const tbody = $('sector-boards-body');
+  tbody.innerHTML = _sectorBoards.slice(0, 60).map((b, i) => {
+    const kindName = { industry: '行业', concept: '概念', region: '地域' }[b.kind] || b.kind;
+    return `<tr data-bk="${b.code}" style="cursor:pointer" onclick="toggleBoardDetail('${b.code}')">
+      <td><b>${b.name}</b></td>
+      <td class="muted">${kindName}</td>
+      <td class="${cls(b.pct)}">${b.pct !== null && b.pct !== undefined ? signed(b.pct) + '%' : '—'}</td>
+      <td class="muted">${b.pct_rank != null ? '前' + (100 - b.pct_rank) + '%' : '—'}</td>
+      <td class="${cls(b.main_inflow)}">${b.main_inflow != null ? yi(b.main_inflow) : '—'}</td>
+      <td class="${cls(b.mom3)}">${b.mom3 != null ? signed(b.mom3) + '%' : '<span class="muted">积累中</span>'}</td>
+      <td>${b.zt_count ? `<b class="up">${b.zt_count}</b>` : '<span class="muted">0</span>'}</td>
+      <td><b style="color:var(--accent)">${b.score ?? '—'}</b></td>
+      <td class="muted">${b.lead_stock || '—'}${b.lead_stock_pct != null ? ` <span class="${cls(b.lead_stock_pct)}">${signed(b.lead_stock_pct)}%</span>` : ''}</td>
+      <td class="muted">▾</td>
+    </tr>`;
+  }).join('');
+  $('sector-board-detail').classList.add('hide');
+}
+async function toggleBoardDetail(bk) {
+  const box = $('sector-board-detail');
+  const row = document.querySelector(`#sector-boards-body tr[data-bk="${bk}"]`);
+  const name = row ? row.querySelector('td b').textContent : bk;
+  if (!box.classList.contains('hide') && box.dataset.bk === bk) { box.classList.add('hide'); return; }
+  box.dataset.bk = bk;
+  box.classList.remove('hide');
+  box.innerHTML = '<span class="muted">加载成分股…</span>';
+  try {
+    const data = await api(`/api/sector/board/${bk}`);
+    box.innerHTML = `<b style="font-size:13px">${name} · 成分股涨幅前 ${data.items.length}</b>
+      <table style="margin-top:6px"><thead><tr><th>代码</th><th>名称</th><th>现价</th><th>涨跌幅</th><th>主力净流入</th></tr></thead>
+      <tbody>${data.items.map(s => `<tr>
+        <td>${s.code}</td><td>${s.name}</td>
+        <td class="${cls(s.price)}">${fmt(s.price)}</td>
+        <td class="${cls(s.pct)}">${s.pct != null ? signed(s.pct) + '%' : '—'}</td>
+        <td class="${cls(s.main_inflow)}">${s.main_inflow != null ? yi(s.main_inflow) : '—'}</td>
+      </tr>`).join('')}</tbody></table>`;
+  } catch (e) { box.innerHTML = `<span class="muted">加载失败：${e.message}</span>`; }
+}
 
 // ---- 自选 ----
 // 量能标签：ratio 是「最新日成交量 / 前5日均量」；>1.15 放量，<0.9 缩量，其余平量
