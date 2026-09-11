@@ -898,7 +898,9 @@ def _holdings_with_pnl(positions: list[dict]) -> list[dict]:
             p["pnl"] = 0.0                                                    # 已清仓无浮动
             p["pnl_pct"] = None
         p["total_pnl"] = round(p["pnl"] + p["realized_pnl"], 2)               # 累计总盈亏
-        k = rate or 1.0
+        # 只有港股才折算：rate 是全局汇率（组合里有港股时非空），
+        # 不能拿给 A 股用——曾把 A 股盈亏也乘 0.855，688795 一笔 -71546 显示成 -61165
+        k = rate if is_hk else 1.0
         p["price_cny"] = round(price * k, 4) if p.get("price") else p.get("price")
         p["market_value_cny"] = round(p["market_value"] * k, 2)
         p["cost_value_cny"] = round(p["cost_value"] * k, 2) if p.get("cost_value") is not None else None

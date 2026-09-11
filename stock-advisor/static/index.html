@@ -48,6 +48,18 @@
     background: rgba(28,35,48,.92); color: #fff; padding: 9px 18px; border-radius: 8px;
     font-size: 13px; opacity: 0; transition: opacity .25s; pointer-events: none; max-width: 80%; }
   .toast.show { opacity: 1; }
+  /* 弹窗（交易流水等明细）：覆盖视口，内部滚动，不抖页面 */
+  .modal-mask { position: fixed; inset: 0; background: rgba(20,26,38,.45); z-index: 90;
+    display: flex; align-items: center; justify-content: center; padding: 16px; }
+  .modal-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    width: min(680px, 100%); max-height: 84vh; display: flex; flex-direction: column;
+    box-shadow: 0 12px 40px rgba(20,26,38,.25); }
+  .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 12px 16px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  .modal-body { overflow: auto; padding: 12px 16px; }
+  .modal-close { border: none; background: none; font-size: 20px; line-height: 1; cursor: pointer;
+    color: var(--muted); padding: 2px 6px; }
+  .modal-close:hover { color: var(--up); }
   .pnl-summary { display: flex; gap: 24px; margin-bottom: 4px; }
   .pnl-summary b { font-size: 16px; }
   .hide { display: none; }
@@ -232,9 +244,19 @@
         <tbody id="holdings-body"></tbody>
       </table>
       <div id="holdings-empty" class="empty hide">还没有交易记录，先「记一笔」买入吧</div>
-      <div id="trades-detail" class="hide" style="margin-top:10px;border-top:1px dashed var(--border);padding-top:10px"></div>
     </div>
   </section>
+
+  <!-- 交易流水弹窗（点持仓行打开，原地不动页面） -->
+  <div id="trades-modal" class="modal-mask hide" onclick="if(event.target===this)hideTrades()">
+    <div class="modal-card" role="dialog" aria-modal="true">
+      <div class="modal-head">
+        <b id="trades-modal-title" style="font-size:14px">交易流水</b>
+        <button class="modal-close" onclick="hideTrades()" title="关闭（Esc）">×</button>
+      </div>
+      <div class="modal-body" id="trades-detail"></div>
+    </div>
+  </div>
 
   <!-- 止盈策略 -->
   <section id="tab-strategies" class="hide">
@@ -914,13 +936,12 @@ async function toggleTrades(code) {
 async function showTrades(code) {
   try {
     const rows = await api('/api/trades?code=' + code);
+    const pos = (_holdingsCache || []).find(h => h.code === code);
+    $('trades-modal-title').innerHTML =
+      `${esc(pos?.name || '')} <span class="muted" style="font-weight:400">${code} · 交易流水（新→旧）</span>`;
+    $('trades-modal').classList.remove('hide');
     const box = $('trades-detail');
-    box.classList.remove('hide');
-    box.innerHTML = `<div class="row" style="justify-content:space-between;margin-bottom:6px">
-        <b class="muted" style="font-size:12px">${code} 交易流水（新→旧）</b>
-        <button class="del" onclick="hideTrades()" title="收起">收起 ↑</button>
-      </div>
-      <div id="pos-strat-${code}" style="margin-bottom:8px"></div>
+    box.innerHTML = `<div id="pos-strat-${code}" style="margin-bottom:8px"></div>
       <table><tbody>${rows.map(t => {
         // 每笔盈亏：卖出=已实现；买入=现价对买入时点成本的浮动（已清仓则为空）
         let pnlCell = '<span class="muted">—</span>';
@@ -1003,9 +1024,12 @@ async function unbindPosStrategy(psId, code) {
 
 function hideTrades() {
   _openTradeCode = null;
-  $('trades-detail').classList.add('hide');
+  $('trades-modal').classList.add('hide');
   $('trades-detail').innerHTML = '';
 }
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && _openTradeCode) hideTrades();
+});
 
 async function delTrade(id, code) {
   if (!confirm('删除这笔交易记录？删除后持仓和盈亏会按剩余流水重新推算。')) return;
