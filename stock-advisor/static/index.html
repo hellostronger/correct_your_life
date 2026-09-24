@@ -73,6 +73,11 @@
               border-radius: 10px; font-size: 11px; color: var(--muted); cursor: pointer; }
   .rel-code:hover { border-color: var(--accent); color: var(--accent); }
   .dyn-item { padding: 10px 4px; border-bottom: 1px solid var(--border); }
+  /* 自选表列多，卡片内横向滚动；备注/搜索词列允许换行不被 nowrap 挤爆 */
+  .table-scroll { overflow-x: auto; }
+  .watch-note { white-space: normal; min-width: 140px; max-width: 260px; line-height: 1.5; }
+  .kw-line { font-size: 11px; margin-top: 2px; }
+  .kw-line .badge { margin-right: 2px; }
   .dyn-item:last-child { border-bottom: none; }
   .dyn-item.unread { background: #f0f5ff; margin: 0 -8px; padding-left: 12px; padding-right: 8px;
                      border-radius: 8px; }
@@ -125,20 +130,19 @@
       <div id="market-vol-intraday" class="muted" style="margin-top:6px;font-size:12px"></div>
     </div>
     <div class="card">
-      <div class="row">
-        <input id="w-code" placeholder="代码：A股600519 / 港股02513" maxlength="6" style="width:180px">
-        <input id="w-note" placeholder="备注（可选），如：关注白酒政策" style="flex:1;min-width:150px">
-        <input id="w-kw" placeholder="搜索词(可选)，如：Kimi,OpenAI" style="flex:1;min-width:170px">
-        <button class="btn" onclick="addWatch()">添加自选</button>
-        <button class="btn ghost" onclick="loadWatch()">刷新行情</button>
+      <div class="row" style="align-items:flex-start">
+        <input id="w-code" placeholder="代码：A股600519 / 港股02513" maxlength="6" style="width:160px">
+        <input id="w-note" placeholder="备注（可选），如：关注白酒政策" style="flex:1;min-width:140px">
+        <span class="btn" style="display:inline-block" onclick="addWatch()">添加自选</span>        <button class="btn ghost" onclick="loadWatch()">刷新行情</button>
       </div>
       <div class="row" style="margin-top:6px">
-        <input id="w-kw-pos" placeholder="🟢 利好词(可选)，如：中标,回购,增持" style="flex:1;min-width:170px">
-        <input id="w-kw-neg" placeholder="🔴 利空词(可选)，如：解禁,减持,降价" style="flex:1;min-width:170px">
+        <input id="w-kw" placeholder="🔍 搜索词(可选)，如：Kimi,OpenAI" style="flex:1;min-width:150px">
+        <input id="w-kw-pos" placeholder="🟢 利好词(可选)，如：中标,回购" style="flex:1;min-width:150px">
+        <input id="w-kw-neg" placeholder="🔴 利空词(可选)，如：解禁,减持" style="flex:1;min-width:150px">
       </div>
       <div class="muted" style="margin-top:4px;font-size:12px">
-        搜索词分三类：中性（竞品动态等，如智谱 02513 配「Kimi,OpenAI,DeepSeek」）、
-        利好（命中标绿 🟢）、利空（命中标红 🔴，利空优先提醒）。逗号分隔，2-4 个/类较合适。
+        搜索词分三类：中性 🔍（竞品动态等）、利好 🟢（命中标绿）、利空 🔴（命中标红，利空优先）。
+        逗号分隔，2-4 个/类较合适，点表格里的「改」可随时调整。
       </div>
     </div>
     <div class="card">
@@ -152,6 +156,7 @@
       <div id="alerts-box" class="muted" style="margin-top:6px;font-size:12px">加载中…（未来 14 天自选股限售解禁、增发新股上市；工作日 8:30 自动推微信）</div>
     </div>
     <div class="card">
+      <div class="table-scroll">
       <table>
         <thead><tr>
           <th>代码</th><th>名称</th><th>现价</th><th>涨跌幅</th>
@@ -159,6 +164,7 @@
         </tr></thead>
         <tbody id="watch-body"></tbody>
       </table>
+      </div>
       <div id="watch-empty" class="empty hide">还没有自选股，输入代码添加吧</div>
     </div>
   </section>
@@ -901,10 +907,9 @@ async function loadWatch() {
     tbody.innerHTML = items.map(i => {
       const q = i.quote || {};
       const kwParts = [];
-      if (i.keywords) kwParts.push(`<span class="badge" style="background:#e8f0fe;color:#1a56db">🔍</span> ${esc(i.keywords)}`);
-      if (i.keywords_pos) kwParts.push(`<span class="badge" style="background:#e5f3e2;color:#1e7d32">🟢利好</span> ${esc(i.keywords_pos)}`);
-      if (i.keywords_neg) kwParts.push(`<span class="badge" style="background:#ffe2e2;color:#b32424">🔴利空</span> ${esc(i.keywords_neg)}`);
-      const kw = kwParts.length ? `<div style="font-size:11px">${kwParts.join('<br>')}</div>` : '';
+      if (i.keywords) kwParts.push(`<div class="kw-line"><span class="badge" style="background:#e8f0fe;color:#1a56db">🔍</span> ${esc(i.keywords)}</div>`);
+      if (i.keywords_pos) kwParts.push(`<div class="kw-line"><span class="badge" style="background:#e5f3e2;color:#1e7d32">🟢利好</span> ${esc(i.keywords_pos)}</div>`);
+      if (i.keywords_neg) kwParts.push(`<div class="kw-line"><span class="badge" style="background:#ffe2e2;color:#b32424">🔴利空</span> ${esc(i.keywords_neg)}</div>`);
       return `<tr data-code="${i.code}">
         <td>${i.code}</td><td>${q.name || i.name || ''}</td>
         <td class="${cls(q.price)}">${fmt(q.price)}</td>
@@ -914,9 +919,10 @@ async function loadWatch() {
         <td>${capCell(q)}</td>
         <td class="vol-cell"><span class="muted">…</span></td>
         <td class="muted">${(q.updated_at || '').replace(' ', '<br>') || '—'}</td>
-        <td class="muted">${i.note || ''}${kw}
-          <button class="btn ghost" style="font-size:11px;padding:2px 8px;margin-top:2px"
-            onclick="editWatch('${i.code}')">改</button></td>        <td><button class="del" onclick="delWatch('${i.code}')" title="删除">×</button></td>
+        <td class="muted watch-note">${i.note || ''}${kwParts.join('')}
+          <button class="btn ghost" style="font-size:11px;padding:2px 8px;margin-top:3px"
+            onclick="editWatch('${i.code}')">改</button></td>
+        <td><button class="del" onclick="delWatch('${i.code}')" title="删除">×</button></td>
       </tr>`;
     }).join('');
     fillWatchlistDatalist(items);  // 「记一笔」代码输入框可下拉引用自选
