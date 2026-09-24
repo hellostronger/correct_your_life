@@ -18,6 +18,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+# 禁用 requests 对系统代理的读取：urllib.getproxies() 在 Windows 上会读到注册表
+# 的 WinINET 代理（如 127.0.0.1:6478），那是给浏览器的——挂掉/半挂时脚本内全部
+# 行情/东财请求跟着 ProxyError（2026-09-25 实测）。NO_PROXY=* 等效全部直连。
+os.environ.setdefault("NO_PROXY", "*")
+os.environ.setdefault("no_proxy", "*")
+
 import psycopg2
 import psycopg2.extras
 import requests

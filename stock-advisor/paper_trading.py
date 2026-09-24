@@ -65,7 +65,8 @@ TRADER_PROMPT = """\
 - reasoning：必须引用报告和账户数据的具体数字说明为什么是这笔交易而不是相反
 
 硬性纪律：现金不足时 action 必须是 hold；没有已有持仓时不能 sell；
-无充分依据倾向 hold——模拟交易亏的是后续统计的胜率，乱动比不动差。"""
+无充分依据倾向 hold——模拟交易亏的是后续统计的胜率，乱动比不动差。
+全部用中文输出（含 reasoning 字段）。"""
 
 REFLECTOR_PROMPT = """\
 你是交易复盘员。一笔模拟交易已到期结算，你会得到：当时的决策与理由、
@@ -500,6 +501,14 @@ def _execute_decision(deps, conf, stock, today, decision, quote) -> tuple[bool, 
     action = decision["action"]
     with get_conn() as conn:
         cur = conn.cursor()
+        # 幂等守卫下沉到数据层：同日同股已有任何决策行（含反向）即拒绝。
+        # 2026-09-24 实发问题：手动触发+线程并发下 LLM 两次跑出 buy 和 sell
+        # 各插入一行（UNIQUE 只限 trade_date+code+side，方向不同不拦），
+        # 同日买+卖双开导致持仓推导=0 但两笔都待结算、账目语义错乱。
+        cur.execute("SELECT 1 FROM sa_paper_trades WHERE trade_date = %s AND code = %s "
+                    "AND status <> 'skipped' LIMIT 1", (today, code))
+        if cur.fetchone():
+            return False, "该股今日已有决策，跳过"
         account = _account_row(cur)
         positions = _derive_paper_positions(cur)
         me = positions.get(code)
