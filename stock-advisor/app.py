@@ -289,6 +289,67 @@ def init_db():
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS idx_sa_plan_advice_plan ON sa_plan_advice (plan_id, created_at DESC);
+    -- 模拟交易（Paper Trading）：LLM 决策 → 收盘价成交 → 5 交易日结算 → 反思沉淀（paper_trading.py）
+    -- 账户单行表（id 恒为 1；reset 即清空三张业务表后重插）
+    CREATE TABLE IF NOT EXISTS sa_paper_account (
+        id             INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        initial_cash   NUMERIC(14,2) NOT NULL,
+        cash           NUMERIC(14,2) NOT NULL,
+        total_value    NUMERIC(14,2),
+        updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    -- 决策日志 = 成交流水（每行既是成交也是可复盘决策；持仓由流水推导，不建持仓表）
+    CREATE TABLE IF NOT EXISTS sa_paper_trades (
+        id            BIGSERIAL PRIMARY KEY,
+        code          VARCHAR(8) NOT NULL,
+        name          VARCHAR(64) NOT NULL DEFAULT '',
+        trade_date    DATE NOT NULL,
+        side          VARCHAR(8) NOT NULL CHECK (side IN ('buy','sell','hold')),
+        shares        INTEGER NOT NULL DEFAULT 0,
+        price         NUMERIC(12,4),
+        value         NUMERIC(14,2),
+        confidence    SMALLINT,
+        stop_loss_pct NUMERIC(6,2),
+        reasoning     TEXT NOT NULL DEFAULT '',
+        report        TEXT NOT NULL DEFAULT '',
+        decision_raw  JSONB NOT NULL DEFAULT '{}'::jsonb,
+        status        VARCHAR(10) NOT NULL DEFAULT 'open'
+                      CHECK (status IN ('open','resolved','skipped')),
+        auto_closed   BOOLEAN NOT NULL DEFAULT FALSE,
+        settle_date   DATE,
+        settle_price  NUMERIC(12,4),
+        raw_return    NUMERIC(10,6),
+        alpha_return  NUMERIC(10,6),
+        benchmark     VARCHAR(12),
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (trade_date, code, side)
+    );
+    CREATE INDEX IF NOT EXISTS idx_sa_paper_trades_status ON sa_paper_trades (status);
+    -- 经验库（Reflector 产物；code='' 为全局蒸馏规则；resolved_at 是 point-in-time 注入键）
+    CREATE TABLE IF NOT EXISTS sa_paper_reflections (
+        id              BIGSERIAL PRIMARY KEY,
+        trade_id        BIGINT NOT NULL UNIQUE,
+        code            VARCHAR(8) NOT NULL DEFAULT '',
+        action          VARCHAR(8) NOT NULL,
+        decision_digest TEXT NOT NULL DEFAULT '',
+        raw_return      NUMERIC(10,6) NOT NULL DEFAULT 0,
+        alpha_return    NUMERIC(10,6) NOT NULL DEFAULT 0,
+        holding_days    SMALLINT NOT NULL DEFAULT 5,
+        benchmark       VARCHAR(12) NOT NULL DEFAULT '',
+        lesson          TEXT NOT NULL,
+        resolved_at     DATE NOT NULL,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_sa_paper_reflections_code_time
+        ON sa_paper_reflections (code, created_at DESC);
+    -- 每日资产快照（收益曲线数据源）
+    CREATE TABLE IF NOT EXISTS sa_paper_equity (
+        snap_date     DATE PRIMARY KEY,
+        cash          NUMERIC(14,2) NOT NULL,
+        market_value  NUMERIC(14,2) NOT NULL,
+        total         NUMERIC(14,2) NOT NULL,
+        daily_return  NUMERIC(10,6)
+    );
     -- 板块轮动快照（建表 DDL 以 sector.py 的 SNAPSHOT_TABLE_DDL 为准，那里也幂等）
     """
     last_exc: Exception | None = None
@@ -2457,6 +2518,209 @@ def _alerts_loop():
             time.sleep(600)
 
 
+# ---------------- 模拟交易（LLM 决策 + 结算反思沉淀，见 paper_trading.py） ----------------
+
+import paper_trading
+import paper_memory
+
+
+def _paper_deps(conf: dict | None = None) -> dict:
+    """给 paper_trading 注入依赖（不 import app 的模块靠这个拿数据函数）。"""
+    return {
+        "get_conn": get_conn,
+        "em_kline_fn": _em_kline_fields,
+        "tx_symbol_fn": _tx_symbol,
+        "quote_fn": fetch_quotes,
+        "conf": conf if conf is not None else _conf_section("paper"),
+        "news_fn": _paper_news_rows,
+        "events_fn": _paper_event_lines,
+        "market_fn": market_volume_status,
+        "trading_days_fn": _trading_days_between,
+        "notify_fn": notifier.notify,
+    }
+
+
+def _paper_news_rows(code: str, limit: int = 10) -> list[dict]:
+    """该股近 7 天新闻（带 sentiment），供决策上下文。"""
+    try:
+        with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT DISTINCT ON (n.url) n.title, n.media, n.source, n.sentiment, "
+                "n.publish_time, n.fetched_at FROM sa_news n "
+                "LEFT JOIN sa_news_related r ON r.url = n.url "
+                "WHERE (n.code = %s OR r.code = %s) "
+                "AND COALESCE(n.publish_time, n.fetched_at) > now() - interval '7 days' "
+                "ORDER BY n.url, COALESCE(n.publish_time, n.fetched_at) DESC LIMIT %s",
+                (code, code, limit))
+            rows = [dict(r) for r in cur.fetchall()]
+            rows.sort(key=lambda r: r["publish_time"] or r["fetched_at"], reverse=True)
+            return rows
+    except Exception:
+        return []
+
+
+def _paper_event_lines(code: str, days: int = 14) -> list[str]:
+    """该股未来 N 天解禁/增发事件（格式化行），供决策上下文。"""
+    try:
+        events = alerts_mod.upcoming_events([code], days=days)
+    except Exception:
+        return []
+    lines = []
+    for e in events[:8]:
+        kind = "解禁" if e.get("type") == "lift" else "增发上市"
+        cap = f"市值约 {e['cap_yi']:g} 亿" if e.get("cap_yi") else ""
+        lines.append(f"{e.get('event_date')} {kind} {cap}（{e.get('detail') or ''}）"
+                     .rstrip("（）"))
+    return lines
+
+
+_paper_state = {"running": False, "settling": False,
+                "last_decision": None, "last_settle": None}
+
+
+@app.get("/api/paper/overview")
+def paper_overview():
+    """账户 + 持仓估值 + 近30日快照 + 胜率统计（tab 打开即调）。"""
+    return paper_trading.account_overview(_paper_deps())
+
+
+@app.get("/api/paper/trades")
+def paper_trades(code: str = "", limit: int = 100):
+    """交易记录（含 reasoning/report 全文），新→旧。"""
+    limit = max(1, min(limit, 500))
+    sql = ("SELECT id, code, name, trade_date, side, shares, price, value, confidence, "
+           "stop_loss_pct, reasoning, status, auto_closed, settle_date, settle_price, "
+           "raw_return, alpha_return, benchmark, created_at FROM sa_paper_trades ")
+    params: list = []
+    if re.fullmatch(r"\d{4,6}", code or ""):
+        sql += "WHERE code = %s "
+        params.append(code)
+    sql += "ORDER BY id DESC LIMIT %s"
+    params.append(limit)
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(sql, params)
+        rows = [dict(r) for r in cur.fetchall()]
+    for r in rows:
+        for key in ("trade_date", "settle_date", "created_at"):
+            r[key] = r[key].isoformat() if r[key] and hasattr(r[key], "isoformat") else r[key]
+        for key in ("price", "value", "raw_return", "alpha_return", "stop_loss_pct"):
+            r[key] = float(r[key]) if r[key] is not None else None
+    return rows
+
+
+@app.get("/api/paper/lessons")
+def paper_lessons(code: str = "", limit: int = 50):
+    """经验库（新→旧）。code 传空串=只要全局规则，不传=全部。"""
+    limit = max(1, min(limit, 200))
+    params: list = []
+    sql = ("SELECT id, trade_id, code, action, decision_digest, raw_return, "
+           "alpha_return, holding_days, lesson, resolved_at, created_at "
+           "FROM sa_paper_reflections ")
+    if code == "":
+        sql += "WHERE code = '' "
+    elif re.fullmatch(r"\d{4,6}", code):
+        sql += "WHERE code = %s "
+        params.append(code)
+    sql += "ORDER BY id DESC LIMIT %s"
+    params.append(limit)
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(sql, params)
+        rows = [dict(r) for r in cur.fetchall()]
+    for r in rows:
+        for key in ("resolved_at", "created_at"):
+            r[key] = r[key].isoformat() if r[key] and hasattr(r[key], "isoformat") else r[key]
+        for key in ("raw_return", "alpha_return"):
+            r[key] = float(r[key]) if r[key] is not None else None
+    return rows
+
+
+class PaperResetIn(BaseModel):
+    confirm: bool = False
+    initial_cash: float = Field(default=100000.0, gt=0, le=100000000)
+
+
+@app.post("/api/paper/run")
+def paper_run():
+    """手动触发一轮决策（后台线程执行，立即返回）。同日幂等：已决策过的股自动跳过。"""
+    if _paper_state["running"]:
+        return {"ok": True, "status": "已在决策中，请稍后"}
+    _paper_state["running"] = True
+
+    def _run():
+        try:
+            _paper_state["last_decision"] = paper_trading.run_decisions(_paper_deps())
+        except Exception as exc:
+            traceback.print_exc()
+            _paper_state["last_decision"] = {"error": str(exc)}
+        finally:
+            _paper_state["running"] = False
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True, "status": "决策已启动"}
+
+
+@app.post("/api/paper/settle")
+def paper_settle():
+    """手动触发结算+复盘（后台线程执行，立即返回）。"""
+    if _paper_state["settling"]:
+        return {"ok": True, "status": "已在结算中，请稍后"}
+    _paper_state["settling"] = True
+
+    def _run():
+        try:
+            _paper_state["last_settle"] = paper_trading.settle_and_reflect(_paper_deps())
+        except Exception as exc:
+            traceback.print_exc()
+            _paper_state["last_settle"] = {"error": str(exc)}
+        finally:
+            _paper_state["settling"] = False
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True, "status": "结算复盘已启动"}
+
+
+@app.post("/api/paper/reset")
+def paper_reset(body: PaperResetIn):
+    """重置模拟账户（清空交易/经验/快照，回填初始资金）。须 confirm=true。"""
+    if not body.confirm:
+        raise HTTPException(400, "须传 confirm=true 才能重置")
+    return paper_trading.reset_account(_paper_deps(), body.initial_cash)
+
+
+@app.get("/api/paper/status")
+def paper_status():
+    return {"running": _paper_state["running"], "settling": _paper_state["settling"],
+            "last_decision": _paper_state["last_decision"],
+            "last_settle": _paper_state["last_settle"]}
+
+
+def _paper_loop():
+    """模拟交易守护线程：交易日两相位（last_day 幂等守卫，仿 _alerts_loop）。
+    15:35 后 run_decisions（收盘价成交）；16:10 后 settle_and_reflect（错开相位
+    给东财日K落库留时间）。config paper.enabled=false 时整轮跳过（改配置即生效，
+    但本线程本身是进程启动时创建的，新增需重启一次）。"""
+    last_decision_day = last_settle_day = None
+    while True:
+        try:
+            now = datetime.now()
+            conf = _conf_section("paper")
+            if (conf.get("enabled") and now.weekday() < 5):
+                if (now.hour, now.minute) >= (15, 35) and last_decision_day != now.date():
+                    result = paper_trading.run_decisions(_paper_deps(conf))
+                    last_decision_day = now.date()
+                    n = len(result.get("decided", []))
+                    print(f"[paper] decisions for {n} stocks", flush=True)
+                if (now.hour, now.minute) >= (16, 10) and last_settle_day != now.date():
+                    result = paper_trading.settle_and_reflect(_paper_deps(conf))
+                    last_settle_day = now.date()
+                    n = len(result.get("settled", []))
+                    print(f"[paper] settled {n} trades", flush=True)
+            time.sleep(300)
+        except Exception as exc:
+            print(f"[paper] loop error: {exc}", flush=True)
+            time.sleep(300)
+
+
 # ---------------- 新闻（多渠道免费抓取，见 news_fetcher.py） ----------------
 
 import news_fetcher
@@ -3284,6 +3548,9 @@ threading.Thread(target=_alerts_loop, daemon=True).start()
 
 # 盘中大盘量能监控线程（交易时段每 5 分钟采量比，放量/缩量翻转推微信；volume 段可配）
 threading.Thread(target=_market_volume_loop, daemon=True).start()
+
+# 模拟交易线程（交易日 15:35 决策 / 16:10 结算复盘；paper.enabled=false 轮内跳过）
+threading.Thread(target=_paper_loop, daemon=True).start()
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8686)

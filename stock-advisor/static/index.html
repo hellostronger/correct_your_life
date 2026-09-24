@@ -116,6 +116,7 @@
     <button data-tab="bili">📺 B站动态<span id="bili-tab-badge" class="tab-badge hide">0</span></button>
     <button data-tab="wb">🔥 微博<span id="wb-tab-badge" class="tab-badge hide">0</span></button>
     <button data-tab="reports">分析报告</button>
+    <button data-tab="paper">🧪 模拟交易</button>
     <button data-tab="notify">🔔 通知</button>
   </div>
 
@@ -572,6 +573,62 @@
   </section>
 
   <!-- 报告 -->
+  <!-- 模拟交易（Paper Trading）：LLM 决策 → 收盘价成交 → 5交易日结算 → 反思沉淀 -->
+  <section id="tab-paper" class="hide">
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <b style="font-size:13px">🧪 模拟账户</b>
+        <span class="row">
+          <button class="btn ghost" style="font-size:12px" onclick="paperRun()">立即决策一轮</button>
+          <button class="btn ghost" style="font-size:12px" onclick="paperSettle()">立即结算复盘</button>
+          <button class="btn ghost" style="font-size:12px" onclick="paperReset()">重置账户</button>
+        </span>
+      </div>
+      <div class="pnl-summary" id="paper-stats" style="margin-top:8px"></div>
+      <div class="muted" id="paper-meta" style="font-size:12px;margin-top:4px"></div>
+    </div>
+    <div class="card">
+      <b style="font-size:13px">📍 模拟持仓</b>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>代码</th><th>名称</th><th>持股</th><th>成本</th><th>现价</th>
+            <th>市值</th><th>浮盈%</th></tr></thead>
+          <tbody id="paper-positions"></tbody>
+        </table>
+      </div>
+      <div id="paper-positions-empty" class="empty hide">暂无模拟持仓</div>
+    </div>
+    <div class="card">
+      <b style="font-size:13px">📜 交易记录（点「理由」看全文）</b>
+      <div class="table-scroll" style="margin-top:6px">
+        <table>
+          <thead><tr><th>日期</th><th>股票</th><th>方向</th><th>价格</th><th>股数</th>
+            <th>状态</th><th>结算</th><th>理由</th></tr></thead>
+          <tbody id="paper-trades"></tbody>
+        </table>
+      </div>
+      <div id="paper-trades-empty" class="empty hide">还没有决策记录。点「立即决策一轮」或等交易日 15:35 自动决策。</div>
+    </div>
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <b style="font-size:13px">🧠 经验库（结算复盘沉淀）</b>
+        <select id="paper-lesson-code" style="padding:6px 10px;border:1px solid var(--border);border-radius:7px"
+                onchange="loadPaperLessons()"></select>
+      </div>
+      <div id="paper-lessons" style="margin-top:8px"></div>
+      <div id="paper-lessons-empty" class="empty hide">暂无经验。模拟交易结算后，复盘结论会沉淀到这里。</div>
+    </div>
+    <div class="card">
+      <b style="font-size:13px">📈 近30日资产</b>
+      <div class="table-scroll" style="margin-top:6px">
+        <table>
+          <thead><tr><th>日期</th><th>现金</th><th>持仓市值</th><th>总资产</th><th>日涨跌</th></tr></thead>
+          <tbody id="paper-equity"></tbody>
+        </table>
+      </div>
+      <div id="paper-equity-empty" class="empty hide">还没有资产快照（结算复盘后生成）</div>
+    </div>
+  </section>
   <section id="tab-reports" class="hide">
     <div class="card" id="report-list-card">
       <div class="row" style="justify-content:space-between">
@@ -615,7 +672,7 @@ document.querySelectorAll('.tabs button').forEach(btn => {
   btn.onclick = () => {
     document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
-    ['market', 'sector', 'holdings', 'strategies', 'plans', 'calendar', 'news', 'bili', 'wb', 'reports', 'notify'].forEach(t =>
+    ['market', 'sector', 'holdings', 'strategies', 'plans', 'calendar', 'news', 'bili', 'wb', 'reports', 'paper', 'notify'].forEach(t =>
       $('tab-' + t).classList.toggle('hide', t !== btn.dataset.tab));
     if (btn.dataset.tab === 'market') { loadWatch(); loadAlerts(); }
     if (btn.dataset.tab === 'sector') { loadSector(); loadIntraday(); startIntradayAuto(); }
@@ -628,6 +685,7 @@ document.querySelectorAll('.tabs button').forEach(btn => {
     if (btn.dataset.tab === 'bili') { loadBiliCreators(); loadBiliDynamics(); loadBiliStatus(); }
     if (btn.dataset.tab === 'wb') { loadWbCreators(); loadWbPosts(); loadWbStatus(); }
     if (btn.dataset.tab === 'reports') loadReports();
+    if (btn.dataset.tab === 'paper') loadPaper();
     if (btn.dataset.tab === 'notify') loadNotifyConf();
   };
 });
@@ -1561,6 +1619,156 @@ async function openReport(date, name) {
 function backToList() {
   $('report-view-card').classList.add('hide');
   $('report-list-card').classList.remove('hide');
+}
+
+// ---- 模拟交易（Paper Trading） ----
+function paperSideBadge(side) {
+  if (side === 'buy') return '<span class="badge" style="background:#ffe2e2;color:#b32424">买入</span>';
+  if (side === 'sell') return '<span class="badge" style="background:#e5f3e2;color:#1e7d32">卖出</span>';
+  return '<span class="badge" style="background:#eee;color:#666">观望</span>';
+}
+function paperStatusBadge(t) {
+  if (t.auto_closed) return '<span class="badge" style="background:#eee;color:#666">到期平仓</span>';
+  if (t.status === 'open') return '<span class="badge" style="background:#e8f0fe;color:#1a56b0">持有中</span>';
+  if (t.status === 'skipped') return '<span class="badge" style="background:#eee;color:#999">未成交</span>';
+  return '<span class="badge" style="background:#e5f3e2;color:#1e7d32">已结算</span>';
+}
+async function loadPaper() {
+  try {
+    const [ov, trades, lessons] = await Promise.all([
+      api('/api/paper/overview'),
+      api('/api/paper/trades?limit=100'),
+      api('/api/paper/lessons?limit=50'),
+    ]);
+    // 账户卡片
+    const acc = ov.account || {};
+    const st = ov.stats || {};
+    const buy = st.buy || {}, sell = st.sell || {};
+    const winN = (buy.wins || 0) + (sell.wins || 0), totalN = (buy.n || 0) + (sell.n || 0);
+    const avgAlpha = totalN ? ((buy.avg_alpha || 0) * (buy.n || 0) + (sell.avg_alpha || 0) * (sell.n || 0)) / totalN : null;
+    $('paper-stats').innerHTML = `
+      <div>总资产<div><b>¥${fmt(Math.round(ov.total))}</b></div>
+        <div class="${cls(ov.total_pnl_pct)}">${ov.total_pnl_pct != null ? signed(ov.total_pnl_pct) + '%' : '—'}</div></div>
+      <div>现金<div>¥${fmt(Math.round(acc.cash || 0))}</div></div>
+      <div>持仓市值<div>¥${fmt(Math.round(ov.market_value || 0))}</div></div>
+      <div>已结算<div>${totalN} 笔</div><div class="muted">买 ${buy.n || 0} / 卖 ${sell.n || 0}</div></div>
+      <div>胜率(alpha>0)<div>${totalN ? Math.round(winN / totalN * 100) + '%' : '—'}</div>
+        <div class="muted">${winN}/${totalN}</div></div>
+      <div>平均alpha<div class="${cls(avgAlpha)}">${avgAlpha != null ? signed((avgAlpha * 100).toFixed(1)) + '%' : '—'}</div></div>`;
+    $('paper-meta').textContent =
+      `成败按持有期相对基准的超额收益（alpha）判定；观望不计入胜率。初始资金 ¥${fmt(Math.round(acc.initial_cash || 0))}`;
+    // 持仓表
+    const pos = ov.positions || [];
+    $('paper-positions-empty').classList.toggle('hide', pos.length > 0);
+    $('paper-positions').innerHTML = pos.map(p => `
+      <tr>
+        <td>${p.code}</td><td>${esc(p.name)}</td>
+        <td>${fmt(p.shares)}</td>
+        <td>${p.avg_cost != null ? p.avg_cost : '—'}</td>
+        <td>${p.price != null ? p.price : '—'}</td>
+        <td>¥${fmt(Math.round(p.market_value || 0))}</td>
+        <td class="${cls(p.pnl_pct)}">${p.pnl_pct != null ? signed(p.pnl_pct) + '%' : '—'}</td>
+      </tr>`).join('');
+    // 交易记录（理由 details 展开）
+    $('paper-trades-empty').classList.toggle('hide', trades.length > 0);
+    $('paper-trades').innerHTML = trades.map(t => `
+      <tr>
+        <td class="muted">${(t.trade_date || '').slice(5)}</td>
+        <td>${esc(t.name || t.code)}</td>
+        <td>${paperSideBadge(t.side)}</td>
+        <td>${t.price != null ? t.price : '—'}</td>
+        <td>${t.shares ? fmt(t.shares) : '—'}</td>
+        <td>${paperStatusBadge(t)}</td>
+        <td class="${cls(t.alpha_return)}">${t.status === 'resolved' && t.raw_return != null
+          ? signed((t.raw_return * 100).toFixed(1)) + '%'
+          + (t.alpha_return != null ? `<span class="muted"> α${signed((t.alpha_return * 100).toFixed(1))}%</span>` : '')
+          : '—'}</td>
+        <td><details style="white-space:normal;min-width:220px;max-width:420px">
+          <summary style="cursor:pointer" class="muted">理由</summary>
+          <div style="font-size:12px;margin-top:4px">${esc(t.reasoning || '（无）')}</div>
+        </details></td>
+      </tr>`).join('');
+    // 经验库（含股票筛选下拉选项）
+    const sel = $('paper-lesson-code');
+    const cur = sel.value;
+    const codes = [...new Set(lessons.filter(l => l.code).map(l => l.code))];
+    sel.innerHTML = '<option value="">全部股票</option>' +
+      codes.map(c => `<option value="${c}">${c}</option>`).join('');
+    if (codes.includes(cur)) sel.value = cur;
+    renderPaperLessons(lessons);
+    // 资产快照
+    const eq = ov.equity || [];
+    $('paper-equity-empty').classList.toggle('hide', eq.length > 0);
+    $('paper-equity').innerHTML = eq.map(e => `
+      <tr>
+        <td class="muted">${(e.snap_date || '')}</td>
+        <td>¥${fmt(Math.round(e.cash || 0))}</td>
+        <td>¥${fmt(Math.round(e.market_value || 0))}</td>
+        <td><b>¥${fmt(Math.round(e.total || 0))}</b></td>
+        <td class="${cls(e.daily_return != null ? e.daily_return * 100 : null)}">
+          ${e.daily_return != null ? signed((e.daily_return * 100).toFixed(2)) + '%' : '—'}</td>
+      </tr>`).join('');
+  } catch (e) { toast('模拟交易数据加载失败: ' + e.message); }
+}
+async function loadPaperLessons() {
+  try {
+    const code = $('paper-lesson-code').value;
+    const lessons = await api('/api/paper/lessons?limit=50' + (code ? '&code=' + code : ''));
+    renderPaperLessons(lessons);
+  } catch (e) { toast('经验库加载失败: ' + e.message); }
+}
+function renderPaperLessons(lessons) {
+  const code = $('paper-lesson-code').value;
+  const shown = code ? lessons.filter(l => l.code === code) : lessons;
+  $('paper-lessons-empty').classList.toggle('hide', shown.length > 0);
+  $('paper-lessons').innerHTML = shown.map(l => {
+    const alpha = l.alpha_return != null ? l.alpha_return * 100 : null;
+    const tag = l.code === ''
+      ? '<span class="badge" style="background:#f3e8fd;color:#6b1fa0">全局规则</span>'
+      : `<span class="badge" style="background:#eee;color:#666">${esc(l.code)}</span>`;
+    const ret = l.code === '' ? '' :
+      `<span class="${cls(alpha)}">${alpha != null ? 'α' + signed(alpha.toFixed(1)) + '%' : '—'}</span>`;
+    return `
+    <div class="report-item" style="cursor:default;flex-direction:column;align-items:flex-start;gap:2px">
+      <span>${tag} ${ret}
+        <span class="muted" style="margin-left:4px">${l.resolved_at || ''} · ${l.action === 'rule' ? '蒸馏' : l.action}</span></span>
+      <span style="white-space:normal">${esc(l.lesson || '')}</span>
+    </div>`;
+  }).join('');
+}
+async function paperRun() {
+  try {
+    const r = await api('/api/paper/run', { method: 'POST' });
+    toast(r.status || '已启动');
+    setTimeout(loadPaperStatus, 3000);
+  } catch (e) { toast('决策启动失败: ' + e.message); }
+}
+async function paperSettle() {
+  try {
+    const r = await api('/api/paper/settle', { method: 'POST' });
+    toast(r.status || '已启动');
+    setTimeout(loadPaperStatus, 3000);
+  } catch (e) { toast('结算启动失败: ' + e.message); }
+}
+async function loadPaperStatus() {
+  try {
+    const s = await api('/api/paper/status');
+    if (s.running || s.settling) {
+      toast(s.running ? '决策进行中…' : '结算进行中…');
+      setTimeout(loadPaperStatus, 8000);
+    } else { loadPaper(); }
+  } catch (e) { /* 静默 */ }
+}
+async function paperReset() {
+  if (!confirm('重置模拟账户？将清空全部模拟交易、经验库和资产快照，初始资金恢复 10 万。')) return;
+  try {
+    await api('/api/paper/reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: true, initial_cash: 100000 })
+    });
+    toast('已重置'); loadPaper();
+  } catch (e) { toast('重置失败: ' + e.message); }
 }
 
 // ---- 新闻 ----

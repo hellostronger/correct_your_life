@@ -71,6 +71,16 @@ volume:
   interval_minutes: 5
   notify: true
 
+# 模拟交易（app.py _paper_loop + paper_trading.py：LLM 决策→收盘价成交→5交易日结算→反思沉淀）
+# enabled=总开关（false 时线程轮内直接跳过，不产生 LLM 费用）；改配置即时生效，
+# 但该后台线程是进程启动时创建的——首次启用/新增需重启一次 python app.py
+paper:
+  enabled: true
+  initial_cash: 100000      # 初始虚拟资金（元）
+  holding_days: 5           # 持有几个交易日后自动平仓结算
+  max_position_pct: 25      # 单票市值上限（% of 总资产）
+  sleep_seconds: 3          # 逐股决策间 sleep，防 LLM 网关限流
+
 # 通知配置（微信走腾讯官方 iLink Bot，凭据存云库；邮件走 SMTP）
 # 网页「通知」标签页可改；auth_code 是邮箱授权码，注意保管
 notify:
