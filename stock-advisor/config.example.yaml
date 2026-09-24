@@ -1,4 +1,8 @@
-# Stock Advisor 新闻抓取配置
+# Stock Advisor 配置模板
+# 使用方法：复制为同目录下的 config.yaml 并按需修改（config.yaml 已被 git 忽略，不会提交）
+#   cp config.example.yaml config.yaml
+# 密钥类配置建议留空，改用环境变量（如 ANTHROPIC_API_KEY），避免明文落盘
+#
 # 网页「新闻」标签页也可修改以下配置（保存后下一轮抓取生效）
 
 news:
@@ -39,11 +43,33 @@ sector:
 withdrawal:
   enabled: true
 
+# LLM 提款建议（Anthropic Claude API；api_key 留空则读环境变量 ANTHROPIC_API_KEY）
+# enabled=允许网页手动生成；auto_advice=盘后里程碑提醒后自动补一条建议（每日每计划至多一次）
+# base_url 留空 = Anthropic 官方端点；使用代理/网关在此填
+llm:
+  enabled: true
+  api_key: ''
+  base_url: ''
+  model: 'claude-opus-5'
+  auto_advice: true
+
 # 财经日历盘前提醒（econ_calendar.py + app.py _calendar_loop）
-# 交易日早 8-12 点窗口检查：今明两日事件（非农/交割/四巫/LPR/手动 FOMC 等）推一条，
-# 重要事件（非农/四巫日）另提前 3 天预告一次；去重状态存 data/calendar_state.json
 calendar:
   enabled: true
+
+# 自选股事件告警（alerts.py：限售解禁 + 增发新股上市，东财公开接口）
+# 工作日 8:30 后扫一轮，窗口（days 自然日）内的新事件推微信/邮件，同事件只推一次
+alerts:
+  enabled: true
+  days: 14
+
+# 盘中大盘量能监控（app.py _market_volume_loop：三大指数行情量比 f49）
+# 交易时段按 interval_minutes 采样；放量/缩量状态翻转（连续两次采样确认）推微信
+# notify=false 只看不推；每天最多 4 条、同方向 45 分钟冷却
+volume:
+  enabled: true
+  interval_minutes: 5
+  notify: true
 
 # 通知配置（微信走腾讯官方 iLink Bot，凭据存云库；邮件走 SMTP）
 # 网页「通知」标签页可改；auth_code 是邮箱授权码，注意保管
@@ -51,9 +77,9 @@ notify:
   wx:
     enabled: true
   email:
-    smtp_host: 
+    smtp_host:
     smtp_port: 0
-    from_addr: 
-    auth_code: 
-    to_addr: 
+    from_addr:
+    auth_code:
+    to_addr:
     enabled: false

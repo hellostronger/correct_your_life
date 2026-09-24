@@ -122,6 +122,7 @@
         <span class="muted" id="market-vol-meta" style="font-size:12px"></span>
       </div>
       <div id="market-vol" class="pnl-summary" style="margin-top:8px"></div>
+      <div id="market-vol-intraday" class="muted" style="margin-top:6px;font-size:12px"></div>
     </div>
     <div class="card">
       <div class="row">
@@ -132,10 +133,20 @@
       </div>
     </div>
     <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <b style="font-size:13px">⚠️ 解禁 / 增发告警<span id="alerts-count" class="muted" style="font-weight:normal"></span></b>
+        <span class="row">
+          <button class="btn ghost" style="font-size:12px" onclick="loadAlerts()">重新检查</button>
+          <button class="btn ghost" style="font-size:12px" onclick="pushAlerts()">推送提醒</button>
+        </span>
+      </div>
+      <div id="alerts-box" class="muted" style="margin-top:6px;font-size:12px">加载中…（未来 14 天自选股限售解禁、增发新股上市；工作日 8:30 自动推微信）</div>
+    </div>
+    <div class="card">
       <table>
         <thead><tr>
           <th>代码</th><th>名称</th><th>现价</th><th>涨跌幅</th>
-          <th>今开</th><th>最高</th><th>最低</th><th>成交额</th><th>量能</th><th>行情时间</th><th>备注</th><th></th>
+          <th>今开</th><th>最高</th><th>最低</th><th>成交额</th><th>总市值</th><th>量能</th><th>行情时间</th><th>备注</th><th></th>
         </tr></thead>
         <tbody id="watch-body"></tbody>
       </table>
@@ -327,6 +338,25 @@
       </div>
       <div id="plans-list"></div>
       <div id="plans-empty" class="empty hide">还没有提款计划。定一个「日期 + 金额」，看看到底怎么提出来。</div>
+    </div>
+    <div class="card">
+      <b style="font-size:13px">🤖 AI 提款建议（Claude API）</b>
+      <div class="row" style="margin-top:8px">
+        <input id="llm-key" type="password" placeholder="Anthropic API key（sk-ant-…）" style="width:260px">
+        <input id="llm-model" placeholder="模型（默认 claude-opus-5）" style="width:200px">
+        <input id="llm-base" placeholder="base_url（可选，代理/网关）" style="width:220px">
+      </div>
+      <div class="row" style="margin-top:8px;align-items:center">
+        <label class="muted"><input type="checkbox" id="llm-enabled"> 启用</label>
+        <label class="muted"><input type="checkbox" id="llm-auto"> 盘后里程碑自动补一条建议（每日每计划至多一次）</label>
+        <button class="btn" onclick="saveLlmConf()">保存</button>
+        <span class="muted" id="llm-status"></span>
+      </div>
+      <div class="muted" style="margin-top:6px">
+        每个计划卡片直接点「🤖 AI 买卖建议」即可（无需展开详情）：把计划进度、持仓明细、卖出凑钱建议、
+        自选观察池、板块轮动、未来解禁/增发事件、近期新闻与大盘量能全部交给 Claude，
+        生成一份「卖哪只、买哪只」的操作建议（含理由与风险提示）。
+        API key 存本机 config.yaml（注意调用会产生 API 费用）；留空则读环境变量 ANTHROPIC_API_KEY。</div>
     </div>
   </section>
 
@@ -572,12 +602,12 @@ document.querySelectorAll('.tabs button').forEach(btn => {
     btn.classList.add('active');
     ['market', 'sector', 'holdings', 'strategies', 'plans', 'calendar', 'news', 'bili', 'wb', 'reports', 'notify'].forEach(t =>
       $('tab-' + t).classList.toggle('hide', t !== btn.dataset.tab));
-    if (btn.dataset.tab === 'market') loadWatch();
+    if (btn.dataset.tab === 'market') { loadWatch(); loadAlerts(); }
     if (btn.dataset.tab === 'sector') { loadSector(); loadIntraday(); startIntradayAuto(); }
     if (btn.dataset.tab === 'holdings') loadHoldings();
     if (btn.dataset.tab === 'strategies') loadStrategies();
     if (btn.dataset.tab === 'holdings' || btn.dataset.tab === 'strategies') refreshTradeStrategyOptions();
-    if (btn.dataset.tab === 'plans') loadPlans();
+    if (btn.dataset.tab === 'plans') { loadPlans(); loadLlmConf(); }
     if (btn.dataset.tab === 'calendar') loadCalendar();
     if (btn.dataset.tab === 'news') { loadNews(); loadConfig(); }
     if (btn.dataset.tab === 'bili') { loadBiliCreators(); loadBiliDynamics(); loadBiliStatus(); }
@@ -758,11 +788,60 @@ async function loadStockBoards() {
 }
 function switchToBoard(bk) { toggleBoardDetail(bk); window.scrollTo({ top: 0, behavior: 'smooth' }); }
 
+// ---- 解禁/增发告警 ----
+async function loadAlerts() {
+  const box = $('alerts-box');
+  try {
+    const data = await api('/api/alerts/upcoming?days=14');
+    const evs = data.events || [];
+    $('alerts-count').textContent = evs.length ? `（${evs.length}）` : '';
+    if (!evs.length) {
+      box.innerHTML = '<span class="muted">未来 14 天自选股暂无解禁/增发事件 ✓</span>'
+        + '<span class="muted" style="margin-left:8px">（A股口径；港股不适用。数据源东财，'
+        + '工作日 8:30 自动扫描推微信）</span>';
+      return;
+    }
+    const today = new Date().toISOString().slice(0, 10);
+    box.innerHTML = evs.map(e => {
+      const soon = e.event_date <= today || e.event_date <= _plusDays(today, 3);
+      const icon = e.type === 'lift' ? '🔓' : '📤';
+      const label = e.type === 'lift' ? '解禁' : '增发上市';
+      return `<div style="padding:2px 0">` +
+        `<span class="${soon ? 'down' : ''}">${icon} <b>${e.event_date}</b></span> ` +
+        `${e.name}（${e.code}）${label} ` +
+        `<b>${e.shares_yi}亿股</b> / 约<b>${e.cap_yi}亿元</b> ` +
+        `<span class="muted">${e.detail || ''}</span></div>`;
+    }).join('');
+  } catch (e) {
+    box.innerHTML = '<span class="muted">告警加载失败: ' + e.message + '</span>';
+  }
+}
+function _plusDays(iso, n) {
+  const d = new Date(iso + 'T00:00:00');
+  d.setDate(d.getDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+async function pushAlerts() {
+  toast('检查中…');
+  try {
+    const r = await api('/api/alerts/check', { method: 'POST' });
+    toast(r.alerted && r.alerted.length ? `已推送 ${r.alerted.length} 个新事件（微信/邮件）`
+                                        : '无新事件（已推送过的不会重复推）');
+  } catch (e) { toast('检查失败: ' + e.message); }
+}
+
 // ---- 自选 ----
 // 量能标签：ratio 是「最新日成交量 / 前5日均量」；>1.15 放量，<0.9 缩量，其余平量
 function volCell(v) {
   if (!v || typeof v.ratio !== 'number') return '<span class="muted">—</span>';
   return `<span class="${v.color}">${v.label} ${v.ratio}x</span>`;
+}
+// 总市值列：后端单位是「亿」（A股=CNY元、港股=HKD元），港股带币种标记
+function capCell(q) {
+  if (!q || typeof q.market_cap !== 'number') return '<span class="muted">—</span>';
+  const n = q.market_cap >= 1e4 ? (q.market_cap / 1e4).toFixed(2) + '万亿'
+                                   : q.market_cap.toFixed(2) + '亿';
+  return n + (q.market === 'hk' ? '<div class="muted" style="font-size:10px">HKD</div>' : '');
 }
 async function loadMarketVolume() {
   try {
@@ -785,8 +864,26 @@ async function loadMarketVolume() {
       const cell = tr.querySelector('.vol-cell');
       if (cell) cell.innerHTML = volCell(stockVol[tr.dataset.code]);
     });
+    loadMarketVolIntraday();
   } catch (e) { /* 大盘量能失败不打断行情刷新 */ }
 }
+// 盘中实时量比一行（行情 f49，交易时段每5分钟采样；状态翻转会自动推微信）
+async function loadMarketVolIntraday() {
+  const box = $('market-vol-intraday');
+  if (!box) return;
+  try {
+    const d = await api('/api/volume/intraday');
+    if (!d.items || !d.items.length) { box.innerHTML = ''; return; }
+    const parts = d.items.map(i => `<span class="muted">${i.name}</span>` +
+      `<b class="${_volColorOf(i.ratio)}">${i.ratio != null ? i.ratio + 'x' : '—'}</b>`);
+    const overall = d.ratio != null
+      ? `<b class="${_volColorOf(d.ratio)}">大盘 ${d.label || '—'} ${d.ratio}x</b>　` : '';
+    const alert = d.last_alert ? `　<span class="muted">最近告警：${d.last_alert.label}（${(d.last_alert.time || '').slice(11, 16)}）</span>` : '';
+    box.innerHTML = overall + parts.join('　') +
+      `<span class="muted">　实时量比 · ${d.updated_at ? d.updated_at.slice(11, 16) : ''} 采样</span>` + alert;
+  } catch { /* 静默 */ }
+}
+const _volColorOf = r => r == null ? 'muted' : (r >= 1.15 ? 'up' : r <= 0.9 ? 'down' : 'muted');
 async function loadWatch() {
   try {
     const items = await api('/api/watchlist');
@@ -800,6 +897,7 @@ async function loadWatch() {
         <td class="${cls(q.change_pct)}">${typeof q.change_pct === 'number' ? signed(q.change_pct) + '%' : '—'}</td>
         <td>${fmt(q.open)}</td><td>${fmt(q.high)}</td><td>${fmt(q.low)}</td>
         <td>${yi(q.amount)}</td>
+        <td>${capCell(q)}</td>
         <td class="vol-cell"><span class="muted">…</span></td>
         <td class="muted">${(q.updated_at || '').replace(' ', '<br>') || '—'}</td>
         <td class="muted">${i.note || ''}</td>
@@ -1173,6 +1271,8 @@ async function loadPlans() {
               : p.deadline_passed ? '<span class="badge" style="background:#ffe2e2;color:#b32424">已逾期</span>'
               : `<span class="muted">剩 ${p.trading_days_left} 个交易日</span>`}</span>
           <span>
+            <button class="btn" style="font-size:12px" id="quick-adv-${p.id}"
+                    onclick="quickGenAdvice(${p.id})">🤖 AI 买卖建议</button>
             <button class="btn ghost" style="font-size:12px" onclick="togglePlanDetail(${p.id})">详情/记提款</button>
             <button class="del" onclick="delPlan(${p.id})" title="删除计划">×</button></span>
         </div>
@@ -1231,9 +1331,95 @@ async function showPlanDetail(id) {
       ${p.gap > 0 ? `<div class="muted" style="margin-top:6px">⚠️ 市值缺口 ${fmt(p.gap)} 元——
         完成目标需组合上涨 ${p.required_total_pct != null ? signed(p.required_total_pct) + '%' : '—'}；
         不现实的话考虑降目标、延日期或场外补本金。</div>` : ''}
+      <div class="row" style="margin-top:8px;align-items:center;border-top:1px dashed var(--border);padding-top:8px">
+        <button class="btn ghost" style="font-size:12px" id="adv-btn-${id}"
+                onclick="genPlanAdvice(${id})">🤖 生成 AI 提款建议</button>
+        <span class="muted" id="adv-status-${id}"></span>
+      </div>
+      <div id="advice-box-${id}" style="margin-top:6px;white-space:pre-wrap;word-break:break-word;
+           line-height:1.7;font-size:12.5px;background:var(--bg);border:1px solid var(--border);
+           border-radius:8px;padding:8px 10px" class="hide"></div>
       ${wdRows ? `<div class="muted" style="margin-top:8px"><b>提款流水</b>：</div>
         <table><tbody>${wdRows}</tbody></table>`
         : '<div class="muted" style="margin-top:6px">还没有提款记录。</div>'}`;
+    showPlanAdvice(id);   // 拉最新一条 AI 建议（无则隐藏框）
+  } catch (e) { toast(e.message); }
+}
+
+// ---- AI 提款建议 ----
+async function showPlanAdvice(id) {
+  try {
+    const a = await api('/api/plans/' + id + '/advice');
+    const box = $('advice-box-' + id);
+    if (!box) return;
+    if (a.content) {
+      box.classList.remove('hide');
+      box.innerHTML = `<b style="font-size:12px">🤖 AI 建议（${esc(a.model || '')} · `
+        + `${(a.created_at || '').replace('T', ' ')} · ${a.auto ? '自动' : '手动'}）</b>\n`
+        + esc(a.content);
+    } else {
+      box.classList.add('hide');
+      box.innerHTML = '';
+    }
+  } catch { /* 无建议不报错 */ }
+}
+async function genPlanAdvice(id) {
+  const btn = $('adv-btn-' + id), st = $('adv-status-' + id);
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ 生成中（约 10-60 秒）…'; }
+  if (st) st.textContent = '';
+  try {
+    const r = await api('/api/plans/' + id + '/advice', { method: 'POST' });
+    const box = $('advice-box-' + id);
+    if (box) {
+      box.classList.remove('hide');
+      box.innerHTML = `<b style="font-size:12px">🤖 AI 建议（${esc(r.model)} · `
+        + `${(r.created_at || '').replace('T', ' ')} · 手动）</b>\n` + esc(r.content);
+    }
+    toast('AI 建议已生成');
+  } catch (e) {
+    if (st) st.textContent = '生成失败: ' + e.message;
+    toast('生成失败: ' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🤖 重新生成建议'; }
+  }
+}
+// 计划卡片上的快捷入口：不用展开详情，直接生成并自动展开显示
+async function quickGenAdvice(id) {
+  const btn = $('quick-adv-' + id);
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ 生成中…'; }
+  try {
+    await api('/api/plans/' + id + '/advice', { method: 'POST' });
+    _openPlanId = id; showPlanDetail(id);   // 展开详情，最新建议由 showPlanAdvice 拉取
+    toast('AI 买卖建议已生成');
+  } catch (e) {
+    toast('生成失败: ' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🤖 AI 买卖建议'; }
+  }
+}
+async function loadLlmConf() {
+  try {
+    const c = await api('/api/llm/config');
+    $('llm-enabled').checked = !!c.enabled;
+    $('llm-auto').checked = !!c.auto_advice;
+    $('llm-model').value = c.model || '';
+    $('llm-base').value = c.base_url || '';
+    $('llm-key').value = '';
+    $('llm-key').placeholder = c.has_key ? `已配置（…${c.key_tail}），留空=不修改`
+                                         : 'Anthropic API key（sk-ant-…）';
+    $('llm-status').textContent = c.has_key ? 'key 已配置 ✓' : '未配置 key（可留空用环境变量）';
+  } catch (e) { /* 静默 */ }
+}
+async function saveLlmConf() {
+  try {
+    await api('/api/llm/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        enabled: $('llm-enabled').checked, auto_advice: $('llm-auto').checked,
+        model: $('llm-model').value.trim(), base_url: $('llm-base').value.trim(),
+        api_key: $('llm-key').value.trim() || undefined,
+      })});
+    toast('AI 配置已保存');
+    loadLlmConf();
   } catch (e) { toast(e.message); }
 }
 async function addWithdrawal(id) {
@@ -1820,6 +2006,7 @@ async function loadNewsFilter() {
 }
 
 loadWatch();
+loadAlerts();
 loadNewsFilter();
 loadUnreadBadge();
 refreshTradeStrategyOptions();

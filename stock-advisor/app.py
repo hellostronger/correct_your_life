@@ -274,6 +274,16 @@ def init_db():
         created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS idx_sa_calendar_date ON sa_calendar_events (event_date);
+    -- LLM 提款建议：一个计划多条历史（每次生成插一行，页面取最新）
+    CREATE TABLE IF NOT EXISTS sa_plan_advice (
+        id         BIGSERIAL PRIMARY KEY,
+        plan_id    BIGINT NOT NULL REFERENCES sa_withdrawal_plans(id) ON DELETE CASCADE,
+        content    TEXT NOT NULL,
+        model      VARCHAR(64) NOT NULL DEFAULT '',
+        auto       BOOLEAN NOT NULL DEFAULT FALSE,   -- 自动（盘后）/手动生成
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_sa_plan_advice_plan ON sa_plan_advice (plan_id, created_at DESC);
     -- 板块轮动快照（建表 DDL 以 sector.py 的 SNAPSHOT_TABLE_DDL 为准，那里也幂等）
     """
     last_exc: Exception | None = None
@@ -398,6 +408,7 @@ def fetch_quotes(codes: list[str]) -> dict[str, dict]:
         result.update(_fetch_quotes_tencent(a_codes))
     if hk_codes:
         result.update(_fetch_quotes_sina_hk(hk_codes))
+        _fill_hk_market_cap(result)
     # 保证顺序与请求一致，未返回的补占位
     for c in codes:
         result.setdefault(c, {"code": c, "error": "行情未返回"})
@@ -436,6 +447,7 @@ def _fetch_quotes_tencent(codes: list[str]) -> dict[str, dict]:
                 "high": _to_float(f[33]),        # 最高
                 "low": _to_float(f[34]),         # 最低
                 "amount": _quote_amount(f[37], "a"),  # 成交额（统一为元）
+                "market_cap": _to_float(f[45]),   # 总市值（亿元；f44 是流通市值）
                 "updated_at": _fmt_quote_time(f[30]),  # 行情快照时间（交易所侧）
             }
     except Exception as exc:  # 行情抓取失败不影响 CRUD
@@ -492,6 +504,45 @@ def _fetch_quotes_sina_hk(codes: list[str]) -> dict[str, dict]:
     return result
 
 
+# 总市值（market_cap，单位亿元）：A股直接来自腾讯行情 f45（f44 是流通市值）；
+# 港股行情走新浪 rt_hk（无市值字段），借腾讯 hk 行情补——腾讯对港股价格有
+# 15 分钟延迟（所以行情换了新浪），但市值不时效敏感，可接受。港股市值按
+# 代码缓存 1 小时（批量拉一次），避免 30s 一轮的行情刷新打爆接口。
+_HK_CAP_TTL = 3600
+_hk_cap_cache: dict[str, tuple[float | None, float]] = {}
+
+
+def _fill_hk_market_cap(result: dict) -> None:
+    """给行情结果里的港股条目补 market_cap 字段（缺失且缓存过期的才发请求）。"""
+    hk = [c for c, q in result.items()
+          if q.get("market") == "hk" and q.get("name") and "market_cap" not in q]
+    now = time.time()
+    fresh = {c: _hk_cap_cache[c][0] for c in hk
+             if c in _hk_cap_cache and now - _hk_cap_cache[c][1] < _HK_CAP_TTL}
+    for c, v in fresh.items():
+        result[c]["market_cap"] = v
+    stale = [c for c in hk if c not in fresh]
+    if not stale:
+        return
+    caps: dict[str, float | None] = {}
+    try:
+        resp = requests.get(TENCENT_QUOTE_URL + ",".join(f"hk{c}" for c in stale),
+                            headers=HEADERS, timeout=10)
+        text = resp.content.decode("gbk", "ignore")
+        for c in stale:
+            m = re.search(rf'hk{c}="([^"]*)"', text)
+            f = m.group(1).split("~") if m else []
+            caps[c] = _to_float(f[45]) if len(f) > 45 else None
+    except Exception as exc:
+        print(f"[quote] 港股市值抓取失败: {exc}", flush=True)
+    for c in stale:
+        if c in caps:  # 请求成功才更新缓存；失败沿用旧值，下一轮重试
+            _hk_cap_cache[c] = (caps[c], now)
+            result[c]["market_cap"] = caps[c]
+        else:
+            result[c]["market_cap"] = _hk_cap_cache[c][0] if c in _hk_cap_cache else None
+
+
 def _to_float(v: str):
     try:
         return float(v)
@@ -529,10 +580,43 @@ VOL_MA_DAYS = 5        # 均量基准窗口（不含今日）
 VOL_RATIO_FLAT = (0.9, 1.15)   # 平量区间：0.9x ~ 1.15x 视为量能持平
 
 
+def _em_secid(symbol: str) -> str | None:
+    """腾讯符号 -> 东财 secid：sh600519->1.600519 / sz000858->0.000858 /
+    hk00700->116.00700 / hkHSI->100.HSI（港股指数）。"""
+    if symbol.startswith("hk"):
+        rest = symbol[2:]
+        return f"100.{rest}" if not rest.isdigit() else f"116.{rest}"
+    if symbol.startswith("sh"):
+        return "1." + symbol[2:]
+    if symbol.startswith("sz"):
+        return "0." + symbol[2:]
+    return None
+
+
+def _em_kline_fields(symbol: str, days: int, fields: str) -> list[str]:
+    """东财日K（push2his）：腾讯 fqkline 被 WAF 拦时兜底（2026-09-16 实测可用）。
+    fields 如 "f51,f56"（日期+成交量）/ "f51,f57"（日期+成交额元）。失败返回 []。"""
+    secid = _em_secid(symbol)
+    if not secid:
+        return []
+    try:
+        resp = requests.get(
+            "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+            params={"secid": secid, "klt": 101, "fqt": 1, "lmt": days,
+                    "fields1": "f1,f2,f3", "fields2": fields, "end": "20500101"},
+            headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        return (resp.json().get("data") or {}).get("klines") or []
+    except Exception:
+        return []
+
+
 def fetch_kline_volumes(symbol: str, days: int = VOL_MA_DAYS + 2) -> list[float]:
     """取某证券近 N 个交易日成交量列表（升序，最后一个元素=最近交易日）。
 
-    symbol 用腾讯符号（sh600519 / hkHSI / hk00700）。失败返回 []。
+    symbol 用腾讯符号（sh600519 / hkHSI / hk00700）。主源腾讯日K；腾讯
+    web.ifzq 域名被 WAF 拦（501，2026-09-16 起频发）时自动兜底东财 push2his
+    （成交量单位与腾讯一致，比值口径不受影响）。都失败返回 []。
     """
     try:
         resp = requests.get(
@@ -543,9 +627,19 @@ def fetch_kline_volumes(symbol: str, days: int = VOL_MA_DAYS + 2) -> list[float]
         data = resp.json().get("data", {}).get(symbol, {})
         bars = data.get("qfqday") or data.get("day") or []
         vols = [_to_float(bar[5]) for bar in bars if len(bar) > 5]
-        return [v for v in vols if v]
+        out = [v for v in vols if v]
+        if out:
+            return out
     except Exception:
-        return []
+        pass
+    ks = _em_kline_fields(symbol, days, "f51,f56")
+    return [v for v in (_to_float(k.split(",")[1]) for k in ks if len(k.split(",")) > 1) if v]
+
+
+def fetch_kline_amounts(symbol: str, days: int = VOL_MA_DAYS + 2) -> list[float]:
+    """近 N 个交易日成交额（元，升序）。东财 f57 为绝对元；A股指数/个股通用。"""
+    ks = _em_kline_fields(symbol, days, "f51,f57")
+    return [v for v in (_to_float(k.split(",")[1]) for k in ks if len(k.split(",")) > 1) if v]
 
 
 def _vol_label(ratio) -> str:
@@ -611,6 +705,144 @@ def watchlist_volume_status(codes: list[str]) -> dict[str, dict]:
         stat = _latest_vs_ma(vols)
         out[code] = {"today_volume": vols[-1] if vols else None, **stat}
     return out
+
+
+# ---------------- 盘中大盘量能监控（放量/缩量异动告警） ----------------
+# 日K均量比是收盘后口径，盘中要盯「现在这个时点算不算放量/缩量」用行情
+# f49 量比：当日每分钟均量 ÷ 过去5日每分钟均量，腾讯实时算好，三大指数一次请求拿齐。
+# 状态翻转（如 平量->放量）连续两次采样确认才推微信/邮件——单次毛刺不轰炸。
+
+_intraday_vol = {"lock": threading.Lock(), "ratio": None, "label": None,
+                 "items": [], "updated_at": None,
+                 "confirmed_label": None, "pending_label": None, "pending_count": 0,
+                 "last_push_ts": 0.0, "last_push_day": None, "push_count_today": 0,
+                 "last_alert": None}
+
+VOL_PUSH_COOLDOWN = 45 * 60     # 同方向翻转告警冷却（秒）
+VOL_PUSH_MAX_PER_DAY = 4        # 每日最多推送条数
+
+
+def _a_share_session(now: datetime) -> bool:
+    """A股交易时段（9:15–11:35 / 12:55–15:05，工作日）。"""
+    if now.weekday() >= 5:
+        return False
+    hm = (now.hour, now.minute)
+    return (9, 15) <= hm <= (11, 35) or (12, 55) <= hm <= (15, 5)
+
+
+def sample_market_volume_now() -> dict:
+    """实时采一次三大指数量比（行情 f49）+ 成交额，写入 _intraday_vol 并返回快照。"""
+    a_indices = [(s, n) for s, n in INDEX_POOL if n != "恒生指数"]
+    items = []
+    try:
+        resp = requests.get(TENCENT_QUOTE_URL + ",".join(s for s, _ in a_indices),
+                            headers=HEADERS, timeout=15)
+        text = resp.content.decode("gbk", "ignore")
+        for sym, name in a_indices:
+            m = re.search(rf'{sym}="([^"]*)"', text)
+            if not m:
+                continue
+            f = m.group(1).split("~")
+            items.append({"name": name,
+                          "ratio": _to_float(f[49]) if len(f) > 49 else None,
+                          "amount": _quote_amount(f[37], "a") if len(f) > 37 else None})
+    except Exception as exc:
+        print(f"[mktvol] sample failed: {exc}", flush=True)
+    ratios = [i["ratio"] for i in items if isinstance(i["ratio"], (int, float))]
+    overall = round(sum(ratios) / len(ratios), 2) if ratios else None
+    snapshot = {"ratio": overall, "label": _vol_label(overall), "items": items,
+                "updated_at": datetime.now().isoformat(timespec="seconds")}
+    with _intraday_vol["lock"]:
+        _intraday_vol.update(snapshot)
+    return snapshot
+
+
+def _market_volume_alert(snapshot: dict) -> dict | None:
+    """状态翻转判定（带一次确认）：新标签连续两次采样出现才触发。返回推送文本或 None。"""
+    now = datetime.now()
+    day = now.strftime("%Y-%m-%d")
+    new = snapshot["label"]
+    if new not in ("放量", "缩量"):
+        new = None  # 平量不告警（回到平量视为噪音，只有明确放量/缩量才推）
+    with _intraday_vol["lock"]:
+        cur = _intraday_vol.get("confirmed_label")
+        if new and new != cur:
+            if _intraday_vol["pending_label"] == new:
+                _intraday_vol["pending_count"] += 1
+            else:
+                _intraday_vol["pending_label"] = new
+                _intraday_vol["pending_count"] = 1
+            confirmed = _intraday_vol["pending_count"] >= 2  # 连续两次同向才确认
+        else:
+            _intraday_vol["pending_label"] = None
+            _intraday_vol["pending_count"] = 0
+            confirmed = False
+        if confirmed:
+            _intraday_vol["confirmed_label"] = new
+            _intraday_vol["pending_label"] = None
+            _intraday_vol["pending_count"] = 0
+            # 冷却 + 每日上限
+            if day != _intraday_vol["last_push_day"]:
+                _intraday_vol["last_push_day"] = day
+                _intraday_vol["push_count_today"] = 0
+            if (_intraday_vol["push_count_today"] >= VOL_PUSH_MAX_PER_DAY
+                    or now.timestamp() - _intraday_vol["last_push_ts"] < VOL_PUSH_COOLDOWN):
+                return None
+            _intraday_vol["last_push_ts"] = now.timestamp()
+            _intraday_vol["push_count_today"] += 1
+            detail = "、".join(f"{i['name']} {i['ratio']}x" for i in snapshot["items"]
+                              if isinstance(i.get("ratio"), (int, float)))
+            amt = sum(i["amount"] for i in snapshot["items"]
+                      if isinstance(i.get("amount"), (int, float)) and i["name"] != "创业板指")
+            text = (f"📊 大盘转为【{new}】：沪深京三大指数平均量比 {snapshot['ratio']}x"
+                    f"（{detail}）\n沪+深成交额已 {amt / 1e8:,.0f} 亿元"
+                    f"\n（{now.strftime('%H:%M')} 采样，量比=当日每分钟均量/前5日同期；"
+                    "来自 stock-advisor 盘中量能监控）")
+            _intraday_vol["last_alert"] = {"time": now.isoformat(timespec="seconds"),
+                                           "label": new, "text": text}
+            return {"title": f"📊 盘中大盘{new}", "content": text}
+        return None
+
+
+@app.get("/api/volume/intraday")
+def volume_intraday():
+    """盘中量能快照（含最近一次告警）；无缓存时现场采一次。"""
+    with _intraday_vol["lock"]:
+        fresh = _intraday_vol["updated_at"] and \
+            (datetime.now() - datetime.fromisoformat(_intraday_vol["updated_at"])
+             ).total_seconds() < 120
+        snap = dict(_intraday_vol) if fresh else None
+    if snap is None:
+        snap = sample_market_volume_now()
+        with _intraday_vol["lock"]:
+            snap = dict(_intraday_vol)
+    snap.pop("lock", None)
+    return snap
+
+
+def _market_volume_loop():
+    """盘中大盘量能守护线程：交易时段按 config volume.interval_minutes 采样，
+    放量/缩量状态翻转（双采样确认）推微信/邮件；收盘后补一次全天总结可选。"""
+    while True:
+        try:
+            conf = _conf_section("volume")
+            interval = max(int(conf.get("interval_minutes") or 5), 1)
+            if conf.get("enabled", True) and _a_share_session(datetime.now()):
+                snap = sample_market_volume_now()
+                if conf.get("notify", True) and snap["ratio"] is not None:
+                    alert = _market_volume_alert(snap)
+                    if alert:
+                        try:
+                            notifier.notify(alert["title"], alert["content"])
+                            print(f"[mktvol] alert pushed: {alert['title']}", flush=True)
+                        except Exception as exc:
+                            print(f"[mktvol] notify failed: {exc}", flush=True)
+                time.sleep(interval * 60)
+            else:
+                time.sleep(300)
+        except Exception as exc:
+            print(f"[mktvol] loop error: {exc}", flush=True)
+            time.sleep(300)
 
 
 @app.get("/api/volume/status")
@@ -1710,12 +1942,13 @@ def plan_detail(plan_id: int):
     return view
 
 
-def check_withdrawal_once(notify: bool = True) -> list[dict]:
+def check_withdrawal_once(notify: bool = True, auto_ai: bool = False) -> list[dict]:
     """每日盘后跑一次：给每个 active 计划算达标状态，推里程碑提醒。
 
     里程碑键：ready（现在就能提）/ d10 d5 d1（剩余交易日首次 ≤N）/ deadline（逾期）。
     同键只推一次（记在 notified JSONB）；「现在就能提」回落后再次达标会重新推
-    （键带日期后缀）。
+    （键带日期后缀）。auto_ai=True 时（后台盘后循环）对触发了里程碑的计划
+    自动补一条 LLM 提款建议（llm.auto_advice 开启 + 当日未生成过才跑）。
     """
     alerts: list[dict] = []
     totals = _withdrawn_totals()
@@ -1760,7 +1993,45 @@ def check_withdrawal_once(notify: bool = True) -> list[dict]:
                            if v.get("required_total_pct") and v["gap"] > 0 else ""))
                 except Exception as exc:
                     print(f"[withdrawal] 通知失败: {exc}", flush=True)
+    if auto_ai and alerts:
+        _auto_plan_advice(alerts)
     return alerts
+
+
+def _auto_plan_advice(alerts: list[dict]) -> None:
+    """盘后里程碑触发后自动补 LLM 建议（llm.auto_advice 开关 + 当日去重）。
+
+    去重用计划行的 notified JSONB（ai:{plan_id}:{date} 键），不另建状态文件。
+    每个计划独立 try/except：一个失败（无 key / API 超时）不影响其余与主流程。
+    """
+    try:
+        conf = llm_advisor.load_llm_conf()
+    except Exception:
+        return
+    if not (conf.get("enabled") and conf.get("auto_advice")):
+        return
+    today = datetime.now().strftime("%Y-%m-%d")
+    done: set[int] = set()
+    for a in alerts:
+        pid = a["plan_id"]
+        if pid in done:
+            continue
+        done.add(pid)
+        try:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute("SELECT notified -> %s FROM sa_withdrawal_plans WHERE id = %s",
+                            (f"ai:{today}", pid))
+                row = cur.fetchone()
+            if not row or row[0] is None:
+                generate_plan_advice(pid, auto=True)
+                with get_conn() as conn, conn.cursor() as cur:
+                    cur.execute("UPDATE sa_withdrawal_plans "
+                                "SET notified = notified || %s::jsonb WHERE id = %s",
+                                (json.dumps({f"ai:{today}": datetime.now().isoformat(
+                                    timespec="seconds")}), pid))
+                print(f"[withdrawal] AI 建议已生成（计划 #{pid}）", flush=True)
+        except Exception as exc:
+            print(f"[withdrawal] AI 建议生成失败（计划 #{pid}）: {exc}", flush=True)
 
 
 def _withdrawal_loop():
@@ -1771,7 +2042,7 @@ def _withdrawal_loop():
             if (_conf_enabled("withdrawal", True)
                     and now.weekday() < 5
                     and (now.hour > 15 or (now.hour == 15 and now.minute >= 10))):
-                check_withdrawal_once()
+                check_withdrawal_once(auto_ai=True)
             time.sleep(1800)
         except Exception as exc:
             print(f"[withdrawal] loop error: {exc}", flush=True)
@@ -1782,6 +2053,237 @@ def _withdrawal_loop():
 def plans_check():
     """手动跑一次提款计划检查（也供 Claude 定时任务调用）。"""
     return {"ok": True, "alerts": check_withdrawal_once()}
+
+
+# ---------------- LLM 提款建议（llm_advisor.py：Claude API，配置在 config.yaml llm 段） ----------------
+
+import llm_advisor
+
+
+class LLMConfIn(BaseModel):
+    enabled: bool | None = None
+    api_key: str | None = None      # 留空/不传 = 不修改已存的 key
+    base_url: str | None = None
+    model: str | None = None
+    auto_advice: bool | None = None
+
+
+def _plan_market_note() -> str:
+    """给模型的市况一句话：大盘量能 + 指数涨跌 + 涨停家数（失败静默降级）。"""
+    parts = []
+    try:
+        mv = market_volume_status()
+        if mv.get("overall_ratio") is not None:
+            parts.append(f"大盘量能{mv['overall_label']}（均量比 {mv['overall_ratio']}x）")
+    except Exception:
+        pass
+    try:
+        ov = sector_mod.build_overview(with_details=False)
+        idx = [f"{i['name']} {i['pct']:+.2f}%" for i in (ov.get("indexes") or [])
+               if isinstance(i.get("pct"), (int, float))]
+        if idx:
+            parts.append("、".join(idx[:4]))
+        zt_total = (ov.get("zt") or {}).get("total")
+        breadth = ov.get("breadth") or {}
+        if zt_total:
+            parts.append(f"涨停 {zt_total} 家")
+        if breadth.get("up") is not None and breadth.get("down") is not None:
+            parts.append(f"涨跌家数 {breadth['up']}:{breadth['down']}")
+    except Exception:
+        pass
+    return "；".join(parts)
+
+
+def _plan_recent_news_titles(held: list[dict]) -> list[str]:
+    """持仓股近 3 天新闻标题（最多 12 条，去重），给模型判断消息面。"""
+    codes = [h["code"] for h in held][:12]
+    if not codes:
+        return []
+    since = datetime.now().isoformat(timespec="seconds")
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT ON (n.url) n.title FROM sa_news n "
+                "LEFT JOIN sa_news_related r ON r.url = n.url "
+                "WHERE (n.code = ANY(%s) OR r.code = ANY(%s)) "
+                "AND COALESCE(n.publish_time, n.fetched_at) > now() - interval '3 days' "
+                "ORDER BY n.url, COALESCE(n.publish_time, n.fetched_at) DESC LIMIT 12",
+                (codes, codes))
+            return [r[0] for r in cur.fetchall()]
+    except Exception:
+        return []
+
+
+def _advice_watch_lines() -> list[str]:
+    """自选观察池（排除已持仓）格式化行：行情快照 + 市值 + 量能 + 行业板块。"""
+    held_codes = {p["code"] for p in _derive_holdings() if p["net_shares"] > 0}
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT code, name, note FROM sa_watchlist")
+        rows = [r for r in cur.fetchall() if r[0] not in held_codes]
+    if not rows:
+        return []
+    quotes = fetch_quotes([r[0] for r in rows])
+    try:
+        vols = watchlist_volume_status([r[0] for r in rows])
+    except Exception:
+        vols = {}
+    try:
+        boards = sector_mod.stock_board_exposure([r[0] for r in rows])
+    except Exception:
+        boards = {}
+    lines = []
+    for code, name, note in rows:
+        q = quotes.get(code) or {}
+        if q.get("error") or not q.get("price"):
+            continue
+        vol = (vols.get(code) or {}).get("label") or ""
+        ind = (boards.get(code) or {}).get("industry") or ""
+        bits = [f"- {name or q.get('name', code)}（{code}）：现价 {q['price']:g} "
+                f"{signed_pct_str(q.get('change_pct'))}，总市值 {q.get('market_cap') or '—'}亿"
+                f" {q.get('currency', '')}"]
+        if vol:
+            bits.append(f"量能{vol}")
+        if ind:
+            bits.append(f"行业:{ind}")
+        if note:
+            bits.append(f"备注:{note}")
+        lines.append("，".join(bits))
+    return lines
+
+
+def signed_pct_str(v) -> str:
+    return f"（{v:+.2f}%）" if isinstance(v, (int, float)) else ""
+
+
+def _advice_sector_lines(held_codes: list[str]) -> list[str]:
+    """板块轮动摘要：当日评分前 5 板块 + 持仓股的行业归属（判断卖出时点/买入方向）。"""
+    lines = []
+    try:
+        ov = sector_mod.build_overview(with_details=False)
+        for b in (ov.get("boards") or [])[:5]:
+            mom = f"，3日{b['mom3']:+.1f}%" if b.get("mom3") is not None else ""
+            lines.append(f"- 轮动评分前5：{b['name']}（评分{b['score']}，"
+                         f"今日{b['pct']:+.2f}%{mom}）" if isinstance(b.get('pct'), (int, float))
+                         else f"- 轮动评分前5：{b['name']}（评分{b['score']}）")
+    except Exception:
+        pass
+    try:
+        exp = sector_mod.stock_board_exposure(held_codes)
+        for code, info in exp.items():
+            if info.get("industry"):
+                lines.append(f"- {code} 所属行业板块：{info['industry']}")
+    except Exception:
+        pass
+    return lines
+
+
+def _advice_event_lines(codes: list[str]) -> list[str]:
+    """未来 21 天自选+持仓的解禁/增发事件行。"""
+    try:
+        evs = alerts_mod.upcoming_events(codes, days=21)
+    except Exception:
+        return []
+    return [f"- {'解禁' if e['type'] == 'lift' else '增发新股上市'} {e['event_date']} "
+            f"{e['name']}（{e['code']}）{e['shares_yi']}亿股/约{e['cap_yi']}亿元 {e['detail']}"
+            for e in evs[:10]]
+
+
+def generate_plan_advice(plan_id: int, auto: bool = False) -> dict:
+    """组上下文 -> 调 Claude -> 存 sa_plan_advice。返回存好的行。失败抛 HTTPException。"""
+    totals = _withdrawn_totals()
+    plans = [p for p in _query_plans(totals) if p["id"] == plan_id]
+    if not plans:
+        raise HTTPException(404, f"计划 #{plan_id} 不存在")
+    held, mv = _active_held()
+    view = _plan_view(plans[0], mv, held)
+    conf = llm_advisor.load_llm_conf()
+    if not conf["enabled"]:
+        raise HTTPException(400, "LLM 建议未启用（通知/提款页的 AI 配置里打开开关并填 API key）")
+    # 量能信息对凑钱顺序有用：按持仓码批量取（失败不阻塞）
+    try:
+        vols = watchlist_volume_status([h["code"] for h in held])
+        for h in held:
+            h["vol_ratio"] = (vols.get(h["code"]) or {}).get("ratio")
+    except Exception:
+        pass
+    held_codes = [h["code"] for h in held]
+    # 融合全系统信息：自选观察池（买入候选）/ 板块轮动 / 解禁增发事件，全部失败降级不阻塞
+    try:
+        watch_lines = _advice_watch_lines()
+    except Exception:
+        watch_lines = []
+    try:
+        sector_lines = _advice_sector_lines(held_codes)
+    except Exception:
+        sector_lines = []
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT code FROM sa_watchlist")
+            all_codes = sorted(held_codes + [r[0] for r in cur.fetchall()])
+        event_lines = _advice_event_lines(all_codes)
+    except Exception:
+        event_lines = []
+    context = llm_advisor.build_context_text(
+        view, held, _plan_recent_news_titles(held), _plan_market_note(),
+        watch_lines=watch_lines, event_lines=event_lines, sector_lines=sector_lines)
+    try:
+        content = llm_advisor.ask_advice(context, conf)
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc))
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO sa_plan_advice (plan_id, content, model, auto) "
+            "VALUES (%s,%s,%s,%s) RETURNING id, created_at",
+            (plan_id, content, conf["model"], auto))
+        aid, created = cur.fetchone()
+    return {"ok": True, "id": aid, "plan_id": plan_id, "model": conf["model"],
+            "auto": auto, "created_at": created.isoformat(timespec="seconds"),
+            "content": content}
+
+
+@app.post("/api/plans/{plan_id}/advice")
+def plan_advice_generate(plan_id: int):
+    """手动生成一条 AI 提款建议（前端按钮触发，约 10-60s）。"""
+    return generate_plan_advice(plan_id)
+
+
+@app.get("/api/plans/{plan_id}/advice")
+def plan_advice_latest(plan_id: int):
+    """取某计划最新一条 AI 建议（无则 content=None，前端显示「生成建议」按钮）。"""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id, content, model, auto, created_at FROM sa_plan_advice "
+                    "WHERE plan_id = %s ORDER BY created_at DESC, id DESC LIMIT 1",
+                    (plan_id,))
+        row = cur.fetchone()
+    if not row:
+        return {"content": None}
+    return {"id": row[0], "content": row[1], "model": row[2], "auto": row[3],
+            "created_at": row[4].isoformat(timespec="seconds")}
+
+
+@app.get("/api/llm/config")
+def llm_get_config():
+    conf = llm_advisor.load_llm_conf()
+    conf.pop("api_key")  # 不回显 key 本体
+    conf.update(llm_advisor.mask_key(llm_advisor.load_llm_conf()["api_key"]))
+    return conf
+
+
+@app.put("/api/llm/config")
+def llm_update_config(body: LLMConfIn):
+    conf = llm_advisor.load_llm_conf()
+    if body.enabled is not None:
+        conf["enabled"] = body.enabled
+    if body.api_key:                      # 空串视为不修改
+        conf["api_key"] = body.api_key.strip()
+    if body.base_url is not None:
+        conf["base_url"] = body.base_url.strip()
+    if body.model:
+        conf["model"] = body.model.strip()
+    if body.auto_advice is not None:
+        conf["auto_advice"] = body.auto_advice
+    llm_advisor.save_llm_conf(conf)
+    return llm_get_config()
 
 
 # ---------------- 财经日历（econ_calendar.py：规则事件 + 手动事件 + 盘前提醒） ----------------
@@ -1856,6 +2358,62 @@ def _conf_enabled(section: str, default: bool) -> bool:
         return bool((data.get(section) or {}).get("enabled", default))
     except Exception:
         return default
+
+
+# ---------------- 自选股事件告警（限售解禁 / 增发上市，见 alerts.py） ----------------
+
+import alerts as alerts_mod
+
+
+def _conf_section(section: str) -> dict:
+    try:
+        import yaml
+        data = yaml.safe_load(CONFIG_FILE.read_text(encoding="utf-8")) or {}
+        return data.get(section) or {}
+    except Exception:
+        return {}
+
+
+@app.get("/api/alerts/upcoming")
+def alerts_upcoming(days: int = 14):
+    """自选股未来 N 天的解禁/增发事件（页面每次现拉，不受已推送状态影响）。"""
+    days = max(1, min(days, 90))
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT code FROM sa_watchlist")
+        codes = [r[0] for r in cur.fetchall()]
+    return {"days": days, "events": alerts_mod.upcoming_events(codes, days=days)}
+
+
+@app.post("/api/alerts/check")
+def alerts_check():
+    """手动触发一次告警扫描（新事件推微信/邮件；同事件只推一次）。"""
+    with get_conn() as conn:
+        fresh = alerts_mod.check_alerts_once(conn, notify_fn=notifier.notify)
+    return {"ok": True, "alerted": fresh}
+
+
+def _alerts_loop():
+    """事件告警守护线程：工作日 8:30 后查一轮（每日一次；事件去重记在
+    data/alerts_state.json，重启不会重复轰炸，首轮发现的历史事件也会推）。"""
+    last_day = None
+    while True:
+        try:
+            now = datetime.now()
+            conf = _conf_section("alerts")
+            if (conf.get("enabled", True) and now.weekday() < 5
+                    and (now.hour, now.minute) >= (8, 30) and now.hour < 21
+                    and last_day != now.date()):
+                with get_conn() as conn:
+                    fresh = alerts_mod.check_alerts_once(
+                        conn, notify_fn=notifier.notify,
+                        days=int(conf.get("days", 14)))
+                last_day = now.date()
+                if fresh:
+                    print(f"[alerts] pushed {len(fresh)} new events", flush=True)
+            time.sleep(600)
+        except Exception as exc:
+            print(f"[alerts] loop error: {exc}", flush=True)
+            time.sleep(600)
 
 
 # ---------------- 新闻（多渠道免费抓取，见 news_fetcher.py） ----------------
@@ -2679,6 +3237,12 @@ threading.Thread(target=_withdrawal_loop, daemon=True).start()
 
 # 财经日历盘前提醒线程（交易日早 8–12 点窗口，今明事件/重要预告推微信）
 threading.Thread(target=_calendar_loop, daemon=True).start()
+
+# 自选股事件告警线程（工作日 8:30 后每日一轮：解禁/增发上市新事件推微信）
+threading.Thread(target=_alerts_loop, daemon=True).start()
+
+# 盘中大盘量能监控线程（交易时段每 5 分钟采量比，放量/缩量翻转推微信；volume 段可配）
+threading.Thread(target=_market_volume_loop, daemon=True).start()
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8686)

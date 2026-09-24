@@ -405,7 +405,11 @@ def collect_once(snap_date: date | None = None, with_breadth: bool = True) -> di
 # ---------------- 分析：动量 / 轮动评分 ----------------
 
 def _load_history(days: int = 6) -> list[tuple]:
-    """取最近 days 个快照日的板块数据（升序）。返回 [(snap_date, code, name, kind, pct, main_inflow, turnover)]。"""
+    """取最近 days 个快照日的板块数据（升序）。返回 [(snap_date, code, name, kind, pct, main_inflow, turnover)]。
+
+    NUMERIC 列 psycopg2 回来是 Decimal，和轮动评分的 float 混算会 TypeError
+    （2026-09-16 实炸：float + Decimal），统一转 float。
+    """
     with _get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """SELECT snap_date, code, name, kind, pct, main_inflow, turnover
@@ -414,7 +418,11 @@ def _load_history(days: int = 6) -> list[tuple]:
                JOIN sa_sector_snapshots s USING (snap_date)
                ORDER BY snap_date, code""",
             (days,))
-        return cur.fetchall()
+        return [(d, code, name, kind,
+                 float(pct) if pct is not None else None,
+                 float(mi) if mi is not None else None,
+                 float(tv) if tv is not None else None)
+                for d, code, name, kind, pct, mi, tv in cur.fetchall()]
 
 
 def _load_daily_meta(days: int = 6) -> list[dict]:

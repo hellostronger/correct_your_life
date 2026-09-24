@@ -1,6 +1,9 @@
 # 环境变量 / 密钥
 .env
 
+# Stock Advisor 真实配置（含密钥，不入库；模板见 config.example.yaml）
+stock-advisor/config.yaml
+
 # Python 运行产物
 __pycache__/
 *.py[cod]
