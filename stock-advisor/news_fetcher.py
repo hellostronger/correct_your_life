@@ -111,12 +111,17 @@ def _norm(code: str, title: str, url: str, source: str,
     }
 
 
-def fetch_eastmoney(code: str, name: str, limit: int, conf: dict) -> list[dict]:
-    """东财公告 + 资讯搜索，两个接口合一渠道。港股(5位)无 A 股公告接口，走资讯搜索。"""
+def fetch_eastmoney(code: str, name: str, limit: int, conf: dict,
+                    keyword: str = "") -> list[dict]:
+    """东财公告 + 资讯搜索，两个接口合一渠道。港股(5位)无 A 股公告接口，走资讯搜索。
+
+    keyword 非空时为"自定义搜索词"模式（竞品动态等）：只跑资讯搜索，不跑公告。
+    """
     items: list[dict] = []
     ch_conf = conf["channels"]["eastmoney"]
     is_hk = re.fullmatch(r"\d{5}", code) is not None
-    if not is_hk:  # 公告接口仅支持 A 股
+    query = keyword or name
+    if not is_hk and not keyword:  # 公告接口仅支持 A 股，且只按股票名跑
         _rate_limit("eastmoney", ch_conf.get("min_interval", 1.0))
         try:
             r = requests.get(
@@ -138,7 +143,7 @@ def fetch_eastmoney(code: str, name: str, limit: int, conf: dict) -> list[dict]:
             pass
     _rate_limit("eastmoney", ch_conf.get("min_interval", 1.0))
     try:  # 资讯搜索（JSONP）
-        param = {"uid": "", "keyword": name, "type": ["cmsArticleWebOld"],
+        param = {"uid": "", "keyword": query, "type": ["cmsArticleWebOld"],
                  "client": "web", "clientVersion": "curr", "clientType": "web",
                  "param": {"cmsArticleWebOld": {"searchScope": "default",
                                                 "sort": "time", "pageIndex": 1,
@@ -159,14 +164,15 @@ def fetch_eastmoney(code: str, name: str, limit: int, conf: dict) -> list[dict]:
     return items
 
 
-def fetch_baidu(code: str, name: str, limit: int, conf: dict) -> list[dict]:
-    """百度新闻垂直搜索（tn=news&rtt=4 按时间排序）。"""
+def fetch_baidu(code: str, name: str, limit: int, conf: dict,
+                keyword: str = "") -> list[dict]:
+    """百度新闻垂直搜索（tn=news&rtt=4 按时间排序）。keyword 非空 = 自定义搜索词模式。"""
     ch_conf = conf["channels"]["baidu"]
     _rate_limit("baidu", ch_conf.get("min_interval", 3.0))
     try:
         r = requests.get(
             "https://www.baidu.com/s",
-            params={"wd": name, "tn": "news", "rtt": 4, "bsst": 1, "cl": 2},
+            params={"wd": keyword or name, "tn": "news", "rtt": 4, "bsst": 1, "cl": 2},
             headers=UA, timeout=10)
         r.raise_for_status()
         html = r.text
@@ -187,14 +193,21 @@ def fetch_baidu(code: str, name: str, limit: int, conf: dict) -> list[dict]:
         return []
 
 
-def fetch_sina(code: str, name: str, limit: int, conf: dict) -> list[dict]:
-    """新浪财经滚动新闻：拉多页财经流，按股票名/简称过滤标题。"""
+def fetch_sina(code: str, name: str, limit: int, conf: dict,
+               keyword: str = "") -> list[dict]:
+    """新浪财经滚动新闻：拉多页财经流，按股票名/简称过滤标题。
+
+    自定义搜索词模式（keyword 非空）同样只做标题过滤——滚动流是全市场混排，
+    竞品关键词（如"OpenAI"）命中率不高，但零成本顺带扫一遍。
+    """
     ch_conf = conf["channels"]["sina"]
     _rate_limit("sina", ch_conf.get("min_interval", 2.0))
     # 新浪滚动流是全市场混排，"贵州茅台"全名命中太苛刻；改用短简称集合匹配
     short_names = {name, name.replace("贵州", "").replace("股份", "")}
     if name.startswith(("ST", "*")):
         short_names.add(name.lstrip("*ST"))
+    if keyword:
+        short_names = {keyword}
     try:
         # 滚动流是全市场混排，单页 50 条命中率低；拉 3 页提高命中
         items = []
@@ -222,7 +235,8 @@ def fetch_sina(code: str, name: str, limit: int, conf: dict) -> list[dict]:
         return []
 
 
-def fetch_duckduckgo(code: str, name: str, limit: int, conf: dict) -> list[dict]:
+def fetch_duckduckgo(code: str, name: str, limit: int, conf: dict,
+                     keyword: str = "") -> list[dict]:
     """DDG Lite HTML 搜索（本机走代理，需长超时）。
 
     实测 DDG 返回的多是行情/个股主页而非新闻文章页，价值有限；
@@ -230,10 +244,11 @@ def fetch_duckduckgo(code: str, name: str, limit: int, conf: dict) -> list[dict]
     """
     ch_conf = conf["channels"]["duckduckgo"]
     _rate_limit("duckduckgo", ch_conf.get("min_interval", 5.0))
+    query = f"{keyword} 新闻" if keyword else f"{name} {code} 新闻"
     try:
         r = requests.post(
             "https://lite.duckduckgo.com/lite/",
-            data={"q": f"{name} {code} 新闻"},
+            data={"q": query},
             headers=UA,
             timeout=ch_conf.get("timeout", 30))
         r.raise_for_status()
@@ -273,21 +288,33 @@ FETCHERS = {
 
 # ---------------- 聚合入口 ----------------
 
-def fetch_for_stock(code: str, name: str, conf: dict | None = None) -> dict:
-    """对一只股票跑所有启用渠道，返回 {code, name, results, errors}。"""
+def fetch_for_stock(code: str, name: str, conf: dict | None = None,
+                    keywords: list[str] | None = None) -> dict:
+    """对一只股票跑所有启用渠道，返回 {code, name, results, errors}。
+
+    keywords: 该股的自定义搜索词（竞品动态等，逗号分隔存 sa_watchlist.keywords）。
+    每个关键词对每个渠道额外跑一轮（东财跳过公告、只搜资讯），命中即关联到该股。
+    """
     conf = conf or load_config()
     limit = conf.get("items_per_query", 10)
+    kw_limit = max(3, limit // 2)   # 关键词轮次取条数减半，控制总量
     results, errors = [], {}
-    for channel, fetcher in FETCHERS.items():
-        ch_conf = conf["channels"].get(channel) or {}
-        if not ch_conf.get("enabled", False):
-            continue
-        try:
-            got = fetcher(code, name, limit, conf)
-            results.extend(got)
-        except Exception as exc:
-            errors[channel] = str(exc)
-    # 跨渠道按 URL 去重
+    queries = [(name, "")] + [(kw, kw) for kw in (keywords or [])]
+    for stock_name, keyword in queries:
+        for channel, fetcher in FETCHERS.items():
+            ch_conf = conf["channels"].get(channel) or {}
+            if not ch_conf.get("enabled", False):
+                continue
+            try:
+                got = fetcher(code, stock_name, kw_limit if keyword else limit,
+                              conf, keyword=keyword)
+                if keyword:  # 标记来自哪个关键词的轮次（去重后统计用）
+                    for it in got:
+                        it["_kw"] = keyword
+                results.extend(got)
+            except Exception as exc:
+                errors[channel] = str(exc)
+    # 跨渠道按 URL 去重（关键词标记只保留第一个命中的）
     seen, uniq = set(), []
     for item in results:
         if item["url"] and item["url"] not in seen:
@@ -332,18 +359,25 @@ def _save_relations(related_map: dict[str, list[str]]) -> None:
                     "ON CONFLICT (url, code) DO NOTHING", (url, code))
 
 
+def _split_keywords(raw: str) -> list[str]:
+    """逗号/中文逗号分隔的搜索词 → 去空去重列表（与 app.py 同规则）。"""
+    return [k.strip() for k in re.split(r"[,，]", raw or "") if k.strip()]
+
+
 def fetch_watchlist(conf: dict | None = None) -> dict:
     """抓取全部自选股并入库，返回轮次统计。
 
     关联逻辑：同一条新闻（URL 相同）命中多只自选股时，只入库一次，
     但通过 sa_news_related 关联到所有命中的股票。
+    每只股票除按名搜索外，还按其自定义搜索词（sa_watchlist.keywords，
+    如智谱配「Kimi,OpenAI,DeepSeek」）各搜一轮，竞品动态也挂到该股新闻流。
     """
     conf = conf or load_config()
     from app import get_conn
     with get_conn() as conn:
         from psycopg2.extras import RealDictCursor
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT code, name FROM sa_watchlist ORDER BY added_at")
+            cur.execute("SELECT code, name, keywords FROM sa_watchlist ORDER BY added_at")
             stocks = [dict(r) for r in cur.fetchall()]
 
     # 逐股抓取，按 URL 聚合：{url: item}，同 URL 补充关联而非重复入库。
@@ -356,8 +390,11 @@ def fetch_watchlist(conf: dict | None = None) -> dict:
                    s["name"].replace("贵州", "").replace("股份", "").replace("-SW", ""))
                   for s in stocks]
     for s in stocks:
-        outcome = fetch_for_stock(s["code"], s["name"], conf)
+        outcome = fetch_for_stock(s["code"], s["name"], conf,
+                                  keywords=_split_keywords(s.get("keywords", "")))
         fetched = 0
+        # 关键词命中的新闻打上标记，stats 单独计数（竞品动态是否有料一眼可见）
+        kw_hits = 0
         for item in outcome["results"]:
             url = item["url"]
             if not url:
@@ -368,6 +405,9 @@ def fetch_watchlist(conf: dict | None = None) -> dict:
             else:
                 url_items[url] = item
                 url_related[url] = [s["code"]]
+            # 关键词轮次抓到的条目：来源标记 orig_query（供统计，不影响入库）
+            if item.get("_kw") and item["_kw"] not in ("", s["name"]):
+                kw_hits += 1
             # 交叉关联：标题提到其他自选股
             title = item["title"]
             for code, full, short in name_index:
@@ -376,7 +416,7 @@ def fetch_watchlist(conf: dict | None = None) -> dict:
                     url_related.setdefault(url, []).append(code)
             fetched += 1
         per_stock.append({"code": s["code"], "name": s["name"],
-                          "fetched": fetched,
+                          "fetched": fetched, "kw_fetched": kw_hits,
                           "errors": outcome["errors"]})
     # 全部股票抓完，统一入库一次（含关联），按关联主股票数分摊统计
     total_new = save_to_db(list(url_items.values()), url_related)

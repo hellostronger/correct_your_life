@@ -94,6 +94,7 @@ def init_db():
         note      VARCHAR(255) NOT NULL DEFAULT '',
         added_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE sa_watchlist ADD COLUMN IF NOT EXISTS keywords TEXT NOT NULL DEFAULT '';
     CREATE TABLE IF NOT EXISTS sa_holdings (
         code      VARCHAR(8) PRIMARY KEY,
         name      VARCHAR(64) NOT NULL DEFAULT '',
@@ -862,6 +863,13 @@ def volume_status():
 class StockIn(BaseModel):
     code: str
     note: str = ""
+    keywords: str = Field(default="", max_length=255,
+                          description="自定义搜索词，逗号分隔（如：Kimi,OpenAI,DeepSeek 新模型,降价）")
+
+
+def _split_keywords(raw: str) -> list[str]:
+    """逗号/中文逗号分隔的搜索词 → 去空去重列表。"""
+    return [k.strip() for k in re.split(r"[,，]", raw or "") if k.strip()]
 
 
 # ---------------- 自选股 CRUD ----------------
@@ -869,7 +877,7 @@ class StockIn(BaseModel):
 @app.get("/api/watchlist")
 def list_watchlist(with_quotes: bool = True):
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("SELECT code, name, note, added_at FROM sa_watchlist ORDER BY added_at")
+        cur.execute("SELECT code, name, note, keywords, added_at FROM sa_watchlist ORDER BY added_at")
         items = cur.fetchall()
     items = [dict(i) for i in items]
     for i in items:
@@ -891,12 +899,28 @@ def add_watchlist(stock: StockIn):
         raise HTTPException(404, f"未找到股票 {code}，请确认代码是否正确")
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO sa_watchlist (code, name, note) VALUES (%s,%s,%s) "
-            "ON CONFLICT (code) DO UPDATE SET note = EXCLUDED.note, name = EXCLUDED.name",
-            (code, quote["name"], stock.note.strip()))
-    item = {"code": code, "name": quote["name"], "note": stock.note.strip()}
+            "INSERT INTO sa_watchlist (code, name, note, keywords) VALUES (%s,%s,%s,%s) "
+            "ON CONFLICT (code) DO UPDATE SET note = EXCLUDED.note, "
+            "keywords = EXCLUDED.keywords, name = EXCLUDED.name",
+            (code, quote["name"], stock.note.strip(),
+             "，".join(_split_keywords(stock.keywords))))
+    item = {"code": code, "name": quote["name"], "note": stock.note.strip(),
+            "keywords": "，".join(_split_keywords(stock.keywords))}
     item["quote"] = quote
     return item
+
+
+@app.put("/api/watchlist/{code}")
+def update_watchlist(code: str, stock: StockIn):
+    """改备注/自定义搜索词（代码以路径为准，body.code 忽略）。"""
+    code = _normalize_code(code)
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE sa_watchlist SET note = %s, keywords = %s WHERE code = %s",
+            (stock.note.strip(), "，".join(_split_keywords(stock.keywords)), code))
+        if cur.rowcount == 0:
+            raise HTTPException(404, f"{code} 不在自选列表中")
+    return {"ok": True, "code": code}
 
 
 @app.delete("/api/watchlist/{code}")

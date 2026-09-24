@@ -17,7 +17,7 @@ import psycopg2.extras  # noqa: E402
 
 def load_watchlist():
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("SELECT code, name, note FROM sa_watchlist ORDER BY added_at")
+        cur.execute("SELECT code, name, note, keywords FROM sa_watchlist ORDER BY added_at")
         return [dict(r) for r in cur.fetchall()]
 
 
@@ -46,7 +46,12 @@ def main():
     last = row[0] if row and row[0] else None
     news_stale = (last is None or
                   datetime.now(last.tzinfo) - last > timedelta(hours=2))
-    print(json.dumps({"stocks": stocks, "holdings": holdings, "news_stale": news_stale},
+    # 提示定时任务：有自定义搜索词的股票需要做竞品动态专项调研
+    # （snapshot 的调用方是 Claude，keywords 直接给它当调研线索）
+    comp_watch = [{"code": s["code"], "name": s["name"], "keywords": s["keywords"]}
+                  for s in stocks if s.get("keywords")]
+    print(json.dumps({"stocks": stocks, "holdings": holdings,
+                      "news_stale": news_stale, "competitor_watch": comp_watch},
                      ensure_ascii=False, indent=2, default=str))
 
 
