@@ -305,6 +305,10 @@ def fetch_for_stock(code: str, name: str, conf: dict | None = None,
             ch_conf = conf["channels"].get(channel) or {}
             if not ch_conf.get("enabled", False):
                 continue
+            # 关键词轮跳过 DDG：它单次要 8-30s 且返回多为聚合页，竞品动态
+            # 靠东财+百度已够；关键词一多整轮时长远超抓取周期就得不偿失了
+            if keyword and channel == "duckduckgo":
+                continue
             try:
                 got = fetcher(code, stock_name, kw_limit if keyword else limit,
                               conf, keyword=keyword)
