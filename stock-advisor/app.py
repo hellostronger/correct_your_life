@@ -95,6 +95,8 @@ def init_db():
         added_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     ALTER TABLE sa_watchlist ADD COLUMN IF NOT EXISTS keywords TEXT NOT NULL DEFAULT '';
+    ALTER TABLE sa_watchlist ADD COLUMN IF NOT EXISTS keywords_pos TEXT NOT NULL DEFAULT '';
+    ALTER TABLE sa_watchlist ADD COLUMN IF NOT EXISTS keywords_neg TEXT NOT NULL DEFAULT '';
     CREATE TABLE IF NOT EXISTS sa_holdings (
         code      VARCHAR(8) PRIMARY KEY,
         name      VARCHAR(64) NOT NULL DEFAULT '',
@@ -123,6 +125,8 @@ def init_db():
         publish_time  TIMESTAMPTZ,
         fetched_at    TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    -- 关键词轮命中的新闻情绪标记：pos=利好词抓到，neg=利空词抓到，空=按股票名抓的
+    ALTER TABLE sa_news ADD COLUMN IF NOT EXISTS sentiment VARCHAR(4) NOT NULL DEFAULT '';
     CREATE TABLE IF NOT EXISTS sa_news_related (
         url      TEXT NOT NULL,
         code     VARCHAR(8) NOT NULL,
@@ -864,7 +868,11 @@ class StockIn(BaseModel):
     code: str
     note: str = ""
     keywords: str = Field(default="", max_length=255,
-                          description="自定义搜索词，逗号分隔（如：Kimi,OpenAI,DeepSeek 新模型,降价）")
+                          description="中性搜索词，逗号分隔（如：Kimi,OpenAI）")
+    keywords_pos: str = Field(default="", max_length=255,
+                              description="利好搜索词，逗号分隔（如：中标,增持,回购）")
+    keywords_neg: str = Field(default="", max_length=255,
+                              description="利空搜索词，逗号分隔（如：解禁,减持,降价）")
 
 
 def _split_keywords(raw: str) -> list[str]:
@@ -877,7 +885,8 @@ def _split_keywords(raw: str) -> list[str]:
 @app.get("/api/watchlist")
 def list_watchlist(with_quotes: bool = True):
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("SELECT code, name, note, keywords, added_at FROM sa_watchlist ORDER BY added_at")
+        cur.execute("SELECT code, name, note, keywords, keywords_pos, keywords_neg, added_at "
+                    "FROM sa_watchlist ORDER BY added_at")
         items = cur.fetchall()
     items = [dict(i) for i in items]
     for i in items:
@@ -897,27 +906,35 @@ def add_watchlist(stock: StockIn):
     quote = fetch_quotes([code]).get(code, {})
     if quote.get("error") or not quote.get("name"):
         raise HTTPException(404, f"未找到股票 {code}，请确认代码是否正确")
+    kw = ("，".join(_split_keywords(stock.keywords)),
+          "，".join(_split_keywords(stock.keywords_pos)),
+          "，".join(_split_keywords(stock.keywords_neg)))
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO sa_watchlist (code, name, note, keywords) VALUES (%s,%s,%s,%s) "
+            "INSERT INTO sa_watchlist (code, name, note, keywords, keywords_pos, keywords_neg) "
+            "VALUES (%s,%s,%s,%s,%s,%s) "
             "ON CONFLICT (code) DO UPDATE SET note = EXCLUDED.note, "
-            "keywords = EXCLUDED.keywords, name = EXCLUDED.name",
-            (code, quote["name"], stock.note.strip(),
-             "，".join(_split_keywords(stock.keywords))))
+            "keywords = EXCLUDED.keywords, keywords_pos = EXCLUDED.keywords_pos, "
+            "keywords_neg = EXCLUDED.keywords_neg, name = EXCLUDED.name",
+            (code, quote["name"], stock.note.strip(), *kw))
     item = {"code": code, "name": quote["name"], "note": stock.note.strip(),
-            "keywords": "，".join(_split_keywords(stock.keywords))}
+            "keywords": kw[0], "keywords_pos": kw[1], "keywords_neg": kw[2]}
     item["quote"] = quote
     return item
 
 
 @app.put("/api/watchlist/{code}")
 def update_watchlist(code: str, stock: StockIn):
-    """改备注/自定义搜索词（代码以路径为准，body.code 忽略）。"""
+    """改备注/搜索词（代码以路径为准，body.code 忽略）。"""
     code = _normalize_code(code)
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "UPDATE sa_watchlist SET note = %s, keywords = %s WHERE code = %s",
-            (stock.note.strip(), "，".join(_split_keywords(stock.keywords)), code))
+            "UPDATE sa_watchlist SET note = %s, keywords = %s, "
+            "keywords_pos = %s, keywords_neg = %s WHERE code = %s",
+            (stock.note.strip(),
+             "，".join(_split_keywords(stock.keywords)),
+             "，".join(_split_keywords(stock.keywords_pos)),
+             "，".join(_split_keywords(stock.keywords_neg)), code))
         if cur.rowcount == 0:
             raise HTTPException(404, f"{code} 不在自选列表中")
     return {"ok": True, "code": code}
@@ -2523,7 +2540,7 @@ def list_news(code: str = "", limit: int = 30):
     params: list = []
     # DISTINCT ON (url) 按 URL 去重（同一新闻只显示一次，关联股票在 related 里给出）
     sql = ("SELECT DISTINCT ON (n.url) n.code, n.title, n.url, n.source, n.media, "
-           "n.publish_time, n.fetched_at FROM sa_news n ")
+           "n.publish_time, n.fetched_at, n.sentiment FROM sa_news n ")
     if re.fullmatch(r"\d{5,6}", code or ""):
         target = code if len(code) == 6 else code.zfill(5)
         sql += ("LEFT JOIN sa_news_related r ON r.url = n.url "

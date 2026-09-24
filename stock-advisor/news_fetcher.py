@@ -289,18 +289,25 @@ FETCHERS = {
 # ---------------- 聚合入口 ----------------
 
 def fetch_for_stock(code: str, name: str, conf: dict | None = None,
-                    keywords: list[str] | None = None) -> dict:
+                    keywords: list[str] | None = None,
+                    keywords_pos: list[str] | None = None,
+                    keywords_neg: list[str] | None = None) -> dict:
     """对一只股票跑所有启用渠道，返回 {code, name, results, errors}。
 
-    keywords: 该股的自定义搜索词（竞品动态等，逗号分隔存 sa_watchlist.keywords）。
+    keywords / keywords_pos / keywords_neg: 中性 / 利好 / 利空搜索词
+    （逗号分隔存 sa_watchlist，中性=竞品动态等，利好/利空按方向打情绪标记）。
     每个关键词对每个渠道额外跑一轮（东财跳过公告、只搜资讯），命中即关联到该股。
+    情绪标记规则：同一 URL 优先保留利空（利空值得先看到），仅标记入库不影响抓取。
     """
     conf = conf or load_config()
     limit = conf.get("items_per_query", 10)
     kw_limit = max(3, limit // 2)   # 关键词轮次取条数减半，控制总量
     results, errors = [], {}
-    queries = [(name, "")] + [(kw, kw) for kw in (keywords or [])]
-    for stock_name, keyword in queries:
+    queries = [(name, "", "")]
+    queries += [(kw, kw, "") for kw in (keywords or [])]
+    queries += [(kw, kw, "pos") for kw in (keywords_pos or [])]
+    queries += [(kw, kw, "neg") for kw in (keywords_neg or [])]
+    for stock_name, keyword, senti in queries:
         for channel, fetcher in FETCHERS.items():
             ch_conf = conf["channels"].get(channel) or {}
             if not ch_conf.get("enabled", False):
@@ -312,17 +319,24 @@ def fetch_for_stock(code: str, name: str, conf: dict | None = None,
             try:
                 got = fetcher(code, stock_name, kw_limit if keyword else limit,
                               conf, keyword=keyword)
-                if keyword:  # 标记来自哪个关键词的轮次（去重后统计用）
+                if keyword:  # 标记来源关键词 + 情绪（去重后统计/入库用）
                     for it in got:
                         it["_kw"] = keyword
+                        it["_senti"] = senti
                 results.extend(got)
             except Exception as exc:
                 errors[channel] = str(exc)
-    # 跨渠道按 URL 去重（关键词标记只保留第一个命中的）
-    seen, uniq = set(), []
+    # 跨渠道按 URL 去重；情绪冲突时利空优先（利空新闻错过代价更高）
+    seen, uniq = {}, []
     for item in results:
-        if item["url"] and item["url"] not in seen:
-            seen.add(item["url"])
+        url = item["url"]
+        if not url:
+            continue
+        if url in seen:
+            if item.get("_senti") == "neg":
+                seen[url]["_senti"] = "neg"
+        else:
+            seen[url] = item
             uniq.append(item)
     return {"code": code, "name": name, "results": uniq, "errors": errors}
 
@@ -332,6 +346,8 @@ def save_to_db(items: list[dict], related_map: dict[str, list[str]] | None = Non
 
     related_map: {url: [codes]}，一条新闻命中多只自选股时的关联关系。
     注意：主 code 列保留"第一次发现该 URL 的股票"，全部关联在 sa_news_related。
+    情绪标记：利空词轮抓到的写 sentiment='neg'；已存在的行只在利空时升级
+    （利空优先），其余情况不动（保留首见情绪，避免被后轮冲掉）。
     返回新增条数。
     """
     if not items:
@@ -340,12 +356,17 @@ def save_to_db(items: list[dict], related_map: dict[str, list[str]] | None = Non
     inserted = 0
     with get_conn() as conn, conn.cursor() as cur:
         for it in items:
+            senti = it.get("_senti") or ""
             cur.execute(
-                "INSERT INTO sa_news (code, title, url, source, media, publish_time) "
-                "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (url) DO NOTHING",
+                "INSERT INTO sa_news (code, title, url, source, media, publish_time, sentiment) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (url) DO NOTHING",
                 (it["code"], it["title"], it["url"], it["source"], it["media"],
-                 it.get("publish_time")))
+                 it.get("publish_time"), senti))
             inserted += cur.rowcount
+            if senti == "neg":  # 已存在的旧新闻，利空标记仍要补上
+                cur.execute(
+                    "UPDATE sa_news SET sentiment = 'neg' "
+                    "WHERE url = %s AND sentiment <> 'neg'", (it["url"],))
     _save_relations(related_map or {})
     return inserted
 
@@ -373,15 +394,18 @@ def fetch_watchlist(conf: dict | None = None) -> dict:
 
     关联逻辑：同一条新闻（URL 相同）命中多只自选股时，只入库一次，
     但通过 sa_news_related 关联到所有命中的股票。
-    每只股票除按名搜索外，还按其自定义搜索词（sa_watchlist.keywords，
-    如智谱配「Kimi,OpenAI,DeepSeek」）各搜一轮，竞品动态也挂到该股新闻流。
+    每只股票除按名搜索外，还按其搜索词各搜一轮：中性词（keywords，
+    竞品动态如「Kimi,OpenAI」）、利好词（keywords_pos，如「中标,回购」）、
+    利空词（keywords_neg，如「解禁,减持」）；利好/利空词命中的新闻带
+    情绪标记（sa_news.sentiment），同一 URL 利空优先。
     """
     conf = conf or load_config()
     from app import get_conn
     with get_conn() as conn:
         from psycopg2.extras import RealDictCursor
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT code, name, keywords FROM sa_watchlist ORDER BY added_at")
+            cur.execute("SELECT code, name, keywords, keywords_pos, keywords_neg "
+                        "FROM sa_watchlist ORDER BY added_at")
             stocks = [dict(r) for r in cur.fetchall()]
 
     # 逐股抓取，按 URL 聚合：{url: item}，同 URL 补充关联而非重复入库。
@@ -395,10 +419,12 @@ def fetch_watchlist(conf: dict | None = None) -> dict:
                   for s in stocks]
     for s in stocks:
         outcome = fetch_for_stock(s["code"], s["name"], conf,
-                                  keywords=_split_keywords(s.get("keywords", "")))
+                                  keywords=_split_keywords(s.get("keywords", "")),
+                                  keywords_pos=_split_keywords(s.get("keywords_pos", "")),
+                                  keywords_neg=_split_keywords(s.get("keywords_neg", "")))
         fetched = 0
         # 关键词命中的新闻打上标记，stats 单独计数（竞品动态是否有料一眼可见）
-        kw_hits = 0
+        kw_hits, pos_hits, neg_hits = 0, 0, 0
         for item in outcome["results"]:
             url = item["url"]
             if not url:
@@ -406,12 +432,19 @@ def fetch_watchlist(conf: dict | None = None) -> dict:
             if url in url_items:
                 if s["code"] not in url_related[url]:
                     url_related[url].append(s["code"])
+                # 同 URL 后到的利空标记，覆盖之前保留的条目（入库时利空优先）
+                if item.get("_senti") == "neg":
+                    url_items[url]["_senti"] = "neg"
             else:
                 url_items[url] = item
                 url_related[url] = [s["code"]]
             # 关键词轮次抓到的条目：来源标记 orig_query（供统计，不影响入库）
             if item.get("_kw") and item["_kw"] not in ("", s["name"]):
                 kw_hits += 1
+                if item.get("_senti") == "pos":
+                    pos_hits += 1
+                elif item.get("_senti") == "neg":
+                    neg_hits += 1
             # 交叉关联：标题提到其他自选股
             title = item["title"]
             for code, full, short in name_index:
@@ -421,6 +454,7 @@ def fetch_watchlist(conf: dict | None = None) -> dict:
             fetched += 1
         per_stock.append({"code": s["code"], "name": s["name"],
                           "fetched": fetched, "kw_fetched": kw_hits,
+                          "pos_fetched": pos_hits, "neg_fetched": neg_hits,
                           "errors": outcome["errors"]})
     # 全部股票抓完，统一入库一次（含关联），按关联主股票数分摊统计
     total_new = save_to_db(list(url_items.values()), url_related)

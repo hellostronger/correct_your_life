@@ -128,13 +128,17 @@
       <div class="row">
         <input id="w-code" placeholder="代码：A股600519 / 港股02513" maxlength="6" style="width:180px">
         <input id="w-note" placeholder="备注（可选），如：关注白酒政策" style="flex:1;min-width:150px">
-        <input id="w-kw" placeholder="自定义搜索词（可选，逗号分隔），如：Kimi,OpenAI,DeepSeek" style="flex:1;min-width:200px">
+        <input id="w-kw" placeholder="搜索词(可选)，如：Kimi,OpenAI" style="flex:1;min-width:170px">
         <button class="btn" onclick="addWatch()">添加自选</button>
         <button class="btn ghost" onclick="loadWatch()">刷新行情</button>
       </div>
+      <div class="row" style="margin-top:6px">
+        <input id="w-kw-pos" placeholder="🟢 利好词(可选)，如：中标,回购,增持" style="flex:1;min-width:170px">
+        <input id="w-kw-neg" placeholder="🔴 利空词(可选)，如：解禁,减持,降价" style="flex:1;min-width:170px">
+      </div>
       <div class="muted" style="margin-top:4px;font-size:12px">
-        自定义搜索词：新闻抓取时除按股票名搜外，还会按这些词各搜一轮并关联到该股——
-        用来盯竞争对手动态（如智谱 02513 配「Kimi,OpenAI,DeepSeek,新模型发布」）。
+        搜索词分三类：中性（竞品动态等，如智谱 02513 配「Kimi,OpenAI,DeepSeek」）、
+        利好（命中标绿 🟢）、利空（命中标红 🔴，利空优先提醒）。逗号分隔，2-4 个/类较合适。
       </div>
     </div>
     <div class="card">
@@ -896,8 +900,11 @@ async function loadWatch() {
     $('watch-empty').classList.toggle('hide', items.length > 0);
     tbody.innerHTML = items.map(i => {
       const q = i.quote || {};
-      const kw = i.keywords
-        ? `<div style="font-size:11px"><span class="badge" style="background:#e8f0fe;color:#1a56db">🔍</span> ${esc(i.keywords)}</div>` : '';
+      const kwParts = [];
+      if (i.keywords) kwParts.push(`<span class="badge" style="background:#e8f0fe;color:#1a56db">🔍</span> ${esc(i.keywords)}`);
+      if (i.keywords_pos) kwParts.push(`<span class="badge" style="background:#e5f3e2;color:#1e7d32">🟢利好</span> ${esc(i.keywords_pos)}`);
+      if (i.keywords_neg) kwParts.push(`<span class="badge" style="background:#ffe2e2;color:#b32424">🔴利空</span> ${esc(i.keywords_neg)}`);
+      const kw = kwParts.length ? `<div style="font-size:11px">${kwParts.join('<br>')}</div>` : '';
       return `<tr data-code="${i.code}">
         <td>${i.code}</td><td>${q.name || i.name || ''}</td>
         <td class="${cls(q.price)}">${fmt(q.price)}</td>
@@ -909,8 +916,7 @@ async function loadWatch() {
         <td class="muted">${(q.updated_at || '').replace(' ', '<br>') || '—'}</td>
         <td class="muted">${i.note || ''}${kw}
           <button class="btn ghost" style="font-size:11px;padding:2px 8px;margin-top:2px"
-            onclick="editWatch('${i.code}')">改</button></td>
-        <td><button class="del" onclick="delWatch('${i.code}')" title="删除">×</button></td>
+            onclick="editWatch('${i.code}')">改</button></td>        <td><button class="del" onclick="delWatch('${i.code}')" title="删除">×</button></td>
       </tr>`;
     }).join('');
     fillWatchlistDatalist(items);  // 「记一笔」代码输入框可下拉引用自选
@@ -930,28 +936,35 @@ function fillWatchlistDatalist(items) {
 }
 async function addWatch() {
   const code = $('w-code').value.trim(), note = $('w-note').value.trim(),
-        kw = $('w-kw').value.trim();
+        kw = $('w-kw').value.trim(), kwPos = $('w-kw-pos').value.trim(),
+        kwNeg = $('w-kw-neg').value.trim();
   if (!/^\d{4,6}$/.test(code)) return toast('请输入代码：A股 6 位（600519）、港股 4-5 位（02513 或 700）');
   try {
     await api('/api/watchlist', { method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code, note, keywords: kw }) });
-    $('w-code').value = ''; $('w-note').value = ''; $('w-kw').value = '';
+      body: JSON.stringify({ code, note, keywords: kw,
+        keywords_pos: kwPos, keywords_neg: kwNeg }) });
+    ['w-code', 'w-note', 'w-kw', 'w-kw-pos', 'w-kw-neg'].forEach(id => $(id).value = '');
     toast('已添加'); loadWatch();
   } catch (e) { toast(e.message); }
 }
 async function editWatch(code) {
-  // 三个顺序 prompt 改备注 / 自定义搜索词（都是可选字段，留空=清除）
+  // 顺序 prompt 改备注 / 三类搜索词（都可选，留空=清除，取消=保留原值）
   const items = await api('/api/watchlist');
   const cur = items.find(i => i.code === code);
   if (!cur) return;
   const note = prompt('备注（留空=清除）：', cur.note || '') ?? (cur.note || '');
-  const kw = prompt('自定义搜索词，逗号分隔，如：Kimi,OpenAI,DeepSeek（留空=清除）：',
+  const kw = prompt('中性搜索词，逗号分隔，如：Kimi,OpenAI（留空=清除）：',
                     cur.keywords || '') ?? (cur.keywords || '');
+  const kwPos = prompt('🟢 利好搜索词，逗号分隔，如：中标,回购,增持（留空=清除）：',
+                       cur.keywords_pos || '') ?? (cur.keywords_pos || '');
+  const kwNeg = prompt('🔴 利空搜索词，逗号分隔，如：解禁,减持,降价（留空=清除）：',
+                       cur.keywords_neg || '') ?? (cur.keywords_neg || '');
   try {
     await api('/api/watchlist/' + code, { method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code, note, keywords: kw }) });
+      body: JSON.stringify({ code, note, keywords: kw,
+        keywords_pos: kwPos, keywords_neg: kwNeg }) });
     toast('已更新'); loadWatch();
   } catch (e) { toast(e.message); }
 }
@@ -1554,9 +1567,15 @@ async function loadNews() {
     $('news-list').innerHTML = items.map(n => {
       const rel = (n.related || []).map(c =>
         `<span class="rel-code" title="关联股票" onclick="filterByCode('${c}')">${c}</span>`).join('');
+      // 情绪标记：利空词/利好词命中的新闻分别标红/绿
+      const senti = n.sentiment === 'neg'
+        ? '<span class="badge" style="background:#ffe2e2;color:#b32424">🔴 利空</span>'
+        : n.sentiment === 'pos'
+        ? '<span class="badge" style="background:#e5f3e2;color:#1e7d32">🟢 利好</span>' : '';
       return `
       <div class="report-item" style="cursor:default">
         <span style="flex:1;min-width:0">
+          ${senti}
           <a href="${n.url}" target="_blank" rel="noopener"
              style="color:inherit;text-decoration:none" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='inherit'">${esc(n.title)}</a>
           <span class="muted" style="margin-left:6px">${esc(n.media || '')}</span>
