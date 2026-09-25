@@ -15,7 +15,8 @@ import os
 import re
 import threading
 import time
-from datetime import datetime
+import traceback          # 守护线程/后台线程的 except 里要打栈（2026-09-25 顺手补：原来漏 import）
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # 禁用 requests 对系统代理的读取：urllib.getproxies() 在 Windows 上会读到注册表
@@ -32,12 +33,36 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+import conf_util
+import crypto_watch
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"          # 兼容保留：迁移前旧 JSON 数据所在目录
 REPORTS_DIR = BASE_DIR / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
 
 ENV_FILE = BASE_DIR.parent / ".env"
+
+# 调度默认值：config.yaml 的 schedule 段缺失/坏值时的回落（网页「⚙️ 调度设置」可改）
+DEFAULT_SCHEDULE = {
+    "premarket_report": {"enabled": True, "time": "08:23"},
+    "postmarket_report": {"enabled": True, "time": "15:57"},
+    "withdrawal": {"check_time": "15:10"},
+    "paper": {"decide_time": "15:35", "settle_time": "16:10"},
+    "sector": {"snapshot_time": "15:10"},
+    "alerts": {"check_time": "08:30"},
+    "calendar": {"start_time": "08:00", "end_time": "12:00"},
+}
+# 抓取周期在各模块自己的段里（news/bili/wb/sector/volume），调度页只做单键手术式改写，
+# 不复制一份真源。这里的默认值仅用于 GET 回显。
+DEFAULT_INTERVALS = {
+    "news": {"enabled": True, "interval_minutes": 30},
+    "bili": {"enabled": True, "interval_minutes": 30},
+    "wb": {"enabled": True, "interval_minutes": 60},
+    "sector": {"enabled": True, "interval_minutes": 5},
+    "volume": {"enabled": True, "interval_minutes": 5},
+}
+INTERVAL_SECTIONS = tuple(DEFAULT_INTERVALS)
 
 
 def _load_db_conf() -> dict:
@@ -2143,13 +2168,15 @@ def _auto_plan_advice(alerts: list[dict]) -> None:
 
 
 def _withdrawal_loop():
-    """提款计划守护线程：每天 15:10 之后每半小时查一次达标/临期状态（当日只推一次）。"""
+    """提款计划守护线程：交易日 check_time（默认 15:10，可网页改）之后每半小时查一次
+    达标/临期状态（当日只推一次）。"""
     while True:
         try:
             now = datetime.now()
+            ch, cm = _sched_time("withdrawal", "check_time")
             if (_conf_enabled("withdrawal", True)
                     and now.weekday() < 5
-                    and (now.hour > 15 or (now.hour == 15 and now.minute >= 10))):
+                    and (now.hour, now.minute) >= (ch, cm)):
                 check_withdrawal_once(auto_ai=True)
             time.sleep(1800)
         except Exception as exc:
@@ -2369,6 +2396,20 @@ def plan_advice_latest(plan_id: int):
             "created_at": row[4].isoformat(timespec="seconds")}
 
 
+@app.get("/api/plans/{plan_id}/advice/history")
+def plan_advice_history(plan_id: int, limit: int = 20):
+    """某计划的 AI 建议历史（新→旧）。每次生成都存一行，页面默认只显示最新一条。"""
+    limit = max(1, min(limit, 100))
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id, model, auto, created_at, left(content, 400) AS brief "
+                    "FROM sa_plan_advice WHERE plan_id = %s "
+                    "ORDER BY created_at DESC, id DESC LIMIT %s", (plan_id, limit))
+        rows = cur.fetchall()
+    return [{"id": r[0], "model": r[1], "auto": r[2],
+             "created_at": r[3].isoformat(timespec="seconds"), "brief": r[4]}
+            for r in rows]
+
+
 @app.get("/api/llm/config")
 def llm_get_config():
     conf = llm_advisor.load_llm_conf()
@@ -2443,12 +2484,15 @@ def calendar_check():
 
 
 def _calendar_loop():
-    """财经日历守护线程：交易日早 8:00–12:00 窗口内每 5 分钟查一次（同键只推一次，
-    实际每天只会推一条今明事件/重要预告），盘前及时推微信。"""
+    """财经日历守护线程：交易日 start_time–end_time 窗口（默认 8:00–12:00，可网页改）
+    内每 5 分钟查一次（同键只推一次，实际每天只会推一条今明事件/重要预告），盘前及时推微信。"""
     while True:
         try:
             now = datetime.now()
-            if now.weekday() < 5 and 8 <= now.hour < 12 \
+            sh, sm = _sched_time("calendar", "start_time")
+            eh, em = _sched_time("calendar", "end_time")
+            if now.weekday() < 5 and (now.hour, now.minute) >= (sh, sm) \
+                    and (now.hour, now.minute) < (eh, em) \
                     and _conf_enabled("calendar", True):
                 with get_conn() as conn:
                     econ_calendar.check_calendar_once(conn, notify_fn=notifier.notify)
@@ -2482,6 +2526,154 @@ def _conf_section(section: str) -> dict:
         return {}
 
 
+# ---------------- 调度设置（config.yaml schedule 段 + 各模块抓取周期，网页可改） ----------------
+
+def _parse_hhmm(raw: str) -> tuple[int, int] | None:
+    """'HH:MM' → (h, m)；格式非法返回 None。"""
+    m = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", str(raw or "").strip())
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _sched_time(group: str, key: str) -> tuple[int, int]:
+    """读 schedule.<group>.<key> 的 HH:MM。缺段/缺键/坏值一律回落默认值。"""
+    raw = (_conf_section("schedule").get(group) or {}).get(key)
+    parsed = _parse_hhmm(raw)
+    if parsed:
+        return parsed
+    fallback = _parse_hhmm(DEFAULT_SCHEDULE.get(group, {}).get(key, "00:00"))
+    return fallback or (0, 0)
+
+
+def _load_schedule_conf() -> dict:
+    """schedule 段 + 各模块抓取周期的合并视图（GET /api/schedule 用）。"""
+    section = _conf_section("schedule")
+    merged = {}
+    for group, defaults in DEFAULT_SCHEDULE.items():
+        merged[group] = {**defaults, **(section.get(group) or {})}
+    intervals = {}
+    for name in INTERVAL_SECTIONS:
+        conf = _conf_section(name)
+        defaults = DEFAULT_INTERVALS[name]
+        intervals[name] = {"enabled": bool(conf.get("enabled", defaults["enabled"])),
+                           "interval_minutes": int(
+                               conf.get("interval_minutes", defaults["interval_minutes"]) or 0)}
+    return {"schedule": merged, "intervals": intervals}
+
+
+def _render_schedule_block(schedule: dict) -> str:
+    """把 schedule 段渲染成 config.yaml 文本块（供 conf_util 整段替换）。"""
+    def q(v) -> str:
+        return "'" + str(v).replace("'", "''") + "'"
+    out = ["# 定时任务时间（网页「⚙️ 调度设置」可改，1 分钟内生效，无需重启；本机时间，周一~周五）",
+           "# premarket/postmarket_report：盘前简报 premarket-brief.md / 盘后复盘 daily-summary.md",
+           "schedule:"]
+    for group, defaults in DEFAULT_SCHEDULE.items():
+        cur = {**defaults, **(schedule.get(group) or {})}
+        out.append(f"  {group}:")
+        for key, dv in defaults.items():
+            val = cur.get(key, dv)
+            if isinstance(val, bool):
+                out.append(f"    {key}: {str(val).lower()}")
+            else:
+                out.append(f"    {key}: {q(val)}")
+    return "\n".join(out)
+
+
+def _render_crypto_block(crypto: dict) -> str:
+    def q(v) -> str:
+        return "'" + str(v).replace("'", "''") + "'"
+    c = {**crypto_watch.DEFAULT_CRYPTO_CONF, **(crypto or {})}
+    return "\n".join([
+        "# 币圈 24h 趋势参考（gate.io 股票永续；欧易 OKX 本机直连不通，此为平替源）",
+        "# interval_minutes: 抓价周期，0=关闭；alert_threshold_pct: |24h涨跌| 阈值，推微信",
+        "crypto:",
+        f"  enabled: {str(bool(c['enabled'])).lower()}",
+        f"  interval_minutes: {int(c['interval_minutes'])}",
+        f"  alert_threshold_pct: {c['alert_threshold_pct']}",
+        f"  alert_cooldown_hours: {c['alert_cooldown_hours']}",
+    ])
+
+
+class ScheduleIn(BaseModel):
+    schedule: dict | None = None
+    intervals: dict | None = None
+    crypto: dict | None = None
+
+
+@app.get("/api/schedule")
+def schedule_get():
+    """调度页初始数据：schedule 段（各任务几点做）+ 各模块抓取周期 + 币圈监控。"""
+    data = _load_schedule_conf()
+    data["crypto"] = crypto_watch.load_crypto_conf()
+    return data
+
+
+@app.put("/api/schedule")
+def schedule_update(body: ScheduleIn):
+    """保存调度设置：整段替换 schedule / crypto 段，抓取周期逐键手术式改写
+    （各模块段里还有别的键，不能整段替换）。写操作走 conf_util.WRITE_LOCK，
+    与 news 段的整文件重写互斥，不会丢段。"""
+    ops: list[tuple[str, str, object]] = []
+    schedule = body.schedule
+    if schedule is not None:
+        # 校验：时间字段必须 HH:MM，enabled 必须布尔
+        merged = _load_schedule_conf()["schedule"]
+        for group, values in schedule.items():
+            if group not in DEFAULT_SCHEDULE or not isinstance(values, dict):
+                raise HTTPException(400, f"未知的调度分组：{group}")
+            for key, val in values.items():
+                if key not in DEFAULT_SCHEDULE[group]:
+                    raise HTTPException(400, f"{group} 不支持字段 {key}")
+                if key == "enabled":
+                    merged[group][key] = bool(val)
+                elif not _parse_hhmm(val):
+                    raise HTTPException(400, f"{group}.{key} 时间格式应为 HH:MM，收到 {val!r}")
+                else:
+                    merged[group][key] = str(val).strip()
+        schedule = merged
+    for name, values in (body.intervals or {}).items():
+        if name not in INTERVAL_SECTIONS or not isinstance(values, dict):
+            raise HTTPException(400, f"未知的抓取模块：{name}")
+        for key, val in values.items():
+            if key == "enabled":
+                ops.append((name, "enabled", bool(val)))
+            elif key == "interval_minutes":
+                try:
+                    minutes = int(val)
+                except (TypeError, ValueError):
+                    raise HTTPException(400, f"{name}.interval_minutes 必须是整数")
+                if not 0 <= minutes <= 1440:
+                    raise HTTPException(400, f"{name}.interval_minutes 需在 0~1440 之间")
+                ops.append((name, "interval_minutes", minutes))
+            else:
+                raise HTTPException(400, f"{name} 不支持字段 {key}")
+    crypto = body.crypto
+    if crypto is not None:
+        for key in crypto:
+            if key not in crypto_watch.DEFAULT_CRYPTO_CONF:
+                raise HTTPException(400, f"crypto 不支持字段 {key}")
+        if "interval_minutes" in crypto:
+            try:
+                minutes = int(crypto["interval_minutes"])
+            except (TypeError, ValueError):
+                raise HTTPException(400, "crypto.interval_minutes 必须是整数")
+            if not 0 <= minutes <= 1440:
+                raise HTTPException(400, "crypto.interval_minutes 需在 0~1440 之间")
+            crypto = {**crypto_watch.DEFAULT_CRYPTO_CONF,
+                      **{k: v for k, v in crypto.items() if v is not None}}
+            crypto["interval_minutes"] = minutes
+    with conf_util.WRITE_LOCK:
+        if schedule is not None:
+            conf_util.replace_or_append_section(
+                CONFIG_FILE, "schedule", _render_schedule_block(schedule))
+        if crypto is not None:
+            conf_util.replace_or_append_section(
+                CONFIG_FILE, "crypto", _render_crypto_block(crypto))
+        for section_key, key, value in ops:
+            conf_util.set_section_key(CONFIG_FILE, section_key, key, value)
+    return schedule_get()
+
+
 @app.get("/api/alerts/upcoming")
 def alerts_upcoming(days: int = 14):
     """自选股未来 N 天的解禁/增发事件（页面每次现拉，不受已推送状态影响）。"""
@@ -2501,15 +2693,16 @@ def alerts_check():
 
 
 def _alerts_loop():
-    """事件告警守护线程：工作日 8:30 后查一轮（每日一次；事件去重记在
-    data/alerts_state.json，重启不会重复轰炸，首轮发现的历史事件也会推）。"""
+    """事件告警守护线程：工作日 check_time（默认 8:30，可网页改）后查一轮（每日一次；
+    事件去重记在 data/alerts_state.json，重启不会重复轰炸，首轮发现的历史事件也会推）。"""
     last_day = None
     while True:
         try:
             now = datetime.now()
             conf = _conf_section("alerts")
+            ah, am = _sched_time("alerts", "check_time")
             if (conf.get("enabled", True) and now.weekday() < 5
-                    and (now.hour, now.minute) >= (8, 30) and now.hour < 21
+                    and (now.hour, now.minute) >= (ah, am) and now.hour < 21
                     and last_day != now.date()):
                 with get_conn() as conn:
                     fresh = alerts_mod.check_alerts_once(
@@ -2702,21 +2895,24 @@ def paper_status():
 
 def _paper_loop():
     """模拟交易守护线程：交易日两相位（last_day 幂等守卫，仿 _alerts_loop）。
-    15:35 后 run_decisions（收盘价成交）；16:10 后 settle_and_reflect（错开相位
-    给东财日K落库留时间）。config paper.enabled=false 时整轮跳过（改配置即生效，
+    decide_time（默认 15:35）后 run_decisions（收盘价成交）；settle_time（默认 16:10）
+    后 settle_and_reflect（错开相位给东财日K落库留时间）。时间点网页可改。
+    config paper.enabled=false 时整轮跳过（改配置即生效，
     但本线程本身是进程启动时创建的，新增需重启一次）。"""
     last_decision_day = last_settle_day = None
     while True:
         try:
             now = datetime.now()
             conf = _conf_section("paper")
+            dh, dm = _sched_time("paper", "decide_time")
+            sh, sm = _sched_time("paper", "settle_time")
             if (conf.get("enabled") and now.weekday() < 5):
-                if (now.hour, now.minute) >= (15, 35) and last_decision_day != now.date():
+                if (now.hour, now.minute) >= (dh, dm) and last_decision_day != now.date():
                     result = paper_trading.run_decisions(_paper_deps(conf))
                     last_decision_day = now.date()
                     n = len(result.get("decided", []))
                     print(f"[paper] decisions for {n} stocks", flush=True)
-                if (now.hour, now.minute) >= (16, 10) and last_settle_day != now.date():
+                if (now.hour, now.minute) >= (sh, sm) and last_settle_day != now.date():
                     result = paper_trading.settle_and_reflect(_paper_deps(conf))
                     last_settle_day = now.date()
                     n = len(result.get("settled", []))
@@ -2744,9 +2940,18 @@ def _read_conf() -> dict:
 def _write_conf(conf: dict) -> None:
     """把新闻配置写回 config.yaml（notify / bili 段由各自模块维护）。
 
-    config.yaml 有 news / bili / notify 三个模块段，整文件重写会互相踩，
+    config.yaml 有 news / bili / notify 等多个模块段，整文件重写会互相踩，
     所以只替换 news: 块本身的行（含其上方紧邻的注释头），其余原样保留。
+
+    整个函数体在 conf_util.WRITE_LOCK 内：它与「调度设置」页的整文件重写
+    （PUT /api/schedule）都是读-改-写整文件，并发会丢段。
     """
+    with conf_util.WRITE_LOCK:
+        _write_conf_locked(conf)
+
+
+def _write_conf_locked(conf: dict) -> None:
+    """_write_conf 的实际写盘逻辑（调用方需已持有 conf_util.WRITE_LOCK）。"""
     ch = conf["channels"]
     news_block = "\n".join([
         "# Stock Advisor 新闻抓取配置",
@@ -3486,6 +3691,216 @@ def get_report(date: str, name: str):
     return {"date": date, "name": name, "content": path.read_text(encoding="utf-8")}
 
 
+# ---------------- 每日报告（盘前简报 / 盘后复盘，daily_reports.py） ----------------
+# 原为 Claude Code 会话级 cron（会话关掉即失效），现由本进程守护线程按时生成。
+
+import daily_reports
+
+
+def _report_calendar_lines() -> list[str]:
+    """今明两日财经日历（规则事件 + 手动事件），给报告上下文。"""
+    today = datetime.now().date()
+    try:
+        with get_conn() as conn:
+            events = econ_calendar.upcoming_events(conn, months=1)
+    except Exception:
+        return []
+    out = []
+    for e in events:
+        if e["date"] not in (today.isoformat(),
+                             (today + timedelta(days=1)).isoformat()):
+            continue
+        mark = "⚡" if e.get("level") == "high" else "•"
+        out.append(f"- {mark} {e['date']} {e.get('time') or ''} {e['title']}".rstrip())
+    return out
+
+
+def _report_paper_decisions() -> list[str]:
+    """当日模拟交易决策（给盘后复盘）。"""
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT name, code, side, shares, price, confidence, reasoning "
+                        "FROM sa_paper_trades WHERE trade_date = %s ORDER BY id", (datetime.now().date(),))
+            rows = cur.fetchall()
+    except Exception:
+        return []
+    label = {"buy": "买入", "sell": "卖出", "hold": "观望"}
+    out = []
+    for name, code, side, shares, price, conf, reason in rows:
+        if side == "hold":
+            out.append(f"- 观望 {name}（{code}）：置信度 {conf or 0}，{(reason or '')[:80]}")
+        else:
+            out.append(f"- {label.get(side, side)} {name}（{code}）{shares} 股 @ {price}，"
+                       f"置信度 {conf or 0}，{(reason or '')[:80]}")
+    return out
+
+
+def _report_deps() -> dict:
+    """给 daily_reports 注入依赖（该模块不 import app）。"""
+    return {
+        "get_conn": get_conn,
+        "quote_fn": fetch_quotes,
+        "volume_fn": watchlist_volume_status,
+        "board_fn": sector_mod.stock_board_exposure,
+        "holdings_fn": lambda: _holdings_with_pnl(_derive_holdings()),
+        "events_fn": _advice_event_lines,
+        "sector_fn": _advice_sector_lines,
+        "calendar_fn": _report_calendar_lines,
+        "news_fn": _paper_news_rows,
+        "market_note_fn": _plan_market_note,
+        "paper_fn": lambda: paper_trading.account_overview(_paper_deps()),
+        "paper_decisions_fn": _report_paper_decisions,
+        "crypto_fn": lambda: crypto_watch.crypto_lines(_crypto_deps()),
+        "notify_fn": notifier.notify,
+    }
+
+
+_reports_state = {"premarket": False, "postmarket": False,
+                  "last_premarket": None, "last_postmarket": None}
+
+
+def _run_report(kind: str) -> None:
+    """后台线程体：跑一次报告生成，异常记进 state 不外抛。"""
+    _reports_state[kind] = True
+    try:
+        result = daily_reports.GENERATORS[kind](_report_deps())
+        _reports_state[f"last_{kind}"] = result
+        print(f"[reports] {kind} done: {result.get('path')}", flush=True)
+    except Exception as exc:
+        traceback.print_exc()
+        _reports_state[f"last_{kind}"] = {"error": str(exc)}
+    finally:
+        _reports_state[kind] = False
+
+
+@app.post("/api/reports/{kind}")
+def report_generate(kind: str):
+    """手动触发盘前简报/盘后复盘（后台线程执行，立即返回，约 1-3 分钟）。"""
+    if kind not in daily_reports.GENERATORS:
+        raise HTTPException(400, "kind 只能是 premarket 或 postmarket")
+    if _reports_state[kind]:
+        return {"ok": True, "status": "已在生成中，请稍后"}
+    threading.Thread(target=_run_report, args=(kind,), daemon=True).start()
+    return {"ok": True, "status": "已开始生成"}
+
+
+@app.get("/api/reports/status")
+def report_status():
+    return _reports_state
+
+
+def _daily_reports_loop():
+    """日报守护线程：交易日按 schedule 段的两个时间点各跑一次（last_day 幂等守卫，
+    仿 _paper_loop）。轮询 60s，改配置即生效，无需重启。
+
+    迟到窗口 2 小时：服务在下午/晚上才启动时不再补一份过期的盘前简报（否则
+    22:00 重启会推一份「今早简报」，内容全是昨天的收盘数据）。手动生成不受此限。
+    """
+    last_day = {"premarket": None, "postmarket": None}
+    while True:
+        try:
+            now = datetime.now()
+            if now.weekday() < 5:
+                for kind, group, key in (("premarket", "premarket_report", "time"),
+                                         ("postmarket", "postmarket_report", "time")):
+                    group_conf = _conf_section("schedule").get(group) or {}
+                    sh, sm = _sched_time(group, key)
+                    due = now.hour * 60 + now.minute
+                    if (group_conf.get("enabled", True)
+                            and sh * 60 + sm <= due <= sh * 60 + sm + 120
+                            and last_day[kind] != now.date()
+                            and not _reports_state[kind]):
+                        last_day[kind] = now.date()
+                        _run_report(kind)   # 同步跑：本分钟只此一件，不占线程池
+            time.sleep(60)
+        except Exception as exc:
+            print(f"[reports] loop error: {exc}", flush=True)
+            time.sleep(300)
+
+
+# ---------------- 币圈 24h 趋势参考（crypto_watch.py，gate.io 股票永续） ----------------
+
+class CryptoWatchIn(BaseModel):
+    contract: str = Field(min_length=3, max_length=32, description="合约名，如 TSLA_USDT")
+    name: str = Field(default="", max_length=64)
+
+
+def _crypto_deps() -> dict:
+    return {"get_conn": get_conn, "notify_fn": notifier.notify}
+
+
+@app.get("/api/crypto/quotes")
+def crypto_quotes():
+    """白名单合约的最新 24h 行情（页面卡片；超 5 分钟未刷新则现场取一次）。"""
+    deps = _crypto_deps()
+    try:
+        items = crypto_watch.list_watch(deps)
+    except Exception:
+        crypto_watch._ensure_tables(deps)
+        items = crypto_watch.list_watch(deps)
+    fresh = items and all(
+        i.get("ts") and
+        (datetime.now(timezone.utc) - datetime.fromisoformat(i["ts"])).total_seconds() < 300
+        for i in items)
+    if not fresh:
+        try:
+            crypto_watch.run_once(deps)
+            items = crypto_watch.list_watch(deps)
+        except Exception as exc:
+            print(f"[crypto] refresh failed: {exc}", flush=True)
+    return {"source": "gate.io 股票永续（欧易 OKX 本机不可达）",
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "items": items}
+
+
+@app.post("/api/crypto/watch")
+def crypto_watch_add(body: CryptoWatchIn):
+    """添加白名单合约（XXX_USDT）。"""
+    try:
+        return crypto_watch.add_watch(_crypto_deps(), body.contract, body.name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.delete("/api/crypto/watch/{contract}")
+def crypto_watch_del(contract: str):
+    """移出白名单（历史行情保留）。"""
+    try:
+        return crypto_watch.remove_watch(_crypto_deps(), contract)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.post("/api/crypto/refresh")
+def crypto_refresh():
+    """立即跑一轮（取价→入库→异动判断），页面「立即刷新」用。"""
+    try:
+        return {"ok": True, **crypto_watch.run_once(_crypto_deps())}
+    except Exception as exc:
+        raise HTTPException(502, f"gate.io 取价失败：{exc}")
+
+
+def _crypto_loop():
+    """币圈监控守护线程：按 crypto.interval_minutes（默认 15，0=关闭）取价入库 +
+    24h 异动推送（阈值与冷却在 crypto 段，网页可改）。24h 连续交易，不限 A 股时段。"""
+    while True:
+        try:
+            conf = crypto_watch.load_crypto_conf()
+            interval = int(conf.get("interval_minutes") or 0)
+            if conf.get("enabled", True) and interval > 0:
+                result = crypto_watch.run_once(_crypto_deps())
+                if result.get("contracts"):
+                    print(f"[crypto] {result['contracts']} contracts updated"
+                          + (f", {result['pushed']} alerts" if result.get("pushed") else ""),
+                          flush=True)
+                time.sleep(max(interval, 1) * 60)
+            else:
+                time.sleep(300)
+        except Exception as exc:
+            print(f"[crypto] loop error: {exc}", flush=True)
+            time.sleep(300)
+
+
 @app.get("/api/health")
 def health():
     with get_conn() as conn, conn.cursor() as cur:
@@ -3525,6 +3940,12 @@ def _normalize_code(code: str) -> str:
 # 全局单连接复用不需要：每请求短连接即可（本地工具规模）
 init_db()
 
+# 币圈白名单/行情表（幂等 DDL + 8 只种子合约，ON CONFLICT DO NOTHING）
+try:
+    crypto_watch._ensure_tables(_crypto_deps())
+except Exception as exc:
+    print(f"[crypto] init tables failed: {exc}", flush=True)
+
 # 自动新闻抓取后台线程（fetch_interval_minutes=0 时轮内直接跳过）
 threading.Thread(target=_auto_fetch_loop, daemon=True).start()
 
@@ -3557,6 +3978,12 @@ threading.Thread(target=_market_volume_loop, daemon=True).start()
 
 # 模拟交易线程（交易日 15:35 决策 / 16:10 结算复盘；paper.enabled=false 轮内跳过）
 threading.Thread(target=_paper_loop, daemon=True).start()
+
+# 每日报告线程（盘前简报 / 盘后复盘；时间点见 config.yaml schedule 段，网页可改）
+threading.Thread(target=_daily_reports_loop, daemon=True).start()
+
+# 币圈 24h 监控线程（gate.io 股票永续；crypto.interval_minutes=0 轮内跳过）
+threading.Thread(target=_crypto_loop, daemon=True).start()
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8686)

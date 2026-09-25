@@ -118,6 +118,7 @@
     <button data-tab="reports">分析报告</button>
     <button data-tab="paper">🧪 模拟交易</button>
     <button data-tab="notify">🔔 通知</button>
+    <button data-tab="schedule">⚙️ 调度设置</button>
   </div>
 
   <!-- 自选行情 -->
@@ -167,6 +168,37 @@
       </table>
       </div>
       <div id="watch-empty" class="empty hide">还没有自选股，输入代码添加吧</div>
+    </div>
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <b style="font-size:13px">🪙 币圈 24h 趋势参考
+          <span class="muted" style="font-weight:normal">（gate.io 股票永续）</span></b>
+        <span class="row">
+          <span class="muted" id="crypto-meta" style="font-size:12px"></span>
+          <button class="btn ghost" style="font-size:12px" onclick="loadCrypto(true)">立即刷新</button>
+          <button class="btn ghost" style="font-size:12px" onclick="loadSchedule()">阈值设置</button>
+        </span>
+      </div>
+      <div style="overflow-x:auto">
+      <table style="margin-top:6px">
+        <thead><tr>
+          <th>名称</th><th>合约</th><th>最新价</th><th>24h 涨跌</th><th>24h 高</th><th>24h 低</th>
+          <th>24h 成交额</th><th></th>
+        </tr></thead>
+        <tbody id="crypto-body"></tbody>
+      </table>
+      </div>
+      <div id="crypto-empty" class="empty hide">白名单为空</div>
+      <div class="row" style="margin-top:8px">
+        <input id="crypto-contract" placeholder="合约名，如 TSLA_USDT" maxlength="32" style="width:190px">
+        <input id="crypto-name" placeholder="显示名（可选）" maxlength="64" style="width:170px">
+        <button class="btn" onclick="addCrypto()">+ 关注</button>
+      </div>
+      <div class="muted" style="margin-top:6px;font-size:12px">
+        欧易(OKX) 在本机网络不通（直连与代理均失败），这里用 gate.io 上同一批美股标的的
+        USDT 永续合约作 24h 连续交易的隔夜情绪参考。永续锚定美股现货但可能有小幅溢价/折价，
+        <b>只作趋势参考，不是精确报价</b>。白名单合约的 24h 涨跌超过阈值会推微信（阈值在「⚙️ 调度设置」改）。
+      </div>
     </div>
   </section>
 
@@ -572,6 +604,89 @@
     </div>
   </section>
 
+  <!-- 调度设置 -->
+  <section id="tab-schedule" class="hide">
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <b style="font-size:13px">📋 每日报告（盘前简报 / 盘后复盘）</b>
+        <span class="muted" style="font-size:12px">Claude 生成，约 2 分钟；需要先在「🏧 提款计划」页配置 API key</span>
+      </div>
+      <div class="row" style="margin-top:8px;align-items:center;flex-wrap:wrap;gap:16px">
+        <label class="muted"><input type="checkbox" id="sch-pre-enabled"> 盘前简报</label>
+        <input type="time" id="sch-pre-time" style="width:120px">
+        <button class="btn ghost" id="sch-pre-btn" onclick="genReport('premarket')">立即生成盘前</button>
+        <span class="muted" id="sch-pre-status" style="font-size:12px"></span>
+      </div>
+      <div class="row" style="margin-top:6px;align-items:center;flex-wrap:wrap;gap:16px">
+        <label class="muted"><input type="checkbox" id="sch-post-enabled"> 盘后复盘</label>
+        <input type="time" id="sch-post-time" style="width:120px">
+        <button class="btn ghost" id="sch-post-btn" onclick="genReport('postmarket')">立即生成盘后</button>
+        <span class="muted" id="sch-post-status" style="font-size:12px"></span>
+      </div>
+      <div class="muted" style="margin-top:6px;font-size:12px">
+        交易日（周一~周五）按上面的时间自动生成，写入「分析报告」页：
+        盘前 → <code>premarket-brief.md</code>，盘后 → <code>daily-summary.md</code>，
+        同时推送微信摘要。同一天只生成一次；节假日不判（与其它任务一致），
+        但报告开头会写明数据时点，模型也会自陈数据陈旧。改时间 1 分钟内生效，不用重启。
+      </div>
+    </div>
+    <div class="card">
+      <b style="font-size:13px">⏰ 定时任务时间</b>
+      <div class="row" style="margin-top:8px;flex-wrap:wrap;gap:16px">
+        <label class="muted">提款计划检查 <input type="time" id="sch-wd" style="width:115px"></label>
+        <label class="muted">模拟交易·决策 <input type="time" id="sch-pd" style="width:115px"></label>
+        <label class="muted">模拟交易·结算 <input type="time" id="sch-ps" style="width:115px"></label>
+        <label class="muted">板块盘后快照 <input type="time" id="sch-ss" style="width:115px"></label>
+        <label class="muted">事件告警扫描 <input type="time" id="sch-al" style="width:115px"></label>
+        <label class="muted">日历提醒窗口 <input type="time" id="sch-cs" style="width:115px">
+          → <input type="time" id="sch-ce" style="width:115px"></label>
+      </div>
+      <div class="muted" style="margin-top:6px;font-size:12px">
+        未列出的内部节奏（止盈扫描 60s/300s、各线程轮询间隔、告警 21:00 收尾）保持硬编码，
+        改它们只会让止盈反应变慢或让守护线程空转。
+      </div>
+    </div>
+    <div class="card">
+      <b style="font-size:13px">🪙 币圈 24h 监控（gate.io 股票永续）</b>
+      <div class="row" style="margin-top:8px;flex-wrap:wrap;gap:16px;align-items:center">
+        <label class="muted"><input type="checkbox" id="sch-cr-enabled"> 启用</label>
+        <label class="muted">抓价周期(分钟) <input type="number" id="sch-cr-interval" min="0" max="1440"
+          style="width:75px;padding:5px 7px;border:1px solid var(--border);border-radius:6px"> 0=关闭</label>
+        <label class="muted">24h 异动阈值(%) <input type="number" id="sch-cr-threshold" min="0" max="100" step="0.5"
+          style="width:80px;padding:5px 7px;border:1px solid var(--border);border-radius:6px"></label>
+        <label class="muted">同向冷却(小时) <input type="number" id="sch-cr-cooldown" min="1" max="72"
+          style="width:75px;padding:5px 7px;border:1px solid var(--border);border-radius:6px"></label>
+      </div>
+      <div class="muted" style="margin-top:6px;font-size:12px">
+        白名单在「自选行情」页的币圈卡片里加删。24h 连续交易，不限 A 股时段；
+        涨跌超阈值且不在冷却期就推一条合并微信。
+      </div>
+    </div>
+    <div class="card">
+      <b style="font-size:13px">🔁 抓取周期</b>
+      <div class="row" style="margin-top:8px;flex-wrap:wrap;gap:16px;align-items:center">
+        <label class="muted"><input type="checkbox" id="sch-iv-news"> 新闻</label>
+        <input type="number" id="sch-iv-news-min" min="0" max="1440" style="width:70px;padding:5px 7px;border:1px solid var(--border);border-radius:6px"> 分钟
+        <label class="muted"><input type="checkbox" id="sch-iv-bili"> B站</label>
+        <input type="number" id="sch-iv-bili-min" min="0" max="1440" style="width:70px;padding:5px 7px;border:1px solid var(--border);border-radius:6px"> 分钟
+        <label class="muted"><input type="checkbox" id="sch-iv-wb"> 微博</label>
+        <input type="number" id="sch-iv-wb-min" min="0" max="1440" style="width:70px;padding:5px 7px;border:1px solid var(--border);border-radius:6px"> 分钟
+        <label class="muted"><input type="checkbox" id="sch-iv-sector"> 板块盘中</label>
+        <input type="number" id="sch-iv-sector-min" min="0" max="1440" style="width:70px;padding:5px 7px;border:1px solid var(--border);border-radius:6px"> 分钟
+        <label class="muted"><input type="checkbox" id="sch-iv-volume"> 大盘量能</label>
+        <input type="number" id="sch-iv-volume-min" min="0" max="1440" style="width:70px;padding:5px 7px;border:1px solid var(--border);border-radius:6px"> 分钟
+      </div>
+      <div class="muted" style="margin-top:6px;font-size:12px">0 = 关闭该模块的自动抓取。抓取周期存在各自模块的配置段里，此处只改这一项，不动其它键。</div>
+    </div>
+    <div class="card">
+      <div class="row">
+        <button class="btn" onclick="saveSchedule()">保存全部设置</button>
+        <button class="btn ghost" onclick="loadSchedule()">重新载入</button>
+        <span class="muted" id="schedule-status" style="font-size:12px"></span>
+      </div>
+    </div>
+  </section>
+
   <!-- 报告 -->
   <!-- 模拟交易（Paper Trading）：LLM 决策 → 收盘价成交 → 5交易日结算 → 反思沉淀 -->
   <section id="tab-paper" class="hide">
@@ -636,8 +751,9 @@
         <button class="btn ghost" onclick="loadReports()">刷新</button>
       </div>
       <div id="report-list"></div>
-      <div id="reports-empty" class="empty hide">还没有报告。定时任务会在交易日盘前/盘后生成；
-        也可以在 Claude 会话里说"分析一下我的自选股"立即生成。</div>
+      <div id="reports-empty" class="empty hide">还没有报告。交易日盘前/盘后会由后台线程自动生成
+        （盘前简报 premarket-brief.md、盘后复盘 daily-summary.md），时间点在「⚙️ 调度设置」里改，
+        也可以在那里点「立即生成」。</div>
     </div>
     <div class="card hide" id="report-view-card">
       <button class="btn ghost back" onclick="backToList()">← 返回列表</button>
@@ -672,9 +788,9 @@ document.querySelectorAll('.tabs button').forEach(btn => {
   btn.onclick = () => {
     document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
-    ['market', 'sector', 'holdings', 'strategies', 'plans', 'calendar', 'news', 'bili', 'wb', 'reports', 'paper', 'notify'].forEach(t =>
+    ['market', 'sector', 'holdings', 'strategies', 'plans', 'calendar', 'news', 'bili', 'wb', 'reports', 'paper', 'notify', 'schedule'].forEach(t =>
       $('tab-' + t).classList.toggle('hide', t !== btn.dataset.tab));
-    if (btn.dataset.tab === 'market') { loadWatch(); loadAlerts(); }
+    if (btn.dataset.tab === 'market') { loadWatch(); loadAlerts(); loadCrypto(); }
     if (btn.dataset.tab === 'sector') { loadSector(); loadIntraday(); startIntradayAuto(); }
     if (btn.dataset.tab === 'holdings') loadHoldings();
     if (btn.dataset.tab === 'strategies') loadStrategies();
@@ -687,6 +803,7 @@ document.querySelectorAll('.tabs button').forEach(btn => {
     if (btn.dataset.tab === 'reports') loadReports();
     if (btn.dataset.tab === 'paper') loadPaper();
     if (btn.dataset.tab === 'notify') loadNotifyConf();
+    if (btn.dataset.tab === 'schedule') loadSchedule();
   };
 });
 
@@ -1437,11 +1554,14 @@ async function showPlanDetail(id) {
       <div class="row" style="margin-top:8px;align-items:center;border-top:1px dashed var(--border);padding-top:8px">
         <button class="btn ghost" style="font-size:12px" id="adv-btn-${id}"
                 onclick="genPlanAdvice(${id})">🤖 生成 AI 提款建议</button>
+        <button class="btn ghost" style="font-size:12px"
+                onclick="showAdviceHistory(${id})">📜 历史建议</button>
         <span class="muted" id="adv-status-${id}"></span>
       </div>
       <div id="advice-box-${id}" style="margin-top:6px;white-space:pre-wrap;word-break:break-word;
            line-height:1.7;font-size:12.5px;background:var(--bg);border:1px solid var(--border);
            border-radius:8px;padding:8px 10px" class="hide"></div>
+      <div id="advice-history-${id}" class="hide" style="margin-top:6px;font-size:12px"></div>
       ${wdRows ? `<div class="muted" style="margin-top:8px"><b>提款流水</b>：</div>
         <table><tbody>${wdRows}</tbody></table>`
         : '<div class="muted" style="margin-top:6px">还没有提款记录。</div>'}`;
@@ -1450,6 +1570,27 @@ async function showPlanDetail(id) {
 }
 
 // ---- AI 提款建议 ----
+// 每次生成都存一行 sa_plan_advice（库里已有 6 条历史）；卡片默认只显示最新一条，
+// 「📜 历史建议」拉全部（正文取前 400 字，全文看最新那条）。
+async function showAdviceHistory(id) {
+  const box = $('advice-history-' + id);
+  if (!box) return;
+  if (!box.classList.contains('hide')) { box.classList.add('hide'); box.innerHTML = ''; return; }
+  try {
+    const rows = await api(`/api/plans/${id}/advice/history?limit=20`);
+    if (!rows.length) {
+      box.innerHTML = '<div class="muted">还没有历史建议</div>';
+    } else {
+      box.innerHTML = rows.map(r => `<details style="margin:3px 0">
+        <summary style="cursor:pointer">${esc(r.created_at.replace('T', ' '))}
+          · ${esc(r.model || '')} · ${r.auto ? '自动' : '手动'} · #${r.id}</summary>
+        <div style="white-space:pre-wrap;word-break:break-word;color:var(--muted);
+             padding:4px 0 4px 10px;border-left:2px solid var(--border)">${esc(r.brief || '')}…</div>
+      </details>`).join('');
+    }
+    box.classList.remove('hide');
+  } catch (e) { toast('加载历史失败: ' + e.message); }
+}
 async function showPlanAdvice(id) {
   try {
     const a = await api('/api/plans/' + id + '/advice');
@@ -1806,6 +1947,148 @@ function filterByCode(code) {
   loadNews();
 }
 const esc = s => (s || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+// ---- 调度设置（config.yaml schedule 段 + 各模块抓取周期 + 币圈监控） ----
+const SCH_INTERVALS = ['news', 'bili', 'wb', 'sector', 'volume'];
+async function loadSchedule() {
+  try {
+    const d = await api('/api/schedule');
+    const s = d.schedule || {};
+    $('sch-pre-enabled').checked = !!(s.premarket_report || {}).enabled;
+    $('sch-pre-time').value = (s.premarket_report || {}).time || '08:23';
+    $('sch-post-enabled').checked = !!(s.postmarket_report || {}).enabled;
+    $('sch-post-time').value = (s.postmarket_report || {}).time || '15:57';
+    $('sch-wd').value = (s.withdrawal || {}).check_time || '15:10';
+    $('sch-pd').value = (s.paper || {}).decide_time || '15:35';
+    $('sch-ps').value = (s.paper || {}).settle_time || '16:10';
+    $('sch-ss').value = (s.sector || {}).snapshot_time || '15:10';
+    $('sch-al').value = (s.alerts || {}).check_time || '08:30';
+    $('sch-cs').value = (s.calendar || {}).start_time || '08:00';
+    $('sch-ce').value = (s.calendar || {}).end_time || '12:00';
+    const c = d.crypto || {};
+    $('sch-cr-enabled').checked = c.enabled !== false;
+    $('sch-cr-interval').value = c.interval_minutes ?? 15;
+    $('sch-cr-threshold').value = c.alert_threshold_pct ?? 3;
+    $('sch-cr-cooldown').value = c.alert_cooldown_hours ?? 6;
+    SCH_INTERVALS.forEach(k => {
+      const iv = (d.intervals || {})[k] || {};
+      $('sch-iv-' + k).checked = iv.enabled !== false;
+      $('sch-iv-' + k + '-min').value = iv.interval_minutes ?? 30;
+    });
+  } catch (e) { toast('加载调度设置失败: ' + e.message); }
+}
+async function saveSchedule() {
+  const st = $('schedule-status');
+  try {
+    const body = {
+      schedule: {
+        premarket_report: { enabled: $('sch-pre-enabled').checked, time: $('sch-pre-time').value },
+        postmarket_report: { enabled: $('sch-post-enabled').checked, time: $('sch-post-time').value },
+        withdrawal: { check_time: $('sch-wd').value },
+        paper: { decide_time: $('sch-pd').value, settle_time: $('sch-ps').value },
+        sector: { snapshot_time: $('sch-ss').value },
+        alerts: { check_time: $('sch-al').value },
+        calendar: { start_time: $('sch-cs').value, end_time: $('sch-ce').value },
+      },
+      intervals: Object.fromEntries(SCH_INTERVALS.map(k => [k, {
+        enabled: $('sch-iv-' + k).checked,
+        interval_minutes: +$('sch-iv-' + k + '-min').value }])),
+      crypto: {
+        enabled: $('sch-cr-enabled').checked,
+        interval_minutes: +$('sch-cr-interval').value,
+        alert_threshold_pct: +$('sch-cr-threshold').value,
+        alert_cooldown_hours: +$('sch-cr-cooldown').value,
+      },
+    };
+    await api('/api/schedule', { method: 'PUT',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (st) st.textContent = '已保存，1 分钟内生效';
+    toast('调度设置已保存');
+  } catch (e) {
+    if (st) st.textContent = e.message;
+    toast(e.message);
+  }
+}
+// 手动生成日报：后台线程跑，前端轮 /api/reports/status 到完成
+let _reportTimer = null;
+async function genReport(kind) {
+  const pre = kind === 'premarket';
+  const btn = $(pre ? 'sch-pre-btn' : 'sch-post-btn');
+  const st = $(pre ? 'sch-pre-status' : 'sch-post-status');
+  try {
+    await api('/api/reports/' + kind, { method: 'POST' });
+    if (btn) btn.disabled = true;
+    if (st) st.textContent = '生成中（约 2 分钟）…';
+    toast('已开始生成，可切到「分析报告」页查看');
+    clearInterval(_reportTimer);
+    _reportTimer = setInterval(async () => {
+      try {
+        const s = await api('/api/reports/status');
+        const last = s['last_' + kind];
+        if (s[kind]) { if (st) st.textContent = '生成中…'; return; }
+        clearInterval(_reportTimer);
+        if (btn) btn.disabled = false;
+        if (last && last.error) {
+          if (st) st.textContent = '失败: ' + last.error;
+          toast('生成失败');
+        } else if (last) {
+          if (st) st.textContent = '已完成 ✓ ' + (last.path || '');
+          toast('报告已生成');
+          loadReports();
+        }
+      } catch { clearInterval(_reportTimer); if (btn) btn.disabled = false; }
+    }, 3000);
+  } catch (e) { toast(e.message); }
+}
+
+// ---- 币圈 24h 趋势参考（gate.io 股票永续） ----
+async function loadCrypto(force = false) {
+  try {
+    if (force) {
+      await api('/api/crypto/refresh', { method: 'POST' });
+    }
+    const d = await api('/api/crypto/quotes');
+    const items = d.items || [];
+    $('crypto-empty').classList.toggle('hide', items.length > 0);
+    $('crypto-body').innerHTML = items.map(i => {
+      const pct = i.change_pct;
+      const vol = (i.vol_quote || 0) >= 1e6
+        ? (i.vol_quote / 1e6).toFixed(2) + 'M' : ((i.vol_quote || 0) / 1e3).toFixed(0) + 'K';
+      return `<tr>
+        <td><b>${esc(i.name || i.contract)}</b></td>
+        <td class="muted">${esc(i.contract)}</td>
+        <td>${i.last != null ? i.last.toFixed(2) : '—'}</td>
+        <td class="${cls(pct)}"><b>${typeof pct === 'number' ? (pct > 0 ? '+' : '') + pct.toFixed(2) + '%' : '—'}</b></td>
+        <td class="muted">${i.high_24h != null ? i.high_24h.toFixed(2) : '—'}</td>
+        <td class="muted">${i.low_24h != null ? i.low_24h.toFixed(2) : '—'}</td>
+        <td class="muted">${vol} USDT</td>
+        <td><button class="btn ghost" style="font-size:12px"
+          onclick="delCrypto('${esc(i.contract)}')">移除</button></td>
+      </tr>`;
+    }).join('');
+    $('crypto-meta').textContent = d.updated_at ? '更新于 ' + d.updated_at.replace('T', ' ') : '';
+  } catch (e) { $('crypto-meta').textContent = '加载失败: ' + e.message; }
+}
+async function addCrypto() {
+  const contract = $('crypto-contract').value.trim().toUpperCase();
+  if (!contract) { toast('请输入合约名，如 TSLA_USDT'); return; }
+  try {
+    await api('/api/crypto/watch', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contract, name: $('crypto-name').value.trim() }) });
+    $('crypto-contract').value = ''; $('crypto-name').value = '';
+    toast('已关注 ' + contract);
+    loadCrypto(true);
+  } catch (e) { toast(e.message); }
+}
+async function delCrypto(contract) {
+  if (!confirm('把 ' + contract + ' 移出币圈白名单？（历史行情保留）')) return;
+  try {
+    await api('/api/crypto/watch/' + encodeURIComponent(contract), { method: 'DELETE' });
+    toast('已移除');
+    loadCrypto();
+  } catch (e) { toast(e.message); }
+}
 
 async function triggerFetch() {
   try {

@@ -93,3 +93,36 @@ notify:
     auth_code:
     to_addr:
     enabled: false
+
+# 定时任务时间（网页「⚙️ 调度设置」可改，1 分钟内生效，无需重启；本机时间，周一~周五）
+# premarket/postmarket_report：盘前简报 premarket-brief.md / 盘后复盘 daily-summary.md
+# withdrawal.check_time / paper.decide_time / paper.settle_time / sector.snapshot_time /
+# alerts.check_time / calendar.start_time~end_time 覆盖对应守护线程里原本硬编码的时间点
+schedule:
+  premarket_report:
+    enabled: true
+    time: '08:23'
+  postmarket_report:
+    enabled: true
+    time: '15:57'
+  withdrawal:
+    check_time: '15:10'
+  paper:
+    decide_time: '15:35'
+    settle_time: '16:10'
+  sector:
+    snapshot_time: '15:10'
+  alerts:
+    check_time: '08:30'
+  calendar:
+    start_time: '08:00'
+    end_time: '12:00'
+
+# 币圈 24h 趋势参考（gate.io 股票永续；欧易 OKX 本机直连不通，此为平替源）
+# 白名单在「自选行情」页的币圈卡片里加删；interval_minutes: 抓价周期，0=关闭
+# alert_threshold_pct: |24h 涨跌| 超此值推微信；alert_cooldown_hours: 同向推送冷却
+crypto:
+  enabled: true
+  interval_minutes: 15
+  alert_threshold_pct: 3
+  alert_cooldown_hours: 6

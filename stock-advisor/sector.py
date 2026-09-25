@@ -846,11 +846,29 @@ def _intraday_loop():
 
 # ---------------- 自动采集线程 ----------------
 
+def _snapshot_time() -> tuple[int, int]:
+    """当日快照时间（默认 15:10），来自 config.yaml 的 schedule.sector.snapshot_time
+    （网页「⚙️ 调度设置」可改）。缺失/坏值回落默认。"""
+    try:
+        text = (BASE_DIR / "config.yaml").read_text(encoding="utf-8")
+        import re
+        import yaml
+        data = yaml.safe_load(text) or {}
+        raw = ((data.get("schedule") or {}).get("sector") or {}).get("snapshot_time")
+        m = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", str(raw or "").strip())
+        if m:
+            return (int(m.group(1)), int(m.group(2)))
+    except Exception:
+        pass
+    return (15, 10)
+
+
 def _is_after_close(now: datetime) -> bool:
-    """收盘后（15:10 之后）才算当日快照时间。"""
+    """收盘后（默认 15:10 之后，可网页改）才算当日快照时间。"""
     if now.weekday() >= 5:
         return False
-    return (now.hour, now.minute) >= (15, 10)
+    sh, sm = _snapshot_time()
+    return (now.hour, now.minute) >= (sh, sm)
 
 
 def _sector_auto_loop():
