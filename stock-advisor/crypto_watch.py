@@ -166,7 +166,15 @@ def fetch_daily_closes(contract: str, days: int = 30) -> list[dict]:
 # ---------------- 白名单（sa_crypto_watch） ----------------
 
 def _ensure_tables(deps) -> None:
+    """建表 + 首次种子。
+
+    种子只在**表刚建出来**这一次播：白名单是用户自己维护的清单，若每次启动都
+    ON CONFLICT DO NOTHING 补一遍，用户删掉的标的会在下次重启时复活
+    （2026-09-25 实测：用户删掉 7 只，重启后又全回来了）。
+    """
     with deps["get_conn"]() as conn, conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('sa_crypto_watch')")
+        fresh_install = cur.fetchone()[0] is None
         cur.execute("""
             CREATE TABLE IF NOT EXISTS sa_crypto_watch (
                 id          BIGSERIAL PRIMARY KEY,
@@ -188,9 +196,10 @@ def _ensure_tables(deps) -> None:
             )""")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_sa_crypto_quotes "
                     "ON sa_crypto_quotes (contract, ts DESC)")
-        for contract, name in SEED_CONTRACTS:
-            cur.execute("INSERT INTO sa_crypto_watch (contract, name) VALUES (%s, %s) "
-                        "ON CONFLICT (contract) DO NOTHING", (contract, name))
+        if fresh_install:
+            for contract, name in SEED_CONTRACTS:
+                cur.execute("INSERT INTO sa_crypto_watch (contract, name) VALUES (%s, %s) "
+                            "ON CONFLICT (contract) DO NOTHING", (contract, name))
 
 
 def list_watch(deps) -> list[dict]:
