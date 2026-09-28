@@ -17,6 +17,11 @@ import threading
 import time
 import traceback          # 守护线程/后台线程的 except 里要打栈（2026-09-25 顺手补：原来漏 import）
 from datetime import datetime, timedelta, timezone
+import datetime as _dt_mod
+
+# 需要序列化成 ISO 字符串的数据库类型（别在函数签名里用 date 当参数名，
+# 那会遮蔽同名类型，isinstance 会直接 TypeError）
+_DT_TYPES = (_dt_mod.datetime, _dt_mod.date)
 from pathlib import Path
 
 # 禁用 requests 对系统代理的读取：urllib.getproxies() 在 Windows 上会读到注册表
@@ -34,7 +39,10 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 import conf_util
+import config_schema
 import crypto_watch
+import wechat_mp
+import x_monitor
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"          # 兼容保留：迁移前旧 JSON 数据所在目录
@@ -62,7 +70,18 @@ DEFAULT_INTERVALS = {
     "sector": {"enabled": True, "interval_minutes": 5},
     "volume": {"enabled": True, "interval_minutes": 5},
 }
-INTERVAL_SECTIONS = tuple(DEFAULT_INTERVALS)
+# ⚠️ news 的周期真身是 `news.fetch_interval_minutes`（_auto_fetch_loop 和
+# news_fetcher 都读它），而 `news.interval_minutes` 是历史遗留的**幽灵键**：
+# 调度页一直写的是它，于是「在调度页改新闻抓取周期」从来没生效过
+# （2026-09-26 核对 _auto_fetch_loop 源码时发现）。这里把读写都指到真身上，
+# 幽灵键已从 config.yaml 删除。
+INTERVAL_KEY = {"news": "fetch_interval_minutes"}
+# news 没有独立的 enabled 开关（0 分钟即关闭），UI 上不给它画复选框
+INTERVAL_NO_ENABLED = {"news"}
+
+
+def _interval_key(name: str) -> str:
+    return INTERVAL_KEY.get(name, "interval_minutes")
 
 
 def _load_db_conf() -> dict:
@@ -373,6 +392,19 @@ def init_db():
     );
     CREATE INDEX IF NOT EXISTS idx_sa_paper_reflections_code_time
         ON sa_paper_reflections (code, created_at DESC);
+    -- status 语义（2026-09-28 修正）：这个字段原本同时承担「交易生命周期」和
+    -- 「本轮决策结果」两件事，于是 side='hold'（判了但没动手、shares=0、根本没
+    -- 持仓）的行也被写成 'open'，页面显示成「持有中」，和旁边的「观望」自相矛盾
+    -- （实测 335 行里有 308 行是这种）。现在拆开：
+    --   none     = 无仓位，仅决策记录（hold）
+    --   skipped  = 想动但没成交（钱不够 / 被 T+1 拦 / 持仓已满）
+    --   open     = 持有中（buy/sell 成交且未平仓）
+    --   resolved = 已结算（含到期平仓写入的反向行）
+    ALTER TABLE sa_paper_trades DROP CONSTRAINT IF EXISTS sa_paper_trades_status_check;
+    ALTER TABLE sa_paper_trades ADD CONSTRAINT sa_paper_trades_status_check
+        CHECK (status IN ('open','resolved','skipped','none'));
+    UPDATE sa_paper_trades SET status = 'none'
+        WHERE side = 'hold' AND status = 'open' AND COALESCE(shares,0) = 0;
     -- 每日资产快照（收益曲线数据源）
     CREATE TABLE IF NOT EXISTS sa_paper_equity (
         snap_date     DATE PRIMARY KEY,
@@ -381,6 +413,39 @@ def init_db():
         total         NUMERIC(14,2) NOT NULL,
         daily_return  NUMERIC(10,6)
     );
+    -- 盘中每 30 分钟一轮的决策周期台账（原来只有盘后单点，没有过程可查）
+    CREATE TABLE IF NOT EXISTS sa_paper_cycles (
+        id          BIGSERIAL PRIMARY KEY,
+        trade_date  DATE NOT NULL,
+        slot        VARCHAR(8) NOT NULL,          -- 'HH:MM'，如 '10:30'
+        kind        VARCHAR(12) NOT NULL DEFAULT 'intraday',  -- intraday|catchup|manual
+        trigger     VARCHAR(16) NOT NULL DEFAULT '',        -- 触发原因（stoploss/interval…）
+        planned     INTEGER NOT NULL DEFAULT 0,   -- 计划判断的标的数
+        acted       INTEGER NOT NULL DEFAULT 0,   -- 实际成交数
+        skipped     INTEGER NOT NULL DEFAULT 0,   -- 已判但未成交（观望/仓位不足）
+        holds       INTEGER NOT NULL DEFAULT 0,   -- 观望
+        elapsed_ms  INTEGER NOT NULL DEFAULT 0,
+        error       TEXT NOT NULL DEFAULT '',
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (trade_date, slot)
+    );
+    -- 盘中多轮决策：唯一键从 (trade_date,code,side) 放宽为 (trade_date,slot,code,side)，
+    -- 否则同一只票当天第二轮就会被唯一约束挡掉（09-24 已踩过同类坑）。
+    -- slot 缺省 '' 兼容历史单点决策的老行。
+    ALTER TABLE sa_paper_trades ADD COLUMN IF NOT EXISTS slot VARCHAR(8) NOT NULL DEFAULT '';
+    -- 交易费用：不扣的话「总资产涨幅」会系统性高于真实可实现收益（双边+最低5元，
+    -- 小额高频下偏差被放大）。2026-09-28 加，历史行 fee_total=0。
+    ALTER TABLE sa_paper_trades ADD COLUMN IF NOT EXISTS fee_total NUMERIC(12,4) NOT NULL DEFAULT 0;
+    ALTER TABLE sa_paper_trades ADD COLUMN IF NOT EXISTS fee_detail JSONB NOT NULL DEFAULT '{}'::jsonb;
+    -- 注意：建表里的 UNIQUE(...) 生成的是**约束**不是裸索引，必须用 DROP CONSTRAINT，
+    -- 用 DROP INDEX 会报 DependentObjectsStillExist（PG 里约束底层就是那个索引）。
+    ALTER TABLE sa_paper_trades
+        DROP CONSTRAINT IF EXISTS sa_paper_trades_trade_date_code_side_key;
+    DROP INDEX IF EXISTS sa_paper_trades_trade_date_code_side_key;
+    CREATE UNIQUE INDEX IF NOT EXISTS sa_paper_trades_trade_date_slot_code_side_key
+        ON sa_paper_trades (trade_date, slot, code, side);
+    CREATE INDEX IF NOT EXISTS idx_sa_paper_trades_slot
+        ON sa_paper_trades (trade_date, slot);
     -- 板块轮动快照（建表 DDL 以 sector.py 的 SNAPSHOT_TABLE_DDL 为准，那里也幂等）
     """
     last_exc: Exception | None = None
@@ -710,25 +775,29 @@ def _em_kline_fields(symbol: str, days: int, fields: str) -> list[str]:
 
 def fetch_kline_volumes(symbol: str, days: int = VOL_MA_DAYS + 2) -> list[float]:
     """取某证券近 N 个交易日成交量列表（升序，最后一个元素=最近交易日）。
+    symbol 用腾讯符号（sh600519 / hkHSI / hk00700 / usAAPL.OQ）。主源腾讯日K；
+    腾讯 web.ifzq 域名被 WAF 拦（501，2026-09-16 起频发）时依次换镜像、再兜底
+    东财 push2his（成交量单位与腾讯一致，比值口径不受影响）。都失败返回 []。
 
-    symbol 用腾讯符号（sh600519 / hkHSI / hk00700）。主源腾讯日K；腾讯
-    web.ifzq 域名被 WAF 拦（501，2026-09-16 起频发）时自动兜底东财 push2his
-    （成交量单位与腾讯一致，比值口径不受影响）。都失败返回 []。
+    ⚠️ 2026-09-26 实测：`web.ifzq.gtimg.cn` 是 501，但**去掉 web. 前缀**的
+    `ifzq.gtimg.cn` 和 `proxy.finance.qq.com/ifzqgtimg` 都正常（A股/港股/美股全通）。
+    原来的域名在东财整域不可达时会让本函数完全失效——量能列整片显示「—」。
     """
-    try:
-        resp = requests.get(
-            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
-            params={"param": f"{symbol},day,,,{days},qfq"},
-            headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        data = resp.json().get("data", {}).get(symbol, {})
-        bars = data.get("qfqday") or data.get("day") or []
-        vols = [_to_float(bar[5]) for bar in bars if len(bar) > 5]
-        out = [v for v in vols if v]
-        if out:
-            return out
-    except Exception:
-        pass
+    for host in ("https://ifzq.gtimg.cn/appstock/app/fqkline/get",
+                 "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get",
+                 "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"):
+        try:
+            resp = requests.get(host, params={"param": f"{symbol},day,,,{days},qfq"},
+                                headers=HEADERS, timeout=15)
+            resp.raise_for_status()
+            data = resp.json().get("data", {}).get(symbol, {})
+            bars = data.get("qfqday") or data.get("day") or []
+            out = [_to_float(bar[5]) for bar in bars if len(bar) > 5]
+            out = [v for v in out if v]
+            if out:
+                return out
+        except Exception:
+            continue
     ks = _em_kline_fields(symbol, days, "f51,f56")
     return [v for v in (_to_float(k.split(",")[1]) for k in ks if len(k.split(",")) > 1) if v]
 
@@ -2551,12 +2620,19 @@ def _load_schedule_conf() -> dict:
     for group, defaults in DEFAULT_SCHEDULE.items():
         merged[group] = {**defaults, **(section.get(group) or {})}
     intervals = {}
-    for name in INTERVAL_SECTIONS:
+    for name in DEFAULT_INTERVALS:
         conf = _conf_section(name)
         defaults = DEFAULT_INTERVALS[name]
-        intervals[name] = {"enabled": bool(conf.get("enabled", defaults["enabled"])),
-                           "interval_minutes": int(
-                               conf.get("interval_minutes", defaults["interval_minutes"]) or 0)}
+        ikey = _interval_key(name)
+        intervals[name] = {
+            # news 没有真身 enabled（0 分钟即关闭），用周期反推一个给 UI 显示
+            "enabled": (int(conf.get(ikey, defaults["interval_minutes"]) or 0) > 0
+                        if name in INTERVAL_NO_ENABLED
+                        else bool(conf.get("enabled", defaults["enabled"]))),
+            "has_enabled": name not in INTERVAL_NO_ENABLED,
+            "key": ikey,
+            "interval_minutes": int(conf.get(ikey, defaults["interval_minutes"]) or 0),
+        }
     return {"schedule": merged, "intervals": intervals}
 
 
@@ -2580,17 +2656,54 @@ def _render_schedule_block(schedule: dict) -> str:
 
 
 def _render_crypto_block(crypto: dict) -> str:
-    def q(v) -> str:
-        return "'" + str(v).replace("'", "''") + "'"
     c = {**crypto_watch.DEFAULT_CRYPTO_CONF, **(crypto or {})}
     return "\n".join([
         "# 币圈 24h 趋势参考（gate.io 股票永续；欧易 OKX 本机直连不通，此为平替源）",
         "# interval_minutes: 抓价周期，0=关闭；alert_threshold_pct: |24h涨跌| 阈值，推微信",
+        "# link_*: 「币↔股」关联统计（日涨跌相关/beta/比价偏离）",
+        "# link_alert_dev_pct: 比价偏离超此值(%)推微信，0=关闭；其余 link_* 见 README",
         "crypto:",
         f"  enabled: {str(bool(c['enabled'])).lower()}",
         f"  interval_minutes: {int(c['interval_minutes'])}",
         f"  alert_threshold_pct: {c['alert_threshold_pct']}",
-        f"  alert_cooldown_hours: {c['alert_cooldown_hours']}",
+        f"  alert_cooldown_hours: {int(c['alert_cooldown_hours'])}",
+        f"  link_enabled: {str(bool(c['link_enabled'])).lower()}",
+        f"  link_refresh_hours: {int(c['link_refresh_hours'])}",
+        f"  link_lookback_days: {int(c['link_lookback_days'])}",
+        f"  link_min_overlap: {int(c['link_min_overlap'])}",
+        f"  link_alert_dev_pct: {c['link_alert_dev_pct']}",
+        f"  link_alert_cooldown_hours: {int(c['link_alert_cooldown_hours'])}",
+    ])
+
+
+def _render_mp_block(mp: dict) -> str:
+    c = {**wechat_mp.DEFAULT_MP_CONF, **(mp or {})}
+    return "\n".join([
+        "# 微信公众号文章监控：拉上游服务的 RSS 源（推荐 WeRSS，见 README）",
+        "# interval_minutes: 拉取周期，0=关闭；notify_new: 有新文章推微信",
+        "mp:",
+        f"  enabled: {str(bool(c['enabled'])).lower()}",
+        f"  interval_minutes: {int(c['interval_minutes'])}",
+        f"  notify_new: {str(bool(c['notify_new'])).lower()}",
+        f"  max_items: {int(c['max_items'])}",
+        f"  keep_days: {int(c['keep_days'])}",
+    ])
+
+
+def _render_x_block(x: dict) -> str:
+    c = {**x_monitor.DEFAULT_X_CONF, **(x or {})}
+    return "\n".join([
+        "# X(Twitter) 指定用户发言监控（twscrape，需 pip install \"twscrape[curl]\"）",
+        "# interval_minutes: 抓取周期，0=关闭；notify_new: 有新推文推微信",
+        "# include_retweets: 是否收录转发（默认关，噪音大）",
+        "x:",
+        f"  enabled: {str(bool(c['enabled'])).lower()}",
+        f"  interval_minutes: {int(c['interval_minutes'])}",
+        f"  notify_new: {str(bool(c['notify_new'])).lower()}",
+        f"  max_tweets: {int(c['max_tweets'])}",
+        f"  keep_days: {int(c['keep_days'])}",
+        f"  include_retweets: {str(bool(c['include_retweets'])).lower()}",
+        f"  wait_timeout: {int(c['wait_timeout'])}",
     ])
 
 
@@ -2598,13 +2711,36 @@ class ScheduleIn(BaseModel):
     schedule: dict | None = None
     intervals: dict | None = None
     crypto: dict | None = None
+    mp: dict | None = None
+    x: dict | None = None
+
+
+# crypto 段里需要按整数校验的键：(键名, 下界, 上界)。上界 1440 = 24 小时上限。
+CRYPTO_INT_FIELDS = (
+    ("interval_minutes", 0, 1440),
+    ("alert_cooldown_hours", 1, 720),
+    ("link_refresh_hours", 0, 720),
+    ("link_lookback_days", 10, 500),
+    ("link_min_overlap", 3, 200),
+    ("link_alert_cooldown_hours", 1, 720),
+)
+# mp / x 段：只有这几个键，其余一律 400（防止前端拼错字段名静默写坏 config）
+MP_KEYS = tuple(wechat_mp.DEFAULT_MP_CONF)
+X_KEYS = tuple(x_monitor.DEFAULT_X_CONF)
+MP_INT_FIELDS = (("interval_minutes", 0, 1440), ("max_items", 1, 100),
+                 ("keep_days", 1, 3650), ("timeout", 3, 300))
+X_INT_FIELDS = (("interval_minutes", 0, 1440), ("max_tweets", 1, 200),
+                ("keep_days", 1, 3650), ("wait_timeout", 1, 300),
+                ("max_text", 100, 20000))
 
 
 @app.get("/api/schedule")
 def schedule_get():
-    """调度页初始数据：schedule 段（各任务几点做）+ 各模块抓取周期 + 币圈监控。"""
+    """调度页初始数据：schedule 段（各任务几点做）+ 各模块抓取周期 + 币圈/公众号/X 监控。"""
     data = _load_schedule_conf()
     data["crypto"] = crypto_watch.load_crypto_conf()
+    data["mp"] = wechat_mp.load_mp_conf()
+    data["x"] = x_monitor.load_x_conf()
     return data
 
 
@@ -2632,11 +2768,17 @@ def schedule_update(body: ScheduleIn):
                     merged[group][key] = str(val).strip()
         schedule = merged
     for name, values in (body.intervals or {}).items():
-        if name not in INTERVAL_SECTIONS or not isinstance(values, dict):
+        if name not in DEFAULT_INTERVALS or not isinstance(values, dict):
             raise HTTPException(400, f"未知的抓取模块：{name}")
+        ikey = _interval_key(name)
         for key, val in values.items():
             if key == "enabled":
-                ops.append((name, "enabled", bool(val)))
+                # news 的真身没有 enabled：勾上就保证周期 ≥1，取消就置 0
+                if name in INTERVAL_NO_ENABLED:
+                    cur = int((_conf_section(name).get(ikey) or 0))
+                    ops.append((name, ikey, max(cur, 1) if val else 0))
+                else:
+                    ops.append((name, "enabled", bool(val)))
             elif key == "interval_minutes":
                 try:
                     minutes = int(val)
@@ -2644,7 +2786,7 @@ def schedule_update(body: ScheduleIn):
                     raise HTTPException(400, f"{name}.interval_minutes 必须是整数")
                 if not 0 <= minutes <= 1440:
                     raise HTTPException(400, f"{name}.interval_minutes 需在 0~1440 之间")
-                ops.append((name, "interval_minutes", minutes))
+                ops.append((name, ikey, minutes))
             else:
                 raise HTTPException(400, f"{name} 不支持字段 {key}")
     crypto = body.crypto
@@ -2652,16 +2794,51 @@ def schedule_update(body: ScheduleIn):
         for key in crypto:
             if key not in crypto_watch.DEFAULT_CRYPTO_CONF:
                 raise HTTPException(400, f"crypto 不支持字段 {key}")
-        if "interval_minutes" in crypto:
+        crypto = {**crypto_watch.DEFAULT_CRYPTO_CONF,
+                  **{k: v for k, v in crypto.items() if v is not None}}
+        # 逐个规范化整数键：不校验的话，一个 "abc" 会原样写进 config.yaml，
+        # 之后每一轮守护线程 int() 转换都炸，且该模块静默停摆
+        for key, lo, hi in CRYPTO_INT_FIELDS:
+            if key not in crypto:
+                continue
             try:
-                minutes = int(crypto["interval_minutes"])
+                val = int(crypto[key])
             except (TypeError, ValueError):
-                raise HTTPException(400, "crypto.interval_minutes 必须是整数")
-            if not 0 <= minutes <= 1440:
-                raise HTTPException(400, "crypto.interval_minutes 需在 0~1440 之间")
-            crypto = {**crypto_watch.DEFAULT_CRYPTO_CONF,
-                      **{k: v for k, v in crypto.items() if v is not None}}
-            crypto["interval_minutes"] = minutes
+                raise HTTPException(400, f"crypto.{key} 必须是整数")
+            if not lo <= val <= hi:
+                raise HTTPException(400, f"crypto.{key} 需在 {lo}~{hi} 之间")
+            crypto[key] = val
+        for key in ("enabled", "link_enabled"):
+            if key in crypto:
+                crypto[key] = bool(crypto[key])
+        for key in ("alert_threshold_pct", "link_alert_dev_pct"):
+            if key in crypto:
+                crypto[key] = float(crypto[key])
+
+    def _norm_extra(body_obj, defaults, int_fields, section):
+        """mp / x 两段结构一样：白名单校验 + 整数规范化。返回 None 表示没传。"""
+        if body_obj is None:
+            return None
+        for key in body_obj:
+            if key not in defaults:
+                raise HTTPException(400, f"{section} 不支持字段 {key}")
+        out = {**defaults, **{k: v for k, v in body_obj.items() if v is not None}}
+        for key, lo, hi in int_fields:
+            if key in body_obj:
+                try:
+                    val = int(out[key])
+                except (TypeError, ValueError):
+                    raise HTTPException(400, f"{section}.{key} 必须是整数")
+                if not lo <= val <= hi:
+                    raise HTTPException(400, f"{section}.{key} 需在 {lo}~{hi} 之间")
+                out[key] = val
+        for key in ("enabled", "notify_new", "include_retweets"):
+            if key in body_obj:
+                out[key] = bool(out[key])
+        return out
+
+    mp = _norm_extra(body.mp, wechat_mp.DEFAULT_MP_CONF, MP_INT_FIELDS, "mp")
+    xconf = _norm_extra(body.x, x_monitor.DEFAULT_X_CONF, X_INT_FIELDS, "x")
     with conf_util.WRITE_LOCK:
         if schedule is not None:
             conf_util.replace_or_append_section(
@@ -2669,6 +2846,10 @@ def schedule_update(body: ScheduleIn):
         if crypto is not None:
             conf_util.replace_or_append_section(
                 CONFIG_FILE, "crypto", _render_crypto_block(crypto))
+        if mp is not None:
+            conf_util.replace_or_append_section(CONFIG_FILE, "mp", _render_mp_block(mp))
+        if xconf is not None:
+            conf_util.replace_or_append_section(CONFIG_FILE, "x", _render_x_block(xconf))
         for section_key, key, value in ops:
             conf_util.set_section_key(CONFIG_FILE, section_key, key, value)
     return schedule_get()
@@ -2773,7 +2954,7 @@ def _paper_event_lines(code: str, days: int = 14) -> list[str]:
     return lines
 
 
-_paper_state = {"running": False, "settling": False,
+_paper_state = {"running": False, "settling": False, "current_slot": None,
                 "last_decision": None, "last_settle": None}
 
 
@@ -2839,23 +3020,27 @@ class PaperResetIn(BaseModel):
 
 
 @app.post("/api/paper/run")
-def paper_run():
-    """手动触发一轮决策（后台线程执行，立即返回）。同日幂等：已决策过的股自动跳过。"""
+def paper_run(force_slot: bool = False):
+    """手动触发一轮决策（后台线程执行，立即返回）。
+
+    收市后拒绝：真实市场那时接不到单，手动触发也不该绕过时段闸门
+    （force_slot 只影响 slot 命名，不放宽交易时段）。
+    """
     if _paper_state["running"]:
         return {"ok": True, "status": "已在决策中，请稍后"}
+    conf = _conf_section("paper")
+    now = datetime.now()
+    st = paper_trading.market_session_state("", now)
+    lh, lm = _hhmm(conf.get("latest_trade_time"), 15, 5)
+    if not (st["open"] and now.hour * 60 + now.minute <= lh * 60 + lm):
+        return {"ok": False, "status": f"已收市（{st['reason']}，现在 {now:%H:%M}），"
+                                       f"不成交。需要复盘请用「立即结算复盘」。",
+                "trading": st}
+    slot = now.strftime("%H:%M") + ("-m" if force_slot else "")
     _paper_state["running"] = True
-
-    def _run():
-        try:
-            _paper_state["last_decision"] = paper_trading.run_decisions(_paper_deps())
-        except Exception as exc:
-            traceback.print_exc()
-            _paper_state["last_decision"] = {"error": str(exc)}
-        finally:
-            _paper_state["running"] = False
-
-    threading.Thread(target=_run, daemon=True).start()
-    return {"ok": True, "status": "决策已启动"}
+    threading.Thread(target=_paper_run_cycle, args=(conf, slot),
+                     kwargs={"kind": "manual", "trigger": "api"}, daemon=True).start()
+    return {"ok": True, "status": "决策已启动", "slot": slot}
 
 
 @app.post("/api/paper/settle")
@@ -2878,6 +3063,50 @@ def paper_settle():
     return {"ok": True, "status": "结算复盘已启动"}
 
 
+@app.get("/api/paper/cycles")
+def paper_cycles(trade_date: str = "", limit: int = 40):
+    """盘中判断轮次台账（哪天哪些 slot 跑过、判了多少、成交多少、耗时多少）。
+
+    参数名刻意不叫 date：那会遮蔽 datetime.date，导致下面 isinstance 报
+    TypeError（arg 2 must be a type）。明细聚合也必须在 with 块**内**跑 ——
+    出块连接已关，再 execute 就是 500。
+    """
+    n = max(1, min(limit, 200))
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        if trade_date:
+            cur.execute("SELECT * FROM sa_paper_cycles WHERE trade_date = %s "
+                        "ORDER BY slot LIMIT %s", (trade_date, n))
+        else:
+            cur.execute("SELECT * FROM sa_paper_cycles "
+                        "ORDER BY trade_date DESC, slot LIMIT %s", (n,))
+        rows = []
+        for r in cur.fetchall():
+            d = dict(r)
+            for k, v in list(d.items()):
+                if isinstance(v, _DT_TYPES):
+                    d[k] = v.isoformat()
+            # 该轮实际写出的决策明细，便于网页展开看
+            cur.execute("""SELECT side, status, count(*) AS n FROM sa_paper_trades
+                           WHERE trade_date = %s AND slot = %s
+                           GROUP BY side, status ORDER BY side, status""",
+                        (r["trade_date"], r["slot"]))
+            d["breakdown"] = [{"side": x["side"], "status": x["status"], "n": x["n"]}
+                              for x in cur.fetchall()]
+            rows.append(d)
+    return {"items": rows}
+
+
+@app.get("/api/paper/reconcile")
+def paper_reconcile(fix: bool = False):
+    """用成交流水重算现金并与账面比对。fix=true 才改写账面（不可逆，谨慎）。
+
+    出现 drift > 0 说明某笔现金增减没落地过（历史上是守护线程重复启动导致
+    的并发下单）。这类偏差不会自己报警，只会表现为「总资产涨了但对不上持仓」。
+    """
+    return paper_trading.reconcile_account(_paper_deps(), fix=fix)
+
+
 @app.post("/api/paper/reset")
 def paper_reset(body: PaperResetIn):
     """重置模拟账户（清空交易/经验/快照，回填初始资金）。须 confirm=true。"""
@@ -2888,39 +3117,238 @@ def paper_reset(body: PaperResetIn):
 
 @app.get("/api/paper/status")
 def paper_status():
+    """顺带把进程内线程清单回出来：用来确认守护线程没有起两份。
+
+    历史上因为 app 被 `__main__` 和 `app` 两个模块对象各执行了一遍模块体，
+    十几个守护线程全都起了两份（实测 _paper_loop 同时有 Thread-11 和 Thread-28，
+    各自持有独立的 last_slot，于是同一个 slot 被判了两轮）。
+    """
+    conf = _conf_section("paper")
+    now = datetime.now()
+    iv = max(1, int(conf.get("interval_minutes", 30) or 30))
+    sm_h, sm_m = _hhmm(conf.get("start_time"), 9, 35)
+    em_h, em_m = _hhmm(conf.get("end_time"), 14, 40)
+    cur_min = now.hour * 60 + now.minute
+    in_win = sm_h * 60 + sm_m <= cur_min <= em_h * 60 + em_m
+    # 下一轮还有几分钟（窗口外返回 None）
+    nxt = None
+    if in_win:
+        nxt = iv - (cur_min % iv)
+    elif cur_min < sm_h * 60 + sm_m:
+        nxt = sm_h * 60 + sm_m - cur_min
     return {"running": _paper_state["running"], "settling": _paper_state["settling"],
+            "current_slot": _paper_state["current_slot"],
+            "interval_minutes": iv,
+            "in_window": in_win,
+            "trading_day": now.weekday() < 5,
+            "next_in_minutes": nxt,
+            "trading": paper_trading.market_session_state("", now),
+            "latest_trade_time": _hhmm(conf.get("latest_trade_time"), 15, 5),
+            "daemon_threads": sorted(
+                t.name for t in threading.enumerate() if t.name.startswith("sa_")),
             "last_decision": _paper_state["last_decision"],
             "last_settle": _paper_state["last_settle"]}
 
 
 def _paper_loop():
-    """模拟交易守护线程：交易日两相位（last_day 幂等守卫，仿 _alerts_loop）。
-    decide_time（默认 15:35）后 run_decisions（收盘价成交）；settle_time（默认 16:10）
-    后 settle_and_reflect（错开相位给东财日K落库留时间）。时间点网页可改。
+    """模拟交易守护线程：交易日按固定节奏反复判断，而不是盘后只判一次。
+
+    一个交易日分三类时刻：
+      1. 盘中轮次  —— [start_time, end_time] 内每 interval_minutes 跑一轮。
+                     每轮先做**免 LLM 的止损扫描**（该跌的立刻走），再按需让 LLM
+                     重新判断。轮次标签 slot='HH:MM'，同一 slot 内同股只判一次。
+      2. 兜底补跑  —— 过了 decide_time 若当天一轮没跑过（服务中途才起来），
+                     补一轮，避免整天被跳过。
+      3. 收盘结算  —— settle_time 后 settle_and_reflect（错开相位给日K落库留时间）。
+
+    幂等有两层：进程内 last_slot 防重复触发，DB 里 UNIQUE(trade_date,slot,code,side)
+    兜底，所以手动触发和线程并发都不会写出重复行。
     config paper.enabled=false 时整轮跳过（改配置即生效，
     但本线程本身是进程启动时创建的，新增需重启一次）。"""
-    last_decision_day = last_settle_day = None
+    last_slot = None          # 已跑过的 'YYYY-MM-DD HH:MM'
+    last_decision_day = None  # 当天是否至少跑过一轮（兜底补跑用）
+    last_settle_day = None
     while True:
         try:
             now = datetime.now()
             conf = _conf_section("paper")
-            dh, dm = _sched_time("paper", "decide_time")
-            sh, sm = _sched_time("paper", "settle_time")
-            if (conf.get("enabled") and now.weekday() < 5):
-                if (now.hour, now.minute) >= (dh, dm) and last_decision_day != now.date():
-                    result = paper_trading.run_decisions(_paper_deps(conf))
+            if conf.get("enabled") and now.weekday() < 5:
+                dh, dm = _sched_time("paper", "decide_time")
+                sh, sm = _sched_time("paper", "settle_time")
+                iv = max(1, int(conf.get("interval_minutes", 30) or 30))
+                sm_h, sm_m = _hhmm(conf.get("start_time"), 9, 35)
+                em_h, em_m = _hhmm(conf.get("end_time"), 14, 40)
+                cur_min = now.hour * 60 + now.minute
+                slot = now.strftime("%H:%M")
+                # 总闸门：A股/港股都没开市就不跑任何一轮。
+                # 原来兜底补跑只判 `>= decide_time` 没有上界，于是 17:24/17:48
+                # 还在成交（2026-09-28 实测），而那会儿行情接口返回的是当日
+                # 收盘价 —— 真实盘接不到这种单。latest_trade_time 是最后
+                # 允许成交的时刻（默认 15:05，A股 15:00 收市，留 5 分钟余量）。
+                mkt = paper_trading.market_session_state("", now)
+                last_h, last_m = _hhmm(conf.get("latest_trade_time"), 15, 5)
+                within = cur_min <= last_h * 60 + last_m
+                can_trade = within and mkt["open"]
+
+                # 1) 盘中轮次：到点就跑（>= 而非 ==，迟一点起也能补上）
+                due = (sm_h * 60 + sm_m) <= cur_min <= (em_h * 60 + em_m)
+                on_mark = cur_min % iv == 0
+                if can_trade and due and on_mark and last_slot != slot:
+                    last_slot = slot
                     last_decision_day = now.date()
-                    n = len(result.get("decided", []))
-                    print(f"[paper] decisions for {n} stocks", flush=True)
+                    _paper_run_cycle(conf, slot, kind="intraday", trigger="interval")
+
+                # 2) 兜底补跑：过了 decide_time 且当天还没跑过任何一轮。
+                #    同样受 can_trade 约束 —— 收市后不再成交（结算不受影响）。
+                elif (can_trade and (now.hour, now.minute) >= (dh, dm)
+                      and last_decision_day != now.date()
+                      and last_slot != slot):
+                    last_slot = slot
+                    last_decision_day = now.date()
+                    _paper_run_cycle(conf, slot, kind="catchup", trigger="decide_time")
+
+                # 3) 收盘结算
                 if (now.hour, now.minute) >= (sh, sm) and last_settle_day != now.date():
-                    result = paper_trading.settle_and_reflect(_paper_deps(conf))
-                    last_settle_day = now.date()
-                    n = len(result.get("settled", []))
-                    print(f"[paper] settled {n} trades", flush=True)
-            time.sleep(300)
+                    _paper_state["settling"] = True
+                    try:
+                        result = paper_trading.settle_and_reflect(_paper_deps(conf))
+                        _paper_state["last_settle"] = result
+                        last_settle_day = now.date()
+                        print(f"[paper] settled {len(result.get('settled', []))} trades",
+                              flush=True)
+                    except Exception as exc:
+                        _paper_state["last_settle"] = {"error": str(exc)}
+                        print(f"[paper] settle error: {exc}", flush=True)
+                    finally:
+                        _paper_state["settling"] = False
+            time.sleep(30)
         except Exception as exc:
             print(f"[paper] loop error: {exc}", flush=True)
-            time.sleep(300)
+            time.sleep(30)
+
+
+def _hhmm(v, default_h: int, default_m: int) -> tuple[int, int]:
+    """解析 'HH:MM'，坏了就用默认值（不抛异常，免得整个轮询线程挂掉）。"""
+    try:
+        h, m = str(v).split(":")
+        return max(0, min(23, int(h))), max(0, min(59, int(m)))
+    except Exception:
+        return default_h, default_m
+
+
+_paper_cycle_lock = threading.Lock()   # 进程内互斥（快速失败，不等）
+# 跨进程互斥：PG 咨询锁。同一把钥匙（session 级）在同一时刻只允许一个持有者，
+# 老老实实建一条连接持到整轮结束。**不能只靠进程内锁** —— 调试时起第二个实例、
+# 或者上一个实例没退干净，都会让两轮同时下单，而 UNIQUE 只挡得住「同 slot 同方向」，
+# 挡不住「同一天不同 slot 各买一笔」。
+_PAPER_LOCK_KEY = 918273645
+
+
+class _PaperAdvisoryLock:
+    """PG 咨询锁 contextmanager。拿不到就让调用方跳过本轮。"""
+
+    def __init__(self, key: int = _PAPER_LOCK_KEY):
+        self.key = key
+        self.conn = None
+        self.got = False
+
+    def __enter__(self):
+        try:
+            self.conn = get_conn()
+            cur = self.conn.cursor()
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (self.key,))
+            self.got = bool(cur.fetchone()[0])
+            self.conn.commit()
+        except Exception as exc:
+            print(f"[paper] 取咨询锁失败: {exc}", flush=True)
+            self.got = False
+        return self.got
+
+    def __exit__(self, *a):
+        if self.conn is not None:
+            try:
+                cur = self.conn.cursor()
+                cur.execute("SELECT pg_advisory_unlock(%s)", (self.key,))
+                self.conn.commit()
+            except Exception:
+                pass
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+        return False
+
+
+def _paper_run_cycle(conf: dict, slot: str, kind: str = "intraday",
+                     trigger: str = "", only: set | None = None) -> dict:
+    """跑一轮盘中判断：先免 LLM 止损，再（按需）LLM 重新决策，最后记台账。
+
+    两道互斥：进程内 Lock + PG 咨询锁。任一拿不到就**跳过本轮**而不是并发跑 ——
+    并发会让同一天同一只票下两笔单，正是 09-24 踩过的那个坑。
+    35 只票一轮要十几分钟，很容易撞上下一个 30 分钟刻度，所以这个跳过是常态。
+    """
+    t0 = time.time()
+    me = f"pid={os.getpid()} thread={threading.current_thread().name}"
+    if not _paper_cycle_lock.acquire(blocking=False):
+        print(f"[paper] {slot} {me} 上一轮还在跑（进程内锁），跳过本轮", flush=True)
+        return {"slot": slot, "kind": kind, "skipped_reason": "上一轮进行中"}
+    adv = _PaperAdvisoryLock()
+    if not adv.__enter__():
+        _paper_cycle_lock.release()
+        print(f"[paper] {slot} {me} 别的进程正在跑（咨询锁），跳过本轮", flush=True)
+        return {"slot": slot, "kind": kind, "skipped_reason": "他进程在跑"}
+    _paper_state["running"] = True
+    _paper_state["current_slot"] = slot
+    acted = holds = skipped = 0
+    err = ""
+    print(f"[paper] {slot} {me} {kind}/{trigger} 开跑", flush=True)
+    try:
+        deps = _paper_deps(conf)
+        # 1) 止损：不需要 LLM，先做，保证该跑的止损不会被 LLM 延迟/解析失败拖掉
+        sl = paper_trading.check_stop_loss(deps, slot)
+        acted += len(sl.get("sold", []))
+        # 2) 重新决策
+        targets = only
+        if targets is None and conf.get("judge_holdings_only"):
+            with deps["get_conn"]() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT code FROM sa_watchlist")
+                wset = {r[0] for r in cur.fetchall()}
+            from paper_trading import _derive_paper_positions
+            with deps["get_conn"]() as conn:
+                targets = set(_derive_paper_positions(conn.cursor()).keys()) & wset
+        res = paper_trading.run_decisions(deps, slot=slot, only=targets)
+        decided = res.get("decided", [])
+        for d in decided:
+            if d.get("executed"):
+                acted += 1
+            elif d.get("action") == "hold":
+                holds += 1
+            else:
+                skipped += 1
+        planned = len(decided) + len(sl.get("sold", []))
+        _paper_state["last_decision"] = res
+        print(f"[paper] {slot} {me} {kind}: 判断 {planned} 成交 {acted} 观望 {holds} "
+              f"未成交 {skipped} 用时 {time.time()-t0:.0f}s", flush=True)
+    except Exception as exc:
+        err = str(exc)
+        traceback.print_exc()
+        print(f"[paper] cycle {slot} error: {exc}", flush=True)
+    finally:
+        elapsed = int((time.time() - t0) * 1000)
+        try:
+            paper_trading.record_cycle(
+                _paper_deps(conf), datetime.now().strftime("%Y-%m-%d"), slot,
+                kind=kind, trigger=trigger, planned=acted + holds + skipped,
+                acted=acted, holds=holds, skipped=skipped, elapsed_ms=elapsed, error=err)
+        except Exception:
+            pass
+        _paper_state["running"] = False
+        _paper_state["current_slot"] = None
+        adv.__exit__(None, None, None)     # 先放 PG 锁
+        _paper_cycle_lock.release()        # 再放进程内锁
+    return {"slot": slot, "kind": kind, "acted": acted, "holds": holds,
+            "skipped": skipped, "elapsed_ms": elapsed, "error": err}
 
 
 # ---------------- 新闻（多渠道免费抓取，见 news_fetcher.py） ----------------
@@ -3090,6 +3518,136 @@ def update_config(body: ConfIn):
                 conf["channels"][name]["enabled"] = bool(enabled)
     _write_conf(conf)
     return _read_conf()
+
+
+# ---------------- 完整配置（config_schema.py：所有 config.yaml 项都能在网页改） ----------------
+#
+# 这是**通用入口**：模式里声明的每个键都能在这里读写，不必为每个模块手写输入框。
+# 与并存的专用入口（/api/schedule、/api/llm/config、/api/notify/config…）写的是同一个
+# config.yaml，都走 conf_util.WRITE_LOCK。
+#
+# 三条安全约定：
+#  1. 写回前**逐项 coerce + 范围校验**，任何一项不合法就整批拒绝（400），
+#     避免「写了一半、剩下的还是旧的」这种半成品配置。
+#  2. 只写**真的变了**的键（set_nested_key 是行级手术），其余键、注释、
+#     兄弟段一律原样保留。
+#  3. secret 项（api_key / auth_code / mp.auth）前端只回掩码；回传掩码或空串
+#     一律视为「不修改」，绝不用掩码覆盖真值。
+
+def _load_config_yaml() -> dict:
+    try:
+        import yaml
+        return yaml.safe_load(CONFIG_FILE.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+
+def _unknown_keys(conf: dict) -> list[str]:
+    """config.yaml 里有、但模式未覆盖的键（返回 `段.点号键` 形式）。
+
+    刻意**不删除**它们（可能是我不知道的手工配置），但要在页面上如实报出来——
+    「所有配置项都能改」这句话必须诚实，否则用户改完却发现某个键管不了。
+    """
+    known = config_schema.field_index()          # {(段, 点号键): 字段}
+    out: list[str] = []
+
+    def walk(node: dict, sec: str, prefix: str) -> None:
+        for k, v in node.items():
+            dotted = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, dict):
+                # 该 dict 只要有任一字段落在它下面，就认为「已覆盖」，继续往下走
+                if not any(s == sec and (d == dotted or d.startswith(dotted + "."))
+                           for s, d in known):
+                    out.append(f"{sec}.{dotted}")
+                else:
+                    walk(v, sec, dotted)
+            elif (sec, dotted) not in known:
+                out.append(f"{sec}.{dotted}")
+
+    for sec, val in conf.items():
+        if sec not in config_schema.SCHEMAS:
+            continue                       # 完全未知的段：不逐键报，只报段名
+        if isinstance(val, dict):
+            walk(val, sec, "")
+        elif (sec, "") not in known:
+            out.append(sec)
+    return out
+
+
+@app.get("/api/config/schema")
+def config_schema_get():
+    """配置模式（前端按它动态生成表单）。"""
+    return {"sections": config_schema.schema_json()}
+
+
+@app.get("/api/config/all")
+def config_all_get():
+    """全部配置项的当前值（模式默认值 → 各模块 DEFAULT_* → config.yaml 依次覆盖）。
+
+    每个字段回：{value, is_default, has_value(secret 项)}。
+    """
+    conf = _load_config_yaml()
+    dflt = config_schema.defaults()
+    sections = []
+    for meta in config_schema.schema_json():
+        rows = []
+        for f in meta["fields"]:
+            sec = meta["section"]
+            cur = conf_util.get_nested(conf.get(sec) or {}, f["key"])
+            dft = conf_util.get_nested(dflt.get(sec) or {}, f["key"], f["default"])
+            is_default = (cur is None) or (cur == dft)
+            if f["secret"]:
+                val, extra = ("", {"has_value": bool(cur)}) if cur else ("", {"has_value": False})
+            else:
+                val, extra = (dft if cur is None else cur), {}
+            rows.append({**f, "value": val, "is_default": is_default, **extra})
+        sections.append({**meta, "rows": rows})
+    return {"sections": sections, "unknown": _unknown_keys(conf)}
+
+
+class ConfigAllIn(BaseModel):
+    # {段: {点号键: 值}}。允许空 dict（= 什么都不改）
+    values: dict = Field(default_factory=dict)
+
+
+@app.put("/api/config/all")
+def config_all_put(body: ConfigAllIn):
+    """批量写配置。整批校验通过后才落盘；只写变化的键。"""
+    known = config_schema.field_index()
+    ops: list[tuple[str, str, object]] = []
+    skipped: list[str] = []
+    errors: list[str] = []
+    for sec, kv in (body.values or {}).items():
+        if sec not in config_schema.SCHEMAS:
+            errors.append(f"未知的配置段：{sec}")
+            continue
+        if not isinstance(kv, dict):
+            errors.append(f"{sec} 的值必须是对象")
+            continue
+        for key, raw in kv.items():
+            field = known.get((sec, key))
+            if not field:
+                errors.append(f"{sec} 不支持字段 {key}")
+                continue
+            try:
+                val, skip = config_schema.coerce(sec, key, raw, field)
+            except ValueError as exc:
+                errors.append(str(exc))
+                continue
+            if skip:
+                skipped.append(f"{sec}.{key}")
+                continue
+            ops.append((sec, key, val))
+    if errors:
+        # 一项都不写：半成品配置比不改更危险
+        raise HTTPException(400, "；".join(errors[:8]))
+    if not ops:
+        return {"ok": True, "written": [], "skipped": skipped}
+    conf_util.write_many(CONFIG_FILE, key_ops=ops)
+    print(f"[config] 页面改了 {len(ops)} 项: "
+          + ", ".join(f"{s}.{k}" for s, k, _ in ops[:12])
+          + ("…" if len(ops) > 12 else ""), flush=True)
+    return {"ok": True, "written": [f"{s}.{k}" for s, k, _ in ops], "skipped": skipped}
 
 
 # ---------------- 通知（微信走腾讯官方 iLink Bot / 邮件 SMTP，见 notifier.py） ----------------
@@ -3751,6 +4309,9 @@ def _report_deps() -> dict:
         "paper_fn": lambda: paper_trading.account_overview(_paper_deps()),
         "paper_decisions_fn": _report_paper_decisions,
         "crypto_fn": lambda: crypto_watch.crypto_lines(_crypto_deps()),
+        "crypto_link_fn": lambda: crypto_watch.link_lines(_crypto_deps()),
+        "mp_fn": lambda: wechat_mp.digest_lines(_mp_deps(), hours=36),
+        "x_fn": lambda: x_monitor.digest_lines(_x_deps(), hours=24),
         "notify_fn": notifier.notify,
     }
 
@@ -3825,6 +4386,10 @@ class CryptoWatchIn(BaseModel):
     name: str = Field(default="", max_length=64)
 
 
+class CryptoRefreshIn(BaseModel):
+    links: bool = Field(default=False, description="是否顺便重算一遍「币↔股」关联统计")
+
+
 def _crypto_deps() -> dict:
     return {"get_conn": get_conn, "notify_fn": notifier.notify}
 
@@ -3872,12 +4437,157 @@ def crypto_watch_del(contract: str):
 
 
 @app.post("/api/crypto/refresh")
-def crypto_refresh():
-    """立即跑一轮（取价→入库→异动判断），页面「立即刷新」用。"""
+def crypto_refresh(body: CryptoRefreshIn | None = None):
+    """立即跑一轮（取价→入库→异动判断），页面「立即刷新」用。
+
+    body={"links": true} 时额外重算一遍关联统计——set_link 明确不挂在写请求上
+    （要发 2N 个 HTTP，最长 30s），由前端拿到 200 后自己带这个参数补算。
+    """
+    out: dict = {"ok": True, **crypto_watch.run_once(_crypto_deps())}
+    if body is not None and body.links:
+        out["links"] = crypto_watch.refresh_links(_crypto_deps())
+    return out
+
+
+# ---------------- 币圈 ↔ 股票 关联统计（crypto_watch.link_*，gate.io 永续 vs 日收盘） ----------------
+# 回答「这只币和它锚定的那只股票到底是什么关系」：日涨跌相关系数、beta、两侧波动率、
+# 比价偏离。数据层在 crypto_watch.py（link_metrics/align_series 纯函数 + 自建历史表
+# sa_crypto_link_stats），这里只做 API 与页面数据组装。
+
+@app.post("/api/crypto/links/refresh")
+def crypto_links_refresh(contracts: str = ""):
+    """重算关联统计（默认全部配了股票的合约）。串行，2N 个 HTTP 请求。
+
+    ⚠️ 这条路由**必须**注册在下面 `/api/crypto/links/{contract}` 之前：FastAPI 按
+    注册顺序匹配，否则 "refresh" 会被 {contract} 吃掉、当成合约名，然后因为缺 body
+    报 422（2026-09-26 实测踩过）。
+    """
+    want = [c.strip().upper() for c in contracts.split(",") if c.strip()]
     try:
-        return {"ok": True, **crypto_watch.run_once(_crypto_deps())}
+        return {"ok": True, **crypto_watch.refresh_links(_crypto_deps(), want or None)}
     except Exception as exc:
-        raise HTTPException(502, f"gate.io 取价失败：{exc}")
+        traceback.print_exc()
+        raise HTTPException(502, f"关联统计重算失败：{exc}")
+
+
+class CryptoLinkIn(BaseModel):
+    stock_code: str = Field(default="", max_length=16,
+                            description="A股6位/港股4-5位/美股字母；空串=解除关联")
+
+
+def _us_quote(ticker: str) -> dict:
+    """美股实时快照（腾讯 qt.gtimg.cn）。关联标的可能是美股，而 fetch_quotes
+    只认 A股/港股（6位/4-5位数字），所以这里单独取一份，只给页面显示用。"""
+    t = (ticker or "").strip().upper()
+    if not re.fullmatch(r"[A-Z][A-Z.\-]{0,5}", t):
+        return {}
+    try:
+        resp = requests.get(f"https://qt.gtimg.cn/q=us{t.replace('.', '-')}",
+                            headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        text = resp.content.decode("gbk", "ignore")
+    except Exception:
+        return {}
+    m = re.search(r'="([^"]*)"', text)
+    if not m or not m.group(1):
+        return {}
+    f = m.group(1).split("~")
+    if len(f) < 33 or not f[3]:
+        return {}
+    return {"code": t, "name": f[1], "market": "us", "currency": "USD",
+            "price": _to_float(f[3]), "change_pct": _to_float(f[32])}
+
+
+def _linked_stock_quote(code: str) -> dict:
+    """关联股票的实时快照。A股/港股复用 fetch_quotes，美股走 _us_quote。"""
+    if not code:
+        return {}
+    if re.fullmatch(r"\d{4,6}", code):
+        q = fetch_quotes([code]).get(code) or {}
+        return {k: q.get(k) for k in ("code", "name", "market", "currency",
+                                      "price", "change_pct") if q.get(k) is not None}
+    return _us_quote(code)
+
+
+def _links_view(deps) -> dict:
+    """白名单 + 关联统计 + 关联股票实时行情，合成页面表格要的一行行数据。"""
+    watch = {w["contract"]: w for w in crypto_watch.list_watch(deps)}
+    try:
+        stats = {r["contract"]: r for r in crypto_watch.recent_links(deps)}
+    except Exception as exc:
+        print(f"[crypto] links read failed: {exc}", flush=True)
+        stats = {}
+    out = []
+    for contract, w in watch.items():
+        st = stats.get(contract)
+        code = w.get("stock_code") or ""
+        # 关联统计里的 stock_code 可能是刚改的（还没重算），以白名单为准
+        if st and code and st.get("stock_code") != code:
+            st = None
+        if st and not code:
+            st = None
+        out.append({
+            "contract": contract,
+            "stock_code": code,
+            "label": {"a": "A股", "hk": "港股", "us": "美股"}.get(
+                (st or {}).get("market", ""), ""),
+            "quote": _linked_stock_quote(code) if code else {},
+            "stats": st,
+        })
+    return {"items": out, "updated_at": datetime.now().isoformat(timespec="seconds")}
+
+
+@app.get("/api/crypto/links")
+def crypto_links():
+    """每个白名单合约的关联配置 + 最新关联统计（不触发重算，重算走 POST）。"""
+    return _links_view(_crypto_deps())
+
+
+@app.get("/api/crypto/links/{contract}")
+def crypto_link_detail(contract: str):
+    """单个合约的已对齐日K 序列（页面画「合约 vs 股票」双线图）。"""
+    return crypto_watch.link_series(_crypto_deps(), contract)
+
+
+@app.post("/api/crypto/links/{contract}")
+def crypto_link_set(contract: str, body: CryptoLinkIn):
+    """设置/解除关联股票。空 stock_code = 解除。认不出的代码 400。
+
+    注：本路由要排在 `/api/crypto/links/refresh` 之后，否则 refresh 会被当合约名。
+    """
+    try:
+        row = crypto_watch.set_link(_crypto_deps(), contract, body.stock_code)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    # 解除关联时把历史统计删掉，否则页面还会显示一条陈旧的 corr
+    if not row.get("stock_code"):
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM sa_crypto_link_stats WHERE contract = %s",
+                        (row["contract"],))
+    return row
+
+
+def _crypto_link_loop():
+    """关联统计守护线程：与抓价周期解耦，按 crypto.link_refresh_hours（默认 6 小时）
+    到点重算一轮 + 比价偏离告警。轮询 5 分钟，改配置即生效。"""
+    while True:
+        try:
+            conf = crypto_watch.load_crypto_conf()
+            if conf.get("link_enabled", True) and int(conf.get("link_refresh_hours") or 0) > 0:
+                deps = _crypto_deps()
+                if crypto_watch.links_due(deps):
+                    result = crypto_watch.refresh_links(deps)
+                    if result.get("computed"):
+                        print(f"[crypto] link recomputed {result['ok']}/{result['computed']}"
+                              f" contracts", flush=True)
+                    try:
+                        crypto_watch._check_link_alerts(
+                            deps, crypto_watch.recent_links(deps), conf)
+                    except Exception as exc:
+                        print(f"[crypto] link alert failed: {exc}", flush=True)
+        except Exception as exc:
+            print(f"[crypto] link loop error: {exc}", flush=True)
+        time.sleep(300)
 
 
 def _crypto_loop():
@@ -3898,6 +4608,258 @@ def _crypto_loop():
                 time.sleep(300)
         except Exception as exc:
             print(f"[crypto] loop error: {exc}", flush=True)
+            time.sleep(300)
+
+
+# ---------------- 微信公众号文章（wechat_mp.py：拉 RSS 源，见该文件头选型说明） ----------------
+
+def _mp_deps() -> dict:
+    return {"get_conn": get_conn, "notify_fn": notifier.notify}
+
+
+class MpSourceIn(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    kind: str = Field(default="rss", description="werss=WeRSS 服务；rss=完整订阅地址")
+    url: str = Field(default="", description="留空则用 config.yaml 的 mp.base_url")
+    feed_id: str = Field(default="all", max_length=64)
+    note: str = Field(default="", max_length=500)
+    use_fresh: bool | None = Field(
+        default=None, description="null=跟随全局 mp.use_fresh；true/false=本源覆盖")
+    auth: str | None = Field(default=None, max_length=500,
+                             description="本源专用 Authorization 头；留空=用全局 mp.auth")
+
+
+class MpSourcePatchIn(BaseModel):
+    name: str | None = None
+    kind: str | None = None
+    url: str | None = None
+    feed_id: str | None = None
+    enabled: bool | None = None
+    note: str | None = None
+    use_fresh: bool | None = None
+    auth: str | None = None
+
+
+class MpReadIn(BaseModel):
+    ids: list[int] | None = None
+    all: bool = False
+
+
+@app.get("/api/mp/sources")
+def mp_sources():
+    return {"items": wechat_mp.list_sources(_mp_deps())}
+
+
+@app.post("/api/mp/sources")
+def mp_source_add(body: MpSourceIn):
+    try:
+        return wechat_mp.add_source(_mp_deps(), body.name, body.url, body.kind,
+                                    body.feed_id, body.note, body.use_fresh, body.auth)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.patch("/api/mp/sources/{sid}")
+def mp_source_patch(sid: int, body: MpSourcePatchIn):
+    try:
+        return wechat_mp.update_source(_mp_deps(), sid,
+                                       **{k: v for k, v in body.model_dump().items()
+                                          if v is not None})
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.delete("/api/mp/sources/{sid}")
+def mp_source_del(sid: int):
+    try:
+        return wechat_mp.remove_source(_mp_deps(), sid)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/mp/articles")
+def mp_articles(source_id: int = 0, unread_only: bool = False, limit: int = 50):
+    return {"items": wechat_mp.list_articles(_mp_deps(), source_id or None,
+                                              unread_only, limit),
+            "unread": wechat_mp.unread_count(_mp_deps())}
+
+
+@app.post("/api/mp/read")
+def mp_read(body: MpReadIn):
+    return {"updated": wechat_mp.mark_read(_mp_deps(), body.ids, body.all)}
+
+
+@app.post("/api/mp/fetch")
+def mp_fetch():
+    """手动拉一轮。同步跑（每源 1 个请求，25s 超时），页面按钮转圈等结果。"""
+    result = wechat_mp.run_once(_mp_deps())
+    if result.get("error"):
+        raise HTTPException(502, result["error"])
+    return result
+
+
+@app.get("/api/mp/status")
+def mp_status():
+    return wechat_mp.get_status(_mp_deps())
+
+
+@app.get("/api/mp/digest")
+def mp_digest(hours: int = 36):
+    lines = wechat_mp.digest_lines(_mp_deps(), hours)
+    return {"hours": hours, "lines": lines, "markdown": "\n".join(lines)}
+
+
+def _mp_loop():
+    """公众号守护线程：按 mp.interval_minutes（默认 30，0=关闭）拉一轮 + 新文推微信。"""
+    while True:
+        try:
+            conf = wechat_mp.load_mp_conf()
+            interval = int(conf.get("interval_minutes") or 0)
+            if conf.get("enabled", True) and interval > 0:
+                result = wechat_mp.run_once(_mp_deps())
+                if result.get("new"):
+                    print(f"[mp] {result['new']} new articles from "
+                          f"{len(result.get('items') or [])} sources", flush=True)
+                time.sleep(max(interval, 1) * 60)
+            else:
+                time.sleep(300)
+        except Exception as exc:
+            print(f"[mp] loop error: {exc}", flush=True)
+            time.sleep(300)
+
+
+# ---------------- X(Twitter) 指定用户发言（x_monitor.py + twscrape） ----------------
+
+def _x_deps() -> dict:
+    return {"get_conn": get_conn, "notify_fn": notifier.notify}
+
+
+class XAccountIn(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    cookies: str = Field(min_length=10, description="auth_token=…; ct0=…")
+
+
+class XWatchIn(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    note: str = Field(default="", max_length=500)
+    with_replies: bool = False
+    min_likes: int = Field(default=0, ge=0)
+
+
+class XWatchPatchIn(BaseModel):
+    note: str | None = None
+    enabled: bool | None = None
+    with_replies: bool | None = None
+    min_likes: int | None = Field(default=None, ge=0)
+
+
+class XReadIn(BaseModel):
+    ids: list[int] | None = None
+    all: bool = False
+
+
+@app.get("/api/x/status")
+def x_status():
+    return x_monitor.get_status(_x_deps())
+
+
+@app.get("/api/x/accounts")
+def x_accounts():
+    return {"items": x_monitor.list_accounts(_x_deps())}
+
+
+@app.post("/api/x/accounts")
+def x_account_save(body: XAccountIn):
+    try:
+        return x_monitor.save_account(_x_deps(), body.name, body.cookies)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.post("/api/x/accounts/test")
+def x_account_test(body: XAccountIn):
+    return x_monitor.test_account(_x_deps(), body.name, body.cookies)
+
+
+@app.delete("/api/x/accounts/{aid}")
+def x_account_del(aid: int):
+    try:
+        return x_monitor.remove_account(_x_deps(), aid)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/x/watch")
+def x_watch():
+    return {"items": x_monitor.list_watch(_x_deps())}
+
+
+@app.post("/api/x/watch")
+def x_watch_add(body: XWatchIn):
+    try:
+        return x_monitor.add_watch(_x_deps(), body.username, body.note,
+                                   body.with_replies, body.min_likes)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.patch("/api/x/watch/{wid}")
+def x_watch_patch(wid: int, body: XWatchPatchIn):
+    try:
+        return x_monitor.update_watch(_x_deps(), wid,
+                                      **{k: v for k, v in body.model_dump().items()
+                                         if v is not None})
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.delete("/api/x/watch/{wid}")
+def x_watch_del(wid: int):
+    try:
+        return x_monitor.remove_watch(_x_deps(), wid)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/x/tweets")
+def x_tweets(watch_id: int = 0, unread_only: bool = False, limit: int = 50):
+    return {"items": x_monitor.list_tweets(_x_deps(), watch_id or None,
+                                           unread_only, limit),
+            "unread": x_monitor.unread_count(_x_deps())}
+
+
+@app.post("/api/x/read")
+def x_read(body: XReadIn):
+    return {"updated": x_monitor.mark_read(_x_deps(), body.ids, body.all)}
+
+
+@app.post("/api/x/fetch")
+def x_fetch():
+    """手动抓一轮。同步跑（每人一次 GraphQL，账号池内部轮换）。"""
+    result = x_monitor.run_once(_x_deps())
+    if result.get("error"):
+        raise HTTPException(502, result["error"])
+    return result
+
+
+def _x_loop():
+    """X 监控守护线程：按 x.interval_minutes（默认 30，0=关闭）抓一轮 + 新推文推微信。
+    未配账号 / 未装 twscrape 时轮内直接跳过（每轮只读一次本地表，很便宜）。"""
+    while True:
+        try:
+            conf = x_monitor.load_x_conf()
+            interval = int(conf.get("interval_minutes") or 0)
+            if conf.get("enabled", True) and interval > 0:
+                result = x_monitor.run_once(_x_deps())
+                if result.get("new"):
+                    print(f"[x] {result['new']} new tweets", flush=True)
+                elif result.get("error"):
+                    print(f"[x] {result['error']}", flush=True)
+                time.sleep(max(interval, 1) * 60)
+            else:
+                time.sleep(300)
+        except Exception as exc:
+            print(f"[x] loop error: {exc}", flush=True)
             time.sleep(300)
 
 
@@ -3937,53 +4899,126 @@ def _normalize_code(code: str) -> str:
     raise HTTPException(400, "股票代码格式：A股 6 位数字（600519）；港股 4-5 位数字（00700 或 700）")
 
 
+# ---------------------------------------------------------------------------
+# 一次性副作用守卫
+# ---------------------------------------------------------------------------
+# 为什么需要：本文件以 `python app.py` 跑时模块名是 __main__，而
+# bili_monitor / news_fetcher / wb_monitor / notifier / sector 里有
+# `from app import get_conn` 这种**延迟导入**（为避开循环依赖）。第一次触发时
+# Python 会把 app.py 再当作模块 `app` 完整执行一遍 —— 于是 init_db() 跑两次、
+# 下面十几个守护线程也全部起了两份（实测 _paper_loop 同时存在 Thread-11 和
+# Thread-28，各有各的 last_slot，于是同一个 slot 被判了两轮）。
+#
+# 这里用**进程级**判据而不是模块级标志：重复的那个是另一个模块对象，
+# 模块级变量对它来说是全新的，挡不住。threading.enumerate() 是进程全局的，
+# 按线程名去重才有效。
+_BOOTSTRAPPED = "sa_bootstrap_done"
+
+
+def _bootstrap_once() -> bool:
+    """整个进程里只执行一次建表/种子/守护线程。返回是否真的执行了。"""
+    import sys
+    if getattr(sys, _BOOTSTRAPPED, False):
+        return False
+    setattr(sys, _BOOTSTRAPPED, True)
+    return True
+
+
+def _start_daemon(target, name: str, args=()) -> bool:
+    """按名字启动守护线程，**同一进程内每个名字只启动一次**。
+    import sys 放在函数内：模块级已经有不少 import，这里不引入新的模块级依赖。
+
+    为什么不用 `threading.enumerate()` 判活：那个判据依赖「线程此刻还活着」，
+    一旦某个循环退出过（异常逃逸、或以后改成可结束的形态），重新导入模块时
+    就会把它再起一份 —— 2026-09-28 实测 sa_mp / sa_x 就各多了一份。
+    改用挂在 sys 上的进程级集合：模块对象有几个都无所谓，进程内唯一。
+
+    sys 里的键不能用一个裸常量（模块各自一份），所以用固定字符串。
+    """
+    import sys
+    started = getattr(sys, "sa_started_daemons", None)
+    if started is None:
+        started = set()
+        setattr(sys, "sa_started_daemons", started)
+    if name in started:
+        return False
+    started.add(name)
+    threading.Thread(target=target, args=args, name=name, daemon=True).start()
+    return True
+
+
 # 全局单连接复用不需要：每请求短连接即可（本地工具规模）
-init_db()
+_BOOTSTRAP = _bootstrap_once()
+if _BOOTSTRAP:
+    init_db()
 
 # 币圈白名单/行情表（幂等 DDL + 8 只种子合约，ON CONFLICT DO NOTHING）
-try:
-    crypto_watch._ensure_tables(_crypto_deps())
-except Exception as exc:
-    print(f"[crypto] init tables failed: {exc}", flush=True)
+if _BOOTSTRAP:
+    try:
+        crypto_watch._ensure_tables(_crypto_deps())
+    except Exception as exc:
+        print(f"[crypto] init tables failed: {exc}", flush=True)
+
+    # 公众号订阅源/文章表（幂等 DDL）
+    try:
+        wechat_mp._ensure_tables(_mp_deps())
+    except Exception as exc:
+        print(f"[mp] init tables failed: {exc}", flush=True)
+
+    # X 账号/监听用户/推文表（幂等 DDL）
+    try:
+        x_monitor._ensure_tables(_x_deps())
+    except Exception as exc:
+        print(f"[x] init tables failed: {exc}", flush=True)
 
 # 自动新闻抓取后台线程（fetch_interval_minutes=0 时轮内直接跳过）
-threading.Thread(target=_auto_fetch_loop, daemon=True).start()
+_start_daemon(_auto_fetch_loop, "sa_auto_fetch")
 
 # B站动态定时抓取后台线程（bili.interval_minutes=0 时轮内直接跳过）
-threading.Thread(target=_bili_auto_loop, daemon=True).start()
+_start_daemon(_bili_auto_loop, "sa_bili")
 
 # 微博博主动态定时抓取后台线程（wb.interval_minutes=0 时轮内直接跳过）
-threading.Thread(target=_wb_auto_loop, daemon=True).start()
+_start_daemon(_wb_auto_loop, "sa_wb")
 
 # 止盈策略监控后台线程（交易时段每 60s 扫一次，触发即通知）
-threading.Thread(target=_strategy_loop, daemon=True).start()
+_start_daemon(_strategy_loop, "sa_strategy")
 
 # 板块轮动快照后台线程（交易日收盘后自动采集当日板块全量，供轮动分析）
-threading.Thread(target=sector_mod._sector_auto_loop, daemon=True).start()
+_start_daemon(sector_mod._sector_auto_loop, "sa_sector")
 
 # 板块盘中监控线程（交易时段每 5 分钟采样 + 急拉/涨停骤增预警；config.yaml sector 段可配）
-threading.Thread(target=sector_mod._intraday_loop, daemon=True).start()
+_start_daemon(sector_mod._intraday_loop, "sa_intraday")
 
 # 提款计划检查线程（交易日 15:10 起半小时查达标/临期，里程碑推微信）
-threading.Thread(target=_withdrawal_loop, daemon=True).start()
+_start_daemon(_withdrawal_loop, "sa_withdrawal")
 
 # 财经日历盘前提醒线程（交易日早 8–12 点窗口，今明事件/重要预告推微信）
-threading.Thread(target=_calendar_loop, daemon=True).start()
+_start_daemon(_calendar_loop, "sa_calendar")
 
 # 自选股事件告警线程（工作日 8:30 后每日一轮：解禁/增发上市新事件推微信）
-threading.Thread(target=_alerts_loop, daemon=True).start()
+_start_daemon(_alerts_loop, "sa_alerts")
 
 # 盘中大盘量能监控线程（交易时段每 5 分钟采量比，放量/缩量翻转推微信；volume 段可配）
-threading.Thread(target=_market_volume_loop, daemon=True).start()
+_start_daemon(_market_volume_loop, "sa_market_volume")
 
-# 模拟交易线程（交易日 15:35 决策 / 16:10 结算复盘；paper.enabled=false 轮内跳过）
-threading.Thread(target=_paper_loop, daemon=True).start()
+# 模拟交易线程（交易日盘中每 interval_minutes 判断一轮 / 16:10 结算复盘；
+# paper.enabled=false 轮内跳过）
+_start_daemon(_paper_loop, "sa_paper")
 
 # 每日报告线程（盘前简报 / 盘后复盘；时间点见 config.yaml schedule 段，网页可改）
-threading.Thread(target=_daily_reports_loop, daemon=True).start()
+_start_daemon(_daily_reports_loop, "sa_daily_reports")
 
 # 币圈 24h 监控线程（gate.io 股票永续；crypto.interval_minutes=0 轮内跳过）
-threading.Thread(target=_crypto_loop, daemon=True).start()
+_start_daemon(_crypto_loop, "sa_crypto")
+
+# 币圈↔股票关联统计线程（crypto.link_refresh_hours 控制重算节奏，与抓价周期解耦）
+_start_daemon(_crypto_link_loop, "sa_crypto_link")
+
+# 公众号文章监控线程（wechat_mp.py；mp.interval_minutes=0 轮内跳过）
+_start_daemon(_mp_loop, "sa_mp")
+
+# X(Twitter) 指定用户发言监控线程（x_monitor.py；x.interval_minutes=0 或未配账号时跳过）
+_start_daemon(_x_loop, "sa_x")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8686)

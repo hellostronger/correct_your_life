@@ -4,3 +4,9 @@ requests>=2.31
 psycopg2-binary>=2.9
 PyYAML>=6.0
 anthropic>=1.5
+
+# X(Twitter) 指定用户发言监控（x_monitor.py）
+# 必须带 [curl] extra：X 会做 TLS 指纹识别，httpx 的指纹会被拒。
+# curl-cffi 做浏览器级指纹伪装。Nitter/snscrape/Twint 均已失效，twscrape 是
+# 目前唯一可用的开源免费方案（2026-09-26 核实，2.8k star，MIT）。
+twscrape[curl]>=0.20

@@ -4,121 +4,307 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Stock Advisor · 股票跟踪</title>
+<script>
+// 主题要在 <body> 渲染前定好，否则深色用户会先闪一下白底。
+// 三态：跟随系统 / 强制浅 / 强制深，存 localStorage。
+(function () {
+  try {
+    var t = localStorage.getItem('sa-theme') || 'auto';
+    var dark = t === 'dark' || (t === 'auto' &&
+      window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches);
+    if (dark) document.documentElement.setAttribute('data-theme', 'dark');
+  } catch (e) {}
+})();
+</script>
 <style>
+  /* ---------- 设计 token ---------- */
   :root {
-    --bg: #f5f6f8; --card: #fff; --text: #1c2330; --muted: #7a8399;
-    --border: #e4e7ee; --up: #d93a3a; --down: #1a9e5c; --accent: #3b6ef5;
+    --bg: #f4f6fa; --bg-2: #eceff5; --card: #fff; --card-2: #f8fafc;
+    --text: #131a26; --text-2: #5b6577; --text-3: #8b95a7;
+    --border: #e3e7ee; --border-2: #d3d9e4;
+    --up: #d92d2d; --up-soft: #fdecec;          /* 红=涨（A 股口径） */
+    --down: #0f9d58; --down-soft: #e7f6ee;      /* 绿=跌 */
+    --accent: #2f62f4; --accent-soft: #e8efff; --accent-ink: #1b46c4;
+    --warn: #b26a00; --warn-soft: #fff2df;
+    --shadow-1: 0 1px 2px rgba(19,26,38,.05), 0 1px 3px rgba(19,26,38,.04);
+    --shadow-2: 0 8px 24px rgba(19,26,38,.10), 0 2px 6px rgba(19,26,38,.06);
+    --shadow-3: 0 24px 60px rgba(19,26,38,.22);
+    --r: 12px; --r-sm: 8px; --r-xs: 6px;
+    --sp: 14px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   }
+  [data-theme="dark"] {
+    --bg: #0d1117; --bg-2: #161b22; --card: #151b23; --card-2: #1c232c;
+    --text: #e6edf3; --text-2: #9aa5b4; --text-3: #6e7a8a;
+    --border: #262d38; --border-2: #333c4a;
+    --up: #f2564d; --up-soft: #3a1d1d;
+    --down: #2ea86a; --down-soft: #12301f;
+    --accent: #5b8cff; --accent-soft: #17233f; --accent-ink: #9dbaff;
+    --warn: #e0a44a; --warn-soft: #33260f;
+    --shadow-1: 0 1px 2px rgba(0,0,0,.4);
+    --shadow-2: 0 8px 24px rgba(0,0,0,.5);
+    --shadow-3: 0 24px 60px rgba(0,0,0,.65);
+  }
+
+  /* ---------- 基础 ---------- */
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
-         background: var(--bg); color: var(--text); }
-  .wrap { max-width: 860px; margin: 0 auto; padding: 20px 16px 60px; }
-  h1 { font-size: 20px; margin-bottom: 4px; }
-  .sub { color: var(--muted); font-size: 12px; margin-bottom: 16px; }
-  .tabs { display: flex; gap: 6px; margin-bottom: 16px; flex-wrap: wrap; }
-  .tabs button { flex: 1 0 auto; min-width: 84px; padding: 9px 8px; border: 1px solid var(--border);
-    background: var(--card); border-radius: 8px; cursor: pointer; color: var(--muted); font-size: 13px; }
-  .tabs button.active { color: var(--accent); border-color: var(--accent); font-weight: 600; }
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px;
-          padding: 14px; margin-bottom: 14px; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei",
+         sans-serif; background: var(--bg); color: var(--text);
+         transition: background .18s, color .18s; }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 0 16px 72px; }
+  h1 { font-size: 19px; letter-spacing: -.2px; }
+  a { color: var(--accent); }
+  code { font-family: var(--mono); font-size: .92em; background: var(--bg-2);
+         padding: 1px 5px; border-radius: 4px; }
+
+  /* ---------- 页头（吸顶） ---------- */
+  .topbar { position: sticky; top: 0; z-index: 40; margin: 0 -16px 14px;
+            padding: 10px 16px 0; background: color-mix(in srgb, var(--bg) 88%, transparent);
+            backdrop-filter: saturate(1.6) blur(10px);
+            border-bottom: 1px solid var(--border); }
+  .topbar-row { display: flex; align-items: center; gap: 10px; }
+  .topbar .sub { margin: 0; flex: 1; min-width: 0; }
+
+  /* ---------- 标签页（吸顶 + 换行全露） ----------
+     15 个标签横向滚动会把后面 5 个藏起来、没有提示，鼠标用户根本发现不了。
+     这里换行全露：占的垂直空间换来「所有功能一眼看到」，值。 */
+  .tabs { display: flex; gap: 4px 6px; flex-wrap: wrap; margin-top: 8px; }
+  .tabs button { flex: 0 0 auto; padding: 7px 11px; border: none; background: none;
+    color: var(--text-2); font-size: 13px; cursor: pointer; white-space: nowrap;
+    border-bottom: 2px solid transparent; margin-bottom: -1px; border-radius: 6px 6px 0 0; }
+  .tabs button:hover { color: var(--text); background: var(--bg-2); }
+  .tabs button.active { color: var(--accent); border-bottom-color: var(--accent);
+                        font-weight: 600; }
+
+  /* ---------- 卡片 ---------- */
+  .card { background: var(--card); border: 1px solid var(--border);
+          border-radius: var(--r); padding: var(--sp); margin-bottom: var(--sp);
+          box-shadow: var(--shadow-1); }
+  .card-head { display: flex; align-items: center; justify-content: space-between;
+               gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+  .card-head b { font-size: 13.5px; }
   .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-  input, button.btn { padding: 8px 10px; border: 1px solid var(--border); border-radius: 7px;
-                      font-size: 14px; outline: none; }
-  input:focus { border-color: var(--accent); }
-  button.btn { background: var(--accent); color: #fff; border: none; cursor: pointer; }
-  button.btn.ghost { background: transparent; color: var(--muted); }
-  button.btn:disabled { opacity: .5; cursor: default; }
+  .row.tight { gap: 6px; }
+
+  /* ---------- 表单 ---------- */
+  input, select, textarea, button.btn { font: inherit; font-size: 13.5px; outline: none;
+    border: 1px solid var(--border-2); border-radius: var(--r-sm);
+    padding: 7px 10px; background: var(--card); color: var(--text); }
+  input::placeholder, textarea::placeholder { color: var(--text-3); }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft); }
+  input[type="checkbox"] { accent-color: var(--accent); width: 15px; height: 15px;
+                           vertical-align: -2px; cursor: pointer; }
+  select { cursor: pointer; }
+  button.btn { background: var(--accent); color: #fff; border-color: transparent;
+    cursor: pointer; font-weight: 500; white-space: nowrap;
+    transition: filter .12s, transform .06s; }
+  button.btn:hover { filter: brightness(1.07); }
+  button.btn:active { transform: translateY(1px); }
+  button.btn.ghost { background: var(--card); color: var(--text-2); border-color: var(--border-2); }
+  button.btn.ghost:hover { color: var(--text); border-color: var(--text-3); background: var(--bg-2); }
+  button.btn.danger { background: var(--up); }
+  button.btn.sm { font-size: 12px; padding: 4px 9px; }
+  button.btn:disabled { opacity: .5; cursor: default; filter: none; }
+  .link-btn { background: none; border: none; color: var(--accent); cursor: pointer;
+              font-size: 12px; padding: 2px 4px; border-radius: 4px; }
+  .link-btn:hover { background: var(--accent-soft); }
+
+  /* ---------- 表格 ---------- */
+  .table-scroll { overflow-x: auto; margin: 0 -4px; padding: 0 4px; }
   table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border);
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border);
            font-size: 13px; white-space: nowrap; }
-  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  th { color: var(--text-3); font-weight: 500; font-size: 11.5px; text-transform: none;
+       position: sticky; top: 0; background: var(--card); z-index: 1; }
+  tbody tr:hover td { background: var(--card-2); }
   tr:last-child td { border-bottom: none; }
+  .num { font-variant-numeric: tabular-nums; }
+
+  /* ---------- 文本 ---------- */
   .up { color: var(--up); } .down { color: var(--down); }
-  .muted { color: var(--muted); font-size: 12px; }
-  .del { color: var(--muted); cursor: pointer; border: none; background: none; font-size: 16px; }
-  .del:hover { color: var(--up); }
-  .empty { color: var(--muted); text-align: center; padding: 18px 0; }
-  .report-item { padding: 9px 4px; border-bottom: 1px solid var(--border); cursor: pointer;
-                 display: flex; justify-content: space-between; gap: 10px; }
-  .report-item:hover { color: var(--accent); }
-  .report-item:last-child { border-bottom: none; }
-  #report-view { white-space: pre-wrap; word-break: break-word; line-height: 1.8; }
-  .back { margin-bottom: 10px; }
-  .toast { position: fixed; left: 50%; bottom: 40px; transform: translateX(-50%);
-    background: rgba(28,35,48,.92); color: #fff; padding: 9px 18px; border-radius: 8px;
-    font-size: 13px; opacity: 0; transition: opacity .25s; pointer-events: none; max-width: 80%; }
-  .toast.show { opacity: 1; }
-  /* 弹窗（交易流水等明细）：覆盖视口，内部滚动，不抖页面 */
-  .modal-mask { position: fixed; inset: 0; background: rgba(20,26,38,.45); z-index: 90;
-    display: flex; align-items: center; justify-content: center; padding: 16px; }
-  .modal-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px;
-    width: min(680px, 100%); max-height: 84vh; display: flex; flex-direction: column;
-    box-shadow: 0 12px 40px rgba(20,26,38,.25); }
-  .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 10px;
-    padding: 12px 16px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
-  .modal-body { overflow: auto; padding: 12px 16px; }
-  .modal-close { border: none; background: none; font-size: 20px; line-height: 1; cursor: pointer;
-    color: var(--muted); padding: 2px 6px; }
-  .modal-close:hover { color: var(--up); }
-  .pnl-summary { display: flex; gap: 24px; margin-bottom: 4px; }
-  .pnl-summary b { font-size: 16px; }
-  .hide { display: none; }
-  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px;
-           flex-shrink: 0; }
+  .muted { color: var(--text-2); font-size: 12px; }
+  .faint { color: var(--text-3); font-size: 11.5px; }
+  .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .empty { color: var(--text-3); text-align: center; padding: 22px 12px; font-size: 13px; }
+  .hide { display: none !important; }
+  .hint { font-size: 12px; color: var(--text-2); line-height: 1.65; margin-top: 6px; }
+  .hint b { color: var(--text); }
+
+  /* ---------- 徽标 ---------- */
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 20px;
+           font-size: 11px; line-height: 1.7; flex-shrink: 0; font-weight: 500; }
   .b-eastmoney { background: #ffe9d6; color: #b25f00; }
   .b-baidu      { background: #e2ecff; color: #2456b3; }
   .b-sina       { background: #ffe2e2; color: #b32424; }
   .b-duckduckgo { background: #e5f3e2; color: #2e7d32; }
-  .rel-code { display: inline-block; padding: 0 7px; border: 1px solid var(--border);
-              border-radius: 10px; font-size: 11px; color: var(--muted); cursor: pointer; }
+  .b-ok   { background: var(--down-soft); color: var(--down); }
+  .b-warn { background: var(--warn-soft); color: var(--warn); }
+  .b-err  { background: var(--up-soft); color: var(--up); }
+  .b-info { background: var(--accent-soft); color: var(--accent-ink); }
+  .b-mute { background: var(--bg-2); color: var(--text-2); }
+  [data-theme="dark"] .b-eastmoney { background: #3a2a12; color: #e5a95c; }
+  [data-theme="dark"] .b-baidu      { background: #16233d; color: #7ea6ff; }
+  [data-theme="dark"] .b-sina       { background: #3a1a1a; color: #f08b86; }
+  [data-theme="dark"] .b-duckduckgo { background: #16301c; color: #74c98c; }
+  .tab-badge { display: inline-block; min-width: 17px; padding: 0 5px; margin-left: 4px;
+               border-radius: 9px; background: var(--up); color: #fff; font-size: 10.5px;
+               line-height: 17px; text-align: center; vertical-align: 1px; }
+  .rel-code { display: inline-block; padding: 0 7px; border: 1px solid var(--border-2);
+              border-radius: 20px; font-size: 11px; color: var(--text-2); cursor: pointer; }
   .rel-code:hover { border-color: var(--accent); color: var(--accent); }
-  .dyn-item { padding: 10px 4px; border-bottom: 1px solid var(--border); }
-  /* 自选表列多，卡片内横向滚动；备注/搜索词列允许换行不被 nowrap 挤爆 */
-  .table-scroll { overflow-x: auto; }
-  .watch-note { white-space: normal; min-width: 140px; max-width: 260px; line-height: 1.5; }
-  .kw-line { font-size: 11px; margin-top: 2px; }
-  .kw-line .badge { margin-right: 2px; }
+
+  /* ---------- 弹窗 ---------- */
+  .modal-mask { position: fixed; inset: 0; z-index: 90; display: flex;
+    align-items: center; justify-content: center; padding: 16px;
+    background: rgba(16,20,28,.5); backdrop-filter: blur(2px);
+    animation: fade .14s ease-out; }
+  @keyframes fade { from { opacity: 0 } }
+  @keyframes pop { from { opacity: 0; transform: translateY(8px) scale(.98) } }
+  .modal-card { background: var(--card); border: 1px solid var(--border);
+    border-radius: 14px; width: min(680px, 100%); max-width: 100%;
+    max-height: 86vh; display: flex; flex-direction: column;
+    box-shadow: var(--shadow-3); animation: pop .16s ease-out; }
+  .modal-card.wide { width: min(920px, 100%); }
+  .modal-head { display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; padding: 13px 16px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  .modal-head b { font-size: 14px; }
+  .modal-body { overflow: auto; padding: 14px 16px; }
+  .modal-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 11px 16px;
+    border-top: 1px solid var(--border); flex-shrink: 0; background: var(--card-2);
+    border-radius: 0 0 14px 14px; }
+  .modal-close { border: none; background: none; font-size: 20px; line-height: 1;
+    cursor: pointer; color: var(--text-3); padding: 2px 7px; border-radius: 6px; }
+  .modal-close:hover { color: var(--up); background: var(--bg-2); }
+  .field { margin-bottom: 12px; }
+  .field > label { display: block; font-size: 12px; color: var(--text-2); margin-bottom: 4px; }
+  .field input, .field textarea, .field select { width: 100%; }
+  .field textarea { resize: vertical; min-height: 62px; font-family: inherit; }
+  .modal-msg { white-space: pre-wrap; line-height: 1.7; }
+
+  /* ---------- 提示条 ---------- */
+  .toast-wrap { position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+    z-index: 120; display: flex; flex-direction: column; gap: 7px; align-items: center;
+    pointer-events: none; width: min(460px, calc(100vw - 32px)); }
+  .toast { background: var(--text); color: var(--bg); padding: 8px 15px;
+    border-radius: 20px; font-size: 13px; box-shadow: var(--shadow-2);
+    animation: pop .16s ease-out; max-width: 100%; text-align: center; }
+  .toast.err { background: var(--up); color: #fff; }
+  .toast.ok  { background: var(--down); color: #fff; }
+  [data-theme="dark"] .toast { background: #2b3440; color: var(--text);
+                               border: 1px solid var(--border-2); }
+  [data-theme="dark"] .toast.err { background: #6d1f1c; color: #ffb4b0;
+                                   border-color: #8a2b26; }
+  [data-theme="dark"] .toast.ok  { background: #14432a; color: #8fe0b4;
+                                   border-color: #1d6039; }
+
+  /* ---------- 动态流（B站/微博/公众号/X 共用） ---------- */
+  .dyn-item { padding: 10px 0; border-bottom: 1px solid var(--border); }
   .dyn-item:last-child { border-bottom: none; }
-  .dyn-item.unread { background: #f0f5ff; margin: 0 -8px; padding-left: 12px; padding-right: 8px;
-                     border-radius: 8px; }
-  .dyn-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .dyn-item.unread { background: var(--accent-soft); margin: 0 -8px; padding-left: 10px;
+                     padding-right: 8px; border-radius: var(--r-sm); }
+  .dyn-head { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
   .dyn-author { font-weight: 600; cursor: pointer; }
   .dyn-author:hover { color: var(--accent); }
   .dyn-text { margin: 4px 0 2px; word-break: break-word; white-space: pre-wrap; }
-  .dyn-stats { color: var(--muted); font-size: 12px; }
-  .dyn-cmt { margin-top: 8px; padding: 8px 10px; background: var(--bg); border-radius: 8px;
-             font-size: 12px; }
+  .dyn-stats { color: var(--text-2); font-size: 12px; }
+  .dyn-cmt { margin-top: 8px; padding: 8px 10px; background: var(--bg-2);
+             border-radius: var(--r-sm); font-size: 12px; }
   .dyn-cmt-item { padding: 5px 0; border-bottom: 1px dashed var(--border); }
   .dyn-cmt-item:last-child { border-bottom: none; }
-  .unread-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  .unread-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%;
                 background: var(--accent); flex-shrink: 0; }
-  .tab-badge { display: inline-block; min-width: 18px; padding: 0 5px; margin-left: 4px;
-               border-radius: 9px; background: var(--up); color: #fff; font-size: 11px;
-               line-height: 18px; }
-  .hold-sort { padding: 4px 10px; font-size: 12px; }
-  .hold-sort.on { background: var(--accent); color: #fff; }
+
+  /* ---------- 杂项 ---------- */
+  .pnl-summary { display: flex; gap: 22px; flex-wrap: wrap; }
+  .pnl-summary > span, .pnl-summary > div { display: flex; flex-direction: column; gap: 1px; }
+  .pnl-summary b { font-size: 15px; }
+  .del { color: var(--text-3); cursor: pointer; border: none; background: none;
+         font-size: 17px; line-height: 1; padding: 0 4px; border-radius: 4px; }
+  .del:hover { color: var(--up); background: var(--up-soft); }
+  #report-view { white-space: pre-wrap; word-break: break-word; line-height: 1.85; }
+  .report-item { padding: 9px 4px; border-bottom: 1px solid var(--border);
+                 cursor: pointer; display: flex; justify-content: space-between; gap: 10px; }
+  .report-item:hover { color: var(--accent); }
+  .report-item:last-child { border-bottom: none; }
+  .back { margin-bottom: 10px; }
+  .watch-note { white-space: normal; min-width: 130px; max-width: 250px; line-height: 1.5; }
+  .kw-line { font-size: 11px; margin-top: 2px; }
+  .hold-sort.sm { padding: 4px 10px; font-size: 12px; }
+  .hold-sort.on { background: var(--accent); color: #fff; border-color: transparent; }
+  .sort-group { display: inline-flex; gap: 0; border: 1px solid var(--border-2);
+                border-radius: var(--r-sm); overflow: hidden; }
+  .sort-group .btn { border: none; border-radius: 0; }
+  .sort-group .btn + .btn { border-left: 1px solid var(--border-2); }
+  details > summary { cursor: pointer; }
+  /* 完整配置：每段一个可折叠，段内两~三列自适应 */
+  .cfg-sec { border-bottom: 1px solid var(--border); }
+  .cfg-sec:last-child { border-bottom: none; }
+  .cfg-sec > summary { list-style: none; }
+  .cfg-sec > summary::-webkit-details-marker { display: none; }
+  .cfg-sec > summary::before {
+    content: "▸"; display: inline-block; width: 14px; color: var(--text-3);
+    transition: transform .12s;
+  }
+  .cfg-sec[open] > summary::before { transform: rotate(90deg); }
+  .cfg-sec > summary:hover { color: var(--accent); }
+  .cfg-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+              gap: 10px 14px; padding: 4px 0 14px; }
+  .cfg-grid .field { margin-bottom: 0; min-width: 0; }
+  .cfg-grid .field input, .cfg-grid .field select { width: 100%; }
+  .cfg-grid .row.tight { font-size: 13px; }
+  .cfg-grid .faint { line-height: 1.5; }
+  @media (max-width: 640px) { .cfg-grid { grid-template-columns: 1fr; } }
+  .spin { display: inline-block; animation: rot .9s linear infinite; }
+  @keyframes rot { to { transform: rotate(360deg) } }
+  /* 骨架屏：比转圈更能表达"正在取数"，也避免布局跳动 */
+  .skel { background: linear-gradient(90deg, var(--bg-2) 25%, var(--card-2) 37%, var(--bg-2) 63%);
+    background-size: 400% 100%; animation: sk 1.3s ease infinite; border-radius: 5px; }
+  @keyframes sk { 0% { background-position: 100% 0 } 100% { background-position: 0 0 } }
+  .skel-line { height: 12px; margin: 9px 0; }
+  .skel-line.w60 { width: 60%; } .skel-line.w40 { width: 40%; }
+  .skel-block { height: 200px; margin-top: 14px; }
+  /* 画布要按设备像素比渲染，否则高分屏上线条发虚 */
+  .chart { width: 100%; display: block; touch-action: pan-y; }
+  .lg { display: inline-block; width: 14px; height: 3px; border-radius: 2px;
+        vertical-align: 3px; margin-right: 4px; }
+  .lg-a { background: var(--accent); } .lg-b { background: var(--up); }
+
+  @media (max-width: 640px) {
+    .wrap { padding: 0 10px 60px; }
+    .topbar { margin: 0 -10px 12px; padding: 9px 10px 0; }
+    .card { padding: 12px; border-radius: 10px; }
+    th, td { padding: 6px 6px; }
+  }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>📈 Stock Advisor</h1>
-  <div class="sub" id="page-date"></div>
-  <div class="sub">本地零成本方案 · 行情来自腾讯公开接口 · 新闻分析报告由 Claude 定时生成</div>
-
-  <div class="tabs">
-    <button data-tab="market" class="active">自选行情</button>
-    <button data-tab="sector">🔄 板块轮动</button>
-    <button data-tab="holdings">我的持仓</button>
-    <button data-tab="strategies">🎯 止盈策略<span id="strategy-tab-badge" class="tab-badge hide">0</span></button>
-    <button data-tab="plans">🏧 提款计划</button>
-    <button data-tab="calendar">📅 财经日历</button>
-    <button data-tab="news">📰 新闻</button>
-    <button data-tab="bili">📺 B站动态<span id="bili-tab-badge" class="tab-badge hide">0</span></button>
-    <button data-tab="wb">🔥 微博<span id="wb-tab-badge" class="tab-badge hide">0</span></button>
-    <button data-tab="reports">分析报告</button>
-    <button data-tab="paper">🧪 模拟交易</button>
-    <button data-tab="notify">🔔 通知</button>
-    <button data-tab="schedule">⚙️ 调度设置</button>
+  <div class="topbar">
+    <div class="topbar-row">
+      <h1>📈 Stock Advisor</h1>
+      <span class="muted" id="page-date"></span>
+      <button class="btn ghost sm" id="theme-btn" onclick="cycleTheme()"
+              title="切换主题（跟随系统 / 浅色 / 深色）">🌓 <span id="theme-label">自动</span></button>
+    </div>
+    <div class="tabs">
+      <button data-tab="market" class="active">自选行情</button>
+      <button data-tab="sector">🔄 板块轮动</button>
+      <button data-tab="holdings">我的持仓</button>
+      <button data-tab="strategies">🎯 止盈策略<span id="strategy-tab-badge" class="tab-badge hide">0</span></button>
+      <button data-tab="plans">🏧 提款计划</button>
+      <button data-tab="calendar">📅 财经日历</button>
+      <button data-tab="news">📰 新闻</button>
+      <button data-tab="bili">📺 B站<span id="bili-tab-badge" class="tab-badge hide">0</span></button>
+      <button data-tab="wb">🔥 微博<span id="wb-tab-badge" class="tab-badge hide">0</span></button>
+      <button data-tab="mp">📰 公众号<span id="mp-tab-badge" class="tab-badge hide">0</span></button>
+      <button data-tab="x">🐦 X<span id="x-tab-badge" class="tab-badge hide">0</span></button>
+      <button data-tab="reports">分析报告</button>
+      <button data-tab="paper">🧪 模拟交易</button>
+      <button data-tab="notify">🔔 通知</button>
+      <button data-tab="schedule">⚙️ 调度</button>
+    </div>
   </div>
 
   <!-- 自选行情 -->
@@ -135,7 +321,8 @@
       <div class="row" style="align-items:flex-start">
         <input id="w-code" placeholder="代码：A股600519 / 港股02513" maxlength="6" style="width:160px">
         <input id="w-note" placeholder="备注（可选），如：关注白酒政策" style="flex:1;min-width:140px">
-        <span class="btn" style="display:inline-block" onclick="addWatch()">添加自选</span>        <button class="btn ghost" onclick="loadWatch()">刷新行情</button>
+        <button class="btn" id="add-watch-btn" onclick="addWatch()">添加自选</button>
+        <button class="btn ghost" onclick="loadWatch()">刷新行情</button>
       </div>
       <div class="row" style="margin-top:6px">
         <input id="w-kw" placeholder="🔍 搜索词(可选)，如：Kimi,OpenAI" style="flex:1;min-width:150px">
@@ -183,21 +370,29 @@
       <table style="margin-top:6px">
         <thead><tr>
           <th>名称</th><th>合约</th><th>最新价</th><th>24h 涨跌</th><th>24h 高</th><th>24h 低</th>
-          <th>24h 成交额</th><th></th>
+          <th>24h 成交额</th><th>关联股票 / 相关度</th><th></th>
         </tr></thead>
         <tbody id="crypto-body"></tbody>
       </table>
       </div>
       <div id="crypto-empty" class="empty hide">白名单为空</div>
       <div class="row" style="margin-top:8px">
-        <input id="crypto-contract" placeholder="合约名，如 TSLA_USDT" maxlength="32" style="width:190px">
-        <input id="crypto-name" placeholder="显示名（可选）" maxlength="64" style="width:170px">
-        <button class="btn" onclick="addCrypto()">+ 关注</button>
+        <input id="crypto-contract" placeholder="合约名，如 TSLA_USDT" maxlength="32" style="width:180px">
+        <input id="crypto-name" placeholder="显示名（可选）" maxlength="64" style="width:160px">
+        <button class="btn" id="add-crypto-btn" onclick="addCrypto()">+ 关注</button>
+        <button class="btn ghost" onclick="refreshAllLinks()">重算全部关联</button>
       </div>
-      <div class="muted" style="margin-top:6px;font-size:12px">
+      <div class="hint">
         欧易(OKX) 在本机网络不通（直连与代理均失败），这里用 gate.io 上同一批美股标的的
         USDT 永续合约作 24h 连续交易的隔夜情绪参考。永续锚定美股现货但可能有小幅溢价/折价，
-        <b>只作趋势参考，不是精确报价</b>。白名单合约的 24h 涨跌超过阈值会推微信（阈值在「⚙️ 调度设置」改）。
+        <b>只作趋势参考，不是精确报价</b>。
+      </div>
+      <div class="hint">
+        <b>关联股票</b>：给每个合约挂一只真实股票，系统会取两侧日K 对齐，算出
+        <b>日涨跌相关系数 / beta / 两侧波动率 / 比价偏离</b>，后台每 6 小时重算一次
+        （节奏在「⚙️ 调度」改）。实测 ZHIPU_USDT↔02513 相关 0.85、MINIMAX_USDT↔00100
+        相关 0.88，比价都 ≈7.8（正是 USD/HKD）——说明这些永续确实锚定标的股价，
+        不只是「名字像」。点徽标看双线图；比价突然偏离会推微信。
       </div>
     </div>
   </section>
@@ -280,7 +475,7 @@
           <option value="">止盈策略：不设</option>
         </select>
         <input id="t-note" placeholder="备注（可选）" style="flex:1;min-width:120px">
-        <button class="btn" onclick="addTrade()">记一笔</button>
+        <button class="btn" id="add-trade-btn" onclick="addTrade()">记一笔</button>
       </div>
       <div class="muted" style="margin-top:6px">流水账模式：每笔买卖各记一条，持仓与盈亏自动推算
         （卖出按平均成本法计入已实现盈亏；日期不填默认今天）。
@@ -289,11 +484,13 @@
     <div class="card">
       <div class="pnl-summary" id="pnl-summary"></div>
       <div class="muted" id="holdings-fx-note" style="margin-bottom:4px"></div>
-      <div class="row" style="margin:6px 0">
+      <div class="row" style="margin:8px 0;gap:10px">
         <span class="muted">排序：</span>
-        <button class="btn ghost hold-sort" data-sort="default" onclick="setHoldSort('default')">默认</button>
-        <button class="btn ghost hold-sort" data-sort="loss" onclick="setHoldSort('loss')">📉 亏损最多在前</button>
-        <button class="btn ghost hold-sort" data-sort="gain" onclick="setHoldSort('gain')">📈 盈利最多在前</button>
+        <span class="sort-group">
+          <button class="btn ghost hold-sort sm" data-sort="default" onclick="setHoldSort('default')">默认</button>
+          <button class="btn ghost hold-sort sm" data-sort="loss" onclick="setHoldSort('loss')">📉 亏损最多</button>
+          <button class="btn ghost hold-sort sm" data-sort="gain" onclick="setHoldSort('gain')">📈 盈利最多</button>
+        </span>
       </div>
       <table>
         <thead><tr>
@@ -307,13 +504,25 @@
   </section>
 
   <!-- 交易流水弹窗（点持仓行打开，原地不动页面） -->
-  <div id="trades-modal" class="modal-mask hide" onclick="if(event.target===this)hideTrades()">
-    <div class="modal-card" role="dialog" aria-modal="true">
+  <div id="trades-modal" class="modal-mask hide">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="trades-modal-title">
       <div class="modal-head">
         <b id="trades-modal-title" style="font-size:14px">交易流水</b>
         <button class="modal-close" onclick="hideTrades()" title="关闭（Esc）">×</button>
       </div>
       <div class="modal-body" id="trades-detail"></div>
+    </div>
+  </div>
+
+  <!-- 通用弹窗（confirm / 表单 / 详情都用它，见 openModal） -->
+  <div id="gen-modal" class="modal-mask hide" onclick="if(event.target===this)closeModal(false)">
+    <div class="modal-card" role="dialog" aria-modal="true" id="gen-modal-card">
+      <div class="modal-head">
+        <b id="gen-modal-title"></b>
+        <button class="modal-close" onclick="closeModal(false)" title="关闭（Esc）">×</button>
+      </div>
+      <div class="modal-body" id="gen-modal-body"></div>
+      <div class="modal-foot hide" id="gen-modal-foot"></div>
     </div>
   </div>
 
@@ -340,7 +549,7 @@
         <input id="s-hold-days" placeholder="持有交易日数 如 20" class="hide" type="number" min="1" style="width:150px">
         <input id="s-name" placeholder="策略名（可选，自动生成）" style="flex:1;min-width:120px">
         <input id="s-note" placeholder="备注（可选）" style="flex:1;min-width:90px">
-        <button class="btn" onclick="addStrategy()">创建策略</button>
+        <button class="btn" id="add-strategy-btn" onclick="addStrategy()">创建策略</button>
       </div>
       <div class="muted" style="margin-top:6px" id="s-kind-hint"></div>
       <div class="muted" style="margin-top:6px">
@@ -372,7 +581,7 @@
                onfocus="this.type='date'" onblur="if(!this.value)this.type='text'">
         <input id="p-amount" placeholder="目标金额（元），如 50000" type="number" min="1" style="width:200px">
         <input id="p-note" placeholder="备注（可选），如：交房租 / 旅游基金" style="flex:1;min-width:150px">
-        <button class="btn" onclick="addPlan()">创建计划</button>
+        <button class="btn" id="add-plan-btn" onclick="addPlan()">创建计划</button>
       </div>
       <div class="muted" style="margin-top:6px">
         创建后自动对比当前持仓总市值，给出达成路径：市值够 → 按浮盈排序的卖出凑钱建议；
@@ -545,6 +754,130 @@
     </div>
   </section>
 
+  <!-- 公众号（拉 RSS 源，上游 WeRSS，见 wechat_mp.py） -->
+  <section id="tab-mp" class="hide">
+    <div class="card">
+      <div class="card-head">
+        <b>📰 订阅源</b>
+        <div class="row tight">
+          <span class="muted" id="mp-status"></span>
+          <button class="btn ghost sm" id="mp-fetch-btn" onclick="triggerMpFetch()">立即拉取</button>
+        </div>
+      </div>
+      <div class="row">
+        <input id="mp-name" placeholder="名称，如：全部公众号" style="width:140px">
+        <select id="mp-kind" style="width:128px">
+          <option value="werss">WeRSS 服务</option>
+          <option value="rss">任意 RSS 地址</option>
+        </select>
+        <input id="mp-url" placeholder="WeRSS 填 http://<服务器IP>:8001；RSS 填完整订阅地址"
+               style="flex:1;min-width:190px">
+        <input id="mp-feed" placeholder="feed_id" value="all" style="width:84px">
+        <button class="btn" id="add-mp-btn" onclick="addMpSource()">添加</button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <label class="muted" title="走 /rss/{id}/fresh 会先让 WeRSS 去上游抓一轮。远程共享实例建议关闭，走它自己的缓存——上游提示「添加订阅频率过高容易被封控」">
+          <input type="checkbox" id="mp-fresh"> 走 /fresh 强制上游更新（留空=跟随全局设置）</label>
+      </div>
+      <div class="hint">
+        微信没有官方接口能读别人公众号的文章，所以本项目<b>不自己爬</b>，只订阅一个现成开源服务
+        （<b>WeRSS</b>，<code>rachelos/we-mp-rss</code>）的 RSS 产物。
+        <b>服务已独立部署</b>，见仓库 <code>mp-service/</code> 目录
+        （<code>cd mp-service &amp;&amp; docker compose up -d</code>，可放在远程机器上）。
+        远程实例的地址、鉴权、fresh 策略在「⚙️ 调度 → 🧩 完整配置」的 <code>mp</code> 段里配一次即可，
+        这里添加源时地址会自动带入。
+      </div>
+      <div class="table-scroll" style="margin-top:10px">
+        <table>
+          <thead><tr><th>名称</th><th>类型</th><th>地址 / feed_id</th><th>更新策略</th>
+            <th>未读</th><th>上轮</th><th>状态</th><th></th></tr></thead>
+          <tbody id="mp-sources-body"></tbody>
+        </table>
+      </div>
+      <div id="mp-sources-empty" class="empty hide">还没有订阅源。先起 WeRSS 服务并订阅几个公众号。</div>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <b>📄 最新文章</b>
+        <div class="row tight">
+          <label class="muted"><input type="checkbox" id="mp-unread-only" onchange="loadMpArticles()"> 只看未读</label>
+          <button class="btn ghost sm" onclick="markAllMpRead()">全部已读</button>
+          <button class="btn ghost sm" onclick="loadMpArticles()">刷新</button>
+        </div>
+      </div>
+      <div id="mp-list"></div>
+      <div id="mp-empty" class="empty hide">还没有文章。添加订阅源后点「立即拉取」。</div>
+    </div>
+  </section>
+
+  <!-- X(Twitter) 指定用户发言（twscrape） -->
+  <section id="tab-x" class="hide">
+    <div class="card">
+      <div class="card-head">
+        <b>🔑 X 账号（cookie）</b>
+        <span class="muted" id="x-status"></span>
+      </div>
+      <div class="row">
+        <input id="x-acc-name" placeholder="备注名（本地标识）" style="width:130px">
+        <input id="x-acc-cookie" type="password" style="flex:1;min-width:200px"
+               placeholder="auth_token=…; ct0=…">
+        <button class="btn ghost" onclick="testXAccount()">测试</button>
+        <button class="btn" id="save-x-btn" onclick="saveXAccount()">保存</button>
+      </div>
+      <div class="hint">
+        Nitter 已于 2026-09 归档（X Corp 发律师函下架），snscrape/Twint 随匿名 guest
+        token 关闭一起失效，<b>目前唯一可用的开源免费方案是 twscrape</b>（MIT，2.8k star）。
+        它用你自己 X 账号的 cookie 轮换请求：在 <b>x.com → F12 → Application → Cookies</b>
+        里复制 <code>auth_token</code> 与 <code>ct0</code> 拼成上面那串。
+        首次使用需装依赖：<code>pip install "twscrape[curl]"</code>（curl 后端做浏览器级
+        TLS 指纹伪装，X 会拒绝 httpx 的指纹）。
+      </div>
+      <div class="table-scroll" style="margin-top:10px">
+        <table>
+          <thead><tr><th>备注名</th><th>cookie</th><th>上轮状态</th><th></th></tr></thead>
+          <tbody id="x-accounts-body"></tbody>
+        </table>
+      </div>
+      <div id="x-accounts-empty" class="empty hide">还没有账号。粘一个 cookie 上来。</div>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <b>👤 监听的人</b>
+        <div class="row tight">
+          <span class="muted" id="x-fetch-meta"></span>
+          <button class="btn ghost sm" id="x-fetch-btn" onclick="triggerXFetch()">立即抓取</button>
+        </div>
+      </div>
+      <div class="row">
+        <input id="x-username" placeholder="@用户名 或 x.com/jack" style="width:170px">
+        <input id="x-note" placeholder="备注（可选）" style="flex:1;min-width:120px">
+        <label class="muted" title="含回复会明显增加噪音"><input type="checkbox" id="x-replies"> 含回复</label>
+        <input id="x-min-likes" type="number" min="0" placeholder="点赞≥" style="width:78px">
+        <button class="btn" id="add-x-btn" onclick="addXWatch()">添加</button>
+      </div>
+      <div class="table-scroll" style="margin-top:10px">
+        <table>
+          <thead><tr><th>用户名</th><th>显示名</th><th>备注</th><th>回复</th>
+            <th>点赞门槛</th><th>启用</th><th></th></tr></thead>
+          <tbody id="x-watch-body"></tbody>
+        </table>
+      </div>
+      <div id="x-watch-empty" class="empty hide">还没有监听的人。</div>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <b>💬 最新推文</b>
+        <div class="row tight">
+          <label class="muted"><input type="checkbox" id="x-unread-only" onchange="loadXTweets()"> 只看未读</label>
+          <button class="btn ghost sm" onclick="markAllXRead()">全部已读</button>
+          <button class="btn ghost sm" onclick="loadXTweets()">刷新</button>
+        </div>
+      </div>
+      <div id="x-list"></div>
+      <div id="x-empty" class="empty hide">还没有推文。添加监听的人后点「立即抓取」。</div>
+    </div>
+  </section>
+
   <!-- 通知 -->
   <section id="tab-notify" class="hide">
     <div class="card">
@@ -647,36 +980,103 @@
       </div>
     </div>
     <div class="card">
-      <b style="font-size:13px">🪙 币圈 24h 监控（gate.io 股票永续）</b>
-      <div class="row" style="margin-top:8px;flex-wrap:wrap;gap:16px;align-items:center">
+      <div class="card-head">
+        <b>🪙 币圈 24h 监控（gate.io 股票永续）</b>
+      </div>
+      <div class="row" style="gap:16px;align-items:center">
         <label class="muted"><input type="checkbox" id="sch-cr-enabled"> 启用</label>
         <label class="muted">抓价周期(分钟) <input type="number" id="sch-cr-interval" min="0" max="1440"
-          style="width:75px;padding:5px 7px;border:1px solid var(--border);border-radius:6px"> 0=关闭</label>
+          style="width:72px;padding:5px 7px"> 0=关闭</label>
         <label class="muted">24h 异动阈值(%) <input type="number" id="sch-cr-threshold" min="0" max="100" step="0.5"
-          style="width:80px;padding:5px 7px;border:1px solid var(--border);border-radius:6px"></label>
-        <label class="muted">同向冷却(小时) <input type="number" id="sch-cr-cooldown" min="1" max="72"
-          style="width:75px;padding:5px 7px;border:1px solid var(--border);border-radius:6px"></label>
+          style="width:76px;padding:5px 7px"></label>
+        <label class="muted">同向冷却(小时) <input type="number" id="sch-cr-cooldown" min="1" max="720"
+          style="width:72px;padding:5px 7px"></label>
       </div>
-      <div class="muted" style="margin-top:6px;font-size:12px">
-        白名单在「自选行情」页的币圈卡片里加删。24h 连续交易，不限 A 股时段；
-        涨跌超阈值且不在冷却期就推一条合并微信。
+      <div class="row" style="margin-top:8px;gap:16px;align-items:center">
+        <label class="muted"><input type="checkbox" id="sch-crl-enabled"> 计算「币↔股」关联</label>
+        <label class="muted">重算周期(小时) <input type="number" id="sch-crl-refresh" min="0" max="720"
+          style="width:72px;padding:5px 7px"></label>
+        <label class="muted">回看天数 <input type="number" id="sch-crl-lookback" min="10" max="500"
+          style="width:72px;padding:5px 7px"></label>
+        <label class="muted">最少重叠日 <input type="number" id="sch-crl-minov" min="3" max="200"
+          style="width:72px;padding:5px 7px"></label>
+      </div>
+      <div class="row" style="margin-top:6px;gap:16px;align-items:center">
+        <label class="muted">比价偏离告警(%) <input type="number" id="sch-crl-dev" min="0" max="100" step="0.5"
+          style="width:76px;padding:5px 7px"></label>
+        <label class="muted">告警冷却(小时) <input type="number" id="sch-crl-devcool" min="1" max="720"
+          style="width:72px;padding:5px 7px"></label>
+        <span class="faint">0 = 关闭该项推送</span>
+      </div>
+      <div class="hint">
+        白名单与关联股票在「自选行情」页的币圈卡片里加。24h 连续交易，不限 A 股时段；
+        涨跌超阈值且不在冷却期就推一条合并微信。关联统计按重算周期取两侧日K 对齐，
+        算相关系数/beta/波动率/比价偏离；比价突然偏离（永续溢价或股票除权）会推微信。
       </div>
     </div>
     <div class="card">
-      <b style="font-size:13px">🔁 抓取周期</b>
-      <div class="row" style="margin-top:8px;flex-wrap:wrap;gap:16px;align-items:center">
-        <label class="muted"><input type="checkbox" id="sch-iv-news"> 新闻</label>
-        <input type="number" id="sch-iv-news-min" min="0" max="1440" style="width:70px;padding:5px 7px;border:1px solid var(--border);border-radius:6px"> 分钟
-        <label class="muted"><input type="checkbox" id="sch-iv-bili"> B站</label>
-        <input type="number" id="sch-iv-bili-min" min="0" max="1440" style="width:70px;padding:5px 7px;border:1px solid var(--border);border-radius:6px"> 分钟
-        <label class="muted"><input type="checkbox" id="sch-iv-wb"> 微博</label>
-        <input type="number" id="sch-iv-wb-min" min="0" max="1440" style="width:70px;padding:5px 7px;border:1px solid var(--border);border-radius:6px"> 分钟
-        <label class="muted"><input type="checkbox" id="sch-iv-sector"> 板块盘中</label>
-        <input type="number" id="sch-iv-sector-min" min="0" max="1440" style="width:70px;padding:5px 7px;border:1px solid var(--border);border-radius:6px"> 分钟
-        <label class="muted"><input type="checkbox" id="sch-iv-volume"> 大盘量能</label>
-        <input type="number" id="sch-iv-volume-min" min="0" max="1440" style="width:70px;padding:5px 7px;border:1px solid var(--border);border-radius:6px"> 分钟
+      <div class="card-head">
+        <b>🧩 完整配置（所有 config.yaml 项）</b>
+        <div class="row tight">
+          <label class="muted" title="只显示与默认值不同的项，快速找出改过的配置">
+            <input type="checkbox" id="cfg-only-changed"> 只看改动过的</label>
+          <label class="muted" title="把本页所有输入框恢复成默认值（保存后生效）">
+            <input type="checkbox" id="cfg-show-adv"> 显示高级项</label>
+        </div>
       </div>
-      <div class="muted" style="margin-top:6px;font-size:12px">0 = 关闭该模块的自动抓取。抓取周期存在各自模块的配置段里，此处只改这一项，不动其它键。</div>
+      <div class="hint">
+        这里的表单是**按后端配置模式动态生成**的：<code>config.yaml</code> 里每个键都会出现在这里，
+        类型与取值范围由后端统一校验。加新配置项只要在 <code>config_schema.py</code> 里加一行，
+        这个页面自动就有输入框——不需要再手写控件，所以不会漏。
+        密钥类字段（LLM key / 邮箱授权码 / 公众号 Authorization）只显示掩码，留空即不修改。
+      </div>
+      <div id="cfg-all-list" style="margin-top:10px">
+        <div class="muted">加载中…</div>
+      </div>
+      <div class="row" style="margin-top:12px;padding-top:10px;border-top:1px dashed var(--border)">
+        <button class="btn" id="save-cfgall-btn" onclick="saveConfigAll()">保存全部配置</button>
+        <button class="btn ghost" onclick="loadConfigAll()">重新载入</button>
+        <span class="muted" id="cfg-all-status" style="font-size:12px"></span>
+      </div>
+      <div id="cfg-unknown" class="hide" style="margin-top:8px"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>📰 公众号 / 🐦 X 抓取周期</b></div>
+      <div class="row" style="gap:16px;align-items:center">
+        <label class="muted"><input type="checkbox" id="sch-mp-enabled"> 公众号</label>
+        <input type="number" id="sch-mp-interval" min="0" max="1440" style="width:72px;padding:5px 7px"> 分钟
+        <label class="muted"><input type="checkbox" id="sch-mp-notify"> 新文推微信</label>
+        <span class="faint" style="width:100%">
+          公众号走 WeRSS 服务的 RSS 产物（根目录 docker-compose 的 <code>werss</code> 服务），
+          本身不爬微信。</span>
+      </div>
+      <div class="row" style="margin-top:6px;gap:16px;align-items:center">
+        <label class="muted"><input type="checkbox" id="sch-x-enabled"> X</label>
+        <input type="number" id="sch-x-interval" min="0" max="1440" style="width:72px;padding:5px 7px"> 分钟
+        <label class="muted"><input type="checkbox" id="sch-x-notify"> 新推文推微信</label>
+        <span class="faint">未配 X 账号 cookie 时本项自动跳过。</span>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><b>🔁 抓取周期</b></div>
+      <div class="row" style="gap:16px;align-items:center">
+        <label class="muted" id="sch-iv-news-on"><input type="checkbox" id="sch-iv-news"> 新闻</label>
+        <input type="number" id="sch-iv-news-min" min="0" max="1440" style="width:70px;padding:5px 7px"> 分钟
+        <label class="muted"><input type="checkbox" id="sch-iv-bili"> B站</label>
+        <input type="number" id="sch-iv-bili-min" min="0" max="1440" style="width:70px;padding:5px 7px"> 分钟
+        <label class="muted"><input type="checkbox" id="sch-iv-wb"> 微博</label>
+        <input type="number" id="sch-iv-wb-min" min="0" max="1440" style="width:70px;padding:5px 7px"> 分钟
+        <label class="muted"><input type="checkbox" id="sch-iv-sector"> 板块盘中</label>
+        <input type="number" id="sch-iv-sector-min" min="0" max="1440" style="width:70px;padding:5px 7px"> 分钟
+        <label class="muted"><input type="checkbox" id="sch-iv-volume"> 大盘量能</label>
+        <input type="number" id="sch-iv-volume-min" min="0" max="1440" style="width:70px;padding:5px 7px"> 分钟
+      </div>
+      <div class="hint">
+        0 = 关闭该模块的自动抓取。写的是各模块自己的配置键——新闻写的是
+        <code>news.fetch_interval_minutes</code>，也就是抓取循环真正读的那个键
+        （原来这里写的是一个没人读的幽灵键，改了不生效，已修）。
+        各模块的超时/条数/阈值等其余配置项，在下面「🧩 完整配置」里改。
+      </div>
     </div>
     <div class="card">
       <div class="row">
@@ -688,7 +1088,7 @@
   </section>
 
   <!-- 报告 -->
-  <!-- 模拟交易（Paper Trading）：LLM 决策 → 收盘价成交 → 5交易日结算 → 反思沉淀 -->
+  <!-- 模拟交易（Paper Trading）：盘中每 N 分钟判断 → 免LLM止损 → 收盘后 5交易日结算 → 反思沉淀 -->
   <section id="tab-paper" class="hide">
     <div class="card">
       <div class="row" style="justify-content:space-between">
@@ -701,6 +1101,62 @@
       </div>
       <div class="pnl-summary" id="paper-stats" style="margin-top:8px"></div>
       <div class="muted" id="paper-meta" style="font-size:12px;margin-top:4px"></div>
+    </div>
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <b style="font-size:13px">⏱ 判断节奏</b>
+        <span class="muted" id="paper-cadence" style="font-size:12px"></span>
+      </div>
+      <div class="row" style="margin-top:8px;gap:10px;flex-wrap:wrap;align-items:flex-end">
+        <label style="font-size:12px;display:flex;flex-direction:column;gap:3px">
+          <span class="muted">每隔（分钟）</span>
+          <input id="paper-iv" type="number" min="1" max="240" step="1"
+                 style="width:84px;padding:5px 7px;border-radius:6px;
+                        border:1px solid var(--border);background:var(--bg-2);color:var(--fg)">
+        </label>
+        <label style="font-size:12px;display:flex;flex-direction:column;gap:3px">
+          <span class="muted">开始</span>
+          <input id="paper-start" type="time"
+                 style="width:110px;padding:5px 7px;border-radius:6px;
+                        border:1px solid var(--border);background:var(--bg-2);color:var(--fg)">
+        </label>
+        <label style="font-size:12px;display:flex;flex-direction:column;gap:3px">
+          <span class="muted">最后判断</span>
+          <input id="paper-end" type="time"
+                 style="width:110px;padding:5px 7px;border-radius:6px;
+                        border:1px solid var(--border);background:var(--bg-2);color:var(--fg)">
+        </label>
+        <label style="font-size:12px;display:flex;flex-direction:column;gap:3px">
+          <span class="muted">止损上限(%)</span>
+          <input id="paper-slmax" type="number" min="1" max="30" step="0.5"
+                 style="width:84px;padding:5px 7px;border-radius:6px;
+                        border:1px solid var(--border);background:var(--bg-2);color:var(--fg)">
+        </label>
+        <label class="row" style="font-size:12px;gap:5px;cursor:pointer">
+          <input id="paper-holdonly" type="checkbox">
+          <span>每轮只判持仓</span>
+        </label>
+        <button class="btn" style="font-size:12px" onclick="savePaperCadence()">保存</button>
+      </div>
+      <div class="muted" style="font-size:11px;margin-top:7px;line-height:1.6">
+        每轮先做<b>免 LLM 止损扫描</b>（跌破止损线立刻走，不花钱不受 LLM 延迟影响），
+        再按上面设置决定要不要让 LLM 重判。费用 ≈ 每轮(自选股数)×2 次 LLM 调用 ——
+        35 只 × 每 30 分钟 ≈ 每天 280 次。嫌贵就勾「每轮只判持仓」。
+        改完 1 分钟内生效，不用重启。
+      </div>
+    </div>
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <b style="font-size:13px">🗂 今日各轮记录</b>
+        <span class="muted" style="font-size:11px">同一轮内一只票只决策一次；不同轮次各自独立</span>
+      </div>
+      <div class="table-scroll" style="max-height:320px;margin-top:6px">
+        <table>
+          <thead><tr><th>时刻</th><th>类型</th><th>触发</th><th>判断</th><th>成交</th>
+            <th>观望</th><th>未成交</th><th>耗时</th><th>明细</th></tr></thead>
+          <tbody id="paper-cycles"></tbody>
+        </table>
+      </div>
     </div>
     <div class="card">
       <b style="font-size:13px">📍 模拟持仓</b>
@@ -761,7 +1217,7 @@
     </div>
   </section>
 </div>
-<div class="toast" id="toast"></div>
+<div class="toast-wrap" id="toast-wrap"></div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -770,41 +1226,327 @@ const fmt = v => (v === null || v === undefined || v === '') ? '—' :
 const cls = v => (typeof v === 'number' ? (v > 0 ? 'up' : v < 0 ? 'down' : '') : '');
 const signed = v => (typeof v === 'number' && v > 0 ? '+' : '') + fmt(v);
 const yi = v => (typeof v === 'number' ? (v / 1e8).toFixed(2) + '亿' : '—');
+const esc = s => (s == null ? '' : String(s)).replace(/[&<>"]/g,
+  c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
-function toast(msg) {
-  const t = $('toast');
-  t.textContent = msg; t.classList.add('show');
-  clearTimeout(t._timer); t._timer = setTimeout(() => t.classList.remove('show'), 2200);
+// ---------- 主题：auto / light / dark 三态循环 ----------
+const THEMES = ['auto', 'light', 'dark'];
+const THEME_LABEL = { auto: '自动', light: '浅色', dark: '深色' };
+function currentTheme() {
+  try { return localStorage.getItem('sa-theme') || 'auto'; } catch (e) { return 'auto'; }
 }
+function applyTheme() {
+  const t = currentTheme();
+  const dark = t === 'dark' || (t === 'auto' &&
+    window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches);
+  if (dark) document.documentElement.setAttribute('data-theme', 'dark');
+  else document.documentElement.removeAttribute('data-theme');
+  const l = $('theme-label');
+  if (l) l.textContent = THEME_LABEL[t];
+}
+function cycleTheme() {
+  const next = THEMES[(THEMES.indexOf(currentTheme()) + 1) % THEMES.length];
+  try { localStorage.setItem('sa-theme', next); } catch (e) {}
+  applyTheme();
+}
+if (window.matchMedia) {
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+    if (currentTheme() === 'auto') applyTheme();
+  });
+}
+
+// ---------- 提示条（可叠加，带类型色） ----------
+function toast(msg, kind) {
+  const wrap = $('toast-wrap');
+  if (!wrap) return;
+  const el = document.createElement('div');
+  el.className = 'toast' + (kind ? ' ' + kind : '');
+  el.setAttribute('role', kind === 'err' ? 'alert' : 'status');
+  el.textContent = msg;
+  wrap.appendChild(el);
+  // 最多同时 3 条，多的从最旧的开始清
+  while (wrap.children.length > 3) wrap.removeChild(wrap.firstChild);
+  setTimeout(() => {
+    el.style.transition = 'opacity .2s';
+    el.style.opacity = '0';
+    setTimeout(() => el.remove(), 220);
+  }, kind === 'err' ? 4200 : 2400);
+}
+const toastErr = m => toast(m, 'err');
+const toastOk = m => toast(m, 'ok');
+/** 骨架屏：取数期间的占位，避免空白和布局跳动 */
+function skeletonBox(lines = 3) {
+  return `<div aria-busy="true" aria-label="加载中">${
+    Array.from({ length: lines }, (_, i) =>
+      `<div class="skel skel-line ${i % 3 === 0 ? 'w60' : i % 3 === 1 ? 'w40' : 'w60'}"></div>`
+    ).join('')}<div class="skel skel-block"></div></div>`;
+}
+
 async function api(url, opts) {
   const resp = await fetch(url, opts);
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) throw new Error(data.detail || resp.statusText);
   return data;
 }
+const jsonPost = (url, body) => api(url, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: body === undefined ? undefined : JSON.stringify(body) });
+const jsonPut = (url, body) => api(url, {
+  method: 'PUT', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(body) });
+const jsonPatch = (url, body) => api(url, {
+  method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(body) });
+
+// ---------- 弹窗层 ----------
+// 原生 confirm()/prompt() 无法自定义样式、不能多字段、样式还随系统变，这里统一收口：
+// 所有删除确认走 confirmDlg()，所有编辑表单走 formDlg()，只读详情走 infoDlg()。
+//
+// 单槽设计：任一时刻只有一个通用弹窗。新开一个会先把上一个按「取消」收掉——
+// 否则上一个的 await 永远悬着，调用方（`if (!await confirmDlg(...)) return;`）
+// 会直接卡死。
+const Modal = (() => {
+  let settle = null;        // 当前弹窗的收尾函数（由 showModal 装）
+  let restoreFocus = null;  // 打开前聚焦的元素，关闭后还回去
+  let scrollY = 0, locked = false;
+
+  const mask = () => $('gen-modal');
+  const focusables = () => Array.from(
+    mask().querySelectorAll('a[href], button:not(:disabled), input:not(:disabled), '
+      + 'select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])'))
+    .filter(e => e.offsetParent !== null);
+
+  function lockScroll(on) {
+    if (on === locked) return;
+    locked = on;
+    if (on) {
+      scrollY = window.scrollY;
+      // 用 fixed + top 偏移，而不是 overflow:hidden —— 后者在移动端会让弹窗内的
+      // 滚动带着背景一起动
+      document.body.style.position = 'fixed';
+      document.body.style.top = `-${scrollY}px`;
+      document.body.style.width = '100%';
+    } else {
+      document.body.style.position = '';
+      document.body.style.top = '';
+      document.body.style.width = '';
+      window.scrollTo(0, scrollY);
+    }
+  }
+
+  function open({ title, body, footer, wide }) {
+    if (settle) { const s = settle; settle = null; s(0); }   // 单槽：先收掉上一个
+    restoreFocus = document.activeElement;
+    $('gen-modal-title').textContent = title || '';
+    $('gen-modal-body').innerHTML = body || '';
+    const foot = $('gen-modal-foot');
+    if (footer) { foot.innerHTML = footer; foot.classList.remove('hide'); }
+    else { foot.innerHTML = ''; foot.classList.add('hide'); }
+    $('gen-modal-card').classList.toggle('wide', !!wide);
+    mask().classList.remove('hide');
+    lockScroll(true);
+  }
+
+  function close(value) {
+    const wasOpen = isOpen();
+    mask().classList.add('hide');
+    $('gen-modal-body').innerHTML = '';
+    $('gen-modal-foot').innerHTML = '';
+    $('gen-modal-foot').onclick = null;
+    const s = settle; settle = null;
+    const back = restoreFocus; restoreFocus = null;
+    if (wasOpen) lockScroll(false);
+    if (s) s(value);
+    // 焦点还回触发它的元素；它可能已被重新渲染掉，故先判存活
+    if (back && back.isConnected && typeof back.focus === 'function') back.focus();
+  }
+
+  const isOpen = () => !mask().classList.contains('hide');
+
+  /** focus='safe' 时焦点强制落在「取消」上（危险操作防手快） */
+  function focusTarget(kind) {
+    const f = focusables();
+    if (!f.length) return;
+    if (kind === 'safe') {
+      (f.find(e => e.dataset && e.dataset.r === '0') || f[0]).focus();
+    } else {
+      const field = $('gen-modal-body').querySelector('input,select,textarea');
+      const primary = f.find(e => e.dataset && e.dataset.r === '1');
+      const t = field || primary || f[0];
+      t.focus();
+      if (field && typeof field.select === 'function') field.select();
+    }
+  }
+
+  return {
+    open, close, isOpen, focusTarget, lockScroll, focusables,
+    setSettle: fn => { settle = fn; },
+    getSettle: () => settle,
+    takeSettle: () => { const s = settle; settle = null; return s; },
+  };
+})();
+
+/**
+ * 统一入口 → Promise。opts:
+ *   title/body/footer/wide   透传给 Modal.open
+ *   focus: 'safe'|'form'     'safe' = 焦点默认落在「取消」
+ *   onOk(): any              点确定时调用；返回 undefined 表示**不关闭**（自行校验）
+ *   cancelValue: any         Esc / 点遮罩 / 取消 时 resolve 的值（默认 0）
+ */
+function showModal(opts) {
+  const { onOk, cancelValue = 0, focus, ...rest } = opts;
+  return new Promise(resolve => {
+    Modal.open(rest);
+    Modal.setSettle(resolve);
+    // 确定键：交给 onOk 决定收不收；遮罩/Esc/取消统一走 close(cancelValue)
+    $('gen-modal-foot').onclick = e => {
+      const b = e.target.closest('button[data-r]');
+      if (!b) return;
+      if (b.dataset.r !== '1') { Modal.close(cancelValue); return; }
+      if (!onOk) { Modal.close(1); return; }
+      const out = onOk();
+      if (out === undefined) return;          // 校验没过：保留弹窗与已填内容
+      Modal.close(out);
+    };
+    setTimeout(() => Modal.focusTarget(focus || 'form'), 30);
+  });
+}
+
+// 底部按钮 / 遮罩点击：走统一 close
+$('gen-modal-foot').addEventListener('click', e => {
+  if (e.target.closest('button[data-r]')) return;   // showModal 自己的 onclick 处理
+  if (e.target.closest('button')) Modal.close(0);
+});
+$('gen-modal').addEventListener('click', e => {
+  if (e.target === $('gen-modal')) Modal.close(0);
+});
+
+// Esc 关闭 + 弹窗内 Enter 提交 + Tab 焦点陷阱
+document.addEventListener('keydown', e => {
+  if (!Modal.isOpen()) {
+    if (e.key === 'Escape' && typeof _openTradeCode !== 'undefined' && _openTradeCode) {
+      e.stopPropagation();
+      hideTrades();
+    }
+    return;
+  }
+  if (e.key === 'Escape') { e.stopPropagation(); Modal.close(0); return; }
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    const t = e.target;
+    if (t && t.tagName === 'TEXTAREA') return;       // 多行文本里回车是换行
+    const ok = Modal.focusables().find(x => x.dataset && x.dataset.r === '1');
+    if (ok) { e.preventDefault(); ok.click(); }
+    return;
+  }
+  if (e.key === 'Tab') {
+    const f = Modal.focusables();
+    if (!f.length) return;
+    const first = f[0], last = f[f.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  }
+});
+
+/** 确认框 → Promise<boolean>（danger=true 时焦点默认在「取消」） */
+function confirmDlg(message, { title = '请确认', okText = '确定', danger = false } = {}) {
+  return showModal({
+    title, focus: danger ? 'safe' : 'form',
+    body: `<div class="modal-msg">${esc(message)}</div>`,
+    footer: `<button class="btn ghost" data-r="0">取消</button>
+             <button class="btn ${danger ? 'danger' : ''}" data-r="1">${esc(okText)}</button>`,
+  }).then(v => v === 1);
+}
+
+/**
+ * 表单弹窗 → Promise<values|null>。
+ * fields: [{key,label,value,placeholder,type,hint,required,options}]
+ * 校验不过时**不关闭**（保留已输入内容），这是它比 prompt 强的地方。
+ */
+function formDlg(title, fields, { okText = '保存', wide = false } = {}) {
+  const body = fields.map(f => {
+    const id = 'f_' + f.key;
+    const common = `id="${id}" placeholder="${esc(f.placeholder || '')}"`;
+    const ctrl = f.type === 'textarea'
+      ? `<textarea ${common} rows="3">${esc(f.value || '')}</textarea>`
+      : f.type === 'select'
+        ? `<select id="${id}">${(f.options || []).map(o =>
+            `<option value="${esc(o)}"${String(o) === String(f.value) ? ' selected' : ''}>${esc(o)}</option>`
+          ).join('')}</select>`
+        : `<input ${common} value="${esc(f.value || '')}"
+             ${f.type ? `type="${f.type}"` : ''}
+             ${f.type === 'number' ? 'min="0" step="1"' : ''}>`;
+    return `<div class="field"><label for="${id}">${esc(f.label)}</label>${ctrl}
+      ${f.hint ? `<div class="faint" style="margin-top:3px">${esc(f.hint)}</div>` : ''}</div>`;
+  }).join('');
+  return showModal({
+    title, body, wide,
+    footer: `<button class="btn ghost" data-r="0">取消</button>
+             <button class="btn" data-r="1">${esc(okText)}</button>`,
+    onOk: () => {
+      const out = {};
+      for (const f of fields) {
+        const el = $('f_' + f.key);
+        out[f.key] = el ? el.value.trim() : '';
+        if (f.required && !out[f.key]) {
+          toastErr(f.label + ' 不能为空');
+          el?.focus();
+          return undefined;                    // 保留弹窗
+        }
+      }
+      return out;
+    },
+  }).then(v => (v && typeof v === 'object') ? v : null);
+}
+
+/** 只读展示弹窗（详情/说明），底部单个「知道了」 */
+function infoDlg(title, bodyHtml, { wide = false, okText = '知道了' } = {}) {
+  return showModal({
+    title, body: bodyHtml, wide,
+    footer: `<button class="btn" data-r="1">${esc(okText)}</button>`,
+  });
+}
+
+/** 按钮防重复提交：包装一次异步动作，期间禁用并显示忙碌态 */
+async function withBusy(btn, label, fn) {
+  if (!btn) return fn();
+  if (btn.disabled) return;
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.innerHTML = `<span class="spin">⏳</span> ${esc(label || old)}`;
+  try { return await fn(); }
+  finally { btn.disabled = false; btn.textContent = old; }
+}
 
 // ---- 标签页 ----
+const TABS = ['market', 'sector', 'holdings', 'strategies', 'plans', 'calendar', 'news',
+              'bili', 'wb', 'mp', 'x', 'reports', 'paper', 'notify', 'schedule'];
+const TAB_LOADERS = {
+  market:    () => { loadWatch(); loadAlerts(); loadCrypto(); },
+  sector:    () => { loadSector(); loadIntraday(); startIntradayAuto(); },
+  holdings:  () => { loadHoldings(); refreshTradeStrategyOptions(); },
+  strategies:() => { loadStrategies(); refreshTradeStrategyOptions(); },
+  plans:     () => { loadPlans(); loadLlmConf(); },
+  calendar:  loadCalendar,
+  news:      () => { loadNews(); loadConfig(); },
+  bili:      () => { loadBiliCreators(); loadBiliDynamics(); loadBiliStatus(); },
+  wb:        () => { loadWbCreators(); loadWbPosts(); loadWbStatus(); },
+  mp:        () => { loadMpSources(); loadMpArticles(); loadMpStatus(); },
+  x:         () => { loadXAccounts(); loadXWatch(); loadXTweets(); loadXStatus(); },
+  reports:   loadReports,
+  paper:     loadPaper,
+  notify:    loadNotifyConf,
+  schedule:  () => { loadSchedule(); loadConfigAll(); },
+};
+function switchTab(name) {
+  document.querySelectorAll('.tabs button').forEach(b =>
+    b.classList.toggle('active', b.dataset.tab === name));
+  TABS.forEach(t => $('tab-' + t).classList.toggle('hide', t !== name));
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+  const loader = TAB_LOADERS[name];
+  if (loader) { try { loader(); } catch (e) { console.error(e); } }
+}
 document.querySelectorAll('.tabs button').forEach(btn => {
-  btn.onclick = () => {
-    document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    ['market', 'sector', 'holdings', 'strategies', 'plans', 'calendar', 'news', 'bili', 'wb', 'reports', 'paper', 'notify', 'schedule'].forEach(t =>
-      $('tab-' + t).classList.toggle('hide', t !== btn.dataset.tab));
-    if (btn.dataset.tab === 'market') { loadWatch(); loadAlerts(); loadCrypto(); }
-    if (btn.dataset.tab === 'sector') { loadSector(); loadIntraday(); startIntradayAuto(); }
-    if (btn.dataset.tab === 'holdings') loadHoldings();
-    if (btn.dataset.tab === 'strategies') loadStrategies();
-    if (btn.dataset.tab === 'holdings' || btn.dataset.tab === 'strategies') refreshTradeStrategyOptions();
-    if (btn.dataset.tab === 'plans') { loadPlans(); loadLlmConf(); }
-    if (btn.dataset.tab === 'calendar') loadCalendar();
-    if (btn.dataset.tab === 'news') { loadNews(); loadConfig(); }
-    if (btn.dataset.tab === 'bili') { loadBiliCreators(); loadBiliDynamics(); loadBiliStatus(); }
-    if (btn.dataset.tab === 'wb') { loadWbCreators(); loadWbPosts(); loadWbStatus(); }
-    if (btn.dataset.tab === 'reports') loadReports();
-    if (btn.dataset.tab === 'paper') loadPaper();
-    if (btn.dataset.tab === 'notify') loadNotifyConf();
-    if (btn.dataset.tab === 'schedule') loadSchedule();
-  };
+  btn.onclick = () => switchTab(btn.dataset.tab);
 });
 
 // ---- 盘中实时榜 ----
@@ -841,7 +1583,7 @@ async function loadIntraday(fetchFresh = false) {
         <td class="muted">▾</td>
       </tr>`;
     }).join('');
-  } catch (e) { toast('盘中数据加载失败: ' + e.message); }
+  } catch (e) { toastErr('盘中数据加载失败: ' + e.message); }
 }
 function startIntradayAuto() {
   // 勾选了自动刷新：交易时段 60s 轮询盘中榜（采样由后台线程做，这里只拉缓存）
@@ -873,7 +1615,7 @@ async function loadSectorRender() {
   try {
     const ov = await api('/api/sector/overview');
     renderSector(ov);
-  } catch (e) { toast('加载板块数据失败: ' + e.message); }
+  } catch (e) { toastErr('加载板块数据失败: ' + e.message); }
 }
 async function sectorSnapshot() {
   const btn = $('sector-snap-btn');
@@ -882,7 +1624,7 @@ async function sectorSnapshot() {
     await api('/api/sector/snapshot', { method: 'POST' });
     toast('采集完成');
     await loadSectorRender();
-  } catch (e) { toast(e.message); }
+  } catch (e) { toastErr(e.message); }
   finally { btn.disabled = false; btn.textContent = '立即采集'; }
 }
 function renderSector(ov) {
@@ -1017,7 +1759,7 @@ async function pushAlerts() {
     const r = await api('/api/alerts/check', { method: 'POST' });
     toast(r.alerted && r.alerted.length ? `已推送 ${r.alerted.length} 个新事件（微信/邮件）`
                                         : '无新事件（已推送过的不会重复推）');
-  } catch (e) { toast('检查失败: ' + e.message); }
+  } catch (e) { toastErr('检查失败: ' + e.message); }
 }
 
 // ---- 自选 ----
@@ -1102,7 +1844,7 @@ async function loadWatch() {
     }).join('');
     fillWatchlistDatalist(items);  // 「记一笔」代码输入框可下拉引用自选
     loadMarketVolume();  // 量能与行情并行取，回来后回填 .vol-cell
-  } catch (e) { toast('加载自选失败: ' + e.message); }
+  } catch (e) { toastErr('加载自选失败: ' + e.message); }
 }
 // 自选股灌进 datalist：记一笔/新增持仓时直接下拉选，免手敲代码
 function fillWatchlistDatalist(items) {
@@ -1116,43 +1858,45 @@ function fillWatchlistDatalist(items) {
   }).join('');
 }
 async function addWatch() {
+  await withBusy($('add-watch-btn'), '添加中', async () => {
   const code = $('w-code').value.trim(), note = $('w-note').value.trim(),
         kw = $('w-kw').value.trim(), kwPos = $('w-kw-pos').value.trim(),
         kwNeg = $('w-kw-neg').value.trim();
-  if (!/^\d{4,6}$/.test(code)) return toast('请输入代码：A股 6 位（600519）、港股 4-5 位（02513 或 700）');
+  if (!/^\d{4,6}$/.test(code)) return toastErr('请输入代码：A股 6 位（600519）、港股 4-5 位（02513 或 700）');
   try {
-    await api('/api/watchlist', { method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code, note, keywords: kw,
-        keywords_pos: kwPos, keywords_neg: kwNeg }) });
-    ['w-code', 'w-note', 'w-kw', 'w-kw-pos', 'w-kw-neg'].forEach(id => $(id).value = '');
-    toast('已添加'); loadWatch();
-  } catch (e) { toast(e.message); }
+    await jsonPost('/api/watchlist', { code, note, keywords: kw,
+      keywords_pos: kwPos, keywords_neg: kwNeg });
+    ['w-code', 'w-note', 'w-kw', 'w-kw-pos', 'w-kw-neg'].forEach(id => { $(id).value = ''; });
+    toastOk('已添加'); loadWatch();
+  } catch (e) { toastErr(e.message); }
+  });
 }
 async function editWatch(code) {
-  // 顺序 prompt 改备注 / 三类搜索词（都可选，留空=清除，取消=保留原值）
+  // 原来这里是连续 4 次 prompt()——关掉一个弹窗再弹下一个，输错一个就得从头来。
+  // 现在一次把四个字段都摆出来，改完一起提交。
   const items = await api('/api/watchlist');
   const cur = items.find(i => i.code === code);
   if (!cur) return;
-  const note = prompt('备注（留空=清除）：', cur.note || '') ?? (cur.note || '');
-  const kw = prompt('中性搜索词，逗号分隔，如：Kimi,OpenAI（留空=清除）：',
-                    cur.keywords || '') ?? (cur.keywords || '');
-  const kwPos = prompt('🟢 利好搜索词，逗号分隔，如：中标,回购,增持（留空=清除）：',
-                       cur.keywords_pos || '') ?? (cur.keywords_pos || '');
-  const kwNeg = prompt('🔴 利空搜索词，逗号分隔，如：解禁,减持,降价（留空=清除）：',
-                       cur.keywords_neg || '') ?? (cur.keywords_neg || '');
+  const v = await formDlg(`编辑自选 ${code}${cur.name ? ' · ' + cur.name : ''}`, [
+    { key: 'note', label: '备注', value: cur.note || '', placeholder: '如：关注白酒政策' },
+    { key: 'kw', label: '🔍 中性搜索词', value: cur.keywords || '',
+      placeholder: 'Kimi,OpenAI', hint: '竞品动态等；逗号分隔。留空=清除' },
+    { key: 'kwPos', label: '🟢 利好搜索词', value: cur.keywords_pos || '',
+      placeholder: '中标,回购,增持', hint: '命中标绿。留空=清除' },
+    { key: 'kwNeg', label: '🔴 利空搜索词', value: cur.keywords_neg || '',
+      placeholder: '解禁,减持,降价', hint: '命中标红（利空优先）。留空=清除' },
+  ]);
+  if (!v) return;
   try {
-    await api('/api/watchlist/' + code, { method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code, note, keywords: kw,
-        keywords_pos: kwPos, keywords_neg: kwNeg }) });
-    toast('已更新'); loadWatch();
-  } catch (e) { toast(e.message); }
+    await jsonPut('/api/watchlist/' + code, {
+      code, note: v.note, keywords: v.kw, keywords_pos: v.kwPos, keywords_neg: v.kwNeg });
+    toastOk('已更新'); loadWatch();
+  } catch (e) { toastErr(e.message); }
 }
 async function delWatch(code) {
-  if (!confirm('删除自选 ' + code + '？')) return;
-  try { await api('/api/watchlist/' + code, { method: 'DELETE' }); loadWatch(); }
-  catch (e) { toast(e.message); }
+  if (!await confirmDlg(`删除自选 ${code}？`, { okText: '删除', danger: true })) return;
+  try { await api('/api/watchlist/' + code, { method: 'DELETE' }); toastOk('已删除'); loadWatch(); }
+  catch (e) { toastErr(e.message); }
 }
 
 // ---- 持仓（流水账） ----
@@ -1212,7 +1956,7 @@ async function loadHoldings() {
       </tr>`;
     }).join('');
     if (_openTradeCode) { if (items.some(i => i.code === _openTradeCode)) await showTrades(_openTradeCode); else hideTrades(); }
-  } catch (e) { toast('加载持仓失败: ' + e.message); }
+  } catch (e) { toastErr('加载持仓失败: ' + e.message); }
 }
 function setHoldSort(mode) { _holdSort = mode; loadHoldings(); }
 
@@ -1242,12 +1986,13 @@ async function addTrade() {
     $('t-strategy').value = '';
     $('t-date').type = 'text';
     toast(side === 'buy' ? '已记买入' : '已记卖出'); loadHoldings();
-  } catch (e) { toast('记账失败: ' + e.message); }
+  } catch (e) { toastErr('记账失败: ' + e.message); }
 }
 
 async function toggleTrades(code) {
   if (_openTradeCode === code) { hideTrades(); return; }
   _openTradeCode = code;
+  _lastTradeCode = code;
   await showTrades(code);
 }
 
@@ -1257,7 +2002,9 @@ async function showTrades(code) {
     const pos = (_holdingsCache || []).find(h => h.code === code);
     $('trades-modal-title').innerHTML =
       `${esc(pos?.name || '')} <span class="muted" style="font-weight:400">${code} · 交易流水（新→旧）</span>`;
-    $('trades-modal').classList.remove('hide');
+    const mask = $('trades-modal');
+    if (mask.classList.contains('hide')) Modal.lockScroll(true);
+    mask.classList.remove('hide');
     const box = $('trades-detail');
     box.innerHTML = `<div id="pos-strat-${code}" style="margin-bottom:8px"></div>
       <table><tbody>${rows.map(t => {
@@ -1287,7 +2034,7 @@ async function showTrades(code) {
         <td><button class="del" onclick="event.stopPropagation();delTrade(${t.id},'${code}')" title="删除该笔">×</button></td>
       </tr>`;}).join('')}</tbody></table>`;
     renderPosStrategies(code);
-  } catch (e) { toast('加载流水失败: ' + e.message); }
+  } catch (e) { toastErr('加载流水失败: ' + e.message); }
 }
 
 // ---- 整仓级策略：直接给某只股票的当前持仓挂策略（不必逐笔引用） ----
@@ -1328,37 +2075,43 @@ async function bindPosStrategy(code) {
     await api(`/api/holdings/${code}/strategies`, { method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ strategy_id: +sel.value }) });
-    toast('已挂到整仓'); _holdingsCache = await api('/api/holdings');
+    toastOk('已挂到整仓'); _holdingsCache = await api('/api/holdings');
     showTrades(code); loadHoldings();
-  } catch (e) { toast(e.message); }
+  } catch (e) { toastErr(e.message); }
 }
 async function unbindPosStrategy(psId, code) {
   try {
     await api('/api/position-strategies/' + psId, { method: 'DELETE' });
     _holdingsCache = await api('/api/holdings');
     showTrades(code); loadHoldings();
-  } catch (e) { toast(e.message); }
+  } catch (e) { toastErr(e.message); }
 }
 
 function hideTrades() {
+  if ($('trades-modal').classList.contains('hide')) return;
   _openTradeCode = null;
   $('trades-modal').classList.add('hide');
   $('trades-detail').innerHTML = '';
+  Modal.lockScroll(false);
+  // 焦点还回刚才点的那一行
+  const back = document.querySelector(`#holdings-body tr[data-code="${_lastTradeCode}"]`);
+  (back || $('tab-holdings'))?.focus?.();
 }
-document.addEventListener('keydown', e => {
-  if (e.key === 'Escape' && _openTradeCode) hideTrades();
-});
+let _lastTradeCode = null;
+// Esc 关闭统一在上面那个 keydown 里处理（通用弹窗优先，其次交易流水）
 
 async function delTrade(id, code) {
-  if (!confirm('删除这笔交易记录？删除后持仓和盈亏会按剩余流水重新推算。')) return;
+  if (!await confirmDlg('删除这笔交易记录？\n删除后持仓和盈亏会按剩余流水重新推算。',
+                        { title: `删除 ${code} 的一笔流水`, okText: '删除', danger: true })) return;
   try { await api('/api/trades/' + id, { method: 'DELETE' }); await showTrades(code); loadHoldings(); }
-  catch (e) { toast(e.message); }
+  catch (e) { toastErr(e.message); }
 }
 
 async function clearTrades(code, count) {
-  if (!confirm(`清账：删除 ${code} 全部 ${count} 笔交易流水？`)) return;
+  if (!await confirmDlg(`清账：删除 ${code} 全部 ${count} 笔交易流水？\n持仓与盈亏会归零，不可恢复。`,
+                        { title: '清账', okText: '全部删除', danger: true })) return;
   try { await api('/api/holdings/' + code, { method: 'DELETE' }); hideTrades(); loadHoldings(); }
-  catch (e) { toast(e.message); }
+  catch (e) { toastErr(e.message); }
 }
 
 // ---- 止盈策略 ----
@@ -1421,7 +2174,7 @@ async function addStrategy() {
       headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     ['s-name', 's-target-pct', 's-drawdown-pct', 's-ladder', 's-hold-days', 's-note'].forEach(id => $(id).value = '');
     toast('策略已创建'); loadStrategies();
-  } catch (e) { toast('创建失败: ' + e.message); }
+  } catch (e) { toastErr('创建失败: ' + e.message); }
 }
 function toggleStrategyKind() {
   const kind = $('s-kind').value;
@@ -1450,12 +2203,13 @@ async function loadStrategies() {
         <td>${(s.used_count + (s.pos_count || 0)) === 0
           ? `<button class="del" onclick="delStrategy(${s.id})" title="删除策略">×</button>` : ''}</td>
       </tr>`).join('');
-  } catch (e) { toast('加载策略失败: ' + e.message); }
+  } catch (e) { toastErr('加载策略失败: ' + e.message); }
 }
 async function delStrategy(id) {
-  if (!confirm('删除该止盈策略？')) return;
+  if (!await confirmDlg('删除该止盈策略？\n被交易或整仓引用时不可删。',
+                        { okText: '删除', danger: true })) return;
   try { await api('/api/strategies/' + id, { method: 'DELETE' }); loadStrategies(); }
-  catch (e) { toast(e.message); }
+  catch (e) { toastErr(e.message); }
 }
 function updateStrategyBadge() {
   // 策略与股票无关，徽标无「待触发」语义，隐藏
@@ -1474,7 +2228,7 @@ async function addPlan() {
       body: JSON.stringify({ target_date: date, target_amount: +amount, note: $('p-note').value.trim() }) });
     $('p-date').value = ''; $('p-date').type = 'text'; $('p-amount').value = ''; $('p-note').value = '';
     toast('计划已创建'); loadPlans();
-  } catch (e) { toast('创建失败: ' + e.message); }
+  } catch (e) { toastErr('创建失败: ' + e.message); }
 }
 async function loadPlans() {
   try {
@@ -1515,7 +2269,7 @@ async function loadPlans() {
       </div>`;
     }).join('');
     if (_openPlanId != null && items.some(p => p.id === _openPlanId)) showPlanDetail(_openPlanId);
-  } catch (e) { toast('加载计划失败: ' + e.message); }
+  } catch (e) { toastErr('加载计划失败: ' + e.message); }
 }
 function togglePlanDetail(id) {
   if (_openPlanId === id) { _openPlanId = null; $('plan-detail-' + id).classList.add('hide'); return; }
@@ -1566,7 +2320,7 @@ async function showPlanDetail(id) {
         <table><tbody>${wdRows}</tbody></table>`
         : '<div class="muted" style="margin-top:6px">还没有提款记录。</div>'}`;
     showPlanAdvice(id);   // 拉最新一条 AI 建议（无则隐藏框）
-  } catch (e) { toast(e.message); }
+  } catch (e) { toastErr(e.message); }
 }
 
 // ---- AI 提款建议 ----
@@ -1589,7 +2343,7 @@ async function showAdviceHistory(id) {
       </details>`).join('');
     }
     box.classList.remove('hide');
-  } catch (e) { toast('加载历史失败: ' + e.message); }
+  } catch (e) { toastErr('加载历史失败: ' + e.message); }
 }
 async function showPlanAdvice(id) {
   try {
@@ -1622,7 +2376,7 @@ async function genPlanAdvice(id) {
     toast('AI 建议已生成');
   } catch (e) {
     if (st) st.textContent = '生成失败: ' + e.message;
-    toast('生成失败: ' + e.message);
+    toastErr('生成失败: ' + e.message);
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = '🤖 重新生成建议'; }
   }
@@ -1636,7 +2390,7 @@ async function quickGenAdvice(id) {
     _openPlanId = id; showPlanDetail(id);   // 展开详情，最新建议由 showPlanAdvice 拉取
     toast('AI 买卖建议已生成');
   } catch (e) {
-    toast('生成失败: ' + e.message);
+    toastErr('生成失败: ' + e.message);
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = '🤖 AI 买卖建议'; }
   }
@@ -1664,7 +2418,7 @@ async function saveLlmConf() {
       })});
     toast('AI 配置已保存');
     loadLlmConf();
-  } catch (e) { toast(e.message); }
+  } catch (e) { toastErr(e.message); }
 }
 async function addWithdrawal(id) {
   const amount = $('pw-amount').value;
@@ -1675,12 +2429,13 @@ async function addWithdrawal(id) {
       body: JSON.stringify({ amount: +amount, wd_date: $('pw-date').value, note: $('pw-note').value.trim() }) });
     toast(r.completed ? '🎉 已提满目标，计划完成！' : '已记录提款');
     loadPlans();
-  } catch (e) { toast(e.message); }
+  } catch (e) { toastErr(e.message); }
 }
 async function delPlan(id) {
-  if (!confirm('删除该提款计划？提款流水会一并删除。')) return;
+  if (!await confirmDlg('删除该提款计划？\n提款流水会一并删除。',
+                        { okText: '删除', danger: true })) return;
   try { await api('/api/plans/' + id, { method: 'DELETE' }); loadPlans(); }
-  catch (e) { toast(e.message); }
+  catch (e) { toastErr(e.message); }
 }
 
 // ---- 财经日历 ----
@@ -1708,7 +2463,7 @@ async function loadCalendar() {
           ${e.note ? `<div class="muted" style="margin-top:2px">${esc(e.note)}</div>` : ''}</span>
         ${srcBadge}</div>`;
     }).join('');
-  } catch (e) { toast('加载日历失败: ' + e.message); }
+  } catch (e) { toastErr('加载日历失败: ' + e.message); }
 }
 async function addCalendarEvent() {
   const date = $('c-date').value, title = $('c-title').value.trim();
@@ -1719,19 +2474,19 @@ async function addCalendarEvent() {
       body: JSON.stringify({ event_date: date, title, time_hint: $('c-time').value.trim(), note: $('c-note').value.trim() }) });
     ['c-date', 'c-title', 'c-time', 'c-note'].forEach(id => $(id).value = '');
     $('c-date').type = 'text';
-    toast('已添加'); loadCalendar();
-  } catch (e) { toast('添加失败: ' + e.message); }
+    toastOk('已添加'); loadCalendar();
+  } catch (e) { toastErr('添加失败: ' + e.message); }
 }
 async function delCalendarEvent(id) {
-  if (!confirm('删除该手动事件？')) return;
+  if (!await confirmDlg('删除该手动事件？', { okText: '删除', danger: true })) return;
   try { await api('/api/calendar/events/' + id, { method: 'DELETE' }); loadCalendar(); }
-  catch (e) { toast(e.message); }
+  catch (e) { toastErr(e.message); }
 }
 async function calendarCheck() {
   try {
     const r = await api('/api/calendar/check', { method: 'POST' });
     toast(r.alerts.length ? `已触发 ${r.alerts.length} 条提醒（推微信/邮件）` : '今明无事件，无提醒');
-  } catch (e) { toast(e.message); }
+  } catch (e) { toastErr(e.message); }
 }
 
 // ---- 报告 ----
@@ -1747,7 +2502,7 @@ async function loadReports() {
           <span>${f.endsWith('daily-summary.md') ? '📋 每日总结' : '📄 ' + f.replace('.md', '')}</span>
           <span class="muted">查看 →</span>
         </div>`).join('')}`).join('');
-  } catch (e) { toast('加载报告失败: ' + e.message); }
+  } catch (e) { toastErr('加载报告失败: ' + e.message); }
 }
 async function openReport(date, name) {
   try {
@@ -1755,7 +2510,7 @@ async function openReport(date, name) {
     $('report-list-card').classList.add('hide');
     $('report-view-card').classList.remove('hide');
     $('report-view').textContent = r.content;
-  } catch (e) { toast(e.message); }
+  } catch (e) { toastErr(e.message); }
 }
 function backToList() {
   $('report-view-card').classList.add('hide');
@@ -1769,18 +2524,37 @@ function paperSideBadge(side) {
   return '<span class="badge" style="background:#eee;color:#666">观望</span>';
 }
 function paperStatusBadge(t) {
+  // 关键：**先看 side 有没有真的持仓**，再看 status。
+  // 原来只看 status，于是 side='hold'（shares=0、根本没有持仓）的行也被
+  // 渲染成「持有中」，和同一行左边显示的「观望」自相矛盾（2026-09-28 实测
+  // 335 行里 308 行是这种，看着像满仓其实是空仓）。
   if (t.auto_closed) return '<span class="badge" style="background:#eee;color:#666">到期平仓</span>';
-  if (t.status === 'open') return '<span class="badge" style="background:#e8f0fe;color:#1a56b0">持有中</span>';
+  if (t.side === 'hold' || t.status === 'none') {
+    return '<span class="badge" style="background:#f4f4f5;color:#71717a">无仓位</span>';
+  }
   if (t.status === 'skipped') return '<span class="badge" style="background:#eee;color:#999">未成交</span>';
-  return '<span class="badge" style="background:#e5f3e2;color:#1e7d32">已结算</span>';
+  if (t.status === 'resolved') return '<span class="badge" style="background:#e5f3e2;color:#1e7d32">已结算</span>';
+  // 只有真有仓位（buy/sell 且未平仓）才叫「持有中」
+  if (t.status === 'open' && (t.shares || 0) > 0) {
+    return '<span class="badge" style="background:#e8f0fe;color:#1a56b0">持有中</span>';
+  }
+  if (t.status === 'open') {
+    return '<span class="badge" style="background:#f4f4f5;color:#71717a">已平仓</span>';
+  }
+  return '<span class="badge" style="background:#eee;color:#999">—</span>';
 }
 async function loadPaper() {
   try {
-    const [ov, trades, lessons] = await Promise.all([
+    const [ov, trades, lessons, cfg, pstat] = await Promise.all([
       api('/api/paper/overview'),
       api('/api/paper/trades?limit=100'),
       api('/api/paper/lessons?limit=50'),
+      api('/api/config/all'),
+      api('/api/paper/status'),
     ]);
+    fillPaperCadence(cfg.sections);
+    renderPaperCadenceStatus(pstat);
+    loadPaperCycles();
     // 账户卡片
     const acc = ov.account || {};
     const st = ov.stats || {};
@@ -1849,14 +2623,14 @@ async function loadPaper() {
         <td class="${cls(e.daily_return != null ? e.daily_return * 100 : null)}">
           ${e.daily_return != null ? signed((e.daily_return * 100).toFixed(2)) + '%' : '—'}</td>
       </tr>`).join('');
-  } catch (e) { toast('模拟交易数据加载失败: ' + e.message); }
+  } catch (e) { toastErr('模拟交易数据加载失败: ' + e.message); }
 }
 async function loadPaperLessons() {
   try {
     const code = $('paper-lesson-code').value;
     const lessons = await api('/api/paper/lessons?limit=50' + (code ? '&code=' + code : ''));
     renderPaperLessons(lessons);
-  } catch (e) { toast('经验库加载失败: ' + e.message); }
+  } catch (e) { toastErr('经验库加载失败: ' + e.message); }
 }
 function renderPaperLessons(lessons) {
   const code = $('paper-lesson-code').value;
@@ -1879,17 +2653,105 @@ function renderPaperLessons(lessons) {
 }
 async function paperRun() {
   try {
-    const r = await api('/api/paper/run', { method: 'POST' });
-    toast(r.status || '已启动');
+    const r = await api('/api/paper/run?force_slot=true', { method: 'POST' });
+    toast(r.status || '已启动' + (r.slot ? '（' + r.slot + '）' : ''));
     setTimeout(loadPaperStatus, 3000);
-  } catch (e) { toast('决策启动失败: ' + e.message); }
+  } catch (e) { toastErr('决策启动失败: ' + e.message); }
+}
+
+/* ---------------- 判断节奏（前端可配，存 paper 段） ---------------- */
+function fillPaperCadence(sections) {
+  // GET /api/config/all 回的是 {sections:[{section,rows:[{key,value}]}]}，不是原始 conf
+  const sec = (sections || []).find(s => s.section === 'paper');
+  const get = k => {
+    const r = (sec && sec.rows || []).find(x => x.key === k);
+    return r ? r.value : undefined;
+  };
+  const set = (id, v) => { const el = $(id); if (el) el.value = (v === undefined || v === null) ? '' : v; };
+  set('paper-iv', get('interval_minutes') != null ? get('interval_minutes') : 30);
+  set('paper-start', get('start_time') || '09:35');
+  set('paper-end', get('end_time') || '14:40');
+  set('paper-slmax', get('stop_loss_max_pct') != null ? get('stop_loss_max_pct') : 5);
+  const ho = $('paper-holdonly');
+  if (ho) ho.checked = !!get('judge_holdings_only');
+}
+
+async function savePaperCadence() {
+  const num = (id, def, lo, hi) => {
+    const v = parseFloat($(id).value);
+    if (isNaN(v)) return def;
+    return Math.max(lo, Math.min(hi, v));
+  };
+  const paper = {
+    interval_minutes: Math.round(num('paper-iv', 30, 1, 240)),
+    start_time: $('paper-start').value || '09:35',
+    end_time: $('paper-end').value || '14:40',
+    stop_loss_max_pct: num('paper-slmax', 5, 1, 30),
+    judge_holdings_only: !!$('paper-holdonly').checked,
+  };
+  if (paper.start_time >= paper.end_time) {
+    toastErr('开始时间必须早于最后判断时间');
+    return;
+  }
+  try {
+    await withBusy(async () => {
+      await api('/api/config/all', {
+        method: 'PUT',
+        body: JSON.stringify({ values: { paper: paper } }),
+      });
+    }, '保存判断节奏');
+    toast('已保存，1 分钟内生效');
+    renderPaperCadenceStatus(await api('/api/paper/status'));
+  } catch (e) { toastErr('保存失败: ' + e.message); }
+}
+
+function renderPaperCadenceStatus(s) {
+  const el = $('paper-cadence');
+  if (!el || !s) return;
+  const parts = [];
+  parts.push(s.trading_day ? '交易日' : '非交易日（周末不跑）');
+  parts.push(s.in_window ? '在判断窗口内' : '不在判断窗口内');
+  if (s.running) parts.push('正在跑 ' + (s.current_slot || '') + ' 这一轮');
+  else if (s.next_in_minutes != null && s.in_window) parts.push('下一轮 ' + s.next_in_minutes + ' 分钟后');
+  el.textContent = '每 ' + s.interval_minutes + ' 分钟 · ' + parts.join(' · ');
+  el.style.color = s.running ? 'var(--accent)' : '';
+}
+
+async function loadPaperCycles() {
+  const tb = $('paper-cycles');
+  if (!tb) return;
+  try {
+    const r = await api('/api/paper/cycles?limit=60');
+    const items = r.items || [];
+    if (!items.length) {
+      tb.innerHTML = '<tr><td colspan="9" class="muted" style="text-align:center;padding:14px">'
+        + '今天还没有跑过判断轮次</td></tr>';
+      return;
+    }
+    const KIND = { intraday: '盘中', catchup: '兜底', manual: '手动' };
+    tb.innerHTML = items.map(c => {
+      const bd = (c.breakdown || []).map(b =>
+        b.side + '/' + b.status + '×' + b.n).join(' ');
+      return `<tr>
+        <td class="tabular-nums">${esc((c.trade_date || '').slice(5))} ${esc(c.slot)}</td>
+        <td>${KIND[c.kind] || esc(c.kind)}</td>
+        <td class="muted">${esc(c.trigger || '')}</td>
+        <td class="tabular-nums">${c.planned}</td>
+        <td class="tabular-nums" style="color:${c.acted ? 'var(--up,#e5534b)' : ''}">${c.acted}</td>
+        <td class="tabular-nums">${c.holds}</td>
+        <td class="tabular-nums">${c.skipped}</td>
+        <td class="tabular-nums">${c.elapsed_ms ? Math.round(c.elapsed_ms / 1000) + 's' : '-'}</td>
+        <td class="muted" style="font-size:11px">${esc(bd || (c.error || '').slice(0, 40))}</td>
+      </tr>`;
+    }).join('');
+  } catch (e) { /* 静默 */ }
 }
 async function paperSettle() {
   try {
     const r = await api('/api/paper/settle', { method: 'POST' });
     toast(r.status || '已启动');
     setTimeout(loadPaperStatus, 3000);
-  } catch (e) { toast('结算启动失败: ' + e.message); }
+  } catch (e) { toastErr('结算启动失败: ' + e.message); }
 }
 async function loadPaperStatus() {
   try {
@@ -1901,15 +2763,16 @@ async function loadPaperStatus() {
   } catch (e) { /* 静默 */ }
 }
 async function paperReset() {
-  if (!confirm('重置模拟账户？将清空全部模拟交易、经验库和资产快照，初始资金恢复 10 万。')) return;
+  if (!await confirmDlg('重置模拟账户？\n将清空全部模拟交易、经验库和资产快照，初始资金恢复 10 万。',
+                        { title: '重置模拟账户', okText: '确认重置', danger: true })) return;
   try {
     await api('/api/paper/reset', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ confirm: true, initial_cash: 100000 })
     });
-    toast('已重置'); loadPaper();
-  } catch (e) { toast('重置失败: ' + e.message); }
+    toastOk('已重置'); loadPaper();
+  } catch (e) { toastErr('重置失败: ' + e.message); }
 }
 
 // ---- 新闻 ----
@@ -1940,13 +2803,12 @@ async function loadNews() {
         <span class="muted">${(n.publish_time || n.fetched_at || '').replace('T', ' ').slice(0, 16)}</span>
       </div>`;
     }).join('');
-  } catch (e) { toast('加载新闻失败: ' + e.message); }
+  } catch (e) { toastErr('加载新闻失败: ' + e.message); }
 }
 function filterByCode(code) {
   $('news-filter').value = code;
-  loadNews();
+  switchTab('news');
 }
-const esc = s => (s || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
 // ---- 调度设置（config.yaml schedule 段 + 各模块抓取周期 + 币圈监控） ----
 const SCH_INTERVALS = ['news', 'bili', 'wb', 'sector', 'volume'];
@@ -1970,12 +2832,28 @@ async function loadSchedule() {
     $('sch-cr-interval').value = c.interval_minutes ?? 15;
     $('sch-cr-threshold').value = c.alert_threshold_pct ?? 3;
     $('sch-cr-cooldown').value = c.alert_cooldown_hours ?? 6;
+    $('sch-crl-enabled').checked = c.link_enabled !== false;
+    $('sch-crl-refresh').value = c.link_refresh_hours ?? 6;
+    $('sch-crl-lookback').value = c.link_lookback_days ?? 45;
+    $('sch-crl-minov').value = c.link_min_overlap ?? 9;
+    $('sch-crl-dev').value = c.link_alert_dev_pct ?? 0;
+    $('sch-crl-devcool').value = c.link_alert_cooldown_hours ?? 12;
+    const mp = d.mp || {};
+    $('sch-mp-enabled').checked = mp.enabled !== false;
+    $('sch-mp-interval').value = mp.interval_minutes ?? 30;
+    $('sch-mp-notify').checked = mp.notify_new !== false;
+    const xc = d.x || {};
+    $('sch-x-enabled').checked = xc.enabled !== false;
+    $('sch-x-interval').value = xc.interval_minutes ?? 30;
+    $('sch-x-notify').checked = xc.notify_new !== false;
     SCH_INTERVALS.forEach(k => {
       const iv = (d.intervals || {})[k] || {};
-      $('sch-iv-' + k).checked = iv.enabled !== false;
+      // news 没有真身 enabled（0 分钟即关闭），接口用周期反推，别画复选框
+      const box = $('sch-iv-' + k + '-on');
+      if (box) box.classList.toggle('hide', iv.has_enabled === false);
       $('sch-iv-' + k + '-min').value = iv.interval_minutes ?? 30;
     });
-  } catch (e) { toast('加载调度设置失败: ' + e.message); }
+  } catch (e) { toastErr('加载调度设置失败: ' + e.message); }
 }
 async function saveSchedule() {
   const st = $('schedule-status');
@@ -1990,14 +2868,33 @@ async function saveSchedule() {
         alerts: { check_time: $('sch-al').value },
         calendar: { start_time: $('sch-cs').value, end_time: $('sch-ce').value },
       },
-      intervals: Object.fromEntries(SCH_INTERVALS.map(k => [k, {
-        enabled: $('sch-iv-' + k).checked,
-        interval_minutes: +$('sch-iv-' + k + '-min').value }])),
+      intervals: Object.fromEntries(SCH_INTERVALS.map(k => {
+        const on = $('sch-iv-' + k + '-on');
+        return [k, {
+          enabled: !on || on.classList.contains('hide') ? undefined : on.checked,
+          interval_minutes: +$('sch-iv-' + k + '-min').value }];
+      })),
       crypto: {
         enabled: $('sch-cr-enabled').checked,
         interval_minutes: +$('sch-cr-interval').value,
         alert_threshold_pct: +$('sch-cr-threshold').value,
         alert_cooldown_hours: +$('sch-cr-cooldown').value,
+        link_enabled: $('sch-crl-enabled').checked,
+        link_refresh_hours: +$('sch-crl-refresh').value,
+        link_lookback_days: +$('sch-crl-lookback').value,
+        link_min_overlap: +$('sch-crl-minov').value,
+        link_alert_dev_pct: +$('sch-crl-dev').value,
+        link_alert_cooldown_hours: +$('sch-crl-devcool').value,
+      },
+      mp: {
+        enabled: $('sch-mp-enabled').checked,
+        interval_minutes: +$('sch-mp-interval').value,
+        notify_new: $('sch-mp-notify').checked,
+      },
+      x: {
+        enabled: $('sch-x-enabled').checked,
+        interval_minutes: +$('sch-x-interval').value,
+        notify_new: $('sch-x-notify').checked,
       },
     };
     await api('/api/schedule', { method: 'PUT',
@@ -2030,7 +2927,7 @@ async function genReport(kind) {
         if (btn) btn.disabled = false;
         if (last && last.error) {
           if (st) st.textContent = '失败: ' + last.error;
-          toast('生成失败');
+          toastErr('生成失败');
         } else if (last) {
           if (st) st.textContent = '已完成 ✓ ' + (last.path || '');
           toast('报告已生成');
@@ -2038,16 +2935,22 @@ async function genReport(kind) {
         }
       } catch { clearInterval(_reportTimer); if (btn) btn.disabled = false; }
     }, 3000);
-  } catch (e) { toast(e.message); }
+  } catch (e) { toastErr(e.message); }
 }
 
-// ---- 币圈 24h 趋势参考（gate.io 股票永续） ----
+// ---- 币圈 24h 趋势参考（gate.io 股票永续）+ 币↔股 关联统计 ----
+let _cryptoLinks = {};   // contract -> {stock_code,label,quote,stats}
+
 async function loadCrypto(force = false) {
   try {
-    if (force) {
-      await api('/api/crypto/refresh', { method: 'POST' });
-    }
-    const d = await api('/api/crypto/quotes');
+    if (force) await jsonPost('/api/crypto/refresh');
+    // 行情与关联统计并行取；关联那半边失败也不该让行情表空白
+    const [d, links] = await Promise.all([
+      api('/api/crypto/quotes'),
+      api('/api/crypto/links').catch(() => ({ items: [] })),
+    ]);
+    _cryptoLinks = {};
+    (links.items || []).forEach(i => { _cryptoLinks[i.contract] = i; });
     const items = d.items || [];
     $('crypto-empty').classList.toggle('hide', items.length > 0);
     $('crypto-body').innerHTML = items.map(i => {
@@ -2057,37 +2960,634 @@ async function loadCrypto(force = false) {
       return `<tr>
         <td><b>${esc(i.name || i.contract)}</b></td>
         <td class="muted">${esc(i.contract)}</td>
-        <td>${i.last != null ? i.last.toFixed(2) : '—'}</td>
+        <td class="num">${i.last != null ? i.last.toFixed(2) : '—'}</td>
         <td class="${cls(pct)}"><b>${typeof pct === 'number' ? (pct > 0 ? '+' : '') + pct.toFixed(2) + '%' : '—'}</b></td>
-        <td class="muted">${i.high_24h != null ? i.high_24h.toFixed(2) : '—'}</td>
-        <td class="muted">${i.low_24h != null ? i.low_24h.toFixed(2) : '—'}</td>
-        <td class="muted">${vol} USDT</td>
-        <td><button class="btn ghost" style="font-size:12px"
-          onclick="delCrypto('${esc(i.contract)}')">移除</button></td>
+        <td class="muted num">${i.high_24h != null ? i.high_24h.toFixed(2) : '—'}</td>
+        <td class="muted num">${i.low_24h != null ? i.low_24h.toFixed(2) : '—'}</td>
+        <td class="muted num">${vol}</td>
+        <td>${linkCell(i.contract)}</td>
+        <td class="muted"><button class="btn ghost sm" onclick="delCrypto('${esc(i.contract)}')">移除</button></td>
       </tr>`;
     }).join('');
     $('crypto-meta').textContent = d.updated_at ? '更新于 ' + d.updated_at.replace('T', ' ') : '';
   } catch (e) { $('crypto-meta').textContent = '加载失败: ' + e.message; }
 }
-async function addCrypto() {
-  const contract = $('crypto-contract').value.trim().toUpperCase();
-  if (!contract) { toast('请输入合约名，如 TSLA_USDT'); return; }
+
+// 关联列：已配且算出来了 → 可点的「相关度」徽标；配了没数据 → 警示；
+// 没配 → 「设关联」按钮
+function linkCell(contract) {
+  const l = _cryptoLinks[contract];
+  if (!l || !l.stock_code) {
+    return `<button class="link-btn" onclick="editCryptoLink('${esc(contract)}')">＋ 设关联</button>`;
+  }
+  const s = l.stats, q = l.quote || {};
+  const name = q.name ? `<span class="muted">${esc(q.name)}</span> ` : '';
+  if (!s || s.status !== 'ok') {
+    const why = (s && s.error) ? esc(s.error).slice(0, 60) : '尚未重算';
+    return `<span class="badge b-warn" title="${why}"
+              onclick="showCryptoLink('${esc(contract)}')">${esc(l.stock_code)} 无数据</span>`;
+  }
+  const dev = s.ratio_dev_pct;
+  const devTxt = (dev == null ? '' :
+    ` 比价偏离 <b class="${Math.abs(dev) >= 5 ? 'up' : ''}">${signed(dev)}%</b>`);
+  return `<span class="row tight" style="flex-wrap:nowrap">
+    <span class="badge b-info" style="cursor:pointer"
+          onclick="showCryptoLink('${esc(contract)}')"
+          title="点击看「合约 vs 股票」双线图与指标">相关 ${s.corr?.toFixed(2)}</span>
+    ${name}<span class="muted">${esc(l.stock_code)}</span>
+    ${q.change_pct != null ? `<span class="${cls(q.change_pct)}">${signed(q.change_pct)}%</span>` : ''}
+    <span class="faint">${devTxt}</span></span>`;
+}
+
+async function editCryptoLink(contract) {
+  const l = _cryptoLinks[contract] || {};
+  const v = await formDlg(`关联「${contract}」到哪只股票`, [
+    { key: 'code', label: '股票代码', value: l.stock_code || '', required: true,
+      placeholder: '600519 / 02513 / TSLA',
+      hint: 'A股 6 位、港股 4-5 位、美股字母代码。留空并保存 = 解除关联。' },
+  ], { okText: '保存并重算' });
+  if (!v) return;
   try {
-    await api('/api/crypto/watch', { method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contract, name: $('crypto-name').value.trim() }) });
+    await jsonPost(`/api/crypto/links/${encodeURIComponent(contract)}`,
+                   { stock_code: v.code });
+    if (!v.code) { toastOk('已解除关联'); loadCrypto(); return; }
+    toastOk('已保存，正在拉两侧日K重算（几秒）…');
+    await jsonPost('/api/crypto/links/refresh', { contracts: contract });
+    toastOk('关联统计已更新');
+    loadCrypto();
+  } catch (e) { toastErr(e.message); }
+}
+
+// 详情弹窗：指标卡 + 双线图（两条价格各自归一化到 100，否则量纲差 7 倍画不出来）
+async function showCryptoLink(contract) {
+  const done = showModal({ title: `${contract} ↔ 关联股票`, wide: true,
+                           body: skeletonBox('正在取两侧日K…') });
+  try {
+    // 缓存里没有就现拉一次：徽标虽然只在 loadCrypto 之后才渲染，但页面刚打开
+    // 或快速切页时仍可能先点到，缺了会显示不出关联股票的名称与现价。
+    if (!_cryptoLinks[contract]) {
+      const all = await api('/api/crypto/links').catch(() => ({ items: [] }));
+      (all.items || []).forEach(i => { _cryptoLinks[i.contract] = i; });
+    }
+    const s = await api(`/api/crypto/links/${encodeURIComponent(contract)}`);
+    const l = _cryptoLinks[contract] || {};
+    const q = l.quote || {};
+    const foot = `<button class="btn ghost" data-r="0">关闭</button>
+                  <button class="btn" data-r="1">改关联 / 重新重算</button>`;
+    if (!s.dates || !s.dates.length) {
+      Modal.close(0);
+      await done;
+      return infoDlg(`${contract} · 还没有关联数据`, `
+        <div class="empty" style="padding:8px 0 14px">还没算出关联统计</div>
+        ${s.error ? `<div class="hint" style="color:var(--warn)">
+            <b>原因</b>：${esc(s.error)}</div>` : ''}
+        <div class="hint">在下面点「设置关联」填上股票代码，系统会取两侧日K 对齐后重算一次。
+        若股票日K 取不到，页面会写明每个免费源分别为什么失败（代码填错 / 源挂了 / 停牌
+        是三回事）。</div>`, { wide: true, okText: '设置关联' })
+        .then(v => { if (v === 1) editCryptoLink(contract); });
+    }
+    const card = (label, val, clsName = '', tip = '') =>
+      `<div><div class="faint">${label}</div><b class="${clsName}">${val}</b>
+       ${tip ? `<div class="faint">${tip}</div>` : ''}</div>`;
+    const dev = s.ratio_dev_pct;
+    Modal.close(0);
+    await done;
+    const shown = showModal({
+      title: `${contract} ↔ ${s.stock_code || ''} ${q.name || ''}`,
+      wide: true, body: ' ', footer: foot,
+    });
+    $('gen-modal-body').innerHTML = `
+      <div class="row" style="justify-content:space-between;margin-bottom:10px;gap:12px">
+        <div><b>${esc(contract)}</b> <span class="muted">永续</span>
+          ${q.price != null ? `<span class="${cls(q.change_pct)}">${q.price} ${signed(q.change_pct)}%</span>` : ''}</div>
+        <div>${q.name ? `<b>${esc(q.name)}</b> ` : ''}<span class="muted">${esc(s.stock_code || '')}</span>
+          ${q.price != null ? `<span class="${cls(q.change_pct)}">${q.price} ${signed(q.change_pct)}%</span>` : ''}</div>
+      </div>
+      <div class="pnl-summary" style="margin-bottom:12px">
+        ${card('日涨跌相关', s.corr?.toFixed(3) ?? '—',
+               Math.abs(s.corr ?? 0) >= 0.7 ? 'up' : '')}
+        ${card('Beta', s.beta?.toFixed(2) ?? '—', '', '合约涨跌 / 股票涨跌')}
+        ${card('波动率 合约', (s.vol_crypto ?? 0) + '%')}
+        ${card('波动率 股票', (s.vol_stock ?? 0) + '%')}
+        ${card('比价', s.ratio?.toFixed(3) ?? '—', '', '股票收盘 / 合约收盘')}
+        ${card('比价偏离', (dev == null ? '—' : signed(dev) + '%'),
+               Math.abs(dev ?? 0) >= 5 ? 'up' : '', '相对中位比价')}
+      </div>
+      <div class="hint" style="margin:0 0 8px">
+        两边价格各自以首日=100 归一化后叠加（量纲差 7 倍，不归一化看不出关系）。
+        样本 ${s.n_obs} 个重叠交易日，截至 ${s.stat_date || '—'}。
+        比价稳定在汇率附近（如港股那批 ≈7.8）说明永续确实锚定标的股价。
+      </div>
+      <canvas id="link-chart" class="chart" height="260"
+              aria-label="合约与关联股票的归一化收盘价对比图"></canvas>
+      <div class="row" style="margin-top:8px;gap:14px">
+        <span class="faint"><i class="lg lg-a"></i> 合约</span>
+        <span class="faint"><i class="lg lg-b"></i> 股票</span>
+      </div>`;
+    drawLinkChart(s);
+    shown.then(v => { if (v === 1) editCryptoLink(contract); });
+  } catch (e) {
+    Modal.close(0);
+    await done;
+    infoDlg('加载失败', `<div class="hint" style="color:var(--up)">${esc(e.message)}</div>`);
+  }
+}
+
+function drawLinkChart(s) {
+  const cv = $('link-chart');
+  if (!cv) return;
+  const css = getComputedStyle(document.documentElement);
+  const accent = css.getPropertyValue('--accent').trim() || '#2f62f4';
+  const up = css.getPropertyValue('--up').trim() || '#d92d2d';
+  const grid = css.getPropertyValue('--border').trim() || '#e3e7ee';
+  const text = css.getPropertyValue('--text-3').trim() || '#8b95a7';
+  const ctx = cv.getContext('2d');
+  // 高分屏上按 devicePixelRatio 放大位图，否则线条发虚
+  const dpr = window.devicePixelRatio || 1;
+  const W = Math.max(280, cv.clientWidth || cv.parentElement.clientWidth || 820);
+  const H = 260;
+  cv.width = Math.round(W * dpr);
+  cv.height = Math.round(H * dpr);
+  cv.style.height = H + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const padL = 36, padR = 12, padT = 10, padB = 24;
+  const iw = W - padL - padR, ih = H - padT - padB;
+  const n = (s.dates || []).length;
+  if (!n) return;
+  const norm = arr => {
+    const base = (arr || []).find(v => typeof v === 'number' && v > 0);
+    if (!base) return (arr || []).map(() => null);
+    return (arr || []).map(v => (typeof v === 'number' ? (v / base) * 100 : null));
+  };
+  const a = norm(s.crypto), b = norm(s.stock);
+  const all = a.concat(b).filter(v => typeof v === 'number');
+  if (!all.length) return;
+  let lo = Math.min(...all), hi = Math.max(...all);
+  const m = (hi - lo) * 0.05 || 1;          // 纵轴留白，首尾不贴边
+  lo -= m; hi += m;
+  const X = i => padL + (n < 2 ? iw / 2 : (i / (n - 1)) * iw);
+  const Y = v => padT + ih - ((v - lo) / (hi - lo)) * ih;
+  ctx.strokeStyle = grid; ctx.fillStyle = text;
+  ctx.lineWidth = 1; ctx.font = '10px system-ui, sans-serif';
+  for (let i = 0; i <= 4; i++) {
+    const v = lo + (hi - lo) * (i / 4), y = Y(v);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+    ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    ctx.fillText(v.toFixed(0), padL - 6, y);
+  }
+  ctx.strokeStyle = grid; ctx.setLineDash([3, 3]);      // 基准线 100
+  ctx.beginPath(); ctx.moveTo(padL, Y(100)); ctx.lineTo(W - padR, Y(100)); ctx.stroke();
+  ctx.setLineDash([]);
+  const line = (arr, color) => {
+    ctx.strokeStyle = color; ctx.lineWidth = 1.8;
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.beginPath();
+    let started = false;
+    arr.forEach((v, i) => {
+      if (typeof v !== 'number') { started = false; return; }   // 缺点断线，不连过去
+      if (!started) { ctx.moveTo(X(i), Y(v)); started = true; }
+      else ctx.lineTo(X(i), Y(v));
+    });
+    ctx.stroke();
+  };
+  line(b, up); line(a, accent);
+  ctx.fillStyle = text; ctx.font = '10px system-ui, sans-serif';
+  ctx.textBaseline = 'top';
+  ctx.textAlign = 'left';
+  ctx.fillText(s.dates[0] || '', padL, H - padB + 6);
+  ctx.textAlign = 'right';
+  ctx.fillText(s.dates[n - 1] || '', W - padR, H - padB + 6);
+}
+
+async function addCrypto() {
+  await withBusy($('add-crypto-btn'), '关注中', async () => {
+  const contract = $('crypto-contract').value.trim().toUpperCase();
+  if (!contract) { toastErr('请输入合约名，如 TSLA_USDT'); return; }
+  try {
+    await jsonPost('/api/crypto/watch',
+                   { contract, name: $('crypto-name').value.trim() });
     $('crypto-contract').value = ''; $('crypto-name').value = '';
-    toast('已关注 ' + contract);
+    toastOk('已关注 ' + contract);
     loadCrypto(true);
-  } catch (e) { toast(e.message); }
+  } catch (e) { toastErr(e.message); }
+  });
 }
 async function delCrypto(contract) {
-  if (!confirm('把 ' + contract + ' 移出币圈白名单？（历史行情保留）')) return;
+  if (!await confirmDlg(`把 ${contract} 移出币圈白名单？\n历史行情与关联统计会保留。`,
+                        { title: '移除合约', okText: '移除', danger: true })) return;
   try {
     await api('/api/crypto/watch/' + encodeURIComponent(contract), { method: 'DELETE' });
-    toast('已移除');
+    toastOk('已移除');
     loadCrypto();
-  } catch (e) { toast(e.message); }
+  } catch (e) { toastErr(e.message); }
+}
+
+// ---- 公众号（拉 RSS 源） ----
+let _mpSources = [];
+async function loadMpSources() {
+  try {
+    const d = await api('/api/mp/sources');
+    _mpSources = d.items || [];
+    $('mp-sources-empty').classList.toggle('hide', _mpSources.length > 0);
+    $('mp-sources-body').innerHTML = _mpSources.map(s => {
+      const st = { ok: ['b-ok', '正常'], error: ['b-err', '出错'],
+                   '': ['b-mute', '未拉过'] }[s.last_status] || ['b-mute', s.last_status || '—'];
+      const fresh = s.use_fresh == null
+        ? `<span class="faint" title="跟随全局 mp.use_fresh（当前 ${s.use_fresh_effective ? '开' : '关'}）">跟随</span>`
+        : `<span class="badge ${s.use_fresh ? 'b-warn' : 'b-mute'}">${s.use_fresh ? 'fresh' : '缓存'}</span>`;
+      return `<tr>
+        <td><b>${esc(s.name)}</b></td>
+        <td><span class="badge ${s.kind === 'werss' ? 'b-info' : 'b-mute'}">${s.kind === 'werss' ? 'WeRSS' : 'RSS'}</span></td>
+        <td class="muted" style="max-width:210px;overflow:hidden;text-overflow:ellipsis"
+            title="${esc(s.url)}${s.feed_id ? ' · feed=' + esc(s.feed_id) : ''}">${esc(s.url)}${s.feed_id && s.feed_id !== 'all' ? ' · ' + esc(s.feed_id) : ''}</td>
+        <td>${fresh}</td>
+        <td>${s.unread ? `<b class="up">${s.unread}</b>` : '<span class="faint">0</span>'}</td>
+        <td class="muted">${s.last_run ? s.last_run.replace('T', ' ').slice(5, 16) : '—'}
+          ${s.last_count ? `<span class="faint">(${s.last_count})</span>` : ''}</td>
+        <td><span class="badge ${st[0]}" title="${esc(s.last_error || '')}">${st[1]}</span>
+          ${s.has_auth ? '<span class="badge b-mute" title="该源或全局配了鉴权">🔒</span>' : ''}</td>
+        <td>
+          <label class="muted" title="停用后不再拉取"><input type="checkbox"
+            ${s.enabled ? 'checked' : ''} onchange="toggleMpSource(${s.id}, this.checked)"> 启用</label>
+          <button class="del" onclick="delMpSource(${s.id},'${esc(s.name)}')" title="删除">×</button>
+        </td></tr>`;
+    }).join('');
+  } catch (e) { toastErr('加载订阅源失败: ' + e.message); }
+}
+async function addMpSource() {
+  await withBusy($('add-mp-btn'), '添加中', async () => {
+  const name = $('mp-name').value.trim();
+  const kind = $('mp-kind').value;
+  const url = $('mp-url').value.trim();
+  const feed_id = $('mp-feed').value.trim() || 'all';
+  // 三态：勾上=强制 fresh，不勾=本源跟随全局（交回 NULL）
+  const use_fresh = $('mp-fresh').checked ? true : null;
+  if (!name) return toastErr('请填写名称');
+  if (!url && !(await api('/api/config/all').then(d =>
+        (d.sections.find(s => s.section === 'mp')?.rows.find(r => r.key === 'base_url')?.value) || '')
+        .catch(() => ''))) {
+    return toastErr('请填写地址（或先在「⚙️ 调度 → 完整配置」里设置 mp.base_url）');
+  }
+  try {
+    await jsonPost('/api/mp/sources', { name, kind, url: url || undefined,
+                                        feed_id, use_fresh });
+    ['mp-name', 'mp-url', 'mp-feed'].forEach(id => { $(id).value = ''; });
+    $('mp-feed').value = 'all';
+    $('mp-fresh').checked = false;
+    toastOk('已添加');
+    loadMpSources();
+  } catch (e) { toastErr(e.message); }
+  });
+}
+async function toggleMpSource(id, enabled) {
+  try {
+    await api('/api/mp/sources/' + id, { method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) });
+  } catch (e) { toastErr(e.message); loadMpSources(); }
+}
+async function delMpSource(id, name) {
+  if (!await confirmDlg(`删除订阅源「${name}」？\n已抓取的文章会一并删除。`,
+                        { okText: '删除', danger: true })) return;
+  try { await api('/api/mp/sources/' + id, { method: 'DELETE' }); toastOk('已删除'); loadMpSources(); }
+  catch (e) { toastErr(e.message); }
+}
+async function loadMpArticles() {
+  try {
+    const unread = $('mp-unread-only').checked ? '&unread_only=true' : '';
+    const d = await api('/api/mp/articles?limit=60' + unread);
+    const items = d.items || [];
+    $('mp-empty').classList.toggle('hide', items.length > 0);
+    $('mp-list').innerHTML = items.map(a => {
+      const ts = a.published_at || a.fetched_at || '';
+      return `<div class="dyn-item ${a.is_read ? '' : 'unread'}">
+        <div class="dyn-head">
+          ${a.is_read ? '' : '<span class="unread-dot" title="未读"></span>'}
+          <span class="dyn-author">${esc(a.mp_name || a.source_name)}</span>
+          <a href="${esc(a.url)}" target="_blank" rel="noopener"
+             class="muted" style="font-size:12px">原文 ↗</a>
+          <span class="muted" style="margin-left:auto;font-size:12px">${ts.replace('T', ' ').slice(0, 16)}</span>
+        </div>
+        <div class="dyn-text" style="font-weight:600;cursor:pointer"
+             onclick="markMpReadOne(${a.id}, this)">${esc(a.title)}</div>
+        ${a.summary ? `<div class="muted" style="margin-top:2px">${esc(a.summary.slice(0, 160))}${a.summary.length > 160 ? '…' : ''}</div>` : ''}
+      </div>`;
+    }).join('');
+    const badge = $('mp-tab-badge');
+    badge.textContent = d.unread || 0;
+    badge.classList.toggle('hide', !d.unread);
+  } catch (e) { toastErr('加载文章失败: ' + e.message); }
+}
+async function markMpReadOne(id, el) {
+  try { await jsonPost('/api/mp/read', { ids: [id] }); el.closest('.dyn-item').classList.remove('unread'); }
+  catch (e) { toastErr(e.message); }
+}
+async function markAllMpRead() {
+  try { const r = await jsonPost('/api/mp/read', { all: true }); toastOk(`已标记 ${r.updated} 条已读`); loadMpArticles(); }
+  catch (e) { toastErr(e.message); }
+}
+async function triggerMpFetch() {
+  const btn = $('mp-fetch-btn');
+  btn.disabled = true; btn.textContent = '拉取中…';
+  try {
+    const r = await jsonPost('/api/mp/fetch');
+    if (r.skipped) toast('跳过：' + (r.reason || ''));
+    else toastOk(r.new ? `新增 ${r.new} 篇` : '没有新文章');
+    loadMpSources(); loadMpArticles();
+  } catch (e) { toastErr(e.message); }
+  finally { btn.disabled = false; btn.textContent = '立即拉取'; }
+}
+async function loadMpStatus() {
+  try {
+    const s = await api('/api/mp/status');
+    const el = $('mp-status');
+    el.textContent = s.sources
+      ? `${s.sources} 个启用源${s.last_run ? ' · 上次 ' + s.last_run.replace('T', ' ').slice(5, 16) : ''}`
+      : '暂无启用的订阅源';
+  } catch { /* 静默 */ }
+}
+
+// ---- X(Twitter) 指定用户发言 ----
+async function loadXStatus() {
+  try {
+    const s = await api('/api/x/status');
+    const el = $('x-status');
+    if (!s.available) {
+      el.innerHTML = `<span class="badge b-err">依赖缺失</span> ${esc(s.reason)}`;
+      return;
+    }
+    el.textContent = `${s.accounts} 个账号 · 监听 ${s.watching} 人`
+      + (s.last_run ? ` · 上次 ${s.last_run.replace('T', ' ').slice(5, 16)}` : '');
+  } catch { /* 静默 */ }
+}
+async function loadXAccounts() {
+  try {
+    const d = await api('/api/x/accounts');
+    const items = d.items || [];
+    $('x-accounts-empty').classList.toggle('hide', items.length > 0);
+    $('x-accounts-body').innerHTML = items.map(a => `<tr>
+      <td><b>${esc(a.name)}</b></td>
+      <td class="muted mono" style="font-size:11px">${esc(a.cookies_masked || '—')}</td>
+      <td>${a.last_status === 'ok' ? '<span class="badge b-ok">正常</span>'
+            : a.last_status === 'error' ? `<span class="badge b-err" title="${esc(a.last_error)}">出错</span>`
+            : '<span class="faint">—</span>'}</td>
+      <td><button class="del" onclick="delXAccount(${a.id},'${esc(a.name)}')" title="删除">×</button></td>
+    </tr>`).join('');
+  } catch (e) { toastErr('加载账号失败: ' + e.message); }
+}
+async function saveXAccount() {
+  await withBusy($('save-x-btn'), '保存中', async () => {
+  const name = $('x-acc-name').value.trim();
+  const cookies = $('x-acc-cookie').value.trim();
+  if (!name) return toastErr('请填备注名');
+  if (!cookies) return toastErr('请粘贴 cookie');
+  try {
+    await jsonPost('/api/x/accounts', { name, cookies });
+    $('x-acc-cookie').value = '';
+    toastOk('已保存'); loadXAccounts(); loadXStatus();
+  } catch (e) { toastErr(e.message); }
+  });
+}
+async function testXAccount() {
+  const name = $('x-acc-name').value.trim() || 'probe';
+  const cookies = $('x-acc-cookie').value.trim();
+  if (!cookies) return toastErr('请先粘贴 cookie');
+  toast('测试中…（约 5-15 秒）');
+  try {
+    const r = await jsonPost('/api/x/accounts/test', { name, cookies });
+    r.ok ? toastOk(r.message) : toastErr(r.error);
+  } catch (e) { toastErr(e.message); }
+}
+async function delXAccount(id, name) {
+  if (!await confirmDlg(`删除 X 账号「${name}」？`, { okText: '删除', danger: true })) return;
+  try { await api('/api/x/accounts/' + id, { method: 'DELETE' }); toastOk('已删除'); loadXAccounts(); }
+  catch (e) { toastErr(e.message); }
+}
+async function loadXWatch() {
+  try {
+    const d = await api('/api/x/watch');
+    const items = d.items || [];
+    $('x-watch-empty').classList.toggle('hide', items.length > 0);
+    $('x-watch-body').innerHTML = items.map(w => `<tr>
+      <td><b>@${esc(w.username)}</b></td>
+      <td class="muted">${esc(w.display_name || '')}</td>
+      <td class="muted">${esc(w.note || '')}</td>
+      <td>${w.with_replies ? '<span class="badge b-info">含</span>' : '<span class="faint">仅推文</span>'}</td>
+      <td>${w.min_likes ? w.min_likes : '<span class="faint">0</span>'}</td>
+      <td><input type="checkbox" ${w.enabled ? 'checked' : ''}
+        onchange="patchXWatch(${w.id}, {enabled: this.checked})"></td>
+      <td><button class="del" onclick="delXWatch(${w.id},'${esc(w.username)}')" title="删除">×</button></td>
+    </tr>`).join('');
+  } catch (e) { toastErr('加载监听列表失败: ' + e.message); }
+}
+async function addXWatch() {
+  await withBusy($('add-x-btn'), '添加中', async () => {
+  const username = $('x-username').value.trim();
+  if (!username) return toastErr('请填用户名');
+  try {
+    await jsonPost('/api/x/watch', {
+      username, note: $('x-note').value.trim(),
+      with_replies: $('x-replies').checked,
+      min_likes: +$('x-min-likes').value || 0 });
+    ['x-username', 'x-note', 'x-min-likes'].forEach(id => { $(id).value = ''; });
+    $('x-replies').checked = false;
+    toastOk('已添加，点「立即抓取」抓一轮');
+    loadXWatch();
+  } catch (e) { toastErr(e.message); }
+  });
+}
+async function patchXWatch(id, body) {
+  try {
+    await api(`/api/x/watch/${id}`, { method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  } catch (e) { toastErr(e.message); loadXWatch(); }
+}
+async function delXWatch(id, username) {
+  if (!await confirmDlg(`不再监听 @${username}？\n已抓取的推文会一并删除。`,
+                        { okText: '删除', danger: true })) return;
+  try { await api('/api/x/watch/' + id, { method: 'DELETE' }); toastOk('已删除'); loadXWatch(); }
+  catch (e) { toastErr(e.message); }
+}
+async function loadXTweets() {
+  try {
+    const unread = $('x-unread-only').checked ? '&unread_only=true' : '';
+    const d = await api('/api/x/tweets?limit=60' + unread);
+    const items = d.items || [];
+    $('x-empty').classList.toggle('hide', items.length > 0);
+    $('x-list').innerHTML = items.map(t => {
+      const s = t.stats || {};
+      const ts = t.created_at || '';
+      const tags = [t.is_reply ? '<span class="badge b-mute">回复</span>' : '',
+                    t.is_retweet ? '<span class="badge b-mute">转发</span>' : ''].join('');
+      return `<div class="dyn-item ${t.is_read ? '' : 'unread'}">
+        <div class="dyn-head">
+          ${t.is_read ? '' : '<span class="unread-dot" title="未读"></span>'}
+          <span class="dyn-author">@${esc(t.username)}</span>
+          ${t.display_name ? `<span class="muted">${esc(t.display_name)}</span>` : ''}
+          ${tags}
+          <a href="${esc(t.url)}" target="_blank" rel="noopener"
+             class="muted" style="font-size:12px">原文 ↗</a>
+          <span class="muted" style="margin-left:auto;font-size:12px">${ts.replace('T', ' ').slice(0, 16)}</span>
+        </div>
+        <div class="dyn-text" style="cursor:pointer"
+             onclick="markXReadOne(${t.id}, this)">${esc(t.text)}</div>
+        <div class="dyn-stats">❤️ ${fmt(s.like)} · 🔁 ${fmt(s.retweet)} · 💬 ${fmt(s.reply)}
+          ${s.view ? ` · 👁 ${fmt(s.view)}` : ''}${s.lang ? ` · ${esc(s.lang)}` : ''}</div>
+      </div>`;
+    }).join('');
+    const badge = $('x-tab-badge');
+    badge.textContent = d.unread || 0;
+    badge.classList.toggle('hide', !d.unread);
+  } catch (e) { toastErr('加载推文失败: ' + e.message); }
+}
+async function markXReadOne(id, el) {
+  try { await jsonPost('/api/x/read', { ids: [id] }); el.closest('.dyn-item').classList.remove('unread'); }
+  catch (e) { toastErr(e.message); }
+}
+async function markAllXRead() {
+  try { const r = await jsonPost('/api/x/read', { all: true }); toastOk(`已标记 ${r.updated} 条已读`); loadXTweets(); }
+  catch (e) { toastErr(e.message); }
+}
+async function triggerXFetch() {
+  const btn = $('x-fetch-btn');
+  btn.disabled = true; btn.textContent = '抓取中…';
+  try {
+    const r = await jsonPost('/api/x/fetch');
+    if (r.skipped) toast('跳过：' + (r.reason || ''));
+    else toastOk(r.new ? `新增 ${r.new} 条推文` : '没有新推文');
+    loadXWatch(); loadXTweets(); loadXStatus();
+  } catch (e) { toastErr(e.message); }
+  finally { btn.disabled = false; btn.textContent = '立即抓取'; }
+}
+
+async function refreshAllLinks() {
+  toast('重算中：每个合约要取两侧日K，约 10-30 秒…');
+  try {
+    const r = await jsonPost('/api/crypto/links/refresh');
+    if (r.skipped) toast('跳过：' + (r.reason || ''));
+    else toastOk(`重算 ${r.computed} 个，成功 ${r.ok} 个`);
+    loadCrypto();
+  } catch (e) { toastErr(e.message); }
+}
+
+// ---- 完整配置（按后端 config_schema 动态生成，覆盖 config.yaml 全部键） ----
+let _cfgAll = null;         // [{section,label,help,rows:[...]}]
+function cfgFieldId(sec, key) { return 'cfg__' + sec + '__' + key.replace(/\./g, '_'); }
+
+async function loadConfigAll() {
+  const box = $('cfg-all-list');
+  box.innerHTML = '<div class="muted">加载中…</div>';
+  try {
+    const d = await api('/api/config/all');
+    _cfgAll = d.sections || [];
+    renderConfigAll();
+    // 模式没覆盖的键要如实报出来，不能让「所有项都能改」变成一句空话
+    const unk = $('cfg-unknown');
+    if (d.unknown && d.unknown.length) {
+      unk.classList.remove('hide');
+      unk.innerHTML = `<div class="hint" style="color:var(--warn)">
+        <b>config.yaml 里有 ${d.unknown.length} 个键尚未纳入页面管理</b>（仍可手改 yaml，
+        本项目不会删除它们）：<code>${esc(d.unknown.join('</code> <code>'))}</code></div>`;
+    } else {
+      unk.classList.add('hide');
+      unk.innerHTML = '';
+    }
+  } catch (e) { box.innerHTML = `<div class="hint" style="color:var(--up)">加载失败：${esc(e.message)}</div>`; }
+}
+
+function renderConfigAll() {
+  const onlyChanged = $('cfg-only-changed').checked;
+  const showAdv = $('cfg-show-adv').checked;
+  const box = $('cfg-all-list');
+  let shown = 0;
+  box.innerHTML = (_cfgAll || []).map(sec => {
+    const rows = sec.rows.filter(r => !onlyChanged || !r.is_default)
+                         .filter(r => showAdv || !r.adv);
+    if (!rows.length) return '';
+    shown += rows.length;
+    const dirty = sec.rows.filter(r => !r.is_default).length;
+    return `<details class="cfg-sec" ${dirty ? 'open' : ''}>
+      <summary style="cursor:pointer;padding:7px 0;font-size:13.5px">
+        <b>${esc(sec.label)}</b>
+        ${dirty ? `<span class="badge b-info">${dirty} 项已改</span>` : ''}
+        <span class="muted" style="font-weight:400;margin-left:6px">${sec.rows.length} 项</span>
+      </summary>
+      ${sec.help ? `<div class="hint" style="margin:0 0 8px">${sec.help}</div>` : ''}
+      <div class="cfg-grid">${rows.map(r => cfgRowHtml(sec.section, r)).join('')}</div>
+    </details>`;
+  }).join('');
+  if (!shown) {
+    box.innerHTML = `<div class="empty">${
+      onlyChanged ? '没有与默认值不同的项' : '（当前筛选下没有可显示的项，试试勾上「显示高级项」）'
+    }</div>`;
+  }
+}
+
+function cfgRowHtml(sec, r) {
+  const id = cfgFieldId(sec, r.key);
+  const cls = 'field' + (r.adv ? ' adv' : '');
+  const dflt = r.default === null || r.default === undefined ? ''
+             : (Array.isArray(r.default) ? r.default.join(', ') : String(r.default));
+  const ph = r.secret
+    ? (r.has_value ? '已配置（留空=不修改）' : '未配置')
+    : (dflt === '' ? '' : `默认 ${dflt}`);
+  let ctrl;
+  if (r.type === 'bool') {
+    ctrl = `<label class="row tight" style="cursor:pointer">
+      <input type="checkbox" id="${id}" ${r.value ? 'checked' : ''}> <span>${esc(r.label)}</span></label>`;
+  } else if (r.type === 'time') {
+    ctrl = `<input type="time" id="${id}" value="${esc(r.value || '')}">`;
+  } else if (r.secret) {
+    ctrl = `<input type="password" id="${id}" value="" placeholder="${esc(ph)}" autocomplete="off">`;
+  } else if (r.type === 'int' || r.type === 'float') {
+    const step = r.type === 'int' ? '1' : '0.1';
+    ctrl = `<input type="number" id="${id}" value="${esc(r.value)}" step="${step}"
+             ${r.min != null ? `min="${r.min}"` : ''} ${r.max != null ? `max="${r.max}"` : ''}>`;
+  } else {
+    ctrl = `<input type="text" id="${id}" value="${esc(r.value)}" placeholder="${esc(ph)}">`;
+  }
+  // bool 的 label 已经画在控件里，这里不再重复输出
+  const label = r.type === 'bool' ? '' : `<label for="${id}">${esc(r.label)}</label>`;
+  return `<div class="${cls}">${label}${ctrl}
+    ${r.help ? `<div class="faint" style="margin-top:3px">${esc(r.help)}</div>` : ''}</div>`;
+}
+
+async function saveConfigAll() {
+  await withBusy($('save-cfgall-btn'), '保存中', async () => {
+  const st = $('cfg-all-status');
+  if (!_cfgAll) return toastErr('配置还没加载');
+  const values = {};
+  let n = 0;
+  for (const sec of _cfgAll) {
+    const kv = {};
+    for (const r of sec.rows) {
+      const el = $(cfgFieldId(sec.section, r.key));
+      if (!el) continue;
+      let v;
+      if (r.type === 'bool') v = el.checked;
+      else v = el.value.trim();
+      if (r.secret && v === '') continue;          // 空 = 不修改
+      if (!r.secret && String(v) === String(r.default === null ? '' : r.default)) {
+        // 与默认值相同就不必写回去，减少无谓的 config.yaml 变动
+        if (r.is_default) continue;
+      }
+      kv[r.key] = v; n++;
+    }
+    if (Object.keys(kv).length) values[sec.section] = kv;
+  }
+  if (!n) { toast('没有改动'); return; }
+  try {
+    if (st) st.textContent = '保存中…';
+    const r = await jsonPut('/api/config/all', { values });
+    const wrote = (r.written || []).length;
+    if (st) st.textContent = `已写入 ${wrote} 项${(r.skipped || []).length ? `，跳过（密钥留空）${r.skipped.length} 项` : ''}`;
+    toastOk(`已保存 ${wrote} 项配置，1 分钟内生效`);
+    loadConfigAll();
+  } catch (e) {
+    if (st) st.textContent = '保存失败';
+    toastErr(e.message);
+  }
+  });
 }
 
 async function triggerFetch() {
@@ -2096,7 +3596,7 @@ async function triggerFetch() {
     toast('抓取已启动，约 10-40 秒（视渠道响应）');
     $('news-fetch-btn').disabled = true;
     pollStatus();
-  } catch (e) { toast(e.message); }
+  } catch (e) { toastErr(e.message); }
 }
 function pollStatus() {
   const timer = setInterval(async () => {
@@ -2142,7 +3642,7 @@ async function saveConfig() {
           duckduckgo: $('cfg-duckduckgo').checked,
         }})});
     toast('设置已保存，下一轮抓取生效');
-  } catch (e) { toast(e.message); }
+  } catch (e) { toastErr(e.message); }
 }
 
 // ---- B站动态 ----
@@ -2158,7 +3658,7 @@ async function loadBiliCreators() {
       <td>${c.uid}</td><td>${esc(c.name || '待抓取后回填')}</td><td class="muted">${esc(c.note || '')}</td>
       <td><button class="del" onclick="delBiliCreator('${c.uid}')" title="删除">×</button></td>
     </tr>`).join('');
-  } catch (e) { toast('加载UP主失败: ' + e.message); }
+  } catch (e) { toastErr('加载UP主失败: ' + e.message); }
 }
 async function addBiliCreator() {
   const uid = $('bc-uid').value.trim(), note = $('bc-note').value.trim();
@@ -2167,13 +3667,14 @@ async function addBiliCreator() {
     await api('/api/bili/creators', { method: 'POST',
       headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid, note }) });
     $('bc-uid').value = ''; $('bc-note').value = '';
-    toast('已添加'); loadBiliCreators();
-  } catch (e) { toast(e.message); }
+    toastOk('已添加'); loadBiliCreators();
+  } catch (e) { toastErr(e.message); }
 }
 async function delBiliCreator(uid) {
-  if (!confirm('删除 UP主 ' + uid + '？（已抓取的动态保留）')) return;
+  if (!await confirmDlg(`删除 UP主 ${uid}？\n已抓取的动态会保留。`,
+                        { okText: '删除', danger: true })) return;
   try { await api('/api/bili/creators/' + uid, { method: 'DELETE' }); loadBiliCreators(); }
-  catch (e) { toast(e.message); }
+  catch (e) { toastErr(e.message); }
 }
 async function loadBiliDynamics() {
   try {
@@ -2204,7 +3705,7 @@ async function loadBiliDynamics() {
       </div>`;
     }).join('');
     loadUnreadBadge();
-  } catch (e) { toast('加载动态失败: ' + e.message); }
+  } catch (e) { toastErr('加载动态失败: ' + e.message); }
 }
 async function toggleBiliComments(dynamicId, toggleEl, hintCount = 0) {
   const box = toggleEl.closest('.dyn-item').querySelector('.dyn-cmt');
@@ -2228,7 +3729,7 @@ async function markAllRead() {
     const r = await api('/api/bili/read', { method: 'POST',
       headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ all: true }) });
     toast(`已标记 ${r.updated} 条为已读`); loadBiliDynamics();
-  } catch (e) { toast(e.message); }
+  } catch (e) { toastErr(e.message); }
 }
 async function loadUnreadBadge() {
   try {
@@ -2259,7 +3760,7 @@ async function triggerBiliFetch() {
     toast('抓取已启动，通常 1-3 分钟（首次登录后更久）');
     $('bili-fetch-btn').disabled = true;
     pollBiliStatus();
-  } catch (e) { toast(e.message); }
+  } catch (e) { toastErr(e.message); }
 }
 function pollBiliStatus() {
   const timer = setInterval(async () => {
@@ -2281,13 +3782,14 @@ function pollBiliStatus() {
   }, 4000);
 }
 async function biliLogin() {
-  if (!confirm('即将弹出浏览器窗口，请用手机B站 App 扫码登录。\n完成扫码后窗口会自动关闭，点「确定」继续。')) return;
+  if (!await confirmDlg('即将弹出浏览器窗口，请用手机B站 App 扫码登录。\n完成扫码后窗口会自动关闭。',
+                        { title: '登录 B站', okText: '拉起浏览器' })) return;
   toast('浏览器已拉起，请在窗口中扫码登录（最长等待数分钟）…');
   try {
     const r = await api('/api/bili/login', { method: 'POST' });
     toast(r.message || (r.ok ? '登录成功' : '登录未完成'));
     loadBiliStatus();
-  } catch (e) { toast('登录失败: ' + e.message); }
+  } catch (e) { toastErr('登录失败: ' + e.message); }
 }
 
 // ---- 微博动态 ----
@@ -2299,7 +3801,7 @@ async function loadWbCreators() {
       <td>${c.uid}</td><td>${esc(c.name || '待抓取后回填')}</td><td class="muted">${esc(c.note || '')}</td>
       <td><button class="del" onclick="delWbCreator('${c.uid}')" title="删除">×</button></td>
     </tr>`).join('');
-  } catch (e) { toast('加载博主失败: ' + e.message); }
+  } catch (e) { toastErr('加载博主失败: ' + e.message); }
 }
 async function addWbCreator() {
   const uid = $('wc-uid').value.trim(), note = $('wc-note').value.trim();
@@ -2308,13 +3810,14 @@ async function addWbCreator() {
     await api('/api/wb/creators', { method: 'POST',
       headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid, note }) });
     $('wc-uid').value = ''; $('wc-note').value = '';
-    toast('已添加'); loadWbCreators();
-  } catch (e) { toast(e.message); }
+    toastOk('已添加'); loadWbCreators();
+  } catch (e) { toastErr(e.message); }
 }
 async function delWbCreator(uid) {
-  if (!confirm('删除博主 ' + uid + '？（已抓取的微博保留）')) return;
+  if (!await confirmDlg(`删除博主 ${uid}？\n已抓取的微博会保留。`,
+                        { okText: '删除', danger: true })) return;
   try { await api('/api/wb/creators/' + uid, { method: 'DELETE' }); loadWbCreators(); }
-  catch (e) { toast(e.message); }
+  catch (e) { toastErr(e.message); }
 }
 async function loadWbPosts() {
   try {
@@ -2342,7 +3845,7 @@ async function loadWbPosts() {
       </div>`;
     }).join('');
     loadWbUnreadBadge();
-  } catch (e) { toast('加载微博失败: ' + e.message); }
+  } catch (e) { toastErr('加载微博失败: ' + e.message); }
 }
 async function toggleWbComments(noteId, toggleEl, hintCount = 0) {
   const box = toggleEl.closest('.dyn-item').querySelector('.dyn-cmt');
@@ -2366,7 +3869,7 @@ async function markAllWbRead() {
     const r = await api('/api/wb/read', { method: 'POST',
       headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ all: true }) });
     toast(`已标记 ${r.updated} 条为已读`); loadWbPosts();
-  } catch (e) { toast(e.message); }
+  } catch (e) { toastErr(e.message); }
 }
 async function loadWbUnreadBadge() {
   try {
@@ -2397,7 +3900,7 @@ async function triggerWbFetch() {
     toast('抓取已启动，通常 1-5 分钟（微博风控较严，速度偏慢属正常）');
     $('wb-fetch-btn').disabled = true;
     pollWbStatus();
-  } catch (e) { toast(e.message); }
+  } catch (e) { toastErr(e.message); }
 }
 function pollWbStatus() {
   const timer = setInterval(async () => {
@@ -2419,13 +3922,14 @@ function pollWbStatus() {
   }, 4000);
 }
 async function wbLogin() {
-  if (!confirm('即将弹出浏览器窗口，请在微博登录页扫码登录（或手机号验证码）。\n完成后窗口会自动关闭，点「确定」继续。')) return;
+  if (!await confirmDlg('即将弹出浏览器窗口，请在微博登录页扫码登录（或手机号验证码）。\n完成后窗口会自动关闭。',
+                        { title: '登录 微博', okText: '拉起浏览器' })) return;
   toast('浏览器已拉起，请在窗口中登录微博（最长等待数分钟）…');
   try {
     const r = await api('/api/wb/login', { method: 'POST' });
     toast(r.message || (r.ok ? '登录成功' : '登录未完成'));
     loadWbStatus();
-  } catch (e) { toast('登录失败: ' + e.message); }
+  } catch (e) { toastErr('登录失败: ' + e.message); }
 }
 
 // ---- 通知（微信 iLink Bot / 邮件 SMTP） ----
@@ -2442,7 +3946,7 @@ async function loadNotifyConf() {
     bits.push(conf.wx.bound ? '微信已登录 ✓' : '微信未登录');
     bits.push(conf.email.enabled && conf.email.from_addr ? `邮件 → ${conf.email.to_addr || '未填接收邮箱'}` : '邮件未启用');
     $('wx-bind-status').textContent = bits.join(' · ');
-  } catch (e) { toast('加载通知配置失败: ' + e.message); }
+  } catch (e) { toastErr('加载通知配置失败: ' + e.message); }
 }
 
 async function saveNotifyConf() {
@@ -2460,7 +3964,7 @@ async function saveNotifyConf() {
       })});
     toast('通知配置已保存');
     loadNotifyConf();
-  } catch (e) { toast(e.message); }
+  } catch (e) { toastErr(e.message); }
 }
 
 async function startWxBind() {
@@ -2472,7 +3976,7 @@ async function startWxBind() {
     $('wx-bind-btn').disabled = true;
     $('wx-bind-status').textContent = '等待扫码…';
     pollWxBind();
-  } catch (e) { toast(e.message); }
+  } catch (e) { toastErr(e.message); }
 }
 
 function pollWxBind() {
@@ -2520,22 +4024,22 @@ async function submitWxVerifyCode() {
       $('wx-bind-status').textContent = '验证码已提交，等待确认…';
       $('wx-verify-code').value = '';
     }
-  } catch (e) { toast(e.message); }
+  } catch (e) { toastErr(e.message); }
 }
 
 async function unbindWx() {
-  if (!confirm('解绑微信？解绑后需重新扫码登录。')) return;
+  if (!await confirmDlg('解绑微信？解绑后需重新扫码登录。', { okText: '解绑', danger: true })) return;
   try {
     await api('/api/notify/wx/unbind');
-    toast('已解绑'); loadNotifyConf();
-  } catch (e) { toast(e.message); }
+    toastOk('已解绑'); loadNotifyConf();
+  } catch (e) { toastErr(e.message); }
 }
 
 async function testNotify(channel) {
   try {
     await api('/api/notify/test?channel=' + channel, { method: 'POST' });
     toast(channel === 'wx' ? '已发送，请查看微信' : '已发送，请查收邮件');
-  } catch (e) { toast('发送失败: ' + e.message); }
+  } catch (e) { toastErr('发送失败: ' + e.message); }
 }
 
 // 自选股下拉（新闻筛选用）
@@ -2547,8 +4051,13 @@ async function loadNewsFilter() {
   } catch { /* 忽略 */ }
 }
 
+// ---- 首屏引导 ----
+// 注意 market 是默认激活的页，**不会**经过 switchTab()，所以它的 loader 在
+// 首屏不会被触发——这里必须显式调一次 loadCrypto()，否则币圈卡片在「打开页面
+// 但没点过自选行情标签」时一直是空的（2026-09-26 截图才发现的既有 bug）。
 loadWatch();
 loadAlerts();
+loadCrypto();
 loadNewsFilter();
 loadUnreadBadge();
 refreshTradeStrategyOptions();

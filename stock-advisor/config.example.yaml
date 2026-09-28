@@ -121,8 +121,49 @@ schedule:
 # 币圈 24h 趋势参考（gate.io 股票永续；欧易 OKX 本机直连不通，此为平替源）
 # 白名单在「自选行情」页的币圈卡片里加删；interval_minutes: 抓价周期，0=关闭
 # alert_threshold_pct: |24h 涨跌| 超此值推微信；alert_cooldown_hours: 同向推送冷却
+#
+# link_* 是「币↔股」关联统计：给每个合约挂一只真实股票，取两侧日K 对齐后算
+# 日涨跌相关系数 / beta / 两侧波动率 / 比价偏离。实测 ZHIPU_USDT↔02513 相关 0.85、
+# MINIMAX_USDT↔00100 相关 0.88，比价都 ≈7.8（正是 USD/HKD），说明这些永续确实
+# 锚定标的股价。link_refresh_hours: 重算周期（与抓价周期解耦）；
+# link_lookback_days: 取多少根日K；link_min_overlap: 重叠交易日下限（保证收益样本 >= 8）
+# link_alert_dev_pct: 比价偏离中位数超此值(%) 推微信，0=关闭；link_alert_cooldown_hours: 冷却
 crypto:
   enabled: true
   interval_minutes: 15
   alert_threshold_pct: 3
   alert_cooldown_hours: 6
+  link_enabled: true
+  link_refresh_hours: 6
+  link_lookback_days: 45
+  link_min_overlap: 9
+  link_alert_dev_pct: 5
+  link_alert_cooldown_hours: 12
+
+# 微信公众号文章监控（wechat_mp.py）
+# 微信没有官方接口能读别人公众号的文章，所以本项目不自己爬，只订阅现成开源服务
+# （推荐 WeRSS = rachelos/we-mp-rss）的 RSS 产物。根目录 docker-compose.yml 里带了
+# `werss` 服务：docker compose --profile werss up -d，然后浏览器开
+# http://127.0.0.1:8001/ 用微信读书扫码登录、在里面订阅公众号。
+# 网页「📰 公众号」页添加订阅源后，这里控制拉取节奏。
+mp:
+  enabled: true
+  interval_minutes: 30
+  notify_new: true
+  max_items: 50
+  keep_days: 120
+
+# X(Twitter) 指定用户发言监控（x_monitor.py + twscrape）
+# 需先装依赖：pip install "twscrape[curl]"（curl 后端做浏览器级 TLS 指纹伪装，
+# X 会拒绝 httpx 的指纹）。Nitter 已归档下架、snscrape/Twint 随匿名 guest token
+# 关闭一起失效，twscrape 是目前唯一可用的开源免费方案。
+# 账号 cookie 在网页「🐦 X」页粘贴（x.com → F12 → Application → Cookies 的
+# auth_token 与 ct0）。未配账号时本段自动跳过。
+x:
+  enabled: true
+  interval_minutes: 30
+  notify_new: true
+  max_tweets: 40
+  keep_days: 90
+  include_retweets: false
+  wait_timeout: 25

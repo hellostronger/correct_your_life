@@ -28,12 +28,333 @@ DEFAULTS = {
     "initial_cash": 100000.0,  # 初始虚拟资金
     "holding_days": 5,         # 持有几个交易日后自动平仓结算
     "max_position_pct": 25,     # 单票市值上限（% of 总资产）
+    "max_positions": 0,         # 同时持仓**只数**上限；0=不限。满了就不再开新仓（卖出不受影响）
+    "latest_trade_time": "15:55",  # 轮次级别的最后允许成交时刻（**粗闸**）。
+                                  # 权威闸门是每只票自己的交易时段（A股 15:00 收、
+                                  # 港股 16:00 收），这里只防止整个轮次在傍晚白跑；
+                                  # 取 15:55 是为了别把港股 15:05~16:00 的正常交易也挡掉。
+                                  # 超过它一律不再成交，避免用收盘价成交
+    "quote_max_age_min": 0,     # >0 时要求行情快照比现在新不超过这么多分钟（0=不额外限制）
     "sleep_seconds": 3,         # 逐股决策间 sleep（防 LLM 网关限流）
     "n_same": 5, "n_cross": 3,  # 经验注入条数
     "keep_per_ticker": 30,      # 经验库每股保留条数
+    # —— 盘中每 30 分钟判断一轮（替代原来「盘后单点」）——
+    "interval_minutes": 30,       # 盘中判断周期（分钟）
+    "start_time": "09:35",        # 盘中窗口起（含）；09:30 开盘留 5 分钟等行情稳定
+    "end_time": "14:40",          # 盘中窗口止（含）；留 20 分钟尾盘，之后不再开新仓
+    "stop_loss_max_pct": 5,       # 止损宽度上限(%)：LLM 定的止损线不得比这更宽
+                                 # （注意是「上限」不是下限：取 max(LLM值, 本值)，
+                                 #   只会把过宽的止损收紧，不会把过窄的放宽）
+    # —— 交易规则（模拟成交也必须守，不然统计出来的胜率是假的）——
+    "tplus0_extra": "",           # 逗号分隔的代码/关键词，强制当 T+0（覆盖自动判定）
+    "tplus1_extra": "",           # 逗号分隔的代码/关键词，强制当 T+1
+    "fees": {},                   # 交易费率覆盖（见 DEFAULT_FEES），完整键在 config.yaml
+    "judge_holdings_only": False, # True=每轮只判已持仓（最省）；False=全自选股都判
 }
 
 EM_FIELDS_OHLCV = "f51,f52,f53,f54,f55,f56,f57"   # 日期,开,收,高,低,量,额
+
+
+# ---------------- 交易费用（按真实市场规则扣） ----------------
+# 为什么必须扣：不扣的话「总资产涨幅」会系统性高于真实可实现的收益，
+# 而且因为费用是双边+最低 5 元，小额高频交易（现在每 30 分钟一轮，单笔金额
+# 可能只有几千元）的偏差被放大很多 —— 5 元佣金对 2000 元的单子就是 0.25%，
+# 相当于凭空多赚 0.25%。胜率统计会跟着失真。
+#
+# 各项依据（2026 现行）：
+#   A 股股票  佣金 万2.5、最低 5 元（双向）；印花税 0.05% **仅卖出**
+#              （2023-08-28 由 0.1% 减半）；过户费 0.001%（双向，沪深已统一）
+#   场内基金  佣金同上；**免印花税**；过户费 0.001%
+#   港股      佣金 万2.5、最低 5 元；印花税 0.1%（**双向都收**，与 A 股不同）
+#              + 交易征费 0.0027% + 交易费 0.00565% + 结算费 0.002%（2~100 元）
+DEFAULT_FEES = {
+    "a_commission_rate": 0.00025, "a_commission_min": 5.0,
+    "a_stamp_duty": 0.0005,        # 仅卖出
+    "transfer_fee": 0.00001,       # 双向
+    "hk_commission_rate": 0.0025, "hk_commission_min": 5.0,
+    "hk_stamp_duty": 0.001,        # 双向
+    "hk_levy": 0.000027, "hk_tx_fee": 0.0000565, "hk_ccass": 0.00002,
+    "hk_settle_min": 2.0, "hk_settle_max": 100.0,
+}
+
+
+# ---------------- 交易时段（收市后不许成交） ----------------
+# 为什么必须有：改成「盘中每 30 分钟判断」后，我发现兜底补跑那一支
+# **没有上界** —— 只要过了 decide_time(15:35) 就触发，于是 17:24、17:48
+# 还在成交（2026-09-28 实测各成交 2 笔）。更糟的是收市后行情接口照样返回
+# 价格（返回的是当日收盘价），代码里没有时间戳校验，就用那个「收盘价」
+# 成交了 —— 真实盘根本做不到这种事，胜率统计直接失真。
+#
+# 三层闸门，任何一层挡住就不成交：
+#   1) 本函数：按 A股/港股各自的交易时段判定
+#   2) quote 的 updated_at：快照时间必须是今天（顺带挡掉周末/节假日）
+#   3) 收市后的兜底补跑：见 app._paper_loop 的 latest_trade_time
+
+# (起, 止) 本地时间。格式 [(h, m, h, m), ...]
+TRADING_SESSIONS = {
+    "sh": ((9, 30, 11, 30), (13, 0, 15, 0)),
+    "sz": ((9, 30, 11, 30), (13, 0, 15, 0)),
+    "hk": ((9, 30, 12, 0), (13, 0, 16, 0)),
+}
+
+
+def market_session_state(code: str = "", now=None) -> dict:
+    """该品种此刻能不能成交。返回 {open, market, reason, hhmm}。
+
+    code 为空时按「任一市场开市」判定（用于轮次级别的门）。
+    """
+    now = now or datetime.now()
+    mm = now.hour * 60 + now.minute
+    mk = market_of(code) if code else ""
+    markets = [mk] if mk else ["sh", "hk"]
+    sess = {m: TRADING_SESSIONS.get(m) for m in markets}
+    for m in markets:
+        for (h1, m1, h2, m2) in (sess.get(m) or ()):
+            if h1 * 60 + m1 <= mm <= h2 * 60 + m2:
+                return {"open": True, "market": m,
+                        "reason": f"{m} 交易时段内", "hhmm": now.strftime("%H:%M")}
+    names = {"sh": "A股", "sz": "A股", "hk": "港股"}
+    if not code:
+        return {"open": False, "market": "",
+                "reason": "A 股与港股均已收市", "hhmm": now.strftime("%H:%M")}
+    return {"open": False, "market": mk,
+            "reason": f"{names.get(mk, mk)}不在交易时段"
+                      f"（{':'.join('%02d:%02d' % (h1, m1) + '-' + '%02d:%02d' % (h2, m2) for h1, m1, h2, m2 in (sess.get(mk) or ()))}）",
+            "hhmm": now.strftime("%H:%M")}
+
+
+def quote_is_fresh(quote: dict, now=None, max_age_minutes: int = 0) -> tuple[bool, str]:
+    """行情快照是否还能用于成交。
+
+    行情接口收市后仍会返回当日收盘价，且不带「已收市」标记；只有快照时间
+    诚实。规则：
+      - 没有 updated_at -> 放行（数据源没给时间，退回时段闸门判断）
+      - updated_at 不是今天 -> 拒绝（隔夜数据，绝不能拿来成交）
+      - 交易时段内且快照比现在还新 -> 拒绝（时钟/源异常）
+      - max_age_minutes > 0 时，超过该年龄也拒绝（盘中卡住的死数据）
+    """
+    q = quote or {}
+    raw = q.get("updated_at")
+    if not raw:
+        return True, "行情无时间戳（退回时段闸门判断）"
+    now = now or datetime.now()
+    if isinstance(raw, str):
+        txt = raw.strip().replace("/", "-")
+        t = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S.%f"):
+            try:
+                t = datetime.strptime(txt, fmt)
+                break
+            except ValueError:
+                continue
+        if t is None:
+            return True, f"行情时间戳无法解析（{raw}），退回时段闸门"
+    elif isinstance(raw, datetime):
+        t = raw.replace(tzinfo=None) if raw.tzinfo else raw
+    else:
+        return True, f"行情时间戳类型未知（{type(raw)}），退回时段闸门"
+    if t.date() != now.date():
+        return False, f"行情快照是 {t.date()} 的，非今日数据（拒绝用它成交）"
+    age = (now - t).total_seconds() / 60.0
+    if max_age_minutes and age > max_age_minutes:
+        return False, f"行情快照已过期 {age:.0f} 分钟（上限 {max_age_minutes}）"
+    return True, f"行情快照 {t.strftime('%H:%M:%S')}（{age:.0f} 分钟前）"
+
+
+def is_fund(code: str, name: str = "") -> bool:
+    """场内基金（ETF/LOF/REIT）—— 决定免不免印花税。
+
+    代码前缀：51x/52x/56x/58x（沪）、15x/16x/18x/50x/20x（深）。
+    注意别和股票撞车：688 开头是**科创板股票**（不是 58x 基金），
+    600/000/002/003/300/301 也都不在列。
+    """
+    c, n = (code or "").strip(), (name or "").upper()
+    if any(k in n for k in ("ETF", "LOF", "REIT", "QDII", "分级", "基金")):
+        return True
+    return len(c) == 6 and c.startswith(("51", "52", "56", "58", "15", "16",
+                                         "18", "50", "20", "90"))
+
+
+def trade_fees(code: str, name: str, side: str, value: float,
+               fee_conf: dict | None = None) -> dict:
+    """算一笔成交的费用。返回 {commission, stamp_duty, transfer, levy, total}。
+
+    value = 成交金额（不含费）。total 是**全部**费用之和。
+    买入时总付出 = value + total；卖出时净收入 = value - total。
+    """
+    f = {**DEFAULT_FEES, **(fee_conf or {})}
+    value = max(0.0, float(value or 0))
+    if value <= 0:
+        return {"commission": 0.0, "stamp_duty": 0.0, "transfer": 0.0,
+                "levy": 0.0, "total": 0.0}
+    if market_of(code) == "hk":
+        comm = max(value * float(f["hk_commission_rate"]), float(f["hk_commission_min"]))
+        stamp = value * float(f["hk_stamp_duty"])          # 港股双向
+        levy = (value * (float(f["hk_levy"]) + float(f["hk_tx_fee"]))
+                + min(max(value * float(f["hk_ccass"]), float(f["hk_settle_min"])),
+                      float(f["hk_settle_max"])))
+        total = comm + stamp + levy
+        return {"commission": round(comm, 4), "stamp_duty": round(stamp, 4),
+                "transfer": 0.0, "levy": round(levy, 4), "total": round(total, 4)}
+    # A 股：股票 vs 场内基金
+    comm = max(value * float(f["a_commission_rate"]), float(f["a_commission_min"]))
+    stamp = 0.0 if is_fund(code, name) else (
+        value * float(f["a_stamp_duty"]) if side == "sell" else 0.0)
+    transfer = value * float(f["transfer_fee"])
+    total = comm + stamp + transfer
+    return {"commission": round(comm, 4), "stamp_duty": round(stamp, 4),
+            "transfer": round(transfer, 4), "levy": 0.0, "total": round(total, 4)}
+
+
+
+# ---------------- 交易规则（T+0/T+1、最小买入单位） ----------------
+# 为什么必须守：改成盘中每 30 分钟判断后，一天会成交很多次。而 A 股股票是
+# T+1 —— 当天买的当天卖在真实市场根本做不到。之前「盘后只判一次」时这个问题
+# 被掩盖了（一天最多一次决策，买和卖不会同时发生）；现在不守就等于让模拟盘
+# 干出真实盘做不到的交易，胜率/收益率统计直接失真。
+#
+# 品种判定只能靠代码前缀 + 名称关键词（本地没有品种主数据）。所以做成
+# 「自动判定 + 配置强制覆盖」，判错了能在 config.yaml 里一行改回来。
+
+# 名称里出现这些词 → T+0（当日可卖）。境内股票型 ETF 不在此列。
+_T0_NAME_HINTS = (
+    "货币", "日利", "添益", "理财", "现金", "货币基金",
+    "国债", "债", "信用债", "同业存单", "可转债", "短融", "地方债",
+    "黄金", "白银", "商品", "原油", "期货", "豆粕", "有色",
+    "纳指", "标普", "日经", "德国", "法国", "沙特", "巴西",
+    "中概", "互联", "港股", "恒生", "香港", "海外", "全球", "国际",
+    "美元", "亚太", "东南亚", "欧洲", "日本", "越南", "印度",
+    "QDII", "LOF", "分级", "货币型", "债", "REIT",
+)
+# 名称里出现这些词 → 明确是境内股票型，强制 T+1（优先级高于上面的 T0 词表，
+# 因为「港股科技ETF」里有"港股"但也可能实际跟踪港股——那个确实是 T0；
+# 而「军工龙头ETF」这种境内股票型必须 T1）
+_T1_NAME_HINTS = ("沪深300", "中证500", "中证1000", "上证50", "科创50",
+                  "创业板", "军工", "白酒", "医药", "半导体", "芯片", "新能源")
+
+
+def market_of(code: str) -> str:
+    """港股 / 沪 / 深。与 app._tx_symbol 的判定保持一致。"""
+    c = (code or "").strip()
+    if len(c) == 5 and c.isdigit():
+        return "hk"
+    if c.startswith(("6", "9", "5")):
+        return "sh"
+    return "sz"
+
+
+def is_star_market(code: str) -> bool:
+    """科创板 688xxx / 689xxx（科创板 CDR）。"""
+    return (code or "").startswith(("688", "689"))
+
+
+def is_bse(code: str) -> bool:
+    """北交所 8xxxxx / 4xxxxx（原新三板精选层）。"""
+    return (code or "").startswith(("8", "4")) and len(code or "") == 6
+
+
+def is_t_plus_0(code: str, name: str = "") -> bool:
+    """该品种是否 T+0（当日买入当日可卖）。
+
+    - 港股：全部 T+0
+    - 货币/债券/黄金/商品/跨境(QDII) ETF 与 LOF：T+0
+    - 境内股票型 ETF、A股股票、科创板、北交所：T+1
+    """
+    code, name = (code or "").strip(), (name or "").strip()
+    override = _rule_overrides()
+    for o in override["t0"]:
+        if o and (o == code or o in name):
+            return True
+    for o in override["t1"]:
+        if o and (o == code or o in name):
+            return False
+    if market_of(code) == "hk":
+        return True
+    upper = name.upper()
+    for hint in _T1_NAME_HINTS:          # 境内股票型先判，避免被 "债/港股" 等词误伤
+        if hint in name:
+            return False
+    for hint in _T0_NAME_HINTS:
+        if hint in name or hint in upper:
+            return True
+    return False
+
+
+def buy_shares_for(code: str, name: str, budget: float, price: float) -> int:
+    """按该品种的申报规则，算出能用 budget 买多少股（0 = 买不起/不合规）。
+
+    - 主板/创业板/ETF/LOF：100 股整数倍
+    - 科创板 688/689：最少 200 股，超出部分 1 股递增（所以用整除而不是向下取整到 100）
+    - 北交所：最少 100 股，1 股递增
+    港股按 100 股的默认手数（本地没有每只港股的具体 board lot 数据）。
+    """
+    if price <= 0 or budget <= 0:
+        return 0
+    raw = int(budget / price)
+    if is_star_market(code):
+        return raw if raw >= 200 else 0            # 不足 200 股直接放弃，不下废单
+    if is_bse(code):
+        return raw if raw >= 100 else 0
+    lots = raw // 100
+    return lots * 100 if lots >= 1 else 0
+
+
+_OVERRIDE_CACHE: dict = {}
+
+
+def _rule_overrides() -> dict:
+    """从 config 读 tplus0_extra / tplus1_extra，按内容缓存（内容变了自动重读）。"""
+    try:
+        import yaml
+        from pathlib import Path
+        p = Path(__file__).resolve().parent / "config.yaml"
+        raw = p.read_text(encoding="utf-8")
+        paper = (yaml.safe_load(raw) or {}).get("paper") or {}
+        sig = (str(paper.get("tplus0_extra")), str(paper.get("tplus1_extra")))
+    except Exception:
+        sig = ("", "")
+    if _OVERRIDE_CACHE.get("sig") != sig:
+        def _split(v):
+            return [x.strip() for x in str(v or "").replace("，", ",").split(",") if x.strip()]
+        _OVERRIDE_CACHE["sig"] = sig
+        _OVERRIDE_CACHE["t0"] = _split(sig[0])
+        _OVERRIDE_CACHE["t1"] = _split(sig[1])
+    return {"t0": _OVERRIDE_CACHE.get("t0", []), "t1": _OVERRIDE_CACHE.get("t1", [])}
+
+
+def sellable_shares(cur, code: str, name: str, today: str) -> tuple[int, int, str]:
+    """今天真正能卖多少股。返回 (可卖, 持仓, 说明)。
+
+    A 股 T+1：当天买入的部分当天不可卖，但**昨天及更早买的那部分可以卖**
+    （所以不是「有买入就全部不可卖」，是按买入日期分层算）。
+    港股/T+0 品种：全部可卖。
+    """
+    cur.execute("""SELECT trade_date, side, shares FROM sa_paper_trades
+                   WHERE code = %s AND side IN ('buy','sell')
+                   AND status <> 'skipped' ORDER BY id""", (code,))
+    rows = cur.fetchall()
+    total = 0
+    today_buy = 0
+    for r in rows:
+        d = str(r[0])[:10] if not isinstance(r[0], dict) else str(r["trade_date"])[:10]
+        side = r[1] if not isinstance(r[0], dict) else r["side"]
+        sh = int(r[2] or 0) if not isinstance(r[0], dict) else int(r["shares"] or 0)
+        if sh <= 0:
+            continue
+        if side == "buy":
+            total += sh
+            if d == today:
+                today_buy += sh
+        else:
+            total = max(0, total - sh)          # 简化：卖出不区分日期
+    if is_t_plus_0(code, name):
+        return total, total, "T+0 当日可卖"
+    locked = min(today_buy, total)
+    free = total - locked
+    if locked > 0:
+        return free, total, f"T+1：今日买入的 {locked} 股当日不可卖"
+    return free, total, "T+1：可卖昨日及更早持仓"
+
 
 ANALYST_PROMPT = """\
 你是一支合并分析团队（技术面+消息面+基本面视角），为一支股票做简短投资分析。
@@ -65,6 +386,8 @@ TRADER_PROMPT = """\
 - reasoning：必须引用报告和账户数据的具体数字说明为什么是这笔交易而不是相反
 
 硬性纪律：现金不足时 action 必须是 hold；没有已有持仓时不能 sell；
+必须严格遵守随附的【交易规则约束】——T+1 品种当日买入的份额当日不可卖，
+被锁定时请直接给 hold，不要规划卖不掉的单；
 无充分依据倾向 hold——模拟交易亏的是后续统计的胜率，乱动比不动差。
 全部用中文输出（含 reasoning 字段）。"""
 
@@ -215,7 +538,8 @@ def _kline_summary(bars: list[dict]) -> str:
 
 # ---------------- LLM 调用（照抄 llm_advisor 两段式） ----------------
 
-def _llm_call(system_prompt: str, user_text: str, max_tokens: int = 1500) -> str:
+def _llm_call(system_prompt: str, user_text: str, max_tokens: int = 1500,
+              extra: str = "") -> str:
     """两段式调用：base_url 非空（代理网关）直接 basic；官方端点先试 full。
     与 llm_advisor.ask_advice 同款降级与 refusal 检查。失败抛 RuntimeError。"""
     import llm_advisor
@@ -227,7 +551,7 @@ def _llm_call(system_prompt: str, user_text: str, max_tokens: int = 1500) -> str
     if conf.get("base_url"):
         kwargs["base_url"] = conf["base_url"]
     client = Anthropic(**kwargs)
-    messages = [{"role": "user", "content": user_text}]
+    messages = [{"role": "user", "content": user_text + (extra or "")}]
     msg, errors = None, []
     attempts = []
     if not conf.get("base_url"):
@@ -318,24 +642,30 @@ def _derive_paper_positions(cur) -> dict[str, dict]:
 
     与真实持仓 sa_trades→_derive_holdings 同思路：buy 累加加权成本，
     sell 按移动平均成本核减。auto_close 的卖出行同样参与推导。
+
+    成本的定义是**净投入**：买入时把该笔手续费也算进成本（cost = 成交额+费用），
+    卖出时按净回款（成交额-费用）核减。这样 pnl_pct 反映的是「扣除全部摩擦后」
+    的真实盈亏，而不是价差本身 —— 否则总资产和持仓收益永远对不上。
     """
     cur.execute(
-        "SELECT code, name, side, shares, price FROM sa_paper_trades "
+        "SELECT code, name, side, shares, price, fee_total FROM sa_paper_trades "
         "WHERE side IN ('buy','sell') AND status <> 'skipped' "
         "ORDER BY id")
     pos: dict[str, dict] = {}
     for row in cur.fetchall():
         if isinstance(row, dict):
             code, name, side = row["code"], row["name"], row["side"]
-            shares, price = row["shares"], row["price"]
+            shares, price, fee = row["shares"], row["price"], row["fee_total"]
         else:
-            code, name, side, shares, price = row
+            code, name, side, shares, price, fee = row
         shares, price = int(shares or 0), float(price or 0)
+        fee = float(fee or 0)
         if shares <= 0 or price <= 0:
             continue
         p = pos.setdefault(code, {"shares": 0, "cost": 0.0, "name": name})
         if side == "buy":
-            p["cost"] = (p["cost"] * p["shares"] + price * shares) / (p["shares"] + shares)
+            net = price * shares + fee          # 净投入含买入费用
+            p["cost"] = (p["cost"] * p["shares"] + net) / (p["shares"] + shares)
             p["shares"] += shares
         else:
             sell = min(shares, p["shares"])
@@ -381,12 +711,32 @@ def _build_context(stock: dict, quote: dict, bars: list[dict],
     return "\n".join(ctx)
 
 
-def run_decisions(deps: dict) -> dict:
-    """盘后为每只自选股生成买卖决策并按当日收盘价成交。
+def position_limit_status(cur, conf: dict) -> dict:
+    """当前持仓只数 vs 上限。0 / 未配 = 不限。
 
-    幂等：同日同股已有决策（trade_date+code+side 唯一）则跳过该股。
+    「持仓」口径与 UI 一致：sa_paper_trades 里 buy/sell 流水推导出的
+    shares>0 的标的（hold 行 shares=0 不算，skipped 不算）。
+    """
+    try:
+        cap = int(conf.get("max_positions") or 0)
+    except (TypeError, ValueError):
+        cap = 0
+    held = _derive_paper_positions(cur)
+    n = len(held)
+    return {"held": n, "cap": cap, "codes": sorted(held),
+            "unlimited": cap <= 0, "full": cap > 0 and n >= cap,
+            "room": (max(0, cap - n) if cap > 0 else None)}
+
+
+def run_decisions(deps: dict, slot: str = "", only: set | None = None) -> dict:
+    """为每只自选股生成买卖决策并按当前价成交（盘中每 30 分钟一轮）。
+
+    slot：决策轮次标签（'HH:MM'）。同一 slot 内同股只决策一次（幂等），
+    不同 slot 各自独立决策 —— 这是「每半小时判断一次」的落点。
+    only：只判这些 code（None = 全部自选股）。盘中已持仓的票可只判持仓，
+    省下 LLM 调用。
     逐股 try/except 隔离，一股失败不影响其余（仿新闻抓取循环）。
-    返回 {date, decided: [{code, name, action, executed, reasoning}...]}。
+    返回 {date, slot, decided: [...]}。
     """
     get_conn = deps["get_conn"]
     conf = {**DEFAULTS, **(deps.get("conf") or {})}
@@ -406,26 +756,42 @@ def run_decisions(deps: dict) -> dict:
             account = {"initial_cash": conf["initial_cash"],
                        "cash": conf["initial_cash"], "total_value": conf["initial_cash"]}
         positions = _derive_paper_positions(cur)
-        # 幂等守卫：今日已决策过的股票集合（任何 side 都算）
-        cur.execute("SELECT DISTINCT code FROM sa_paper_trades WHERE trade_date = %s",
-                    (today,))
+        # 持仓只数上限：满了就把「还没持仓的票」从候选里剔掉。
+        # 放这里而不是只在成交处拦，是为了**省 LLM 调用** —— 满仓时没必要
+        # 再为新标的跑两次 LLM（每轮 35 只 × 2 次是主要成本）。
+        # 已持仓的票仍然照判（要判断卖不卖），卖出不受上限影响。
+        limit = position_limit_status(cur, conf)
+        blocked_by_limit = set()
+        if limit["full"]:
+            blocked_by_limit = {s["code"] for s in stocks if s["code"] not in positions}
+            if blocked_by_limit:
+                stocks = [s for s in stocks if s["code"] not in blocked_by_limit]
+                print(f"[paper] 持仓已满 {limit['held']}/{limit['cap']}，"
+                      f"本轮跳过 {len(blocked_by_limit)} 只未持仓标的（省 LLM 调用）",
+                      flush=True)
+        # 幂等守卫：**本 slot** 已决策过的股票集合（任何 side 都算）
+        cur.execute("SELECT DISTINCT code FROM sa_paper_trades "
+                    "WHERE trade_date = %s AND slot = %s", (today, slot))
         done = {r["code"] for r in cur.fetchall()}
+    if only is not None:
+        stocks = [s for s in stocks if s["code"] in only]
     for stock in stocks:
         code = stock["code"]
         if code in done:
             continue
         try:
-            _decide_one(deps, conf, stock, today, results)
+            _decide_one(deps, conf, stock, today, results, slot)
             done.add(code)   # 股间也不重入（并发手动触发/线程双写防护）
         except Exception as exc:
-            # UniqueViolation = 已有同日决策行（线程与手动触发并发），静默跳过
-            if "sa_paper_trades_trade_date_code_side_key" in str(exc):
-                print(f"[paper] {code} 已有今日决策，跳过", flush=True)
+            # UniqueViolation = 本 slot 已有决策行（线程与手动触发并发），静默跳过
+            if "sa_paper_trades_trade_date_slot_code_side_key" in str(exc):
+                print(f"[paper] {code} 本轮已有决策，跳过", flush=True)
             else:
                 traceback.print_exc()
                 print(f"[paper] decide {code} failed: {exc}", flush=True)
         time.sleep(float(conf.get("sleep_seconds", 3)))
-    return {"date": today, "decided": results}
+    return {"date": today, "slot": slot, "decided": results,
+            "position_limit": limit, "skipped_by_limit": sorted(blocked_by_limit)}
 
 
 def _real_dict_cursor(deps):
@@ -434,7 +800,42 @@ def _real_dict_cursor(deps):
     return psycopg2.extras.RealDictCursor
 
 
-def _decide_one(deps, conf, stock, today, results):
+def _rule_brief(code: str, name: str, held: bool, free_shares: int = 0,
+                limit: dict | None = None) -> str:
+    """给 LLM 看的一句交易规则说明（避免它规划出市场做不到的操作）。"""
+    t0 = is_t_plus_0(code, name)
+    mk = market_of(code)
+    if is_star_market(code):
+        lot = "科创板：买入最少 200 股，超出部分可 1 股递增"
+    elif is_bse(code):
+        lot = "北交所：买入最少 100 股，可 1 股递增"
+    elif mk == "hk":
+        lot = "港股：按 100 股的默认手数计（本地无逐只 board lot 数据）"
+    else:
+        lot = "买入须为 100 股的整数倍"
+    t1 = "T+0（当日买入当日可卖）" if t0 else "T+1（当日买入当日不可卖，最早次日卖出）"
+    sell = ""
+    if held and not t0:
+        sell = (f"；该股今日可卖 {free_shares} 股"
+                + ("（今日买入的部分被 T+1 锁定）" if free_shares < 1 else ""))
+    elif held and t0:
+        sell = "；该股 T+0，持仓可随时卖"
+    extra = ""
+    lim = limit or {}
+    if not held and lim.get("full"):
+        extra = (f"\n- 账户当前持仓 {lim['held']} 只已达上限 {lim['cap']} 只，"
+                 f"本轮**不允许开新仓**：你必须给 hold，"
+                 f"不要给出任何 buy 方案（会被系统直接拒单）")
+    elif not held and lim.get("cap"):
+        extra = (f"\n- 账户持仓上限 {lim['cap']} 只，当前 {lim['held']} 只，"
+                 f"还剩 {lim['room']} 个名额")
+    return (f"\n\n【交易规则约束（硬性，违反会被系统拒单）】\n"
+            f"- 市场：{ {'hk': '港股', 'sh': '沪市', 'sz': '深市'}[mk] }；{t1}\n"
+            f"- {lot}\n"
+            f"- 卖出{ sell.lstrip('；') if sell else '无持仓'}{extra}")
+
+
+def _decide_one(deps, conf, stock, today, results, slot: str = ""):
     get_conn, em_kline_fn = deps["get_conn"], deps["em_kline_fn"]
     quote_fn, tx_symbol_fn = deps["quote_fn"], deps["tx_symbol_fn"]
     news_fn, events_fn = deps.get("news_fn"), deps.get("events_fn")
@@ -471,14 +872,22 @@ def _decide_one(deps, conf, stock, today, results):
     # 3. LLM 调用 1：分析师
     report = _llm_call(ANALYST_PROMPT, ctx + f"\n\n数据时点 {today}。请给出分析报告。")
     # 4. LLM 调用 2：交易员（结构化）
+    # 把交易规则也告诉它，否则它会规划出真实市场做不到的事（比如让 A 股当天买当天卖）
+    with get_conn() as conn:
+        c2 = conn.cursor()
+        _free, _held, _rule = sellable_shares(c2, code, name, today)
+        _lim = position_limit_status(c2, conf)
+    rules = _rule_brief(code, name, positions.get(code) is not None, _free, _lim)
     raw_trader = _llm_call(
         TRADER_PROMPT,
         f"【分析报告】\n{report}\n\n【账户现状】\n可用现金 {account['cash']:,.0f} 元，"
         f"总资产 {account['total_value']:,.0f} 元，"
-        f"已持有该股 {positions[code]['shares']} 股（成本 {positions[code]['cost']:g}）"
+        f"已持有该股 {positions[code]['shares']} 股（成本 {positions[code]['cost']:g}，"
+        f"今日可卖 {_free} 股）"
         if code in positions else
         f"【分析报告】\n{report}\n\n【账户现状】\n可用现金 {account['cash']:,.0f} 元，"
-        f"总资产 {account['total_value']:,.0f} 元，该股无持仓")
+        f"总资产 {account['total_value']:,.0f} 元，该股无持仓",
+        extra=rules)
     decision = _validate_decision(_extract_json(raw_trader) or {})
     if decision is None:
         decision = {"action": "hold", "confidence": 1, "target_value_pct": 0,
@@ -487,94 +896,293 @@ def _decide_one(deps, conf, stock, today, results):
     decision["report"] = report
     decision["raw"] = raw_trader
     # 5. 成交执行（资金硬约束代码强制）
-    executed, note = _execute_decision(deps, conf, stock, today, decision, quote)
+    executed, note = _execute_decision(deps, conf, stock, today, decision, quote, slot)
     results.append({"code": code, "name": name, "action": decision["action"],
                      "executed": executed, "reasoning": decision["reasoning"],
                      "note": note})
 
 
-def _execute_decision(deps, conf, stock, today, decision, quote) -> tuple[bool, str]:
-    """按当日收盘价成交。返回 (是否成交, 备注)。资金约束全部代码强制。"""
+def _execute_decision(deps, conf, stock, today, decision, quote,
+                      slot: str = "") -> tuple[bool, str]:
+    """按当前价成交（盘中原价，不再是收盘价）。返回 (是否成交, 备注)。资金约束全部代码强制。"""
     get_conn = deps["get_conn"]
     code = stock["code"]
     price = float(quote["price"])
     action = decision["action"]
     with get_conn() as conn:
         cur = conn.cursor()
-        # 幂等守卫下沉到数据层：同日同股已有任何决策行（含反向）即拒绝。
+        # 幂等守卫下沉到数据层：**同一 slot 内**同股已有任何决策行（含反向）即拒绝。
         # 2026-09-24 实发问题：手动触发+线程并发下 LLM 两次跑出 buy 和 sell
         # 各插入一行（UNIQUE 只限 trade_date+code+side，方向不同不拦），
         # 同日买+卖双开导致持仓推导=0 但两笔都待结算、账目语义错乱。
-        cur.execute("SELECT 1 FROM sa_paper_trades WHERE trade_date = %s AND code = %s "
-                    "AND status <> 'skipped' LIMIT 1", (today, code))
+        # 改为按 slot 判定：同一轮里仍只允许一个方向，但**不同轮次可以各自决策**，
+        # 这正是「每 30 分钟判断一次」需要的语义。
+        cur.execute("SELECT 1 FROM sa_paper_trades WHERE trade_date = %s AND slot = %s "
+                    "AND code = %s AND status <> 'skipped' LIMIT 1", (today, slot, code))
         if cur.fetchone():
-            return False, "该股今日已有决策，跳过"
+            return False, "该股本轮已有决策，跳过"
         account = _account_row(cur)
         positions = _derive_paper_positions(cur)
         me = positions.get(code)
+        fees_c = conf.get("fees")
+        # 收市闸门（权威）：真实市场收市后接不到单，模拟盘不能拿收盘价成交。
+        # 行情接口收市后照样返回价格，所以必须自己判时段 + 校验快照时间。
+        _st = market_session_state(code)
+        if not _st["open"]:
+            return False, f"{_st['market'] or '市场'}不在交易时段（{_st['reason']}），不成交"
+        _fresh, _why = quote_is_fresh(
+            quote, max_age_minutes=int(conf.get("quote_max_age_min") or 0))
+        if not _fresh:
+            return False, f"行情不可用于成交：{_why}"
         if action == "buy":
+            # 持仓只数上限的**权威**校验点。run_decisions 里已经先剔过一轮候选
+            # （为了省 LLM 调用），但手动触发 / 止损自动卖出后的加仓 / 未来新增
+            # 的调用路径都只到这里，所以真正的闸门必须落在这里。
+            # 加仓（me 已存在）不占新名额，不受限制。
+            limit = position_limit_status(cur, conf)
+            if not me and limit["full"]:
+                cur.execute(
+                    _insert_trade_sql(),
+                    (code, stock["name"], today, slot, "buy", 0, price, 0,
+                     decision["confidence"], decision["stop_loss_pct"],
+                     decision["reasoning"], decision.get("report", ""),
+                     json.dumps({"decision": decision}, ensure_ascii=False),
+                     "skipped", 0, "{}"))
+                conn.commit()
+                return False, (f"持仓只数已达上限 {limit['held']}/{limit['cap']}，"
+                               f"不再开新仓（记为 skipped；卖出不受此限）")
             budget = account["total_value"] * float(decision["target_value_pct"]) / 100
             budget = min(budget, account["cash"])
             max_pos_value = account["total_value"] * float(conf["max_position_pct"]) / 100
             if me:
                 budget = min(budget, max(0, max_pos_value - me["shares"] * me["cost"]))
-            shares = int(budget / price) // 100 * 100   # A股整手
-            if shares < 100:
+            # 申报单位按品种走：主板/创业板/ETF 100 股整数倍，科创板最少 200 股
+            # 且超出后 1 股递增（原来一律 //100*100，科创板会算出 100 股的废单）
+            shares = buy_shares_for(code, stock.get("name", ""), budget, price)
+            if shares < 1:
                 cur.execute(
                     _insert_trade_sql(),
-                    (code, stock["name"], today, "buy", 0, price, 0,
+                    (code, stock["name"], today, slot, "buy", 0, price, 0,
                      decision["confidence"], decision["stop_loss_pct"],
                      decision["reasoning"], decision.get("report", ""),
                      json.dumps({"decision": decision, "raw": decision.get("raw", "")},
-                                ensure_ascii=False), "skipped"))
+                                ensure_ascii=False), "skipped", 0, "{}"))
                 conn.commit()
-                return False, "现金或仓位上限不足，未成交（记为 skipped）"
+                why = ("科创板最少 200 股，预算不足" if is_star_market(code)
+                       else "现金或仓位上限不足，不足 1 手")
+                return False, f"{why}，未成交（记为 skipped）"
             value = shares * price
+            fee = trade_fees(code, stock.get("name", ""), "buy", value, fees_c)
+            # 现金约束要把费用算进去：否则「买得起」但「付完钱就变负」
+            while shares >= 1 and value + fee["total"] > account["cash"]:
+                shares -= 100 if not is_star_market(code) else 1
+                if shares < 1:
+                    break
+                value = shares * price
+                fee = trade_fees(code, stock.get("name", ""), "buy", value, fees_c)
+            if shares < 1:
+                cur.execute(
+                    _insert_trade_sql(),
+                    (code, stock["name"], today, slot, "buy", 0, price, 0,
+                     decision["confidence"], decision["stop_loss_pct"],
+                     decision["reasoning"], decision.get("report", ""),
+                     json.dumps({"decision": decision}, ensure_ascii=False),
+                     "skipped", 0, "{}"))
+                conn.commit()
+                return False, "现金不足以支付成交额与手续费，未成交（记为 skipped）"
             cur.execute(_insert_trade_sql(),
-                        (code, stock["name"], today, "buy", shares, price, value,
+                        (code, stock["name"], today, slot, "buy", shares, price, value,
                          decision["confidence"], decision["stop_loss_pct"],
                          decision["reasoning"], decision.get("report", ""),
-                         json.dumps({"decision": decision}, ensure_ascii=False), "open"))
+                         json.dumps({"decision": decision}, ensure_ascii=False), "open",
+                         fee["total"], json.dumps(fee, ensure_ascii=False)))
             cur.execute("UPDATE sa_paper_account SET cash = cash - %s, updated_at = now() "
-                        "WHERE id = 1", (value,))
+                        "WHERE id = 1", (value + fee["total"],))
             conn.commit()
-            return True, f"买入 {shares} 股 × {price:g}"
+            return True, (f"买入 {shares} 股 × {price:g}，费用 {fee['total']:g}"
+                          f"（佣金 {fee['commission']:g}"
+                          + (f" + 过户费 {fee['transfer']:g}" if fee["transfer"] else "")
+                          + "）")
         if action == "sell":
             if not me:
                 cur.execute(
                     _insert_trade_sql(),
-                    (code, stock["name"], today, "sell", 0, price, 0,
+                    (code, stock["name"], today, slot, "sell", 0, price, 0,
                      decision["confidence"], None, decision["reasoning"],
                      decision.get("report", ""),
-                     json.dumps({"decision": decision}, ensure_ascii=False), "skipped"))
+                     json.dumps({"decision": decision}, ensure_ascii=False),
+                     "skipped", 0, "{}"))
                 conn.commit()
                 return False, "无持仓可卖（记为 skipped）"
-            shares = me["shares"]
-            value = shares * price
-            cur.execute(_insert_trade_sql(),
-                        (code, stock["name"], today, "sell", shares, price, value,
+            # T+1 闸门：A股当天买的当天不能卖。盘中多轮交易后这条必须有，
+            # 否则模拟盘会干出真实盘做不到的事，胜率统计直接失真。
+            free, held, rule_note = sellable_shares(cur, code, stock.get("name", ""), today)
+            if free < held:
+                if free < 1:
+                    cur.execute(
+                        _insert_trade_sql(),
+                        (code, stock["name"], today, slot, "sell", 0, price, 0,
                          decision["confidence"], None, decision["reasoning"],
                          decision.get("report", ""),
-                         json.dumps({"decision": decision}, ensure_ascii=False), "open"))
+                         json.dumps({"decision": decision, "rule": rule_note},
+                                    ensure_ascii=False), "skipped", 0, "{}"))
+                    conn.commit()
+                    return False, f"{rule_note}，本次无法卖出（记为 skipped）"
+            shares = min(free, held) if free < held else held
+            if shares < 1:
+                return False, f"{rule_note}，无可卖股"
+            value = shares * price
+            fee = trade_fees(code, stock.get("name", ""), "sell", value, fees_c)
+            cur.execute(_insert_trade_sql(),
+                        (code, stock["name"], today, slot, "sell", shares, price, value,
+                         decision["confidence"], None, decision["reasoning"],
+                         decision.get("report", ""),
+                         json.dumps({"decision": decision}, ensure_ascii=False), "open",
+                         fee["total"], json.dumps(fee, ensure_ascii=False)))
+            # 净回款 = 成交额 - 费用
             cur.execute("UPDATE sa_paper_account SET cash = cash + %s, updated_at = now() "
-                        "WHERE id = 1", (value,))
+                        "WHERE id = 1", (value - fee["total"],))
             conn.commit()
-            return True, f"卖出 {shares} 股 × {price:g}"
-        # hold：记录决策理由（可解析性），不占资金
+            extra = (f" + 印花税 {fee['stamp_duty']:g}" if fee["stamp_duty"] else "")
+            return True, (f"卖出 {shares} 股 × {price:g}，费用 {fee['total']:g}"
+                          f"（佣金 {fee['commission']:g}{extra}"
+                          + (f" + 杂费 {fee['levy']:g}" if fee["levy"] else "") + "）")
+        # hold：记录决策理由（可解析性），不占资金、**不产生持仓**。
+        # status 用 'none'（无仓位）而不是 'open' —— 否则页面会把这行显示成
+        # 「持有中」，和同一行 side 显示的「观望」自相矛盾（2026-09-28 实测
+        # 335 行里 308 行是这种）。
         cur.execute(_insert_trade_sql(),
-                    (code, stock["name"], today, "hold", 0, None, None,
+                    (code, stock["name"], today, slot, "hold", 0, None, None,
                      decision["confidence"], None, decision["reasoning"],
                      decision.get("report", ""),
-                     json.dumps({"decision": decision}, ensure_ascii=False), "open"))
+                     json.dumps({"decision": decision}, ensure_ascii=False), "none",
+                     0, "{}"))
         conn.commit()
         return False, "观望"
 
 
 def _insert_trade_sql() -> str:
     return ("INSERT INTO sa_paper_trades "
-            "(code, name, trade_date, side, shares, price, value, confidence, "
-            " stop_loss_pct, reasoning, report, decision_raw, status) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)")
+            "(code, name, trade_date, slot, side, shares, price, value, confidence, "
+            " stop_loss_pct, reasoning, report, decision_raw, status, fee_total, fee_detail) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)")
+
+
+# ---------------- 盘中轮次：免 LLM 止损 + 周期台账 ----------------
+
+def check_stop_loss(deps: dict, slot: str = "", max_pct: float | None = None) -> dict:
+    """盘中免 LLM 的止损扫描：持仓现价跌破各自 stop_loss_pct 立即市价卖出。
+
+    这是「每 N 分钟判断一次」最值钱的一半 —— 止损是最该发生在盘中的动作，
+    却完全不需要 LLM（不烧钱、不等 3~10 秒、不会因解析失败而漏掉）。
+    止损线取该股最近一笔**未平仓**买入时记录的值（当时 LLM 定的）；
+    max_pct 是止损宽度的**上限**（取 max(LLM值, 上限)），把 LLM 定得过宽的止损
+    收紧 —— 防止它给个 -15% 形同虚设的止损。上限不会把过窄的止损放宽。
+    逐股 try/except 隔离。
+    """
+    get_conn, quote_fn = deps["get_conn"], deps["quote_fn"]
+    conf = {**DEFAULTS, **(deps.get("conf") or {})}
+    today = datetime.now().strftime("%Y-%m-%d")
+    cap = float(max_pct if max_pct is not None
+                else conf.get("stop_loss_max_pct", 5))
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=_real_dict_cursor(deps))
+        # 每只票取「最近一笔 open 买入」上记录的止损线
+        cur.execute("""
+            SELECT DISTINCT ON (code) code, name, stop_loss_pct
+            FROM sa_paper_trades
+            WHERE side='buy' AND status='open'
+            ORDER BY code, id DESC""")
+        stops = {r["code"]: r for r in cur.fetchall()}
+        positions = _derive_paper_positions(cur)
+    targets = [c for c in positions if c in stops]
+    if not targets:
+        return {"date": today, "slot": slot, "checked": 0, "sold": []}
+    # 收市后**不成交**，但仍然要报：否则「止损触发了却没走」会静默。
+    # 停牌/隔夜的止损要等下一个交易时段的第一轮处理。
+    off_session = [c for c in targets if not market_session_state(c)["open"]]
+    tradable = [c for c in targets if c not in off_session]
+    # T+1 预筛：A 股当天买入的部分卖不掉。止损不能对锁定的份额生效，
+    # 但要记下来「触发了却卖不掉」，否则会误以为风控在正常工作。
+    sellable = {}
+    with get_conn() as conn:
+        c2 = conn.cursor()
+        for code in targets:
+            free, held, note = sellable_shares(
+                c2, code, stops[code].get("name") or positions[code].get("name") or "",
+                today)
+            sellable[code] = (free, held, note)
+    quotes = quote_fn(tradable) if tradable else {}
+    sold, skipped = [], list(off_session)
+    for code in tradable:
+        try:
+            q = quotes.get(code) or {}
+            price = q.get("price")
+            if not isinstance(price, (int, float)) or price <= 0:
+                skipped.append({"code": code, "reason": "行情不可得"})
+                continue
+            row = stops[code]
+            sl_raw = row.get("stop_loss_pct")
+            sl = float(sl_raw) if sl_raw not in (None, "") else float(conf.get("stop_loss_pct", 8))
+            sl = max(sl, cap)             # 宽度上限：LLM 定得再宽也不放过宽的止损
+            cost = positions[code]["cost"]
+            pnl_pct = (float(price) / cost - 1) * 100 if cost else 0.0
+            if pnl_pct > -sl:
+                continue                  # 还没到止损线，继续拿着
+            free, held, rule_note = sellable.get(code, (0, 0, ""))
+            if free < 1:
+                # 触发了但一股都卖不掉（T+1 锁定）—— 必须记下来，否则会误判风控有效
+                skipped.append({"code": code, "name": positions[code].get("name", ""),
+                                "pnl_pct": round(pnl_pct, 2), "stop_loss_pct": sl,
+                                "reason": f"止损已触发但{rule_note}，本轮无法卖出"})
+                print(f"[paper] 止损触发但卖不掉 {code} {positions[code].get('name','')} "
+                      f"({pnl_pct:.2f}% <= -{sl:g}%)：{rule_note}", flush=True)
+                continue
+            decision = {
+                "action": "sell", "confidence": 100,
+                "target_value_pct": 0, "stop_loss_pct": sl,
+                "reasoning": (f"盘中止损：现价 {price:g} 较成本 {cost:.4f} 跌 {pnl_pct:.2f}%，"
+                              f"触发止损线 -{sl:g}%（免 LLM 自动执行）"),
+            }
+            stock = {"code": code, "name": row.get("name") or positions[code].get("name") or ""}
+            executed, note = _execute_decision(deps, conf, stock, today, decision,
+                                               {"price": float(price)}, slot)
+            (sold if executed else skipped).append(
+                {"code": code, "name": stock["name"], "pnl_pct": round(pnl_pct, 2),
+                 "stop_loss_pct": sl, "note": note})
+        except Exception as exc:
+            traceback.print_exc()
+            skipped.append({"code": code, "reason": f"异常: {exc}"})
+    if sold:
+        print(f"[paper] 盘中止损 {len(sold)} 只: "
+              f"{[s['code'] for s in sold]}", flush=True)
+    if off_session:
+        print(f"[paper] {len(off_session)} 只持仓已收市，止损待下一交易时段处理: "
+              f"{off_session}", flush=True)
+    return {"date": today, "slot": slot, "checked": len(tradable), "sold": sold,
+            "skipped": skipped, "off_session": off_session}
+
+
+def record_cycle(deps: dict, cycle_date: str, slot: str, kind: str = "intraday",
+                 trigger: str = "", planned: int = 0, acted: int = 0,
+                 holds: int = 0, skipped: int = 0, elapsed_ms: int = 0,
+                 error: str = "") -> None:
+    """写一条周期台账（同一 date+slot 覆盖写，重试不会堆重复行）。"""
+    try:
+        with deps["get_conn"]() as conn:
+            conn.cursor().execute(
+                "INSERT INTO sa_paper_cycles "
+                "(trade_date, slot, kind, trigger, planned, acted, holds, skipped, "
+                " elapsed_ms, error) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (trade_date, slot) DO UPDATE SET "
+                " kind=EXCLUDED.kind, trigger=EXCLUDED.trigger, planned=EXCLUDED.planned, "
+                " acted=EXCLUDED.acted, holds=EXCLUDED.holds, skipped=EXCLUDED.skipped, "
+                " elapsed_ms=EXCLUDED.elapsed_ms, error=EXCLUDED.error, created_at=now()",
+                (cycle_date, slot, kind, trigger, planned, acted, holds, skipped,
+                 elapsed_ms, error[:2000]))
+            conn.commit()
+    except Exception as exc:
+        print(f"[paper] record_cycle 失败: {exc}", flush=True)
 
 
 # ---------------- 结算与反思 ----------------
@@ -627,7 +1235,7 @@ def settle_and_reflect(deps: dict) -> dict:
                 bench_ret = None
                 alpha = -raw_ret  # 卖出后下跌=卖对了
             _close_trade(deps, t, settle_date, settle_price, raw_ret, alpha,
-                         bench_sym, hold_days)
+                         bench_sym, hold_days, conf.get("fees"))
             settled.append({"id": t["id"], "code": code, "side": t["side"],
                             "trade_date": str(t["trade_date"])[:10],
                             "entry_price": entry_price,
@@ -671,34 +1279,39 @@ def settle_and_reflect(deps: dict) -> dict:
     return {"date": today, "settled": settled, "pending": pending, "equity": snap}
 
 
-def _close_trade(deps, t, settle_date, settle_price, raw_ret, alpha, bench_sym, hold_days):
-    """平仓落库：写反向成交行 + 回填结算字段 + 现金调整。"""
+def _close_trade(deps, t, settle_date, settle_price, raw_ret, alpha, bench_sym, hold_days,
+                 fee_conf: dict | None = None):
+    """平仓落库：写反向成交行 + 回填结算字段 + 现金调整（**净回款要扣手续费**）。"""
     get_conn = deps["get_conn"]
-    code, side = t["code"], t["side"]
+    code, side, name = t["code"], t["side"], t["name"]
     shares = int(t["shares"] or 0)
     value = shares * settle_price if shares else 0
+    # 平仓也是一笔真实卖出，同样有佣金+印花税+过户费
+    fee = trade_fees(code, name, "sell" if side == "buy" else "buy", value, fee_conf)
     with get_conn() as conn:
         cur = conn.cursor()
         # 反向成交行（auto_close 标记到期强平；status='resolved' 不再进入结算队列）
         cur.execute(
             "INSERT INTO sa_paper_trades "
-            "(code, name, trade_date, side, shares, price, value, confidence, "
-            " stop_loss_pct, reasoning, report, decision_raw, status, auto_closed) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,NULL,NULL,%s,'',%s,'resolved',TRUE)",
-            (code, t["name"], settle_date, "sell" if side == "buy" else "buy",
+            "(code, name, trade_date, slot, side, shares, price, value, confidence, "
+            " stop_loss_pct, reasoning, report, decision_raw, status, auto_closed, "
+            " fee_total, fee_detail) "
+            "VALUES (%s,%s,%s,'',%s,%s,%s,%s,NULL,NULL,%s,'',%s,'resolved',TRUE,%s,%s)",
+            (code, name, settle_date, "sell" if side == "buy" else "buy",
              shares, settle_price, value, "到期自动平仓",
-             json.dumps({"auto_close_of": t["id"]}, ensure_ascii=False)))
+             json.dumps({"auto_close_of": t["id"]}, ensure_ascii=False),
+             fee["total"], json.dumps(fee, ensure_ascii=False)))
         cur.execute(
             "UPDATE sa_paper_trades SET status = 'resolved', settle_date = %s, "
             "settle_price = %s, raw_return = %s, alpha_return = %s, benchmark = %s "
             "WHERE id = %s",
             (settle_date, settle_price, raw_ret, alpha, bench_sym, t["id"]))
-        if side == "buy":       # 买入到期平仓：现金回流
+        if side == "buy":       # 买入到期平仓：现金回流（净回款 = 成交额 - 费用）
             cur.execute("UPDATE sa_paper_account SET cash = cash + %s WHERE id = 1",
-                        (value,))
-        else:                   # 卖出到期回补：现金扣回（恢复持仓成本）
+                        (value - fee["total"],))
+        else:                   # 卖出到期回补：现金扣回（含费用）
             cur.execute("UPDATE sa_paper_account SET cash = cash - %s WHERE id = 1",
-                        (value,))
+                        (value + fee["total"],))
         conn.commit()
 
 
@@ -773,6 +1386,47 @@ def _snapshot_equity(deps) -> dict:
 
 # ---------------- 总览 ----------------
 
+def reconcile_account(deps, fix: bool = False) -> dict:
+    """用成交流水重算现金，和账面 cash 对账。
+
+    为什么需要：cash 是被增量 UPDATE 的（每次买减、每次卖加），不是从流水
+    推导的。一旦某笔 UPDATE 因为并发/异常没落地，账面就会和流水永久对不上，
+    而且没有任何地方会报警 —— 表现就是「总资产涨了但说不清是哪来的」
+    （2026-09-28 实测差 5000，来自早期守护线程重复启动、两个循环并发下单的时期）。
+
+    fix=False 只报告；fix=True 才把 cash 改写成流水推算值。
+    """
+    with deps["get_conn"]() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT initial_cash, cash FROM sa_paper_account WHERE id = 1")
+        row = cur.fetchone()
+        if not row:
+            return {"ok": False, "error": "模拟账户不存在"}
+        initial, cash_book = float(row[0]), float(row[1])
+        cur.execute("""SELECT
+              COALESCE(SUM(CASE WHEN side='buy'  THEN shares*price + fee_total END),0),
+              COALESCE(SUM(CASE WHEN side='sell' THEN shares*price - fee_total END),0)
+            FROM sa_paper_trades
+            WHERE status <> 'skipped' AND side IN ('buy','sell')""")
+        # 注意只能取一次：aggregate 查询只返回一行，第二次 fetchone() 是 None
+        r = cur.fetchone()
+        buy_sum, sell_sum = float(r[0]), float(r[1])
+        cash_calc = round(initial - buy_sum + sell_sum, 2)
+        drift = round(cash_book - cash_calc, 2)
+        applied = False
+        if fix and abs(drift) >= 0.01:
+            cur.execute("UPDATE sa_paper_account SET cash = %s, updated_at = now() "
+                        "WHERE id = 1", (cash_calc,))
+            conn.commit()
+            applied = True
+    note = ("账面 cash 与成交流水一致 ✓" if abs(drift) < 0.01 else
+            "账面比流水多 %.2f 元（早期并发下单时期的遗留，非当前代码路径）" % drift)
+    return {"ok": True, "fixed": applied, "initial_cash": initial,
+            "buy_total": round(buy_sum, 2), "sell_total": round(sell_sum, 2),
+            "cash_book": round(cash_book, 2), "cash_calculated": cash_calc,
+            "drift": drift, "note": note}
+
+
 def account_overview(deps: dict) -> dict:
     """前端总览：账户 + 持仓（按最新收盘估值）+ 近30日快照 + 胜率统计。"""
     get_conn, em_kline_fn = deps["get_conn"], deps["em_kline_fn"]
@@ -812,9 +1466,35 @@ def account_overview(deps: dict) -> dict:
                         "pnl_pct": round((price / p["cost"] - 1) * 100, 2)
                         if price and p["cost"] else None})
     total = (account["cash"] + market_value) if account else 0
+    # account 里的 total_value 是数据库列，只在结算(_snapshot_equity)时刷新，
+    # 所以盘中一直是陈的。页面拿它和 total / 持仓浮盈一起显示就会「对不上」
+    # （2026-09-28 实发：卡片显示 100000、汇总显示 105244）。
+    # 这里回填**实时**值，并把列里的旧值单独命名为 stored_total_value 备查。
+    if account:
+        account = {**account,
+                   "stored_total_value": account.get("total_value"),
+                   "total_value": round(total, 2)}
+    unrealized = round(sum((p["market_value"] - p["shares"] * p["avg_cost"])
+                           for p in pos_out if p.get("avg_cost")), 2)
+    # 已实现 = 总盈亏 - 未实现。必须单独返回，否则页面只显示「持仓浮盈」时
+    # 用户会发现它和「总资产涨幅」差一个数（差的就是平仓那部分）却无从解释。
+    realized = round((total - account["initial_cash"]) - unrealized, 2) \
+        if account and account.get("initial_cash") else 0.0
+    try:
+        # cap 来自 **config**，不是 sa_paper_account 那一行 —— 那一行只有
+        # initial_cash/cash/total_value 三个字段，从里面取 max_positions 永远是 None
+        cap = int((deps.get("conf") or {}).get("max_positions") or 0)
+    except (TypeError, ValueError):
+        cap = 0
     return {"account": account, "positions": pos_out,
             "market_value": round(market_value, 2), "total": round(total, 2),
             "equity": equity, "stats": stats,
+            "positions_count": len(pos_out), "max_positions": cap,
+            "positions_full": bool(cap > 0 and len(pos_out) >= cap),
+            "positions_room": (max(0, cap - len(pos_out)) if cap > 0 else None),
+            "position_pnl": unrealized, "realized_pnl": realized,
+            "total_pnl": round(total - account["initial_cash"], 2)
+            if account and account.get("initial_cash") else None,
             "total_pnl_pct": round((total / account["initial_cash"] - 1) * 100, 2)
             if account and account.get("initial_cash") else None}
 
