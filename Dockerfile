@@ -51,8 +51,10 @@ WORKDIR /app/stock-advisor
 ENV UV_BIN=/usr/local/bin/uv \
     PYTHONUNBUFFERED=1
 
-# 运行时数据走卷：reports（分析报告）、browser_data（登录态，重启不丢）、data（爬虫 jsonl 产出）
-VOLUME ["/app/stock-advisor/reports", "/srv/MediaCrawler/browser_data", "/srv/MediaCrawler/data"]
+# 运行时数据走卷：reports（分析报告）、browser_data（登录态，重启不丢）、data（爬虫 jsonl
+# 产出 + twscrape 的 X 账号池 x_accounts.db）
+VOLUME ["/app/stock-advisor/reports", "/app/stock-advisor/data",
+        "/srv/MediaCrawler/browser_data", "/srv/MediaCrawler/data"]
 
 # app.py 读 ENV_FILE = BASE_DIR.parent / ".env"，即 /app/.env；
 # compose 把宿主机 .env 挂到 /correct_your_life/.env，这里链过去

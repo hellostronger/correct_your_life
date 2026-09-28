@@ -1,0 +1,51 @@
+# 微信公众号监控服务（WeRSS）· 独立部署
+#
+#   复制 .env.example 为 .env 并按需修改，然后：
+#     docker compose up -d
+#     docker compose logs -f
+#
+# 起来后浏览器打开 http://<服务器IP>:8001/  →  微信读书扫码登录  →  订阅公众号
+#
+# 然后回到 stock-advisor 的「📰 公众号」页添加订阅源（见仓库根 README）。
+# 本服务与 stock-advisor **不共享**任何配置或数据：它只被当成一个 RSS 提供方。
+
+services:
+  werss:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # 想锁定版本：同时改 Dockerfile 里的 BASE_IMAGE 与这里的 args，二者需一致
+      # args:
+      #   BASE_IMAGE: ghcr.io/rachelos/we-mp-rss:1.5.2
+      # 国内拉不动时换成镜像源：
+      #   args:
+      #     BASE_IMAGE: docker.1ms.run/rachelos/we-mp-rss:latest
+    image: we-mp-rss:local
+    container_name: we-mp-rss
+    restart: unless-stopped
+    ports:
+      # 想只在本机访问就改成 "127.0.0.1:8001:8001"；
+      # 要让 stock-advisor 从另一台机器访问则必须监听 0.0.0.0（即默认写法）
+      - "${WERSS_PORT:-8001}:8001"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      # Web UI 登录凭据。**远程部署务必改掉默认密码**
+      USERNAME: ${WERSS_USERNAME:-admin}
+      PASSWORD: ${WERSS_PASSWORD:-admin@123}
+      # SQLite（默认）。换 MySQL 见 README「换 MySQL」
+      DB: ${WERSS_DB:-sqlite:///data/db.db}
+      AUTO_RELOAD: ${WERSS_AUTO_RELOAD:-False}
+      # 出口代理（可选，格式 socks5://user:pass@host:port）。服务器直连不通时才需要
+      PROXY_ENABLED: ${WERSS_PROXY_ENABLED:-False}
+      PROXY_URL: ${WERSS_PROXY_URL:-}
+    volumes:
+      # SQLite 库 + 文章缓存 + 微信读书的 Chrome profile。**丢了就要重新扫码订阅**
+      - ${WERSS_DATA_DIR:-./data}:/app/data
+    # 镜像里已带 HEALTHCHECK（校验数据目录可写 + 首页可达），compose 这份是覆盖
+    # 成更紧的节奏；镜像自带的那个仍然生效，二者取其一
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/wrss-healthcheck.sh"]
+      interval: 60s
+      timeout: 15s
+      start_period: 120s
+      retries: 3

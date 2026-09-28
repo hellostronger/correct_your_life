@@ -4,7 +4,11 @@
 # 构建：  docker compose build
 # 运行：  docker compose up -d          页面 http://127.0.0.1:8686/
 # 扫码：  登录二维码写到 ./mediacrawler-browser/bili_login_qrcode.png，
-#         见 README「Docker 运行」一节services:
+#         见 README「Docker 运行」一节
+#
+# ⚠️ 公众号监控的 WeRSS 上游放在 profile 里，默认不启动：
+#    docker compose --profile werss up -d
+services:
   stock-advisor:
     build:
       context: .
@@ -31,6 +35,15 @@
       - ./stock-advisor/reports:/app/stock-advisor/reports
       # config.yaml 挂载使网页改配置直接落到宿主文件
       - ./stock-advisor/config.yaml:/app/stock-advisor/config.yaml
+      # data/ 放 twscrape 的 X 账号池（x_accounts.db）与各模块状态文件，
+      # 丢了要重新扫码/重配，必须持久化
+      - ./stock-advisor/data:/app/stock-advisor/data
       # MediaCrawler 运行数据（登录态必须持久化，否则每次重启都要扫码）
       - ./mediacrawler-browser:/srv/MediaCrawler/browser_data
       - ./mediacrawler-data:/srv/MediaCrawler/data
+
+# ⚠️ 微信公众号监控的 WeRSS 服务**不在这里**——它需要长期存活的登录态 + Chromium，
+#    天生是独立服务端。已拆到同级的 mp-service/ 目录独立部署：
+#        cd mp-service && docker compose up -d
+#    本服务只通过 HTTP 拉它的 RSS 产物（地址在 config.yaml 的 mp.base_url
+#    或网页「📰 公众号」页配置），两边不共享配置与数据。
