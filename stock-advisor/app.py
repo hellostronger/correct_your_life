@@ -346,6 +346,10 @@ def init_db():
         -- 否则「LLM 隔夜就止损 vs 止盈策略会拿到什么」这个最有价值的对照会中途消失。
         base_cost    NUMERIC(12,4),
         base_shares  INTEGER,
+        -- 影子仓的建仓日。冻结后模拟持仓已经消失、entry_date 取不到，
+        -- 但 time_stop 只看「拿了多久」，所以这个日期必须存在绑定行上，
+        -- 否则最该对照的影子仓恰恰对时间止盈是瞎的。
+        base_entry_date DATE,
         frozen_at    TIMESTAMPTZ,
         -- 移动止盈/回撤止盈的峰值基准；随行情单调抬升
         peak_price   NUMERIC(12,4),
@@ -359,6 +363,64 @@ def init_db():
     );
     CREATE INDEX IF NOT EXISTS idx_sa_paper_sb_open
         ON sa_paper_strategy_bindings (enabled, triggered_at, code);
+    -- 建仓日是后补的列（2026-09-29 扩策略维度时加）：CREATE TABLE IF NOT EXISTS
+    -- 不会给已存在的表补列，必须显式 ALTER，否则老库直接报 column does not exist。
+    ALTER TABLE sa_paper_strategy_bindings
+        ADD COLUMN IF NOT EXISTS base_entry_date DATE;
+
+    -- ============ 全市场名册 + 新股挖掘（2026-09-29）============
+    -- 为什么必须有名册：系统的新闻是**按自选股关键词**抓的，实测 sa_news 10066 行里
+    -- 出现的代码 100% 都在自选股里 —— 靠现有新闻永远发现不了新股票。
+    -- 要挖「你还没关注的票」，先得有一份「公司全称 -> 代码」字典。
+    CREATE TABLE IF NOT EXISTS sa_stock_roster (
+        code      VARCHAR(8) PRIMARY KEY,
+        name      VARCHAR(64)  NOT NULL DEFAULT '',
+        full_name VARCHAR(128) NOT NULL DEFAULT '',
+        list_date DATE,                    -- 上市日期：判定新股/次新股靠它，不靠 N 前缀
+        industry  VARCHAR(64)  NOT NULL DEFAULT '',
+        market    VARCHAR(64)  NOT NULL DEFAULT '',
+        first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+        last_seen  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        -- 本次刷新没出现（退市/停牌）。**不删**，否则「昨天还在名册里」这个判断失效
+        stale     BOOLEAN     NOT NULL DEFAULT FALSE
+    );
+    CREATE INDEX IF NOT EXISTS idx_sa_roster_list_date
+        ON sa_stock_roster (list_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_sa_roster_name
+        ON sa_stock_roster (name);
+
+    CREATE TABLE IF NOT EXISTS sa_stock_roster_meta (
+        id            INT PRIMARY KEY DEFAULT 1,
+        fetched_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+        got           INTEGER     NOT NULL DEFAULT 0,
+        pages         INTEGER     NOT NULL DEFAULT 0,
+        declared_count INTEGER    NOT NULL DEFAULT 0,
+        meta          JSONB       NOT NULL DEFAULT '{}'::jsonb
+    );
+
+    -- 候选池。**status 决定它还会不会再来**：
+    --   new=待审  promoted=已进自选  dismissed=用户忽略（永久不再出现）
+    CREATE TABLE IF NOT EXISTS sa_discover_candidates (
+        code        VARCHAR(8) PRIMARY KEY,
+        name        VARCHAR(64)  NOT NULL DEFAULT '',
+        industry    VARCHAR(64)  NOT NULL DEFAULT '',
+        list_date   DATE,
+        listed_days INTEGER,
+        score       NUMERIC(8,2) NOT NULL DEFAULT 0,
+        n_sources   INTEGER      NOT NULL DEFAULT 0,
+        sources     JSONB        NOT NULL DEFAULT '[]'::jsonb,
+        evidence    JSONB        NOT NULL DEFAULT '[]'::jsonb,  -- 原文片段+来源+链接
+        is_new      BOOLEAN      NOT NULL DEFAULT FALSE,
+        is_sub_new  BOOLEAN      NOT NULL DEFAULT FALSE,
+        pct         NUMERIC(8,4),
+        status      VARCHAR(16)  NOT NULL DEFAULT 'new',
+        note        TEXT         NOT NULL DEFAULT '',
+        first_seen  TIMESTAMPTZ  NOT NULL DEFAULT now(),
+        last_seen   TIMESTAMPTZ  NOT NULL DEFAULT now(),
+        decided_at  TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_sa_disc_status_score
+        ON sa_discover_candidates (status, score DESC);
 
     -- 影子卖出记录：策略认为「该卖了」的时刻与价格，**不产生任何真实成交**
     CREATE TABLE IF NOT EXISTS sa_paper_strategy_exits (
@@ -3016,13 +3078,30 @@ def _alerts_loop():
 
 import paper_trading
 import paper_strategy
+import stock_discovery
+import stock_roster
 import paper_memory
 
 
 def _paper_strategy_deps() -> dict:
     """paper_strategy 注入依赖（quote_fn 复用行情，账务复用 paper_trading）。"""
     return {"get_conn": get_conn, "quote_fn": fetch_quotes,
+            # trading_days_fn 必须给：time_stop 的持有天数要按**交易日**算，
+            # 跟真实持仓（_trading_days_between）同一口径。用自然日会让
+            # 「持有10日」在第 7 个自然日就触发，早 40%。
+            "trading_days_fn": _trading_days_between,
             "conf": (_conf_section("paper") or {}).get("strategy") or {}}
+
+
+def _discover_deps() -> dict:
+    """stock_discovery 注入依赖。名册刷新走 datacenter，行情复用腾讯。"""
+    return {"get_conn": get_conn, "quote_fn": fetch_quotes,
+            "conf": _conf_section("discover") or {}}
+
+
+# 挖新股的运行态（页面「最近一次挖掘结果」用）
+_discover_state: dict = {"last_run": None, "last_result": None,
+                         "last_error": None, "last_auto_added": []}
 
 
 def _paper_deps(conf: dict | None = None) -> dict:
@@ -3274,6 +3353,28 @@ class PaperStrategyToggleIn(BaseModel):
     enabled: bool
 
 
+# ---- 挖新股（discover）的请求模型 ----
+class DiscoverRosterIn(BaseModel):
+    pass          # 目前无参，留着以后加「只刷某个市场」
+
+
+class DiscoverMineIn(BaseModel):
+    hours: int | None = Field(default=None, ge=1, le=720,
+                              description="回看多少小时；留空用配置值")
+    auto_add: bool = Field(default=True, description="跑完是否按门槛自动加自选")
+    dry_run: bool = Field(default=False, description="只报告不加自选")
+
+
+class DiscoverAutoAddIn(BaseModel):
+    dry_run: bool = Field(default=True, description="默认只看会加哪些，不真加")
+
+
+class DiscoverDecideIn(BaseModel):
+    code: str = Field(min_length=1, max_length=8)
+    action: str = Field(description="promote=加自选 / dismiss=忽略 / reset=放回候选池")
+    note: str = Field(default="", max_length=255)
+
+
 @app.get("/api/paper/strategies")
 def paper_strategies_list():
     """可用的止盈/止损策略 + 已挂到模拟持仓上的绑定。"""
@@ -3317,6 +3418,111 @@ def paper_strategy_unbind(bid: int):
 def paper_strategy_compare(code: str = ""):
     """策略对照：策略卖 vs 持有到今天 vs LLM 实际怎么卖。"""
     return paper_strategy.compare(_paper_strategy_deps(), code=code)
+
+
+# ---------- 挖新股：全市场发现 ----------
+
+@app.get("/api/discover/roster")
+def discover_roster():
+    """名册状态：多少只、多久没刷了、上次抓取有没有抓全。"""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT fetched_at, got, pages, declared_count, meta "
+                    "FROM sa_stock_roster_meta WHERE id=1")
+        row = cur.fetchone()
+        cur.execute("SELECT count(*) FILTER (WHERE NOT stale) AS live, "
+                    "count(*) FILTER (WHERE stale) AS stale, "
+                    "count(*) FILTER (WHERE list_date >= CURRENT_DATE - 20) AS fresh20, "
+                    "count(*) FILTER (WHERE list_date >= CURRENT_DATE - 90) AS fresh90 "
+                    "FROM sa_stock_roster")
+        stat = cur.fetchone()
+    age_h = None
+    if row and row[0]:
+        age_h = round((datetime.now() - row[0].replace(tzinfo=None)).total_seconds()
+                      / 3600.0, 1)
+    return {"roster": {"got": row[1] if row else 0,
+                       "pages": row[2] if row else 0,
+                       "declared_count": row[3] if row else 0,
+                       "fetched_at": row[0].isoformat() if row and row[0] else None,
+                       "age_hours": age_h,
+                       "complete": bool(row and row[4] and row[4].get("complete"))},
+            "counts": {"live": stat[0], "stale": stat[1],
+                       "listed_20d": stat[2], "listed_90d": stat[3]}}
+
+
+@app.post("/api/discover/roster/refresh")
+def discover_roster_refresh(body: DiscoverRosterIn):
+    """强制刷新名册（5638 只约 15 秒 / 12 个请求）。"""
+    return stock_roster.refresh_roster(_discover_deps(), force=True)
+
+
+@app.post("/api/discover/mine")
+def discover_mine(body: DiscoverMineIn):
+    """跑一轮挖掘：扫各内容源 -> 名册解析代码 -> 打分 -> 候选池。"""
+    result = stock_discovery.mine(_discover_deps(), hours=body.hours or None)
+    if result.get("ok") and body.auto_add:
+        result["auto"] = stock_discovery.auto_add(_discover_deps(),
+                                                  dry_run=body.dry_run)
+    return result
+
+
+@app.get("/api/discover/candidates")
+def discover_candidates(status: str = "new", limit: int = 200):
+    """候选池。带完整证据（原文片段 + 来源 + 链接）。"""
+    items = stock_discovery.list_candidates(_discover_deps(), status=status,
+                                           limit=limit)
+    return {"items": items, "n": len(items),
+            "runtime": {"last_run": _discover_state["last_run"],
+                        "last_error": _discover_state["last_error"],
+                        "auto_added": _discover_state["last_auto_added"][:10],
+                        "last_result": _discover_state["last_result"]}}
+
+
+@app.post("/api/discover/auto-add")
+def discover_auto_add(body: DiscoverAutoAddIn):
+    """按门槛把高置信候选加进自选股。dry_run=true 只看会加哪些。"""
+    return stock_discovery.auto_add(_discover_deps(), dry_run=body.dry_run)
+
+
+@app.post("/api/discover/decide")
+def discover_decide(body: DiscoverDecideIn):
+    """人工裁决：promote 加自选 / dismiss 忽略（永久不再出现）/ reset 放回。"""
+    return stock_discovery.decide(_discover_deps(), body.code, body.action,
+                                 body.note or "")
+
+
+@app.get("/api/discover/new-listings")
+def discover_new_listings(days: int = 30, only_unwatched: bool = True,
+                          limit: int = 100):
+    """最近 N 天上市的票（新股/次新股通道），按上市日期倒序。"""
+    import stock_roster as SR
+    with get_conn() as conn, conn.cursor() as cur:
+        sql = ("SELECT code, name, list_date, industry, market FROM sa_stock_roster "
+               "WHERE stale = FALSE AND list_date IS NOT NULL "
+               "AND list_date >= CURRENT_DATE - %s")
+        args = [int(days)]
+        if only_unwatched:
+            sql += " AND code <> ALL(SELECT code FROM sa_watchlist)"
+        sql += " ORDER BY list_date DESC LIMIT %s"
+        args.append(int(limit))
+        cur.execute(sql, args)
+        rows = cur.fetchall()
+        today = datetime.now().date()
+        out = []
+        for code, name, ld, ind, mkt in rows:
+            d0 = None
+            if ld:
+                try:
+                    d0 = (ld if isinstance(ld, _dt_mod.date)
+                          else datetime.strptime(str(ld)[:10], "%Y-%m-%d").date())
+                except ValueError:
+                    d0 = None
+            out.append({"code": code, "name": name or "",
+                        "list_date": str(ld)[:10] if ld else None,
+                        # max(0,...)：名册里会出现「明天上市」的票（新股日历会提前披露），
+                        # 直接相减会得到 -1，显示成「上市 -1 天」。
+                        "listed_days": max(0, (today - d0).days) if d0 else None,
+                        "industry": ind or "", "market": mkt or ""})
+    return {"days": days, "n": len(out), "items": out}
 
 
 @app.post("/api/paper/strategies/scan")
@@ -5112,6 +5318,59 @@ def _x_loop():
             time.sleep(300)
 
 
+def _discover_loop():
+    """挖新股守护线程：按 discover.interval_minutes 跑一轮挖掘。
+
+    刻意放成独立线程而不是挂进 _paper_loop：挖掘的价值与交易时段无关
+    （盘后公众号/社媒的内容照样是信号），而且它有名册刷新这种「一跑就是
+    12 个请求」的重量级操作，不该拖慢盘中每 30 分钟的决策节奏。
+    """
+    while True:
+        try:
+            conf = _conf_section("discover") or {}
+            interval = int(conf.get("interval_minutes", 60) or 0)
+            if not conf.get("enabled", True) or interval <= 0:
+                time.sleep(300)
+                continue
+            result = stock_discovery.mine(_discover_deps())
+            if result.get("ok"):
+                added = 0
+                if conf.get("auto_add", True):
+                    aa = stock_discovery.auto_add(_discover_deps())
+                    added = aa.get("added", 0)
+                    if added:
+                        print(f"[discover] 自动加自选 {added} 只: "
+                              + ", ".join(x["code"] for x in aa.get("items", [])[:8]),
+                              flush=True)
+                        _discover_state["last_auto_added"] = aa.get("items", [])
+                        try:
+                            notifier.notify(
+                                f"🔭 挖到 {added} 只高置信新标的，已加自选："
+                                + "、".join(f"{x['name']}({x['code']})"
+                                           for x in aa.get("items", [])[:8]))
+                        except Exception:
+                            pass
+                msg = (f"[discover] 候选 {result.get('candidates', 0)} 只，"
+                       f"自动加 {added} 只；各源 "
+                       + json.dumps(result.get("scanned", {}), ensure_ascii=False))
+                if result.get("source_errors"):
+                    msg += "；源异常 " + json.dumps(result["source_errors"],
+                                                   ensure_ascii=False)[:160]
+                print(msg, flush=True)
+                _discover_state.update({
+                    "last_run": datetime.now().isoformat(timespec="seconds"),
+                    "last_result": {k: v for k, v in result.items() if k != "roster"},
+                    "auto_added": added})
+            else:
+                print(f"[discover] 挖掘失败: {result.get('why')}", flush=True)
+                _discover_state["last_error"] = result.get("why")
+            time.sleep(max(interval, 1) * 60)
+        except Exception as exc:
+            print(f"[discover] loop error: {exc}", flush=True)
+            _discover_state["last_error"] = str(exc)
+            time.sleep(300)
+
+
 @app.get("/api/health")
 def health():
     with get_conn() as conn, conn.cursor() as cur:
@@ -5268,6 +5527,7 @@ _start_daemon(_mp_loop, "sa_mp")
 
 # X(Twitter) 指定用户发言监控线程（x_monitor.py；x.interval_minutes=0 或未配账号时跳过）
 _start_daemon(_x_loop, "sa_x")
+_start_daemon(_discover_loop, "sa_discover")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8686)

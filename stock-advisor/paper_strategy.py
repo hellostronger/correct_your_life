@@ -23,22 +23,56 @@
    -> hold_pct = 现价 / 基准成本 - 1，对所有策略同一口径。
 """
 import json
-from datetime import date, datetime
+from datetime import datetime
+
+from psycopg2.extras import execute_values
 
 # ---------------- 预置策略 ----------------
-# sa_strategies 原本是空的（系统建好了但一条策略都没定义过），直接预置三套有代表性的：
-# 保守 / 标准 / 激进。留着让用户自己改 —— 策略探索的前提是有东西可改。
+# sa_strategies 原本是空的（系统建好了但一条策略都没定义过），预置 7 条。
+#
+# 关键不是「多」，是**覆盖决策维度**。原来只有 3 条，全是「锁利润」，结果：
+#   - 一条砍亏损的都没有 —— 而「该多早砍掉亏损」恰恰是模拟盘最该回答的问题
+#   - 一条不看价格的都没有 —— 时间止盈是唯一不依赖行情形态的退出理由
+# 现在把 app._eval_strategy 支持的 6 种 kind 全部覆盖，再加一组移动止盈的
+# 参数敏感性（5% / 8%）：只给一个 8% 没法回答「这个参数调 3 个点会怎样」。
+#
+# 命名统一「角色·参数」，角色说明它替谁做决策：
+#   砍亏损 = stop_loss / 时间 = time_stop / 锁利润 = pct/trailing/drawdown/ladder
 PRESET_STRATEGIES = [
-    {"name": "保守·峰值回撤8%", "kind": "trailing", "target_pct": 8,
+    # ---- 锁利润：跟随回撤（参数敏感性对照：5% 紧、8% 松）----
+    {"name": "锁利·移动止盈5%", "kind": "trailing", "target_pct": 5,
+     "drawdown_pct": 5, "config": {},
+     "note": "从最高点回撤5%就走。最紧的一条，回吐最少但最容易被洗出去。"
+             "和「移动止盈8%」配对看，能看出这个参数每放宽3个点的代价。"},
+    {"name": "锁利·移动止盈8%", "kind": "trailing", "target_pct": 8,
      "drawdown_pct": 8, "config": {},
-     "note": "从最高点回撤8%就走。适合趋势票，回吐少但容易被洗出去。"},
-    {"name": "标准·固定止盈15%", "kind": "pct", "target_pct": 15,
+     "note": "从最高点回撤8%就走。适合趋势票，中庸基准线。"},
+    # ---- 锁利润：先赚够再启动回撤（与移动止盈的区别就在「先赚够」）----
+    {"name": "锁利·回撤止盈(涨10%后回撤5%)", "kind": "drawdown", "target_pct": 10,
+     "drawdown_pct": 5, "config": {},
+     "note": "先涨过10%才开始跟踪峰值，之后回撤5%才卖。跟移动止盈的区别是"
+             "「先有利润才启动」——不赚钱的票不会因为小震荡被洗出去。"},
+    # ---- 锁利润：固定阈值 ----
+    {"name": "锁利·固定止盈15%", "kind": "pct", "target_pct": 15,
      "drawdown_pct": None, "config": {},
-     "note": "涨15%无条件走。简单可预期，适合震荡市。"},
-    {"name": "激进·分批+10%/+20%", "kind": "ladder", "target_pct": 20,
+     "note": "涨15%无条件走。简单可预期，适合震荡市；单边行情里会卖早。"},
+    # ---- 锁利润：分批落袋 ----
+    {"name": "锁利·分批+10%/+20%", "kind": "ladder", "target_pct": 20,
      "drawdown_pct": None,
      "config": {"steps": [{"pct": 10, "ratio": 0.5}, {"pct": 20, "ratio": 0.5}]},
-     "note": "涨10%卖一半落袋，涨20%卖剩下。上涨行情里最能跑。"},
+     "note": "涨10%卖一半落袋，涨20%卖剩下。单边上涨行情里最能跑，"
+             "代价是震荡市里利润被切碎。"},
+    # ---- 砍亏损（唯一一条不看「赚了多少」的止盈类策略）----
+    {"name": "砍亏损·止损8%", "kind": "stop_loss", "target_pct": 8,
+     "drawdown_pct": None, "config": {},
+     "note": "跌破成本8%就走。用来回答「LLM 的止损是不是砍太早/太晚」——"
+             "注意模拟盘本身还有 ATR 自适应止损在跑，两条一起看能分清"
+             "「固定比例止损」和「波动率止损」哪个更有效。"},
+    # ---- 时间止盈（唯一一条不依赖价格的退出理由）----
+    {"name": "时间·持有10个交易日", "kind": "time_stop", "target_pct": 10,
+     "drawdown_pct": None, "config": {"hold_days": 10},
+     "note": "拿满10个交易日无条件走。看的是「资金效率」而不是「价格」——"
+             "回答「赚的那点波动，值不值得占着仓位」。"},
 ]
 
 
@@ -92,14 +126,25 @@ def _cfg(v):
     return {}
 
 
-def _held_days(entry_date, today: str):
-    """持有自然日数。_eval_strategy 的 time_stop 按「天」计，保持同一口径。"""
+def _held_days(deps: dict, entry_date, now):
+    """持有**交易日**数。必须与真实持仓同口径。
+
+    app._eval_strategy 的 time_stop 判的是「已持有 N 个交易日」，真实持仓那边用
+    _trading_days_between 算（跳周末）。这里原先用自然日，会让「持有10日」在第 7 个
+    自然日就触发 —— 早 40%，而且和我自己在注释里写的「同一套语义」直接矛盾。
+
+    entry_date 取自绑定行的 base_entry_date 而不是模拟持仓的 entry_date：
+    仓位被 LLM 平掉后持仓就没了，entry_date 跟着消失，而影子仓还得继续跟踪，
+    time_stop 恰恰是那种「持仓没了就没意义」的策略 —— 那样等于冻结后时间止盈全瞎。
+    """
     if not entry_date:
         return None
+    fn = deps.get("trading_days_fn")
+    if fn is None:                      # 依赖没注入时的兜底，行为退化为 0 而不是崩溃
+        return None
     try:
-        d0 = date.fromisoformat(str(entry_date)[:10])
-        return max(0, (date.fromisoformat(today) - d0).days)
-    except (ValueError, TypeError):
+        return int(fn(str(entry_date)[:10], now))
+    except Exception:
         return None
 
 
@@ -131,12 +176,15 @@ def auto_bind(deps: dict, codes: list[str]) -> int:
             return 0
         cur.execute("SELECT strategy_id, code FROM sa_paper_strategy_bindings")
         have = {(r[0], r[1]) for r in cur.fetchall()}
-        ins = [(sid, c) for sid in sids for c in codes if (sid, c) not in have]
+        ins = [(sid, c, "auto") for sid in sids for c in codes if (sid, c) not in have]
         if not ins:
             return 0
-        cur.executemany(
-            "INSERT INTO sa_paper_strategy_bindings (strategy_id, code, note) "
-            "VALUES (%s,%s,'auto') ON CONFLICT (strategy_id, code) DO NOTHING", ins)
+        # execute_values 而非 executemany：后者每行一次网络往返，这台远程共享云库
+        # 单次往返约 65ms（实测 executemany 写 1200 行花了 81.7 秒）。
+        execute_values(cur,
+                       "INSERT INTO sa_paper_strategy_bindings (strategy_id, code, note) "
+                       "VALUES %s ON CONFLICT (strategy_id, code) DO NOTHING",
+                       ins, page_size=500)
     return len(ins)
 
 
@@ -208,21 +256,26 @@ def list_bindings(deps: dict) -> dict:
                        "note": r[6] or ""} for r in cur.fetchall()]
         cur.execute(
             "SELECT b.id, b.strategy_id, b.code, b.enabled, b.peak_price, b.ladder_step, "
-            "b.triggered_at, b.base_cost, b.base_shares, b.frozen_at, b.note, "
-            "s.name, s.kind FROM sa_paper_strategy_bindings b "
+            "b.triggered_at, b.base_cost, b.base_shares, b.base_entry_date, b.frozen_at, "
+            "b.note, s.name, s.kind FROM sa_paper_strategy_bindings b "
             "JOIN sa_strategies s ON s.id=b.strategy_id ORDER BY b.code, s.id")
         binds = [{
             "id": r[0], "strategy_id": r[1], "code": r[2], "enabled": r[3],
             "peak_price": _float(r[4]), "ladder_step": r[5] or 0,
             "triggered_at": r[6].isoformat() if r[6] else None,
-            "base_cost": _float(r[7]), "base_shares": r[8], "frozen": bool(r[9]),
-            "note": r[10] or "", "strategy_name": r[11], "kind": r[12]}
+            "base_cost": _float(r[7]), "base_shares": r[8],
+            "base_entry_date": str(r[9])[:10] if r[9] else None,
+            "frozen": bool(r[10]),
+            "note": r[11] or "", "strategy_name": r[12], "kind": r[13]}
             for r in cur.fetchall()]
         cur.execute("SELECT binding_id, count(*) FROM sa_paper_strategy_exits "
                     "GROUP BY binding_id")
         hits = {r[0]: r[1] for r in cur.fetchall()}
+    now = datetime.now()
     for b in binds:
         b["exit_count"] = hits.get(b["id"], 0)
+        # 交易日口径，与 scan_once / 真实持仓的 time_stop 一致
+        b["held_days"] = _held_days(deps, b["base_entry_date"], now)
     return {"strategies": strategies, "bindings": binds}
 
 
@@ -246,8 +299,8 @@ def scan_once(deps: dict, now=None, slot: str = "") -> list[dict]:
 
     BIND_SQL = (
         "SELECT b.id, b.strategy_id, b.code, b.peak_price, b.ladder_step, "
-        "b.base_cost, b.base_shares, b.frozen_at, s.name, s.kind, s.target_pct, "
-        "s.drawdown_pct, s.config FROM sa_paper_strategy_bindings b "
+        "b.base_cost, b.base_shares, b.base_entry_date, b.frozen_at, s.name, s.kind, "
+        "s.target_pct, s.drawdown_pct, s.config FROM sa_paper_strategy_bindings b "
         "JOIN sa_strategies s ON s.id=b.strategy_id "
         "WHERE b.enabled AND b.triggered_at IS NULL ORDER BY b.id")
 
@@ -291,14 +344,19 @@ def scan_once(deps: dict, now=None, slot: str = "") -> list[dict]:
             base = _float(pos.get("cost")) if live else _float(r["base_cost"])
             shares = int(pos.get("shares") or 0) if live else int(r["base_shares"] or 0)
             frozen = bool(r["frozen_at"])
+            entry = (str(pos["entry_date"])[:10] if live and pos.get("entry_date")
+                     else (str(r["base_entry_date"])[:10] if r.get("base_entry_date")
+                           else None))
 
             if live:
-                # 持仓成本变了（加仓/部分平仓）就刷新影子仓基准，并解冻
+                # 持仓变了（加仓/部分平仓）就刷新影子仓基准，并解冻
                 if abs((_float(r["base_cost"]) or 0) - base) > 1e-6 or \
-                        (r["base_shares"] or 0) != shares or frozen:
+                        (r["base_shares"] or 0) != shares or frozen or \
+                        str(r.get("base_entry_date") or "")[:10] != (entry or ""):
                     cur.execute(
                         "UPDATE sa_paper_strategy_bindings SET base_cost=%s, base_shares=%s, "
-                        "frozen_at=NULL WHERE id=%s", (base, shares, r["id"]))
+                        "base_entry_date=%s, frozen_at=NULL WHERE id=%s",
+                        (base, shares, entry or None, r["id"]))
             elif not frozen and (_float(r["base_cost"]) or 0) > 0:
                 # 实盘已平但从未冻结（老数据）→ 现在冻结，策略继续虚拟持有
                 cur.execute("UPDATE sa_paper_strategy_bindings SET frozen_at=now() WHERE id=%s",
@@ -308,7 +366,7 @@ def scan_once(deps: dict, now=None, slot: str = "") -> list[dict]:
                 continue
 
             gain_pct = (price / base - 1) * 100
-            held = _held_days(pos.get("entry_date"), today)
+            held = _held_days(deps, entry, now)
             cfg = _cfg(r["config"])
             tp = _float(r["target_pct"])
             dd = _float(r["drawdown_pct"])
@@ -404,11 +462,12 @@ def compare(deps: dict, code: str = "") -> dict:
     """
     import paper_trading as PT
     get_conn = deps["get_conn"]
+    now_dt = datetime.now()          # compare 没有 now 参数（只读对照，不做判定）
 
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT b.id, b.code, b.strategy_id, b.enabled, b.peak_price, b.ladder_step, "
-            "b.triggered_at, b.base_cost, b.base_shares, b.frozen_at, "
+            "b.triggered_at, b.base_cost, b.base_shares, b.base_entry_date, b.frozen_at, "
             "s.name, s.kind, s.target_pct, s.drawdown_pct, s.config "
             "FROM sa_paper_strategy_bindings b JOIN sa_strategies s ON s.id=b.strategy_id "
             "ORDER BY b.code, s.id")
@@ -456,6 +515,8 @@ def compare(deps: dict, code: str = "") -> dict:
         live = int(pos.get("shares") or 0) > 0
         base = _float(pos.get("cost")) if live else _float(b["base_cost"])
         shares = int(pos.get("shares") or 0) if live else int(b["base_shares"] or 0)
+        entry = (str(pos["entry_date"])[:10] if live and pos.get("entry_date")
+                 else (str(b["base_entry_date"])[:10] if b.get("base_entry_date") else None))
         price = g["price"]
         hold_pct = round((price / base - 1) * 100, 2) \
             if (price and base and base > 0) else None
@@ -490,6 +551,8 @@ def compare(deps: dict, code: str = "") -> dict:
             "drawdown_pct": _float(b["drawdown_pct"]),
             "peak": _float(b["peak_price"]), "ladder_step": b["ladder_step"] or 0,
             "base_cost": base, "base_shares": shares, "frozen": bool(b["frozen_at"]),
+            "base_entry_date": entry,
+            "held_days": _held_days(deps, entry, now_dt),
             "status": status, "exits": ex_out,
             "strat_pct": round(strat_pct, 2) if strat_pct is not None else None,
             "strat_amount": round(strat_amt, 2) if strat_amt is not None else None,
@@ -521,21 +584,31 @@ def compare(deps: dict, code: str = "") -> dict:
 def _summary(items: list[dict]) -> dict:
     """全局口径：策略整体比死拿好多少 —— 探索策略最终要回答的那个问题。"""
     best_edges, spread = [], []
+    by_kind: dict[str, list[float]] = {}
     for g in items:
         rows = [r for r in g["rows"] if r["edge"] is not None]
         if not rows:
             continue
         e = [r["edge"] for r in rows]
         best_edges.append(max(e))
-        spread.append(max(r["strat_pct"] for r in rows if r["strat_pct"] is not None)
-                      - min(r["strat_pct"] for r in rows if r["strat_pct"] is not None))
+        pcts = [r["strat_pct"] for r in rows if r["strat_pct"] is not None]
+        if pcts:
+            spread.append(max(pcts) - min(pcts))
+        for r in rows:
+            by_kind.setdefault(r["kind"], []).append(r["edge"])
     return {
         "codes": len(items),
         "bindings": sum(len(g["rows"]) for g in items),
         "triggered": sum(1 for g in items for r in g["rows"] if r["status"] == "triggered"),
         "frozen": sum(1 for g in items for r in g["rows"] if r["frozen"]),
+        "kinds": sorted(by_kind),
+        # 每种 kind 的平均超额：横向看「哪一类退出规则更有效」，
+        # 比逐票看更有意义 —— 逐票的差异大多来自个股，不是策略。
+        "edge_by_kind": {k: round(sum(v) / len(v), 2)
+                         for k, v in sorted(by_kind.items())},
         "avg_best_edge": round(sum(best_edges) / len(best_edges), 2) if best_edges else None,
         "avg_spread": round(sum(spread) / len(spread), 2) if spread else None,
-        "note": ("edge>0 = 该策略比死拿好。avg_spread 越大说明这几套策略分歧越大，"
-                 "越值得继续观察哪套最终胜出。"),
+        "note": ("edge>0 = 该策略比死拿好。edge_by_kind 横向看哪一类退出规则更有效"
+                 "（比逐票看可靠，逐票差异多半来自个股而非策略）。"
+                 "avg_spread 越大说明几套策略分歧越大，越值得继续观察谁最终胜出。"),
     }

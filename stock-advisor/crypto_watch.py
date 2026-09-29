@@ -24,6 +24,8 @@ import json
 import re
 import threading
 import time
+
+from psycopg2.extras import execute_values
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -1130,9 +1132,15 @@ def _save_quotes(deps, quotes: dict) -> None:
     if not rows:
         return
     with deps["get_conn"]() as conn, conn.cursor() as cur:
-        cur.executemany(
+        # execute_values 而非 executemany：后者每行一次网络往返，这台远程共享
+        # 云库单次往返约 65ms。670 行 executemany ≈ 44 秒，而这个函数是
+        # **每 15 分钟跑一次**的后台线程，白白把连接占住 44 秒。
+        # （2026-09-29 做挖新股时实测出来的，顺手修）
+        execute_values(
+            cur,
             "INSERT INTO sa_crypto_quotes (contract, last, change_pct, high_24h, low_24h, "
-            "vol_quote) VALUES (%s,%s,%s,%s,%s,%s)", rows)
+            "vol_quote) VALUES %s",
+            rows, page_size=500)
         # 保留 30 天，防止长跑无限膨胀（每 15 分钟一插约 670 行/天）
         cur.execute("DELETE FROM sa_crypto_quotes WHERE ts < now() - interval '30 days'")
 

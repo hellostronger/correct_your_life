@@ -345,6 +345,67 @@
       <div id="alerts-box" class="muted" style="margin-top:6px;font-size:12px">加载中…（未来 14 天自选股限售解禁、增发新股上市；工作日 8:30 自动推微信）</div>
     </div>
     <div class="card">
+      <details>
+        <summary style="cursor:pointer">
+          <b style="font-size:13px">🔭 挖新股（全市场发现：你还没关注的票）</b>
+          <span class="muted" id="discover-meta" style="font-size:12px;font-weight:normal"></span>
+        </summary>
+        <div class="muted" style="font-size:12px;margin:6px 0">
+          系统的新闻是<b>按自选股关键词</b>抓的，所以<b>永远发现不了新股票</b> ——
+          实测 10066 行新闻里出现过的代码 100% 都在自选股里。这里换一条路：
+          先建一份全市场「公司全称→代码」名册，再扫公众号/B站/微博/X 的正文，
+          用<b>交易所登记的公司全称</b>做最长匹配，把提到的新公司解析成代码。
+          <br>
+          用全称而不是关键词，是为了避开静态词表的假阳性（之前「创新药」会误命中
+          蓝色光标）。全市场只有 1 个两字公司名，歧义天然极低。
+          每条候选都附<b>原文片段</b>——挖错了一眼能看出来，这是敢开「自动加自选」的前提。
+        </div>
+
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0">
+          <button class="btn" onclick="runMine(true)">立即挖掘</button>
+          <button class="btn ghost" onclick="refreshRoster()">刷新名册</button>
+          <button class="btn ghost" onclick="previewAutoAdd()">看会自动加哪些</button>
+          <select id="disc-filter" oninput="loadDiscover()">
+            <option value="new">待审候选</option>
+            <option value="promoted">已加自选</option>
+            <option value="dismissed">已忽略</option>
+            <option value="all">全部</option>
+          </select>
+          <input id="disc-kw" placeholder="代码/名称" style="width:96px"
+                 oninput="renderDiscover()">
+          <label class="muted" style="font-size:12px">
+            <input type="checkbox" id="disc-onlynew" onchange="loadDiscover()"> 只看新股/次新
+          </label>
+        </div>
+
+        <div id="disc-stats" style="margin:4px 0 8px"></div>
+        <div id="disc-list"></div>
+        <div id="disc-empty" class="empty hide">
+          还没有候选。点「立即挖掘」跑一轮。<br>
+          <span class="muted">候选靠内容源产生：现在公众号有数据，微博/X 还是空的，
+            B站动态多为闲聊。源越多，「多源交叉」这条硬条件越容易满足，
+            高置信自动加自选才会真正生效。</span>
+        </div>
+
+        <details style="margin-top:10px">
+          <summary style="cursor:pointer"><b style="font-size:13px">📆 新股 / 次新股（按上市日期）</b></summary>
+          <div class="muted" style="font-size:12px;margin:6px 0">
+            名册里的<b>上市日期</b>是精确口径（不用东财那个只标首日的 N 前缀）。
+            这里列的是尚未进自选股的新上市公司。
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;margin:6px 0">
+            <label class="muted" style="font-size:12px">上市天数 ≤</label>
+            <input id="disc-nl-days" type="number" value="30" min="1" max="365"
+                   style="width:70px" onchange="loadNewListings()">
+            <button class="btn ghost" onclick="loadNewListings()">查询</button>
+            <span id="disc-nl-hint" class="muted" style="font-size:12px"></span>
+          </div>
+          <div id="disc-nl"></div>
+        </details>
+      </details>
+    </div>
+
+    <div class="card">
       <div class="table-scroll">
       <table>
         <thead><tr>
@@ -1598,7 +1659,7 @@ async function withBusy(btn, label, fn) {
 const TABS = ['market', 'sector', 'holdings', 'strategies', 'plans', 'calendar', 'news',
               'bili', 'wb', 'mp', 'x', 'reports', 'paper', 'notify', 'schedule'];
 const TAB_LOADERS = {
-  market:    () => { loadWatch(); loadAlerts(); loadCrypto(); },
+  market:    () => { loadWatch(); loadAlerts(); loadCrypto(); loadDiscover(); },
   sector:    () => { loadSector(); loadIntraday(); startIntradayAuto(); },
   holdings:  () => { loadHoldings(); refreshTradeStrategyOptions(); },
   strategies:() => { loadStrategies(); refreshTradeStrategyOptions(); },
@@ -1893,6 +1954,210 @@ async function loadMarketVolIntraday() {
   } catch { /* 静默 */ }
 }
 const _volColorOf = r => r == null ? 'muted' : (r >= 1.15 ? 'up' : r <= 0.9 ? 'down' : 'muted');
+  // ---------- 挖新股：全市场发现（2026-09-29）----------
+  // 系统的新闻按自选股关键词抓，所以发现不了新股票；这里靠全市场名册 +
+  // 内容源正文的**公司全称匹配**来挖。
+  async function loadDiscover() {
+    const st = ($('disc-filter') || {}).value || 'new';
+    try {
+      const d = await api('/api/discover/candidates?status=' + st + '&limit=300');
+      window.__disc = d;
+      renderDiscover();
+      loadRosterMeta();
+    } catch (e) {
+      const b = $('disc-list');
+      if (b) b.innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>';
+    }
+  }
+
+  function renderDiscover() {
+    const d = window.__disc || {};
+    const box = $('disc-list');
+    if (!box) return;
+    const kw = (($('disc-kw') || {}).value || '').trim().toLowerCase();
+    const onlyNew = ($('disc-onlynew') || {}).checked;
+    let items = d.items || [];
+    if (kw) items = items.filter(it =>
+      ((it.code || '') + ' ' + (it.name || '')).toLowerCase().includes(kw));
+    if (onlyNew) items = items.filter(it => it.is_new || it.is_sub_new);
+    $('disc-empty').classList.toggle('hide', (d.items || []).length > 0);
+    if (!items.length) {
+      box.innerHTML = (d.items || []).length
+        ? '<div class="empty">当前筛选无匹配</div>' : '';
+      return;
+    }
+    box.innerHTML = '<div class="table-scroll"><table><thead><tr>'
+      + '<th>代码</th><th>名称</th><th>信号分</th><th>来源</th>'
+      + '<th>上市</th><th>涨跌幅</th><th>行业</th>'
+      + '<th style="min-width:220px">证据（原文片段）</th><th>操作</th>'
+      + '</tr></thead><tbody>'
+      + items.map(it => {
+        const tag = it.is_new ? '<span class="badge" style="background:#fde8e8;color:#b42318">新股</span>'
+          : it.is_sub_new ? '<span class="badge" style="background:#fff4e5;color:#b54708">次新</span>' : '';
+        const ev = (it.evidence || []).slice(0, 3).map(e =>
+          '<div style="font-size:11px;margin-bottom:3px">'
+          + '<span class="badge" style="background:#eef2f7;color:#475467">' + esc(e.source) + '</span> '
+          + '<span class="muted">命中「' + esc(e.name) + '」</span> '
+          + esc((e.snippet || '').slice(0, 120)) + '</div>').join('');
+        const nSrc = it.n_sources || 0;
+        return '<tr>'
+          + '<td>' + esc(it.code) + '</td>'
+          + '<td><b>' + esc(it.name) + '</b></td>'
+          + '<td><b class="' + cls(it.score) + '">' + it.score + '</b>'
+          + '<div class="muted" style="font-size:10px">' + nSrc + ' 个来源</div></td>'
+          + '<td style="font-size:11px">' + (it.sources || []).map(esc).join('+') + '</td>'
+          + '<td style="font-size:11px">' + (it.list_date || '—')
+          + '<div>' + (it.listed_days == null ? '' : it.listed_days + ' 天') + tag + '</div></td>'
+          + '<td class="' + cls(it.pct) + '">'
+          + (it.pct == null ? '—' : signed(it.pct) + '%') + '</td>'
+          + '<td class="muted" style="font-size:11px">' + esc((it.industry || '').slice(0, 14)) + '</td>'
+          + '<td>' + (ev || '<span class="muted">—</span>') + '</td>'
+          + '<td><button class="btn" onclick="decideCandidate(\'' + esc(it.code) + '\',\'promote\')">加自选</button> '
+          + '<button class="btn ghost" onclick="decideCandidate(\'' + esc(it.code) + '\',\'dismiss\')">忽略</button>'
+          + '</td></tr>';
+      }).join('')
+      + '</tbody></table></div>';
+  }
+
+  function renderDiscStats(runtime) {
+    const box = $('disc-stats');
+    if (!box) return;
+    const items = (window.__disc || {}).items || [];
+    const cnt = { 新股: 0, 次新: 0, 多源: 0 };
+    items.forEach(it => {
+      if (it.is_new) cnt.新股++;
+      if (it.is_sub_new && !it.is_new) cnt.次新++;
+      if ((it.n_sources || 0) >= 2) cnt.多源++;
+    });
+    const r = runtime || {};
+    const auto = (r.auto_added || []);
+    box.innerHTML = '<div style="display:flex;gap:8px;flex-wrap:wrap">'
+      + [['待审', items.length], ['新股', cnt.新股], ['次新', cnt.次新],
+        ['多源交叉', cnt.多源]].map(c =>
+        '<div style="border:1px solid var(--border,#eee);border-radius:6px;'
+        + 'padding:5px 10px;min-width:76px">'
+        + '<div class="muted" style="font-size:11px">' + c[0] + '</div>'
+        + '<div style="font-size:15px;font-weight:600">' + c[1] + '</div></div>').join('')
+      + '</div>'
+      + (r.last_run ? '<div class="muted" style="font-size:11px;margin-top:5px">'
+        + '最近一轮 ' + esc(r.last_run) + '</div>' : '')
+      + (r.last_error ? '<div class="muted" style="font-size:11px;margin-top:3px;'
+        + 'color:#b42318">上轮失败：' + esc(r.last_error) + '</div>' : '')
+      + (auto.length ? '<div style="font-size:12px;margin-top:5px">最近自动加自选：'
+        + auto.map(x => esc(x.name) + '(' + esc(x.code) + '·' + x.n_sources + '源·'
+          + x.score + '分)').join('、') + '</div>' : '');
+    const meta = $('disc-meta');
+    if (meta && r.last_run) meta.textContent = '最近 ' + r.last_run;
+  }
+
+  async function loadRosterMeta() {
+    try {
+      const r = await api('/api/discover/roster');
+      const d = (window.__disc || {});
+      renderDiscStats(d.runtime);
+      const box = $('disc-stats');
+      if (box && r && r.roster) {
+        const extra = document.createElement('div');
+        extra.className = 'muted';
+        extra.style.fontSize = '11px';
+        extra.style.marginTop = '5px';
+        extra.textContent = '名册 ' + r.counts.live + ' 只'
+          + '（' + (r.roster.age_hours == null ? '?' : r.roster.age_hours) + ' 小时前刷新，'
+          + (r.roster.complete ? '完整' : '部分') + '）'
+          + ' · 20 天内上市 ' + r.counts.listed_20d + ' 只'
+          + ' · 90 天内 ' + r.counts.listed_90d + ' 只';
+        box.appendChild(extra);
+      }
+    } catch (e) { /* 名册状态拿不到不影响主列表 */ }
+  }
+
+  async function runMine(manual) {
+    const hint = $('disc-meta');
+    if (hint) hint.textContent = '挖掘中…';
+    try {
+      const r = await jsonPost('/api/discover/mine',
+        { hours: 336, auto_add: !!manual });
+      if (hint) {
+        hint.textContent = r.ok
+          ? '候选 ' + r.candidates + ' 只' + (r.auto ? '，自动加 ' + (r.auto.added || 0) + ' 只' : '')
+          : '失败：' + (r.why || '');
+      }
+      await loadDiscover();
+    } catch (e) {
+      if (hint) hint.textContent = '挖掘失败：' + e.message;
+    }
+  }
+
+  async function refreshRoster() {
+    const hint = $('disc-meta');
+    if (hint) hint.textContent = '刷新名册中（约 20 秒）…';
+    try {
+      const r = await jsonPost('/api/discover/roster/refresh', {});
+      if (hint) {
+        hint.textContent = r.ok
+          ? '名册 ' + r.got + ' 只' + (r.meta && r.meta.stopped ? '（部分）' : '')
+          : '刷新失败';
+      }
+      await loadDiscover();
+    } catch (e) {
+      if (hint) hint.textContent = '刷新失败：' + e.message;
+    }
+  }
+
+  async function previewAutoAdd() {
+    try {
+      const r = await jsonPost('/api/discover/auto-add', { dry_run: true });
+      const lines = [
+        '门槛：分数 ≥ ' + r.threshold + ' 且 独立来源 ≥ ' + r.min_sources,
+        '会加 ' + r.added + ' 只，留在候选池 ' + r.kept_back + ' 只',
+      ];
+      (r.items || []).forEach(x => lines.push(
+        '  ✅ ' + x.code + ' ' + x.name + ' 分' + x.score + ' ' + x.n_sources
+        + '源(' + (x.sources || []).join('+') + ')'));
+      (r.keep_examples || []).forEach(x => lines.push(
+        '  ⛔ ' + x.code + ' ' + x.name + ' —— ' + x.why));
+      alert(lines.join('\n'));
+    } catch (e) { alert('查询失败：' + e.message); }
+  }
+
+  async function decideCandidate(code, action) {
+    const label = action === 'promote' ? '加自选' : '忽略';
+    if (action === 'dismiss' && !confirm('忽略 ' + code + '？之后不会再出现在候选池。')) return;
+    try {
+      await jsonPost('/api/discover/decide', { code: code, action: action });
+      await loadDiscover();
+    } catch (e) { alert('操作失败：' + e.message); }
+  }
+
+  async function loadNewListings() {
+    const days = parseInt((($('disc-nl-days') || {}).value || '30'), 10) || 30;
+    const box = $('disc-nl');
+    if (box) box.innerHTML = '<div class="muted">查询中…</div>';
+    try {
+      const d = await api('/api/discover/new-listings?days=' + days + '&only_unwatched=true');
+      const hint = $('disc-nl-hint');
+      if (hint) hint.textContent = d.n + ' 只';
+      if (!d.items.length) {
+        box.innerHTML = '<div class="empty">近 ' + days + ' 天没有未关注的新上市股票</div>';
+        return;
+      }
+      box.innerHTML = '<div class="table-scroll"><table><thead><tr>'
+        + '<th>代码</th><th>名称</th><th>上市日期</th><th>已上市</th><th>行业</th>'
+        + '<th>市场</th><th></th></tr></thead><tbody>'
+        + d.items.map(it =>
+          '<tr><td>' + esc(it.code) + '</td><td><b>' + esc(it.name) + '</b></td>'
+          + '<td>' + esc(it.list_date || '—') + '</td>'
+          + '<td>' + (it.listed_days == null ? '—' : it.listed_days + ' 天') + '</td>'
+          + '<td class="muted" style="font-size:11px">' + esc((it.industry || '').slice(0, 20)) + '</td>'
+          + '<td class="muted" style="font-size:11px">' + esc((it.market || '').slice(0, 12)) + '</td>'
+          + '<td><button class="btn" onclick="decideCandidate(\'' + esc(it.code)
+          + '\',\'promote\')">加自选</button></td></tr>').join('')
+        + '</tbody></table></div>';
+    } catch (e) {
+      if (box) box.innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>';
+    }
+  }
+
 async function loadWatch() {
   try {
     const items = await api('/api/watchlist');
@@ -2789,12 +3054,14 @@ function paperStatusBadge(t) {
           + '<td class="' + cls(r.strat_pct) + '"><b>' + pct(r.strat_pct) + '</b></td>'
           + '<td class="muted">' + pct(r.hold_pct) + '</td>'
           + '<td class="' + cls(r.edge) + '"><b>' + pct(r.edge) + '</b></td>'
+          + '<td class="muted">' + (r.held_days == null ? '—' : r.held_days) + '</td>'
           + '<td style="font-size:11px">' + exits + '</td>'
           + '</tr>';
       }).join('');
       return head + '<div class="table-scroll"><table><thead><tr>'
         + '<th>策略</th><th>状态</th><th>策略收益</th><th>死拿</th>'
         + '<th title="策略% − 死拿%，正数 = 这套策略比一直拿着强">超额</th>'
+        + '<th title="建仓日至今的**交易日**数（跳周末，与真实持仓的时间止盈同口径）">持有天</th>'
         + '<th>影子卖出记录</th>'
         + '</tr></thead><tbody>' + rows + '</tbody></table></div>';
     }).join('');
@@ -2822,6 +3089,23 @@ function paperStatusBadge(t) {
         + (typeof c[1] === 'string' && c[1].startsWith('-') ? 'down' : '') + '">'
         + esc(c[1]) + '</div></div>').join('')
       + '</div>'
+      // 横向汇总：哪一类退出规则更有效。比逐票看可靠 —— 逐票的差异多半来自个股而非策略。
+      + (s.edge_by_kind && Object.keys(s.edge_by_kind).length
+          ? '<div style="margin-top:8px"><b style="font-size:12px">'
+            + '按退出类型横向看平均超额</b>'
+            + '<div class="table-scroll"><table><thead><tr><th>退出类型</th>'
+            + '<th>平均超额</th><th>读法</th></tr></thead><tbody>'
+            + Object.keys(s.edge_by_kind).sort(
+                (a, b) => s.edge_by_kind[b] - s.edge_by_kind[a]).map(k =>
+              '<tr><td>' + esc(k) + '</td>'
+              + '<td class="' + cls(s.edge_by_kind[k]) + '"><b>'
+              + signed(s.edge_by_kind[k]) + '%</b></td>'
+              + '<td class="muted" style="font-size:11px">'
+              + (s.edge_by_kind[k] > 0
+                  ? '这一类退出规则平均比死拿强'
+                  : s.edge_by_kind[k] < 0 ? '这一类平均不如死拿' : '与死拿持平')
+              + '</td></tr>').join('')
+            + '</tbody></table></div></div>' : '')
       + '<div class="muted" style="font-size:11px;margin-top:6px">' + esc(s.note || '') + '</div>';
     const hint = $('paper-strat-hint');
     if (hint) {
@@ -2872,6 +3156,7 @@ function paperStatusBadge(t) {
         bbox.innerHTML = '<div class="muted" style="font-size:12px;margin:4px 0">'
           + '共 ' + bs.length + ' 条绑定</div><div class="table-scroll"><table><thead><tr>'
           + '<th>代码</th><th>策略</th><th>基准成本</th><th>基准股数</th>'
+          + '<th>建仓日</th><th>持有天</th>'
           + '<th>峰值</th><th>档位</th><th>影子卖出</th><th>状态</th><th>操作</th>'
           + '</tr></thead><tbody>'
           + bs.map(b =>
@@ -2879,6 +3164,8 @@ function paperStatusBadge(t) {
             + '<td>' + esc(b.strategy_name) + '</td>'
             + '<td>' + fmt(b.base_cost) + '</td>'
             + '<td>' + fmt(b.base_shares) + '</td>'
+            + '<td>' + (b.base_entry_date || '—') + '</td>'
+            + '<td>' + (b.held_days == null ? '—' : b.held_days) + '</td>'
             + '<td>' + fmt(b.peak_price) + '</td>'
             + '<td>' + (b.ladder_step || 0) + '</td>'
             + '<td>' + (b.exit_count || 0) + '</td>'
