@@ -256,12 +256,17 @@ SCHEMAS: dict[str, dict[str, Any]] = {
     },
     # ---------------- 告警 / 日历 / 量能 / 提款 ----------------
     "alerts": {
-        "label": "⚠️ 解禁/增发告警",
-        "help": "A 股口径（港股不适用），数据源东财。",
+        "label": "⚠️ 解禁/增发/减持告警",
+        "help": "A 股口径（港股不适用），数据源东财",
         "fields": [
             {"key": "enabled", "t": "bool", "d": True, "label": "启用"},
             {"key": "days", "t": "int", "d": 14, "lo": 1, "hi": 90,
-             "label": "提前天数", "help": "窗口内的新事件推微信，同事件只推一次"},
+             "label": "提前天数", "help": "解禁/增发窗口内的新事件推微信，同事件只推一次"},
+            {"key": "reduce_enabled", "t": "bool", "d": True, "label": "启用减持提醒",
+             "help": "预披露（提前预警）+ 高管实际减持。只看自选股里的 A 股"},
+            {"key": "reduce_lookback_days", "t": "int", "d": 5, "lo": 1, "hi": 90,
+             "label": "减持回看天数",
+             "help": "往前看几天内的减持公告/明细。每天扫一轮，取 5~7 天即可覆盖长假"},
         ],
     },
     "calendar": {

@@ -2114,12 +2114,19 @@ def strategies_check():
 
 
 # ---------------- 提款计划（某日期前提出多少钱，系统给达成路径） ----------------
-# 思路：目标金额 - 已提款 = 还需要的现金；拿它对比当前持仓总市值：
+# 思路：**双进度**——
+#   已变现  从 sa_trades 推导（卖出净额），卖出就动，不用另外记
+#   已转出  sa_withdrawals 手动记（钱真的出了券商账户才算）
+# 两个进度都对着同一个目标：需要变现多少、还需要转出多少分别是多少。
+# 为什么要两个而不是一个：卖出 ≠ 提现。卖掉了钱还在券商账户里，只有转出才算
+# 真的达成。之前只有一个「已提款」进度，卖出完全不体现（买卖流水只被回放成
+# 净持仓余额），于是买入反而能让计划看起来更接近达成——那是加本金，不是贡献。
+# 达成路径仍拿「还需变现」对比持仓市值：
 #   市值够        -> 直接按建议卖出凑钱（按浮盈排序，优先兑现赚得多的）
 #   市值不够      -> 算缺口、所需总收益率、剩余交易日、复合日收益率，分级判定难度
 #      （轻松/正常/积极/风险极高/不可能），提醒「要么降目标、要么延日期、要么补本金」
-# 每日收盘后检查一次：达标/临近截止(10/5/1交易日)/逾期 推微信，里程碑键记在
-# notified JSONB 里防重复轰炸。提款流水（sa_withdrawals）累计记进度。
+# 每日收盘后检查一次：达标/临近截止(10/5/1交易日)/逾期/已变现未转出 推微信，
+# 里程碑键记在 notified JSONB 里防重复轰炸。
 
 class PlanIn(BaseModel):
     target_date: str = Field(description="截止日期 YYYY-MM-DD")
@@ -2173,30 +2180,130 @@ def _sell_suggestion(held: list[dict], need: float) -> list[dict]:
     return out
 
 
-def _plan_view(plan: dict, held_mv: float, held: list[dict]) -> dict:
-    """把一个计划行 + 当前持仓汇总成「达成路径」视图（列表/详情共用）。"""
-    need = float(plan["target_amount"]) - plan["withdrawn"]   # 还需要提的钱
-    gap = round(need - held_mv, 2)                           # >0 = 市值不够
+def _net_cash_curve() -> tuple[list[tuple[str, float]], float]:
+    """净变现现金曲线：([(交易日, 当日净额), ...] 按日升序, 当日正现金合计)。
+
+    一笔交易的净额 = 卖出 shares*price 为正、买入为负。
+    为什么用净额而不是累计卖出额：卖出→买回→再卖出时累计卖出额会把同一笔钱算两遍。
+    提款计划关心「从市场里真正取出来多少现金」，所以买入要扣掉。
+    数据全部来自 sa_trades（记一笔流水），**不新建表**——存派生值就得跟着补录/删账
+    同步，迟早对不上；直接算没有同步问题。
+    """
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT trade_date::text, "
+            "COALESCE(SUM(CASE WHEN side = 'sell' THEN shares * price "
+            "                  ELSE -(shares * price) END), 0) "
+            "FROM sa_trades GROUP BY trade_date ORDER BY trade_date")
+        rows = cur.fetchall()
+    curve = [(d, float(a)) for d, a in rows]
+    return curve, sum(a for _, a in curve if a > 0)
+
+
+def _realized_allocations(plans: list[dict]) -> dict[int, float]:
+    """把净变现按计划**独占**分配：同一笔钱只能落在一个计划上，且买入会冲减它。
+
+    这是账户现金的**滚动余额**模型，不是「每天净额各算各的」——后者会漏掉
+    「卖完又买回」：09-23 卖出 44,520 认领进计划，09-24 买入 39,396，如果按独立
+    正负日累加，显示仍是 44,520，可那 39,396 已经把钱放回市场了，真实可提现只有
+    5,124。买入在这里必须**冲减已认领的额度**，否则进度虚高（2026-09-29 实测踩过）。
+
+    两条规则同时成立：
+      1. **独占**  每一笔到账现金最多被一个计划认领（按计划创建顺序先到先得）
+      2. **可冲减** 买入先花未认领的现金，不够的部分从**最近认领**的那笔回收
+                    （刚卖出的钱最可能就是被这次买入吃掉的那部分）
+
+    计划还只能认领**自己创建日当天及以后**到账的现金：创建前已有的钱不算它的功劳。
+
+    于是不变量 Σ分配 ≤ Σ正现金 恒成立，且「卖出又买回 = 没变现」能被正确反映。
+    """
+    curve, _ = _net_cash_curve()
+    alloc = {p["id"]: 0.0 for p in plans}
+    order = sorted(plans, key=lambda x: (x.get("created_date") or "", x["id"]))
+    unclaimed: list[list] = []   # [到账日, 剩余可用金额]，按到达顺序
+    claims: list[list] = []      # [plan_id, 金额]，按认领顺序（尾部=最新）
+    for d, delta in curve:
+        if delta > 0:
+            unclaimed.append([d, delta])
+            for p in order:
+                start = p.get("created_date") or "1970-01-01"
+                if start > d:
+                    continue                       # 计划还没诞生，这天的钱不算它的
+                need = float(p["target_amount"]) - alloc[p["id"]]
+                if need <= 1e-9:
+                    continue
+                for lot in unclaimed:             # 同一笔钱先到先得
+                    if lot[1] <= 1e-9 or lot[0] < start:
+                        continue
+                    take = min(lot[1], need)
+                    lot[1] -= take
+                    need -= take
+                    alloc[p["id"]] += take
+                    claims.append([p["id"], take])
+                    if need <= 1e-9:
+                        break
+        elif delta < 0:
+            spend = -delta
+            for lot in reversed(unclaimed):       # 先花还没算进任何计划的钱
+                if spend <= 1e-9:
+                    break
+                take = min(lot[1], spend)
+                lot[1] -= take
+                spend -= take
+            while spend > 1e-9 and claims:        # 不够就从最近认领的那笔回收
+                cid, amt = claims[-1]
+                take = min(amt, spend)
+                claims[-1][1] = amt - take
+                alloc[cid] -= take
+                spend -= take
+                if claims[-1][1] <= 1e-9:
+                    claims.pop()
+            # 还差的部分（超出所有已认领+未认领的现金）视为动用初始本金，
+            # 不追扣任何计划——本金不是卖出来的，不该算谁的成绩
+    return {pid: round(max(0.0, v), 2) for pid, v in alloc.items()}
+
+
+def _plan_view(plan: dict, held_mv: float, held: list[dict], realized: float) -> dict:
+    """把一个计划行 + 当前持仓汇总成「达成路径」视图（列表/详情共用）。
+
+    realized 必须由调用方从 _realized_allocations 传入——**不要**在这里自己按
+    created_date 再算一遍：那正是会让每个计划都独占同一笔卖出的写法。
+    """
+    target = float(plan["target_amount"])
+    withdrawn = plan["withdrawn"]
+    realized_pct = round(realized / target * 100, 1) if target else 0.0
+    withdrawn_pct = round(withdrawn / target * 100, 1) if target else 0.0
+    need_realize = round(target - realized, 2)      # 还要卖多少才够
+    need_now = round(target - withdrawn, 2)          # 还要转出多少
+    gap = round(need_realize - held_mv, 2)           # >0 = 市值不够
     tdays = _trading_days_until(plan["target_date"])
     deadline_passed = plan["target_date"] < datetime.now().strftime("%Y-%m-%d")
     view = {**{k: plan[k] for k in ("id", "target_date", "target_amount", "note", "status")},
-            "withdrawn": plan["withdrawn"], "need_now": round(need, 2),
+            "withdrawn": withdrawn, "need_now": need_now,
+            "realized": realized, "need_realize": need_realize,
+            "realized_pct": realized_pct, "withdrawn_pct": withdrawn_pct,
+            # 卖掉了但还没转出、此刻躺在账户里能直接提走的钱
+            "available_to_withdraw": round(max(0.0, min(realized, need_now)), 2),
             "holdings_mv": round(held_mv, 2), "gap": gap,
             "trading_days_left": tdays, "deadline_passed": deadline_passed,
             "required_total_pct": None, "required_daily_pct": None,
             "difficulty": None, "sell_plan": []}
-    if need <= 0:
+    if withdrawn >= target:
         view["difficulty"] = "✅ 已完成"
+        return view
+    if need_realize <= 0:
+        # 卖够了但没转出——最容易忘的一件事，单独点出来
+        view["difficulty"] = "💵 已变现，尚未转出"
         return view
     if held_mv <= 0:
         view["difficulty"] = "🚫 无持仓可变现"
         return view
-    need_ratio = need / held_mv
+    need_ratio = need_realize / held_mv
     view["required_total_pct"] = round((need_ratio - 1) * 100, 2)
     if need_ratio <= 1:  # 市值够：直接卖就行
         view["difficulty"] = "💰 现在就能提"
         view["required_daily_pct"] = 0.0
-        view["sell_plan"] = _sell_suggestion(held, need)
+        view["sell_plan"] = _sell_suggestion(held, need_realize)
         return view
     # 市值不够：需要组合整体涨 need_ratio-1。按剩余交易日折算复合日收益率
     if tdays <= 0:
@@ -2226,6 +2333,10 @@ def _query_plans(withdrawn_map: dict | None = None) -> list[dict]:
         r["target_date"] = r["target_date"].isoformat()
         r["target_amount"] = float(r["target_amount"])
         r["withdrawn"] = (withdrawn_map or {}).get(r["id"], 0.0)
+        # 净变现的起算点：计划创建那天。缺失（老数据 created_at 为 null）时退化为
+        # 全量流水起点，宁可多算也别让进度显示 0
+        r["created_date"] = (r["created_at"].isoformat()[:10] if r.get("created_at")
+                             else "1970-01-01")
         cfg = r.get("notified")
         r["notified"] = cfg if isinstance(cfg, dict) else (json.loads(cfg or "{}"))
     return rows
@@ -2248,7 +2359,9 @@ def _active_held():
 @app.get("/api/plans")
 def list_plans():
     held, mv = _active_held()
-    return [_plan_view(p, mv, held) for p in _query_plans(_withdrawn_totals())]
+    plans = _query_plans(_withdrawn_totals())
+    rm = _realized_allocations(plans)
+    return [_plan_view(p, mv, held, rm.get(p["id"], 0.0)) for p in plans]
 
 
 @app.post("/api/plans")
@@ -2309,7 +2422,8 @@ def plan_detail(plan_id: int):
     if not plans:
         raise HTTPException(404, f"计划 #{plan_id} 不存在")
     held, mv = _active_held()
-    view = _plan_view(plans[0], mv, held)
+    rm = _realized_allocations(plans)
+    view = _plan_view(plans[0], mv, held, rm.get(plans[0]["id"], 0.0))
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("SELECT id, wd_date, amount, note FROM sa_withdrawals "
                     "WHERE plan_id = %s ORDER BY wd_date DESC, id DESC", (plan_id,))
@@ -2323,7 +2437,8 @@ def plan_detail(plan_id: int):
 def check_withdrawal_once(notify: bool = True, auto_ai: bool = False) -> list[dict]:
     """每日盘后跑一次：给每个 active 计划算达标状态，推里程碑提醒。
 
-    里程碑键：ready（现在就能提）/ d10 d5 d1（剩余交易日首次 ≤N）/ deadline（逾期）。
+    里程碑键：done（已转出达标）/ cash_ready（**已变现但还没转出**）/ ready（现在就能提）
+    / d10 d5 d1（剩余交易日首次 ≤N）/ deadline（逾期）。
     同键只推一次（记在 notified JSONB）；「现在就能提」回落后再次达标会重新推
     （键带日期后缀）。auto_ai=True 时（后台盘后循环）对触发了里程碑的计划
     自动补一条 LLM 提款建议（llm.auto_advice 开启 + 当日未生成过才跑）。
@@ -2332,16 +2447,26 @@ def check_withdrawal_once(notify: bool = True, auto_ai: bool = False) -> list[di
     totals = _withdrawn_totals()
     held, mv = _active_held()
     today = datetime.now().strftime("%Y-%m-%d")
-    for p in _query_plans(totals):
+    plans = _query_plans(totals)
+    # 分配必须对**全部**计划一起做（含 done 的），否则删掉一个已完成计划会让
+    # 后面计划的独占份额凭空变大——钱不会因为计划被删就多出来
+    rm = _realized_allocations(plans)
+    for p in plans:
         if p["status"] != "active":
             continue
-        v = _plan_view(p, mv, held)
+        v = _plan_view(p, mv, held, rm.get(p["id"], 0.0))
         milestones = []
         if v["need_now"] <= 0:
             milestones.append(("done", "已提满目标金额，计划完成"))
+        elif v["need_realize"] <= 0:
+            # 卖够了但没转出：钱在账户里躺着一分没动目标，这种最容易被忘掉
+            milestones.append((
+                f"cash_ready:{today}",
+                f"已变现 {v['realized']:,.0f} 元够目标，但只转出了 {v['withdrawn']:,.0f} 元，"
+                f"还差 {v['need_now']:,.0f} 元（钱还躺在账户里）"))
         elif v["gap"] <= 0:
             milestones.append((f"ready:{today}",
-                               f"市值已够（{v['holdings_mv']:,.0f} ≥ {v['need_now']:,.0f}），可着手卖出提款"))
+                               f"市值已够（{v['holdings_mv']:,.0f} ≥ {v['need_realize']:,.0f}），可着手卖出提款"))
         tleft = v["trading_days_left"]
         if not v["deadline_passed"] and v["gap"] > 0:
             for n in (10, 5, 1):
@@ -2367,6 +2492,9 @@ def check_withdrawal_once(notify: bool = True, auto_ai: bool = False) -> list[di
                         f"{p['target_amount']:,.0f} 元）\n\n• {msg}\n"
                         f"• 还需 {v['need_now']:,.0f} 元，当前持仓市值 {v['holdings_mv']:,.0f} 元\n"
                         f"• 状态：{v['difficulty'] or '—'}"
+                        + (f"\n• 已变现 {v['realized']:,.0f} / 已转出 {v['withdrawn']:,.0f}"
+                           f"（还差 {v['need_now']:,.0f}）"
+                           if v.get("realized") is not None else "")
                         + (f"\n• 需涨 {v['required_total_pct']:g}%（剩 {tleft} 个交易日）"
                            if v.get("required_total_pct") and v["gap"] > 0 else ""))
                 except Exception as exc:
@@ -2558,24 +2686,34 @@ def _advice_sector_lines(held_codes: list[str]) -> list[str]:
 
 
 def _advice_event_lines(codes: list[str]) -> list[str]:
-    """未来 21 天自选+持仓的解禁/增发事件行。"""
+    """未来 21 天解禁/增发 + 近 N 天减持的事件行（提款计划的 LLM 上下文）。"""
     try:
-        evs = alerts_mod.upcoming_events(codes, days=21)
+        conf = _alerts_conf()
+        evs = alerts_mod.all_events(
+            codes, days=21,
+            reduce_lookback_days=int(conf.get("reduce_lookback_days",
+                                              alerts_mod.DEFAULT_REDUCE_LOOKBACK)),
+            include_reduce=bool(conf.get("reduce_enabled", True)))
     except Exception:
         return []
-    return [f"- {'解禁' if e['type'] == 'lift' else '增发新股上市'} {e['event_date']} "
-            f"{e['name']}（{e['code']}）{e['shares_yi']}亿股/约{e['cap_yi']}亿元 {e['detail']}"
+    return [f"- {alerts_mod.KIND_META.get(e['type'], ('•', e['type']))[1]} "
+            f"{e['event_date']} {e['name']}（{e['code']}）"
+            f"{e.get('shares_txt') or ''} {e.get('detail') or ''}".strip()
             for e in evs[:10]]
 
 
 def generate_plan_advice(plan_id: int, auto: bool = False) -> dict:
     """组上下文 -> 调 Claude -> 存 sa_plan_advice。返回存好的行。失败抛 HTTPException。"""
     totals = _withdrawn_totals()
-    plans = [p for p in _query_plans(totals) if p["id"] == plan_id]
+    all_plans = _query_plans(totals)
+    plans = [p for p in all_plans if p["id"] == plan_id]
     if not plans:
         raise HTTPException(404, f"计划 #{plan_id} 不存在")
     held, mv = _active_held()
-    view = _plan_view(plans[0], mv, held)
+    # 必须在**全部**计划上分配完再取这一个。只拿单行去分配会让它独占整池变现额，
+    # 与 /api/plans 里显示的进度对不上（同一计划两个页面两个数）。
+    rm = _realized_allocations(all_plans)
+    view = _plan_view(plans[0], mv, held, rm.get(plans[0]["id"], 0.0))
     conf = llm_advisor.load_llm_conf()
     if not conf["enabled"]:
         raise HTTPException(400, "LLM 建议未启用（通知/提款页的 AI 配置里打开开关并填 API key）")
@@ -3031,32 +3169,67 @@ def schedule_update(body: ScheduleIn):
     return schedule_get()
 
 
+def _alerts_conf() -> dict:
+    """告警配置。reduce_lookback_days 兜底用 alerts_mod 的模块默认，
+    免得 app 里再抄一份真源（抄了就会漂——config_schema 的 d: 也要跟着改）。"""
+    conf = _conf_section("alerts")
+    conf.setdefault("reduce_enabled", True)
+    conf.setdefault("reduce_lookback_days", alerts_mod.DEFAULT_REDUCE_LOOKBACK)
+    return conf
+
+
 @app.get("/api/alerts/upcoming")
 def alerts_upcoming(days: int = 14):
-    """自选股未来 N 天的解禁/增发事件（页面每次现拉，不受已推送状态影响）。"""
+    """自选股事件（页面每次现拉，不受已推送状态影响）。
+
+    含**未来**的解禁/增发（days 窗口）和**刚过去**的减持（reduce_lookback_days
+    回看）——两类时间方向相反，见 alerts.py 模块头。
+    """
     days = max(1, min(days, 90))
+    conf = _alerts_conf()
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT code FROM sa_watchlist")
         codes = [r[0] for r in cur.fetchall()]
-    return {"days": days, "events": alerts_mod.upcoming_events(codes, days=days)}
+    events = alerts_mod.all_events(
+        codes, days=days,
+        reduce_lookback_days=int(conf.get("reduce_lookback_days",
+                                          alerts_mod.DEFAULT_REDUCE_LOOKBACK)),
+        include_reduce=bool(conf.get("reduce_enabled", True)))
+    # 带上图标/中文标签，页面直接渲染，别让前端再写一份 type->文案的映射
+    for e in events:
+        icon, label = alerts_mod.KIND_META.get(e["type"], ("•", e["type"]))
+        e["icon"], e["label"] = icon, label
+    return {"days": days,
+            "reduce_lookback_days": int(conf.get("reduce_lookback_days",
+                                                  alerts_mod.DEFAULT_REDUCE_LOOKBACK)),
+            "events": events}
 
 
 @app.post("/api/alerts/check")
 def alerts_check():
     """手动触发一次告警扫描（新事件推微信/邮件；同事件只推一次）。"""
+    conf = _alerts_conf()
     with get_conn() as conn:
-        fresh = alerts_mod.check_alerts_once(conn, notify_fn=notifier.notify)
+        fresh = alerts_mod.check_alerts_once(
+            conn, notify_fn=notifier.notify, days=int(conf.get("days", 14)),
+            reduce_lookback_days=int(conf.get("reduce_lookback_days",
+                                              alerts_mod.DEFAULT_REDUCE_LOOKBACK)),
+            include_reduce=bool(conf.get("reduce_enabled", True)))
     return {"ok": True, "alerted": fresh}
 
 
 def _alerts_loop():
     """事件告警守护线程：工作日 check_time（默认 8:30，可网页改）后查一轮（每日一次；
-    事件去重记在 data/alerts_state.json，重启不会重复轰炸，首轮发现的历史事件也会推）。"""
+    事件去重记在 data/alerts_state.json，重启不会重复轰炸，首轮发现的历史事件也会推）。
+
+    减持类事件靠「每日扫一遍」兜住周末/长假：法定预披露是提前 15 个交易日，
+    漏过一轮不会错过整个计划；回看天数只需覆盖到上次扫描即可（默认 5 天 ≥ 长假）。
+    """
     last_day = None
     while True:
         try:
             now = datetime.now()
-            conf = _conf_section("alerts")
+            conf = _alerts_conf()
             ah, am = _sched_time("alerts", "check_time")
             if (conf.get("enabled", True) and now.weekday() < 5
                     and (now.hour, now.minute) >= (ah, am) and now.hour < 21
@@ -3064,7 +3237,11 @@ def _alerts_loop():
                 with get_conn() as conn:
                     fresh = alerts_mod.check_alerts_once(
                         conn, notify_fn=notifier.notify,
-                        days=int(conf.get("days", 14)))
+                        days=int(conf.get("days", 14)),
+                        reduce_lookback_days=int(
+                            conf.get("reduce_lookback_days",
+                                     alerts_mod.DEFAULT_REDUCE_LOOKBACK)),
+                        include_reduce=bool(conf.get("reduce_enabled", True)))
                 last_day = now.date()
                 if fresh:
                     print(f"[alerts] pushed {len(fresh)} new events", flush=True)
@@ -3081,6 +3258,7 @@ import paper_strategy
 import stock_discovery
 import stock_roster
 import paper_memory
+import paper_goal
 
 
 def _paper_strategy_deps() -> dict:
@@ -3170,17 +3348,23 @@ def _paper_social(code: str, name: str) -> dict:
 
 
 def _paper_event_lines(code: str, days: int = 14) -> list[str]:
-  """该股未来 N 天解禁/增发事件（格式化行），供决策上下文。"""
+  """该股的解禁/增发/减持事件（格式化行），供模拟交易决策上下文。"""
   try:
-      events = alerts_mod.upcoming_events([code], days=days)
+      conf = _alerts_conf()
+      events = alerts_mod.all_events(
+          [code], days=days,
+          reduce_lookback_days=int(conf.get("reduce_lookback_days",
+                                            alerts_mod.DEFAULT_REDUCE_LOOKBACK)),
+          include_reduce=bool(conf.get("reduce_enabled", True)))
   except Exception:
       return []
   lines = []
   for e in events[:8]:
-      kind = "解禁" if e.get("type") == "lift" else "增发上市"
-      cap = f"市值约 {e['cap_yi']:g} 亿" if e.get("cap_yi") else ""
-      lines.append(f"{e.get('event_date')} {kind} {cap}（{e.get('detail') or ''}）"
-                   .rstrip("（）"))
+      kind = alerts_mod.KIND_META.get(e.get("type"), ("•", e.get("type")))[1]
+      amt = " ".join(x for x in (e.get("shares_txt") or "",
+                                 f"约{e['cap_yi']}亿元" if e.get("cap_yi") else "") if x)
+      lines.append(f"{e.get('event_date')} {kind} {amt}（{e.get('detail') or ''}）"
+                   .rstrip("（）").replace("  ", " "))
   return lines
 
 
@@ -3548,7 +3732,63 @@ def paper_reset(body: PaperResetIn):
     """重置模拟账户（清空交易/经验/快照，回填初始资金）。须 confirm=true。"""
     if not body.confirm:
         raise HTTPException(400, "须传 confirm=true 才能重置")
+    # 目标也一并清掉：净值归零后旧目标的 base_value 完全失去意义，
+    # 留着只会让对比表里混进一批起点不同的样本
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE sa_paper_goals SET status = 'cancelled' "
+                    "WHERE status = 'active'")
+        conn.commit()
     return paper_trading.reset_account(_paper_deps(), body.initial_cash)
+
+
+@app.get("/api/paper/goal")
+def paper_goal_get():
+    """当前生效的目标 + 进度（进度按收盘价口径，与结算快照一致）。
+
+    一次返回 active 目标、约束提示和历史列表，前端不用发多个请求。
+    """
+    deps = _paper_deps()
+    total = paper_goal.current_total(deps)
+    g = paper_goal.active_goal(deps)
+    return {
+        "current_total": total,
+        "goal": paper_goal.goal_progress(g, total) if g else None,
+        "constrain": paper_goal.constrain_note(deps),
+        "history": [paper_goal.goal_progress(x, total) for x in
+                    paper_goal.list_goals(deps, limit=30)],
+    }
+
+
+class PaperGoalIn(BaseModel):
+    target_return_pct: float = Field(gt=0, le=100000, description="目标收益率 %，如 8 表示 8%")
+    horizon_days: int = Field(gt=0, le=3650, description="期限（自然日，含今天）")
+    mode: str = Field(default="observe", description="observe=只度量；constrain=临期收紧仓位")
+    note: str = Field(default="", max_length=255)
+
+
+@app.post("/api/paper/goal")
+def paper_goal_create(body: PaperGoalIn):
+    """设一个收益率目标。多个 observe 目标可并存用于对比，constrain 同时只能一个。"""
+    try:
+        return paper_goal.create_goal(_paper_deps(), body.target_return_pct,
+                                      body.horizon_days, body.mode, body.note)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.post("/api/paper/goal/{goal_id}/cancel")
+def paper_goal_cancel(goal_id: int):
+    """取消进行中的目标（不算达标也不算到期，status='cancelled'）。"""
+    try:
+        return paper_goal.cancel_goal(_paper_deps(), goal_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+
+
+@app.post("/api/paper/goal/check")
+def paper_goal_check():
+    """手动跑一次目标判定（结算后自动跑，这个是给网页上的「立即检查」用）。"""
+    return {"ok": True, "closed": paper_goal.evaluate_active(_paper_deps(), notify=True)}
 
 
 @app.get("/api/paper/status")
@@ -5394,7 +5634,12 @@ def health():
 
 @app.get("/")
 def index():
-    return FileResponse(BASE_DIR / "static" / "index.html")
+    # no-cache 不是「不缓存」：是每次都回来问一次 ETag。没收这行时浏览器会一直用
+    # 旧副本——改完 static/index.html 刷新页面看到的还是老代码（表现为新加的字段
+    # 渲染成 null、老映射还在用），很难看出是缓存问题。FileResponse 自带 ETag，
+    # 所以未改动时仍是 304，代价只有一次条件请求。
+    return FileResponse(BASE_DIR / "static" / "index.html",
+                        headers={"Cache-Control": "no-cache"})
 
 
 def _normalize_code(code: str) -> str:
@@ -5478,6 +5723,12 @@ if _BOOTSTRAP:
         x_monitor._ensure_tables(_x_deps())
     except Exception as exc:
         print(f"[x] init tables failed: {exc}", flush=True)
+
+    # 模拟盘目标模式表（幂等 DDL）
+    try:
+        paper_goal.ensure_tables(_paper_deps())
+    except Exception as exc:
+        print(f"[paper_goal] init tables failed: {exc}", flush=True)
 
 # 自动新闻抓取后台线程（fetch_interval_minutes=0 时轮内直接跳过）
 _start_daemon(_auto_fetch_loop, "sa_auto_fetch")

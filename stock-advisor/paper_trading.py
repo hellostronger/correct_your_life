@@ -888,6 +888,11 @@ def _build_context(stock: dict, quote: dict, bars: list[dict],
                 + (f"已持有该股 {me['shares']} 股，成本 {me['cost']:g}"
                    if me else "该股无持仓")
                 + f"；单票仓位上限 {conf['max_position_pct']}%")
+    if conf.get("_goal_line"):
+        # 目标进度（收益率目标）。observe 模式也给 LLM 看，只是不加硬约束——
+        # 让它知道这轮是朝着一个具体收益目标去的；constrain 且临期时会带
+        # 「禁止开新仓」的明确指令（系统侧也真的会拒单）
+        ctx.append(conf["_goal_line"])
     if social:
         ctx.append(_social_block(social))
     ctx.append(f"【历史决策复盘经验】\n{past_context}")
@@ -906,8 +911,13 @@ def position_limit_status(cur, conf: dict) -> dict:
         cap = 0
     held = _derive_paper_positions(cur)
     n = len(held)
+    # 目标临期收紧：禁止开新仓。算作 full（与持仓只数上限同一档），这样
+    # _rule_brief 会把它写成硬约束、_execute_decision 也真的会拒单——
+    # 只在 prompt 里叮嘱一句 LLM 未必听，拒单在代码里才靠得住
+    frozen = bool(conf.get("_no_new_positions"))
     return {"held": n, "cap": cap, "codes": sorted(held),
-            "unlimited": cap <= 0, "full": cap > 0 and n >= cap,
+            "unlimited": cap <= 0, "full": (cap > 0 and n >= cap) or frozen,
+            "frozen": frozen,
             "room": (max(0, cap - n) if cap > 0 else None)}
 
 
@@ -923,6 +933,27 @@ def run_decisions(deps: dict, slot: str = "", only: set | None = None) -> dict:
     """
     get_conn = deps["get_conn"]
     conf = {**DEFAULTS, **(deps.get("conf") or {})}
+    # 目标模式（paper_goal.py）：约束型目标在「临期未达标」时收紧单票上限并
+    # 禁止开新仓。**只做减法**——落后时放大仓位是为了达标而加赌注，会把失败
+    # 概率进一步推高；临期未达标真正该做的是别再把已有收益搭进去。
+    # conf 上面刚 spread 成了本轮副本，改它不污染配置文件。
+    try:
+        import paper_goal
+        _gnote = paper_goal.constrain_note(deps)
+    except Exception as exc:
+        print(f"[paper] 目标模式读取失败（忽略）: {exc}", flush=True)
+        _gnote = None
+    if _gnote:
+        conf["_goal_line"] = paper_goal.context_line(deps)
+        if _gnote.get("tighten"):
+            _old = float(conf["max_position_pct"])
+            conf["max_position_pct"] = min(_old, float(_gnote["position_cap_pct"]))
+            conf["_no_new_positions"] = True
+            print(f"[paper] 目标临期收紧：单票上限 {_old}% -> "
+                  f"{conf['max_position_pct']}%，本轮禁止开新仓"
+                  f"（目标 {_gnote['target_return_pct']:g}%，"
+                  f"当前 {_gnote['return_pct']:+.2f}%，剩 {_gnote['days_left']} 天）",
+                  flush=True)
     today = datetime.now().strftime("%Y-%m-%d")
     results = []
     with get_conn() as conn:
@@ -1005,7 +1036,11 @@ def _rule_brief(code: str, name: str, held: bool, free_shares: int = 0,
         sell = "；该股 T+0，持仓可随时卖"
     extra = ""
     lim = limit or {}
-    if not held and lim.get("full"):
+    if not held and lim.get("frozen"):
+        extra = ("\n- ⛔ 账户目标已临期未达标，进入**收紧期**：本轮**不允许开新仓**，"
+                 "只允许对已有持仓减仓或持有落袋。你必须给 hold 或 sell，"
+                 "不要给出任何 buy 方案（会被系统直接拒单）")
+    elif not held and lim.get("full"):
         extra = (f"\n- 账户当前持仓 {lim['held']} 只已达上限 {lim['cap']} 只，"
                  f"本轮**不允许开新仓**：你必须给 hold，"
                  f"不要给出任何 buy 方案（会被系统直接拒单）")
@@ -1676,6 +1711,17 @@ def settle_and_reflect(deps: dict) -> dict:
             print(f"[paper] prune failed: {exc}", flush=True)
         conn.commit()
     snap = _snapshot_equity(deps)
+    # 目标模式：结算完净值就该判定目标（达标/到期）。放在快照之后——进度要用
+    # 当日收盘总资产，提前判会用到昨天的数。失败不阻塞结算主流程。
+    try:
+        import paper_goal
+        closed = paper_goal.evaluate_active(deps, notify=True)
+        if closed:
+            snap = {**(snap or {}), "goals_closed": [
+                {"id": c["id"], "status": c["status"], "return_pct": c["return_pct"]}
+                for c in closed]}
+    except Exception as exc:
+        print(f"[paper] 目标判定失败（不影响结算）: {exc}", flush=True)
     if notify_fn and settled:
         lines = "\n".join(
             f"{s['side']} {s['code']}：收益 {s['raw_return'] * 100:+.1f}%"

@@ -210,17 +210,20 @@ def _ensure_tables(deps) -> None:
             )""")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_sa_crypto_quotes "
                     "ON sa_crypto_quotes (contract, ts DESC)")
+        # 迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列，必须显式 ALTER。
+        # ⚠️ fresh_install 的求值位置不能动——它隐式依赖「SELECT to_regclass
+        # 早于所有 DDL」，挪到最后就变成恒 False，用户删掉的合约每次重启复活。
+        # 但这条 ALTER 必须在下面的种子 INSERT 之前：建表 DDL 里没有 stock_code 列，
+        # 新库上先 INSERT 会报 column does not exist 并回滚整个事务，
+        # sa_crypto_watch/quotes/link_stats 三张表一起建不出来（2026-09-29 首次部署实测）。
+        cur.execute("ALTER TABLE sa_crypto_watch ADD COLUMN IF NOT EXISTS "
+                    "stock_code VARCHAR(16) NOT NULL DEFAULT ''")
+
         if fresh_install:
             for contract, name, stock_code in SEED_CONTRACTS:
                 cur.execute("INSERT INTO sa_crypto_watch (contract, name, stock_code) "
                             "VALUES (%s, %s, %s) ON CONFLICT (contract) DO NOTHING",
                             (contract, name, stock_code))
-
-        # 迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列，必须显式 ALTER。
-        # ⚠️ 上面 fresh_install 的求值位置不能动——它隐式依赖「SELECT to_regclass
-        # 早于所有 DDL」，挪到最后就变成恒 False，用户删掉的合约每次重启复活。
-        cur.execute("ALTER TABLE sa_crypto_watch ADD COLUMN IF NOT EXISTS "
-                    "stock_code VARCHAR(16) NOT NULL DEFAULT ''")
         # 首次建表时种下的关联写进老行（此时表是空的，不存在"覆盖用户选择"的问题）
         if fresh_install:
             for contract, _name, stock_code in SEED_CONTRACTS:

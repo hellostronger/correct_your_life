@@ -336,13 +336,13 @@
     </div>
     <div class="card">
       <div class="row" style="justify-content:space-between">
-        <b style="font-size:13px">⚠️ 解禁 / 增发告警<span id="alerts-count" class="muted" style="font-weight:normal"></span></b>
+        <b style="font-size:13px">⚠️ 解禁 / 增发 / 减持告警<span id="alerts-count" class="muted" style="font-weight:normal"></span></b>
         <span class="row">
           <button class="btn ghost" style="font-size:12px" onclick="loadAlerts()">重新检查</button>
           <button class="btn ghost" style="font-size:12px" onclick="pushAlerts()">推送提醒</button>
         </span>
       </div>
-      <div id="alerts-box" class="muted" style="margin-top:6px;font-size:12px">加载中…（未来 14 天自选股限售解禁、增发新股上市；工作日 8:30 自动推微信）</div>
+      <div id="alerts-box" class="muted" style="margin-top:6px;font-size:12px">加载中…（未来 14 天自选股限售解禁、增发新股上市，以及减持预披露计划与已发生的董监高减持；工作日 8:30 自动推微信）</div>
     </div>
     <div class="card">
       <details>
@@ -660,7 +660,9 @@
     <div class="card">
       <b style="font-size:13px">🤖 AI 提款建议（Claude API）</b>
       <div class="row" style="margin-top:8px">
-        <input id="llm-key" type="password" placeholder="Anthropic API key（sk-ant-…）" style="width:260px">
+        <input id="llm-key" type="password" placeholder="Anthropic API key（sk-ant-…）" style="width:260px" autocomplete="off">
+        <button class="btn ghost" style="flex:0 0 auto"
+                onclick="togglePwd(this,'llm-key')" title="显示/隐藏">👁</button>
         <input id="llm-model" placeholder="模型（默认 claude-opus-5）" style="width:200px">
         <input id="llm-base" placeholder="base_url（可选，代理/网关）" style="width:220px">
       </div>
@@ -881,7 +883,9 @@
       <div class="row">
         <input id="x-acc-name" placeholder="备注名（本地标识）" style="width:130px">
         <input id="x-acc-cookie" type="password" style="flex:1;min-width:200px"
-               placeholder="auth_token=…; ct0=…">
+               placeholder="auth_token=…; ct0=…" autocomplete="off">
+        <button class="btn ghost" style="flex:0 0 auto"
+                onclick="togglePwd(this,'x-acc-cookie')" title="显示/隐藏">👁</button>
         <button class="btn ghost" onclick="testXAccount()">测试</button>
         <button class="btn" id="save-x-btn" onclick="saveXAccount()">保存</button>
       </div>
@@ -970,7 +974,9 @@
       <b style="font-size:13px">✉️ 邮件通知（SMTP）</b>
       <div class="row" style="margin-top:8px">
         <input id="nf-from" placeholder="发送邮箱，如 me@qq.com" style="width:220px">
-        <input id="nf-auth" type="password" placeholder="授权码（不是登录密码）" style="width:170px">
+        <input id="nf-auth" type="password" placeholder="授权码（不是登录密码）" style="width:170px" autocomplete="off">
+        <button class="btn ghost" style="flex:0 0 auto"
+                onclick="togglePwd(this,'nf-auth')" title="显示/隐藏">👁</button>
         <input id="nf-to" placeholder="接收邮箱，如 me@qq.com" style="width:220px">
       </div>
       <div class="row" style="margin-top:8px">
@@ -1162,6 +1168,46 @@
       </div>
       <div class="pnl-summary" id="paper-stats" style="margin-top:8px"></div>
       <div class="muted" id="paper-meta" style="font-size:12px;margin-top:4px"></div>
+    </div>
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <b style="font-size:13px">🎯 目标模式</b>
+        <span class="row">
+          <button class="btn ghost" style="font-size:12px" onclick="loadPaperGoal()">刷新</button>
+          <button class="btn ghost" style="font-size:12px" onclick="paperGoalCheck()">立即检查</button>
+        </span>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:4px">
+        设一个「N 天内赚到 X%」的目标，虚拟盘按它结算与判定。收益率以
+        <b>建目标那一刻的总资产</b>为基准，期限按自然日。多个「只度量」目标可并存对比；
+        「临期收紧」目标同时只能有一个。
+      </div>
+      <div id="paper-goal-box" style="margin-top:8px"></div>
+      <div class="row" style="margin-top:8px;flex-wrap:wrap;align-items:flex-end;gap:8px">
+        <label style="font-size:12px;display:flex;flex-direction:column;gap:3px">
+          <span class="muted">目标收益率 (%)</span>
+          <input id="pg-ret" type="number" step="0.5" min="0.1" placeholder="如 8 表示 8%"
+                 style="width:130px;padding:5px 7px;border-radius:6px;
+                        border:1px solid var(--border);background:var(--bg-2);color:var(--fg)">
+        </label>
+        <label style="font-size:12px;display:flex;flex-direction:column;gap:3px">
+          <span class="muted">期限（自然日，含今天）</span>
+          <input id="pg-days" type="number" step="1" min="1" placeholder="如 20"
+                 style="width:130px;padding:5px 7px;border-radius:6px;
+                        border:1px solid var(--border);background:var(--bg-2);color:var(--fg)">
+        </label>
+        <label style="font-size:12px;display:flex;flex-direction:column;gap:3px">
+          <span class="muted">模式</span>
+          <select id="pg-mode" style="width:190px;padding:5px 7px;border-radius:6px;
+                  border:1px solid var(--border);background:var(--bg-2);color:var(--fg)">
+            <option value="observe">只度量（可多个，对比用）</option>
+            <option value="constrain">临期收紧（限仓位+禁开新仓）</option>
+          </select>
+        </label>
+        <input id="pg-note" placeholder="备注（可选）" style="flex:1;min-width:120px">
+        <button class="btn" onclick="createPaperGoal()">设定目标</button>
+      </div>
+      <div id="paper-goal-history" style="margin-top:10px"></div>
     </div>
     <div class="card">
       <div class="row" style="justify-content:space-between;align-items:center">
@@ -1858,7 +1904,24 @@ async function loadStockBoards() {
 }
 function switchToBoard(bk) { toggleBoardDetail(bk); window.scrollTo({ top: 0, behavior: 'smooth' }); }
 
-// ---- 解禁/增发告警 ----
+// ---- 密钥框显示/隐藏 ----
+// 为什么需要：这几个框收的都是要**核对**的长串（cookie 60+ 字符、授权码 16 位、
+// sk-ant-…），粘错或被浏览器/剪贴板截断时，password 框全变成圆点，完全看不出断在哪。
+// 只在用户主动点 👁 时才明文显示，且不会把值写进任何持久化存储。
+// ⚠️ 这与「回显已保存的密钥」是两件事：后端对 secret 一律不回传明文
+// （x_monitor.list_accounts 的 cookies 恒为 ""，config 走 has_value + placeholder），
+// 本函数只影响**本次会话里用户自己输入的内容**。
+function togglePwd(btn, inputId) {
+  const el = $(inputId);
+  if (!el) return;
+  const show = el.type === 'password';
+  el.type = show ? 'text' : 'password';
+  btn.textContent = show ? '🙈' : '👁';
+  btn.classList.toggle('on', show);
+  try { btn.title = show ? '隐藏' : '显示/隐藏'; } catch (e) { /* title 无关紧要 */ }
+}
+
+// ---- 解禁/增发/减持告警 ----
 async function loadAlerts() {
   const box = $('alerts-box');
   try {
@@ -1866,20 +1929,25 @@ async function loadAlerts() {
     const evs = data.events || [];
     $('alerts-count').textContent = evs.length ? `（${evs.length}）` : '';
     if (!evs.length) {
-      box.innerHTML = '<span class="muted">未来 14 天自选股暂无解禁/增发事件 ✓</span>'
+      box.innerHTML = '<span class="muted">未来 14 天自选股暂无解禁/增发事件，'
+        + `最近 ${data.reduce_lookback_days} 天也暂无减持 ✓</span>`
         + '<span class="muted" style="margin-left:8px">（A股口径；港股不适用。数据源东财，'
         + '工作日 8:30 自动扫描推微信）</span>';
       return;
     }
     const today = new Date().toISOString().slice(0, 10);
     box.innerHTML = evs.map(e => {
-      const soon = e.event_date <= today || e.event_date <= _plusDays(today, 3);
-      const icon = e.type === 'lift' ? '🔓' : '📤';
-      const label = e.type === 'lift' ? '解禁' : '增发上市';
+      // 减持/公告类事件日期在过去或就是今天，一律标红（已发生的抛压最该先看）
+      const past = e.event_date <= today;
+      const soon = past || e.event_date <= _plusDays(today, 3);
+      // 图标/标签由后端随事件下发（alerts.KIND_META），别在这里再写一份映射
+      const icon = e.icon || '•', label = e.label || e.type;
+      const amt = [e.shares_txt, e.cap_yi ? `约${e.cap_yi}亿元` : '']
+        .filter(Boolean).join(' / ');
       return `<div style="padding:2px 0">` +
         `<span class="${soon ? 'down' : ''}">${icon} <b>${e.event_date}</b></span> ` +
         `${e.name}（${e.code}）${label} ` +
-        `<b>${e.shares_yi}亿股</b> / 约<b>${e.cap_yi}亿元</b> ` +
+        (amt ? `<b>${amt}</b> ` : '') +
         `<span class="muted">${e.detail || ''}</span></div>`;
     }).join('');
   } catch (e) {
@@ -2577,9 +2645,12 @@ async function loadPlans() {
     const items = await api('/api/plans');
     $('plans-empty').classList.toggle('hide', items.length > 0);
     $('plans-list').innerHTML = items.map(p => {
-      const pct = p.target_amount > 0
-        ? Math.min(100, Math.round(p.withdrawn / p.target_amount * 100)) : 0;
+      // 双进度：已变现（记一笔的卖出净额，自动）/ 已转出（手动记提款）。
+      // 卖出≠提现，所以两条分开走；gap 用的 need_realize 就是「还要卖多少」
+      const pctW = Math.max(0, Math.min(100, p.withdrawn_pct ?? 0));
+      const pctR = Math.max(0, Math.min(100, p.realized_pct ?? 0));
       const urgent = !p.deadline_passed && p.trading_days_left <= 5 && p.status === 'active';
+      const cashReady = p.available_to_withdraw > 0;
       return `<div class="card" style="margin:8px 0;background:var(--bg);${urgent ? 'border-color:var(--up)' : ''}">
         <div class="row" style="justify-content:space-between">
           <span><b>${p.target_date} 前提出 ${fmt(p.target_amount)} 元</b>
@@ -2593,11 +2664,21 @@ async function loadPlans() {
             <button class="del" onclick="delPlan(${p.id})" title="删除计划">×</button></span>
         </div>
         <div style="margin-top:6px">
-          <div style="background:var(--border);border-radius:5px;height:8px;overflow:hidden">
-            <div style="width:${pct}%;height:100%;background:var(--accent)"></div></div>
+          <div class="row" style="justify-content:space-between;font-size:12px">
+            <span class="muted">已转出 <b>${fmt(p.withdrawn)}</b> / ${fmt(p.target_amount)}（${pctW}%）</span>
+            <span class="muted">已变现 <b class="${p.realized > 0 ? 'up' : ''}">${fmt(p.realized)}</b>（${pctR}%）</span>
+          </div>
+          <div style="background:var(--border);border-radius:5px;height:8px;overflow:hidden;margin-top:3px"
+               title="已转出（手动记提款的钱真的出了账户）">
+            <div style="width:${pctW}%;height:100%;background:var(--accent)"></div></div>
+          <div style="background:var(--border);border-radius:5px;height:8px;overflow:hidden;margin-top:2px"
+               title="已变现（自建仓日起 卖出净额 = 卖出 − 买入，记一笔卖出即自动更新）">
+            <div style="width:${pctR}%;height:100%;background:var(--up);opacity:.55"></div></div>
+          ${cashReady ? `<div class="muted" style="margin-top:4px;font-size:12px">
+            💵 已有 <b class="up">${fmt(p.available_to_withdraw)}</b> 元变现但未转出，可在「详情/记提款」一键记上</div>` : ''}
           <div class="row" style="justify-content:space-between;margin-top:4px">
-            <span class="muted">已提款 ${fmt(p.withdrawn)}（${pct}%）</span>
-            <span class="muted">还需 <b>${fmt(p.need_now)}</b> · 持仓市值 ${fmt(p.holdings_mv)}</span>
+            <span class="muted">还需转出 <b>${fmt(p.need_now)}</b>${p.need_realize !== p.need_now ? ` · 还需变现 ${fmt(p.need_realize)}` : ''}</span>
+            <span class="muted">持仓市值 ${fmt(p.holdings_mv)}</span>
           </div>
         </div>
         <div class="row" style="margin-top:4px;justify-content:space-between">
@@ -2633,15 +2714,24 @@ async function showPlanDetail(id) {
         <td class="muted">${esc(w.note || '')}</td>
         <td class="muted">#${w.id}</td></tr>`).join('');
     box.innerHTML = `
+      <div class="muted" style="margin-bottom:6px">
+        双进度：<b>已变现 ${fmt(p.realized)}</b>（自 ${esc(p.created_date || '—')} 起卖出净额，
+        记一笔卖出自动更新）· <b>已转出 ${fmt(p.withdrawn)}</b>（手动记提款）。
+        还需变现 ${fmt(p.need_realize)} · 还需转出 ${fmt(p.need_now)}
+      </div>
       <div class="row">
         <input id="pw-amount" placeholder="本次提款金额" type="number" min="0.01" step="0.01" style="width:140px">
         <input id="pw-date" placeholder="日期（默认今天）" style="width:150px"
                onfocus="this.type='date'" onblur="if(!this.value)this.type='text'">
         <input id="pw-note" placeholder="备注" style="flex:1;min-width:80px">
+        ${p.available_to_withdraw > 0
+          ? `<button class="btn ghost" style="flex:0 0 auto"
+               onclick="fillAvailable(${id},${p.available_to_withdraw})"
+               title="填入「已变现但未转出」的金额">💵 一键填 ${fmt(p.available_to_withdraw)}</button>` : ''}
         <button class="btn" onclick="addWithdrawal(${id})">记一笔提款</button>
       </div>
       ${p.sell_plan && p.sell_plan.length ? `
-        <div class="muted" style="margin-top:8px"><b>💡 卖出凑钱建议</b>（优先兑现浮盈高的，凑 ${fmt(p.need_now)} 元）：</div>
+        <div class="muted" style="margin-top:8px"><b>💡 卖出凑钱建议</b>（优先兑现浮盈高的，凑 ${fmt(p.need_realize)} 元）：</div>
         <table><thead><tr><th>股票</th><th>浮动</th><th>建议卖出</th><th>回笼资金</th><th></th></tr></thead>
         <tbody>${sellRows}</tbody></table>` : ''}
       ${p.gap > 0 ? `<div class="muted" style="margin-top:6px">⚠️ 市值缺口 ${fmt(p.gap)} 元——
@@ -2761,6 +2851,15 @@ async function saveLlmConf() {
     toast('AI 配置已保存');
     loadLlmConf();
   } catch (e) { toastErr(e.message); }
+}
+// 「一键填」：把「已变现但未转出」的金额带进提款输入框。只填不提交——
+// 钱有没有真的转出只有用户知道，得他自己点「记一笔提款」。
+function fillAvailable(id, amt) {
+  const el = $('pw-amount');
+  if (el) { el.value = amt; el.focus(); el.select(); }
+  const note = $('pw-note');
+  if (note && !note.value) note.value = '转出已变现资金';
+  toast(`已填入 ${fmt(amt)} 元，确认无误后点「记一笔提款」`);
 }
 async function addWithdrawal(id) {
   const amount = $('pw-amount').value;
@@ -3231,6 +3330,122 @@ function paperStatusBadge(t) {
     } catch (e) { alert('操作失败：' + e.message); }
   }
 
+// ---- 模拟盘目标模式 ----
+const GOAL_ST = { reached: ['✅ 达标', '#e5f3e2', '#2e7d32'],
+                  expired: ['⏰ 到期未达标', '#ffe2e2', '#b32424'],
+                  cancelled: ['✋ 已取消', 'var(--border-2)', 'var(--muted)'],
+                  active: ['▶️ 进行中', 'var(--bg-2)', 'var(--text-2)'] };
+function goalBadge(st) {
+  const [t, bg, fg] = GOAL_ST[st] || GOAL_ST.active;
+  return `<span class="badge" style="background:${bg};color:${fg}">${t}</span>`;
+}
+function _goalBar(pct, color, title) {
+  const w = Math.max(0, Math.min(100, pct || 0));
+  return `<div style="background:var(--border);border-radius:5px;height:8px;overflow:hidden"
+               title="${esc(title || '')}">
+            <div style="width:${w}%;height:100%;background:${color}"></div></div>`;
+}
+function _goalCard(g) {
+  const behind = g.gap_pct > 0;
+  const dl = g.days_left;
+  const need = g.required_daily_pct;
+  const rows = [
+    `收益率进度 ${g.return_progress_pct}%`,
+    `时间进度 ${g.time_pct}%（${g.days_passed}/${g.days_total} 天）`,
+  ].join(' · ');
+  return `<div style="padding:6px 0;border-bottom:1px dashed var(--border)">
+    <div class="row" style="justify-content:space-between">
+      <span><b>${g.target_return_pct}% / ${g.days_total} 天</b>
+        ${goalBadge(g.status)}
+        <span class="muted" style="font-size:11px">${g.mode === 'constrain' ? '临期收紧' : '只度量'}</span></span>
+      ${g.status === 'active'
+        ? `<button class="del" onclick="cancelPaperGoal(${g.id})" title="取消目标">×</button>` : ''}
+    </div>
+    <div style="margin-top:4px">${_goalBar(g.return_progress_pct, 'var(--accent)', rows)}</div>
+    <div class="row" style="justify-content:space-between;margin-top:3px;font-size:12px">
+      <span class="muted">${rows}</span>
+      <span class="${behind ? 'up' : 'down'}">${behind ? '落后' : '领先'}
+        ${Math.abs(g.gap_pct || 0).toFixed(2)} 个百分点</span>
+    </div>
+    <div class="muted" style="font-size:11.5px;margin-top:2px">
+      ${esc(g.start_date)} ~ ${esc(g.end_date)} ·
+      起始 ${fmt(g.base_value)} → 当前 ${fmt(g.current_total)}
+      ${g.status === 'active'
+        ? `· ${dl > 0 ? `还剩 ${dl} 天${need != null ? `，需日均 ${(+need).toFixed(3)}%` : ''}`
+                     : '· 今天到期'}`
+        : `· 终局 ${(+g.return_pct || 0) > 0 ? '+' : ''}${(+g.return_pct || 0).toFixed(2)}%`}
+      ${g.note ? ` · ${esc(g.note)}` : ''}
+    </div>
+  </div>`;
+}
+async function loadPaperGoal() {
+  const box = $('paper-goal-box'), hist = $('paper-goal-history');
+  if (!box) return;
+  try {
+    const d = await api('/api/paper/goal');
+    const g = d.goal;
+    if (g) {
+      let extra = '';
+      if (d.constrain && d.constrain.tighten) {
+        extra = `<div class="muted" style="font-size:12px;color:var(--up);margin-top:4px">
+          ⛔ 已进入到期前收紧期：本轮禁止开新仓，单票上限压到
+          ${d.constrain.position_cap_pct}%（原 ${(d.constrain.position_cap_pct / 0.6).toFixed(1)}%）。
+          收紧只做减法——不为达标加仓。</div>`;
+      }
+      box.innerHTML = _goalCard(g) + extra;
+    } else {
+      box.innerHTML = '<div class="muted" style="font-size:12px">还没有进行中的目标。'
+        + '在下面填「收益率 + 天数」设一个。</div>';
+    }
+    const done = (d.history || []).filter(x => x.status !== 'active');
+    if (done.length) {
+      const hit = done.filter(x => x.status === 'reached').length;
+      const avg = done.reduce((s, x) => s + (+x.return_pct || 0), 0) / done.length;
+      hist.innerHTML = `<div class="muted" style="font-size:12px;margin-bottom:4px">
+          <b>历史目标对比</b>：${done.length} 个已结束，达标 ${hit} 个
+          （${Math.round(hit / done.length * 100)}%），平均收益率
+          ${avg > 0 ? '+' : ''}${avg.toFixed(2)}%</div>`
+        + done.map(_goalCard).join('');
+    } else {
+      hist.innerHTML = '';
+    }
+  } catch (e) {
+    box.innerHTML = '<span class="muted">目标读取失败: ' + esc(e.message) + '</span>';
+  }
+}
+async function createPaperGoal() {
+  const ret = parseFloat($('pg-ret').value);
+  const days = parseInt($('pg-days').value, 10);
+  const mode = $('pg-mode').value;
+  const note = $('pg-note').value.trim();
+  if (!(ret > 0)) return toastErr('请填目标收益率（%）');
+  if (!(days >= 1)) return toastErr('请填期限天数');
+  try {
+    const g = await api('/api/paper/goal', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target_return_pct: ret, horizon_days: days, mode, note }) });
+    $('pg-ret').value = ''; $('pg-days').value = ''; $('pg-note').value = '';
+    toastOk(`已设定：${g.target_return_pct}% / ${g.days_total} 天（至 ${g.end_date}）`);
+    loadPaperGoal();
+  } catch (e) { toastErr(e.message); }
+}
+async function cancelPaperGoal(id) {
+  if (!await confirmDlg('取消这个目标？', { okText: '取消目标', danger: true })) return;
+  try { await api(`/api/paper/goal/${id}/cancel`, { method: 'POST' });
+        toastOk('已取消'); loadPaperGoal(); }
+  catch (e) { toastErr(e.message); }
+}
+async function paperGoalCheck() {
+  toast('检查中…');
+  try {
+    const r = await api('/api/paper/goal/check', { method: 'POST' });
+    toast(r.closed && r.closed.length
+      ? `结掉了 ${r.closed.length} 个目标：${r.closed.map(c => c.status === 'reached' ? '✅达标' : '⏰到期').join('、')}`
+      : '没有目标达标或到期');
+    loadPaperGoal();
+  } catch (e) { toastErr(e.message); }
+}
+
 async function loadPaper() {
   try {
     const [ov, trades, lessons, cfg, pstat, rounds] = await Promise.all([
@@ -3244,6 +3459,7 @@ async function loadPaper() {
     fillPaperCadence(cfg.sections);
     renderPaperCadenceStatus(pstat);
     loadPaperCycles();
+    loadPaperGoal();
     // 策略对照单独拉：它要逐票取行情 + 逐 code 做 FIFO 配对，比上面几个重，
     // 不能塞进 Promise.all 里拖慢模拟盘主体加载。
     loadPaperStrategyCompare();
