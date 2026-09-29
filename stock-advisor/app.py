@@ -147,6 +147,14 @@ def init_db():
     ALTER TABLE sa_watchlist ADD COLUMN IF NOT EXISTS keywords TEXT NOT NULL DEFAULT '';
     ALTER TABLE sa_watchlist ADD COLUMN IF NOT EXISTS keywords_pos TEXT NOT NULL DEFAULT '';
     ALTER TABLE sa_watchlist ADD COLUMN IF NOT EXISTS keywords_neg TEXT NOT NULL DEFAULT '';
+    -- social_keys：这只票属于哪些概念/板块词（逗号分隔），用于社媒信号的概念层。
+    -- 2026-09-29 加。**刻意不给默认映射表** —— 实测按公司名匹配社媒内容命中率为
+    -- 0.0%（社媒讲的是板块概念，不讲公司全名：「PCB龙头，直线封涨停」里没有任一
+    -- 自选股的公司名），而静态概念表会产生假阳性：「创新药」里的「创新」会匹配到
+    -- 蓝色光标，「涨停」会把所有含该词的票全拉进来。宁可漏，不可错 —— 假阳性喂给
+    -- LLM 比不给更糟。留空则只走「直呼」与「全市场热度」两层，由 LLM 自行判断
+    -- 「现在什么题材在火、和这只票有没有关系」。
+    ALTER TABLE sa_watchlist ADD COLUMN IF NOT EXISTS social_keys TEXT NOT NULL DEFAULT '';
     CREATE TABLE IF NOT EXISTS sa_holdings (
         code      VARCHAR(8) PRIMARY KEY,
         name      VARCHAR(64) NOT NULL DEFAULT '',
@@ -453,8 +461,18 @@ def init_db():
     """
     last_exc: Exception | None = None
     for stmt in [s.strip() for s in ddl.split(";") if s.strip()]:
-        if stmt.startswith("--"):  # 纯注释段（split 后残留）没有可执行语句
-            stmt = "\n".join(l for l in stmt.splitlines() if not l.strip().startswith("--"))
+        # 逐行剥掉注释，不管注释在段首还是段中。
+        # 2026-09-29 修：原来只在 `stmt.startswith("--")` 时才剥，而 ddl 是用
+        # `split(";")` 拆的，所以任何**夹在两条语句之间**的注释都会和后面的
+        # 语句粘成同一段，段首不是 -- 就整段不剥，psycopg2 直接报
+        # `syntax error at or near "#"`，init_db 整体失败、服务起不来。
+        # （2026-09-29 加 sa_watchlist.social_keys 时踩到：注释写在
+        #  keywords_neg 那条 ALTER 之后、新 ALTER 之前。）
+        # 逐行剥还顺带修好了字符串字面量里含 ';' 的老问题（拆出来是半条 SQL，
+        # 那种本来也执行不了，只是以前靠 startswith 恰好没被暴露）。
+        stmt = "\n".join(l for l in stmt.splitlines()
+                         if not l.strip().startswith("--"))
+        stmt = stmt.strip()
         if not stmt:
             continue
         ok = False
@@ -2917,6 +2935,10 @@ def _paper_deps(conf: dict | None = None) -> dict:
         "conf": conf if conf is not None else _conf_section("paper"),
         "news_fn": _paper_news_rows,
         "events_fn": _paper_event_lines,
+          # 社媒信号（公众号/B站/微博/X）—— 2026-09-29 加。之前这些源一直在抓、
+          # 一直在推微信，但一条都没进过决策上下文，等于白抓。
+          "social_fn": _paper_social,
+          "social_keys_fn": _paper_social_keys,
         "market_fn": market_volume_status,
         "trading_days_fn": _trading_days_between,
         "notify_fn": notifier.notify,
@@ -2942,19 +2964,45 @@ def _paper_news_rows(code: str, limit: int = 10) -> list[dict]:
         return []
 
 
-def _paper_event_lines(code: str, days: int = 14) -> list[str]:
-    """该股未来 N 天解禁/增发事件（格式化行），供决策上下文。"""
+def _paper_social_keys(code: str) -> str:
+    """该股配置的概念/板块词（sa_watchlist.social_keys），用于社媒概念层。
+    留空则只走「直呼」与「全市场热度」两层 —— 不猜、不用默认映射表。"""
     try:
-        events = alerts_mod.upcoming_events([code], days=days)
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT social_keys FROM sa_watchlist WHERE code=%s", (code,))
+            row = cur.fetchone()
+        return (row[0] if row else "") or ""
     except Exception:
-        return []
-    lines = []
-    for e in events[:8]:
-        kind = "解禁" if e.get("type") == "lift" else "增发上市"
-        cap = f"市值约 {e['cap_yi']:g} 亿" if e.get("cap_yi") else ""
-        lines.append(f"{e.get('event_date')} {kind} {cap}（{e.get('detail') or ''}）"
-                     .rstrip("（）"))
-    return lines
+        return ""
+
+
+def _paper_social(code: str, name: str) -> dict:
+    """社媒三层信号（直呼 / 概念 / 全市场热度），供决策上下文。"""
+    import social_signal
+    try:
+        return social_signal.for_stock(
+            {"get_conn": get_conn}, code, name,
+            social_keys=_paper_social_keys(code),
+            conf=_conf_section("paper").get("social"))
+    except Exception as exc:
+        print(f"[paper] 社媒信号 {code} 取数失败: {exc}", flush=True)
+        return {"direct": [], "concept": [], "hot": [],
+                "note": "社媒信号取数失败"}
+
+
+def _paper_event_lines(code: str, days: int = 14) -> list[str]:
+  """该股未来 N 天解禁/增发事件（格式化行），供决策上下文。"""
+  try:
+      events = alerts_mod.upcoming_events([code], days=days)
+  except Exception:
+      return []
+  lines = []
+  for e in events[:8]:
+      kind = "解禁" if e.get("type") == "lift" else "增发上市"
+      cap = f"市值约 {e['cap_yi']:g} 亿" if e.get("cap_yi") else ""
+      lines.append(f"{e.get('event_date')} {kind} {cap}（{e.get('detail') or ''}）"
+                   .rstrip("（）"))
+  return lines
 
 
 _paper_state = {"running": False, "settling": False, "current_slot": None,

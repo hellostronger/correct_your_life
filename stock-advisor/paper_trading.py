@@ -810,10 +810,58 @@ def _derive_paper_positions(cur) -> dict[str, dict]:
 
 # ---------------- 决策流水线 ----------------
 
+SOCIAL_CAVEAT = (
+    "⚠️ 以下是**社媒内容**（公众号 / B站动态与评论 / 微博 / X），非权威信息："
+    "可能失真、被操纵、断章取义，也可能是股吧闲聊。它的证据等级**低于公告、"
+    "财报与持牌媒体新闻** —— 可作为「市场情绪与题材热度」的参考，不要当作事实依据，"
+    "更不要因为某条社媒内容就改变对基本面的判断。若某条内容与新闻或公告矛盾，"
+    "一律以新闻公告为准。"
+)
+
+
+def _social_block(social: dict) -> str:
+    """把社媒三层信号渲染进决策上下文。
+
+    分三层给 LLM，语义完全不同，不能混在一堆里：
+      ① 直呼本股      —— 高可信，直接相关
+      ② 命中配置的概念 —— 中可信，反映本股所属板块的动向
+      ③ 全市场热度    —— **仅供参考**，由 LLM 自行判断「这个题材与本股有无关系」
+
+    第③层是主力：社媒讲的是板块概念而非公司全名（实测按公司名匹配社媒内容
+    命中率为 0.0%：「PCB龙头，直线封涨停」里没有任何一个自选股的公司名），
+    让 LLM 做语义判断比任何静态映射表都准，而且天然没有假阳性。
+    """
+    lines = ["【社媒信号（公众号 / B站 / 微博 / X）】", SOCIAL_CAVEAT]
+    d = social.get("direct") or []
+    if d:
+        lines.append("① 近期直接提到本公司的内容：")
+        lines += ["- " + x for x in d]
+    else:
+        lines.append("① 近期没有直接提到本公司的社媒内容。")
+    c = social.get("concept") or []
+    if c:
+        lines.append("② 命中本股所属概念/板块的内容：")
+        lines += ["- " + x for x in c]
+    else:
+        lines.append("② 该股未配置概念词（social_keys），或近期无相关内容。"
+                     "如需启用，请在自选股里给该股填概念词。")
+    h = social.get("hot") or []
+    if h:
+        lines.append("③ 全市场社媒热度榜（**与本股未必相关**，请自行判断题材能否映射到"
+                     "本股；只在你认为确有关联时才写进理由）：")
+        lines += ["- " + x for x in h]
+    else:
+        lines.append("③ 近期无社媒热度内容。")
+    n = social.get("note")
+    if n:
+        lines.append("（采集说明：%s）" % n)
+    return "\n".join(lines)
+
+
 def _build_context(stock: dict, quote: dict, bars: list[dict],
                    news: list[dict], events: list[dict],
                    market_note: str, account: dict, positions: dict,
-                   past_context: str, conf: dict) -> str:
+                   past_context: str, conf: dict, social: dict | None = None) -> str:
     ctx = [
         f"【股票】{stock['name']}（{stock['code']}）",
         f"【实时行情】现价 {quote.get('price') or '—'}，"
@@ -840,6 +888,8 @@ def _build_context(stock: dict, quote: dict, bars: list[dict],
                 + (f"已持有该股 {me['shares']} 股，成本 {me['cost']:g}"
                    if me else "该股无持仓")
                 + f"；单票仓位上限 {conf['max_position_pct']}%")
+    if social:
+        ctx.append(_social_block(social))
     ctx.append(f"【历史决策复盘经验】\n{past_context}")
     return "\n".join(ctx)
 
@@ -987,6 +1037,15 @@ def _decide_one(deps, conf, stock, today, results, slot: str = ""):
         return
     news = news_fn(code, limit=10) if news_fn else []
     events = events_fn(code, days=14) if events_fn else []
+    # 社媒信号（公众号/B站/微博/X）。取数失败返回空 dict，_social_block 会渲染成
+    # 「近期无内容」，不会因为某个采集模块挂掉而让整轮决策失败。
+    social_fn = deps.get("social_fn")
+    social: dict = {}
+    if social_fn:
+        try:
+            social = social_fn(code, name) or {}
+        except Exception as exc:
+            print(f"[paper] {code} 社媒信号异常: {exc}", flush=True)
     market_note = ""
     if market_fn:
         mv = market_fn()
@@ -1001,7 +1060,7 @@ def _decide_one(deps, conf, stock, today, results, slot: str = ""):
             cur, code, n_same=int(conf.get("n_same", 5)),
             n_cross=int(conf.get("n_cross", 3)), as_of=today)
     ctx = _build_context(stock, quote, bars, news, events, market_note,
-                         account, positions, past, conf)
+                         account, positions, past, conf, social)
     # 3. LLM 调用 1：分析师
     report = _llm_call(ANALYST_PROMPT, ctx + f"\n\n数据时点 {today}。请给出分析报告。")
     # 4. LLM 调用 2：交易员（结构化）
