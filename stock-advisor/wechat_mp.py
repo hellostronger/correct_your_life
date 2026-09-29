@@ -38,6 +38,33 @@ import re
 import threading
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+from html import unescape as _html_unescape
+
+
+# 块级标签换行用的（正文转纯文本时保留段落结构）
+_BLOCK = re.compile(
+    r"</\s*(p|div|section|article|li|tr|h[1-6]|blockquote|br|hr)\s*>|"
+    r"<\s*br\s*/?\s*>", re.I)
+_SCRIPT = re.compile(r"<\s*(script|style)\b[^>]*>.*?<\s*/\s*\1\s*>", re.I | re.S)
+_TAG = re.compile(r"<[^>]+>")
+
+
+def _html_to_text(html: str) -> str:
+    """HTML 正文 → 纯文本（只删标签，不引第三方库）。
+
+    存两份的理由（2026-09-29）：content_html 保留原文，供存档与将来重新解析；
+    content_text 供喂 LLM 与全文搜索 —— 实测单篇 HTML 最高 54,566 字符，
+    剥完标签约 5,000 字符，小一个数量级。
+    """
+    if not html:
+        return ""
+    s = _SCRIPT.sub(" ", html)
+    s = _BLOCK.sub("\n", s)
+    s = _TAG.sub("", s)
+    s = _html_unescape(s)
+    s = re.sub(r"[ \t\u00a0\u3000]+", " ", s)
+    s = re.sub(r"\n\s*\n\s*\n+", "\n\n", s)
+    return s.strip()
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
@@ -60,10 +87,28 @@ DEFAULT_MP_CONF = {
     # 远程共享实例建议 false：走 WeRSS 自己的缓存，不反复催它爬——
     # 上游明确提示「添加订阅频率过高容易被封控」，而本项目默认 30 分钟一轮。
     "use_fresh": False,
+    # ---- use_fresh 的限频（2026-09-29 加）----
+    # 问题：use_fresh 与 interval_minutes 是耦合的。直接开 use_fresh 的话，
+    # 30 分钟 × N 个源 = 每天上百次去微信抓，必然触发风控。
+    # 实测 2026-09-29：4 个源里 3 个抓不到正文，微信侧 content:encoded
+    # 直接是空的 —— 典型的被拦。
+    # 办法：**把两个频率解耦** —— 照常每 interval_minutes 读一次（读的是
+    # WeRSS 自己的缓存，几乎零成本），但「催 WeRSS 去微信抓」这个动作
+    # 单独限频。两者代价差极大：
+    #   读缓存 = 一次 HTTP GET，可以高频
+    #   催抓取 = WeRSS 拉起 Chromium 访问微信，风控只按这个计数
+    'fresh_interval_minutes': 180,  # 催抓的最小间隔（分钟）
+    'fresh_jitter_minutes': 30,    # 抖动上限，避免整点撞车
+    # 连续 N 轮没新文章就把间隔翻倍（退避）；一旦有新文章立刻恢复原频率。
+    # 「没更新就别去催」—— 这是省配额的关键，不只是限频。
+    'fresh_backoff_rounds': 3,
 }
 
-# 摘要字段：刻意**不含** content/正文——WeRSS 的 content 是完整 HTML 全文，
-# 存进库会把每行撑到几十 KB，而页面和推送都只显示前两百来字。
+# 摘要字段：只取真正的**摘要**类字段。
+# 原注记说「刻意不含 content/正文——WeRSS 的 content 是完整 HTML 全文，存进库会把
+# 每行撑到几十 KB」，这在「只要标题做监控」的前提下成立。但用户要的是**存档全文**，
+# 所以 2026-09-29 改成：正文单独存 content_html / content_text 两列，
+# summary 仍只放摘要（页面、推送、喂 LLM 都读它，不碰正文列）。
 _DESC_KEYS = ("description", "summary", "digest", "abstract", "excerpt", "sub_title")
 _TITLE_KEYS = ("title", "name", "subject")
 _URL_KEYS = ("url", "link", "origLink", "source_url", "guid", "href", "permalink")
@@ -106,8 +151,53 @@ def _get(url: str, timeout: int = 25, auth: str = "") -> str:
     return resp.text
 
 
-def build_url(src: dict, conf: dict) -> str:
-    """订阅源 → 实际请求地址。"""
+def _should_go_fresh(src: dict, conf: dict, now=None) -> tuple[bool, str]:
+    """决定这一轮要不要走 /fresh（催 WeRSS 去微信抓）。返回 (是否 fresh, 说明)。
+
+    这是防风控的核心。直接开 use_fresh 的话，interval_minutes(30) × 源数
+    = 每天上百次催抓，微信侧必然拦（2026-09-29 实测 3/4 的源正文为空）。
+
+    三重限流，代价从低到高：
+      1) 最小间隔 fresh_interval_minutes —— 硬闸，不足就不催
+      2) 退避：连续 fresh_backoff_rounds 轮没有新文章，间隔 ×2^轮数
+         （没更新就别去催；有更新嫌疑才值得花配额）
+      3) 抖动 —— 在 [0, fresh_jitter_minutes] 内随机，避免固定节奏被识别
+    last_fresh_at 落在库里而非内存：否则每次重启都会立刻催一次。
+    """
+    want = src.get("use_fresh")
+    if want is None:
+        want = conf.get("use_fresh", False)
+    if not want:
+        return False, ""
+
+    now = now or datetime.now(timezone.utc)
+    base = int(conf.get("fresh_interval_minutes") or 180)
+    jit = int(conf.get("fresh_jitter_minutes") or 0)
+    idle = int(src.get("idle_rounds") or 0)
+    br = int(conf.get("fresh_backoff_rounds") or 0)
+    # 退避倍数：连续 idle 轮没新文，每满 br 轮翻一倍，上限 8 倍（≈24 小时一次）
+    mult = 1
+    if br > 0 and idle >= br:
+        mult = min(8, 2 ** ((idle // br)))
+    need = base * mult
+
+    last = src.get("last_fresh_at")
+    if last is not None:
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        elapsed = (now - last).total_seconds() / 60.0
+        # 抖动取 [-jit, +jit] 的一半区间，保证不会因抖动而「必然够」
+        eff = max(1.0, need - jit / 2.0)
+        if elapsed < eff:
+            left = int(need - elapsed)
+            return False, (f"限频：距上次催抓 {int(elapsed)} 分 < "
+                           f"需要 {need} 分（{left} 分后再催）"
+                           + (f"，已退避 ×{mult}" if mult > 1 else ""))
+    return True, ""
+
+
+def _build_url_ex(src: dict, conf: dict, go_fresh: bool) -> str:
+    """地址拼装（fresh 与否由调用方决定）。非 werss 源直接用自己的完整地址。"""
     limit = max(1, min(int(conf.get("max_items") or 50), 100))
     if (src.get("kind") or "rss").lower() != "werss":
         return (src.get("url") or "").strip()
@@ -117,12 +207,16 @@ def build_url(src: dict, conf: dict) -> str:
                          "配一次，网页添加源时会自动带入）")
     fid = (src.get("feed_id") or "all").strip() or "all"
     # /fresh 会先让 WeRSS 去上游抓一轮再返回；不加就只能吃它的缓存
-    # （缓存默认一天两次）。远程共享实例通常用缓存，见 DEFAULT_MP_CONF.use_fresh。
-    fresh = src.get("use_fresh")
-    if fresh is None:
-        fresh = conf.get("use_fresh", False)
-    tail = "/fresh" if fresh else ""
+    # （缓存默认一天两次）。是否真的走 /fresh 由 _should_go_fresh 决定 ——
+    # 它把「读缓存」和「催抓微信」两个频率解耦，避免高频催抓被风控。
+    tail = "/fresh" if go_fresh else ""
     return f"{base}/rss/{fid}{tail}?limit={limit}"
+
+
+def build_url(src: dict, conf: dict) -> str:
+    """订阅源 → 实际请求地址（自行判定要不要走 /fresh）。"""
+    go_fresh, _why = _should_go_fresh(src, conf)
+    return _build_url_ex(src, conf, go_fresh)
 
 
 # ---------------- 解析：JSON / RSS 2.0 / Atom / RSS 1.0 ----------------
@@ -241,9 +335,17 @@ def _items_from_json(data) -> list[dict]:
         if not url or not title:
             continue
         desc = _first(it, _DESC_KEYS)
+        # JSON 源的正文：WeRSS 的 ext=json 会把全文放在 content/content_html/
+        # content_encoded/body 等字段。优先级从高到低。
+        body = _nested_str(it, ("content_html", "content_encoded", "content",
+                                "body", "html", "raw_content"))
         title, desc = _norm(title, desc)
+        if not desc and body:
+            desc = _norm(title, _html_to_text(body)[:400])[1]
         out.append({
             "title": title, "url": url, "summary": desc,
+            "content_html": body,
+            "content_text": _html_to_text(body) if body else "",
             "author": _nested_str(it, ("author", "author_name")) or _mp_name_of(it),
             "mp_name": _mp_name_of(it),
             "published_at": _parse_dt(_first(it, _DATE_KEYS)),
@@ -265,13 +367,20 @@ def _items_from_xml(root) -> list[dict]:
     out = []
     for el in items:
         title = desc = link = guid = author = mp_name = ""
+        body = ""          # content:encoded —— 全文原文（HTML）
         date_raw = ""
         for ch in el.iter():
             name = _lname(ch.tag)
             text = (ch.text or "").strip()
             if name == "title" and not title:
                 title = text
-            elif name in ("description", "summary", "content", "encoded") and not desc:
+            elif name in ("content", "encoded") and not body:
+                # 2026-09-29 拆开：原来 content:encoded 和 description 抢同一个
+                # desc 槽位，谁先到谁占。content:encoded 是**全文**（实测单篇
+                # 最高 54,566 字符），description 是摘要；混在一起再被 _norm
+                # 截断，等于把全文扔了。现在各存各的。
+                body = text
+            elif name in ("description", "summary") and not desc:
                 desc = text
             elif name == "link":
                 # Atom 的 link 是属性 href；RSS 2.0 的 link 是文本
@@ -300,8 +409,13 @@ def _items_from_xml(root) -> list[dict]:
         if not link or not title:
             continue
         title, desc = _norm(title, desc)
+        # 摘要优先用 description；没有 description 时用全文截一段（很多源只给全文）
+        if not desc and body:
+            desc = _norm(title, _html_to_text(body)[:400])[1]
         out.append({
             "title": title, "url": link, "summary": desc,
+            "content_html": body,
+            "content_text": _html_to_text(body) if body else "",
             "author": author or mp_name, "mp_name": mp_name,
             "published_at": _parse_dt(date_raw),
             "guid": guid or link,
@@ -355,6 +469,14 @@ def _ensure_tables(deps) -> None:
         cur.execute("ALTER TABLE sa_mp_sources ADD COLUMN IF NOT EXISTS "
                     "use_fresh BOOLEAN")
         cur.execute("ALTER TABLE sa_mp_sources ADD COLUMN IF NOT EXISTS auth TEXT")
+        # last_fresh_at：上次**真的催过 WeRSS 去微信抓**的时间。
+        # 必须落库而不是放内存 —— 放内存的话每次重启都会「上次从未 fresh 过」
+        # 而立刻再催一次，反复重启就是持续的风控压力。
+        cur.execute("ALTER TABLE sa_mp_sources ADD COLUMN IF NOT EXISTS "
+                    "last_fresh_at TIMESTAMPTZ")
+        # idle_rounds：连续多少轮没有新文章。用来退避（没更新就别去催）。
+        cur.execute("ALTER TABLE sa_mp_sources ADD COLUMN IF NOT EXISTS "
+                    "idle_rounds INTEGER NOT NULL DEFAULT 0")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS sa_mp_articles (
                 id           BIGSERIAL PRIMARY KEY,
@@ -370,36 +492,63 @@ def _ensure_tables(deps) -> None:
                 is_read      BOOLEAN     NOT NULL DEFAULT FALSE,
                 UNIQUE (source_id, guid)
             )""")
+        # content_html：公众号文章**全文原文**（WeRSS 的 content:encoded，HTML）。
+        # 2026-09-29 加。原设计只留 summary，理由是「全文单条几十 KB，存库会撑爆」——
+        # 这个顾虑在「只要标题做监控」时成立，但用户要的是存档全文。
+        # 实测单篇最大 54,566 字符；按日均 30 篇/源 × 10 源估算约 15~20 MB/年，
+        # PostgreSQL TOAST 会自动压缩外存，这个量级完全不是问题。
+        # 摘要仍单独留一份，页面/推送/喂 LLM 都只读 summary，不碰这列。
+        cur.execute("ALTER TABLE sa_mp_articles "
+                    "ADD COLUMN IF NOT EXISTS content_html TEXT NOT NULL DEFAULT ''")
+        # 纯文本版（剥掉 HTML 标签）：喂 LLM / 全文搜索用，比 HTML 小约 10 倍。
+        # ext=md 出口实测单篇 ~5 KB，content:encoded HTML ~50 KB。
+        cur.execute("ALTER TABLE sa_mp_articles "
+                    "ADD COLUMN IF NOT EXISTS content_text TEXT NOT NULL DEFAULT ''")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_sa_mp_articles_pub "
                     "ON sa_mp_articles (published_at DESC NULLS LAST, id DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_sa_mp_articles_src "
                     "ON sa_mp_articles (source_id, id DESC)")
+        # 全文检索用 GIN 触发器太重，这里只建一个表达式索引辅助 LIKE '关键词%' 场景，
+        # 真正的正文检索交给 ILIKE 全表扫（存档量级下够用）。
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sa_mp_articles_title "
+                    "ON sa_mp_articles (md5(title))")
 
 
 def list_sources(deps) -> list[dict]:
     conf = load_mp_conf()
-    with deps["get_conn"]() as conn, conn.cursor() as cur:
-        cur.execute("SELECT id, name, kind, url, feed_id, enabled, note, use_fresh, "
-                    "last_run, last_status, last_count, last_error, created_at "
-                    "FROM sa_mp_sources ORDER BY id")
-        rows = cur.fetchall()
+    import psycopg2.extras  # 延迟导入：本模块整体不依赖 psycopg2，只有
+    with deps["get_conn"]() as conn, conn.cursor(          # 走 DB 的函数才需要
+            cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        # 2026-09-29 改成按列名取值。原来是位置索引 r[0]~r[13]，而 SELECT 里
+        # 漏了后加的 auth 列（它在 sa_mp_sources 里是第 14 位）—— 于是 r[8]
+        # 拿到的是 last_run（datetime）而不是 auth，_mask_auth 里
+        # auth.partition(" ") 抛 AttributeError，/api/mp/sources 与
+        # /api/mp/status 一起 500。
+        # 位置索引只要加一列就错位；按列名取则永远对得上。
+        cur.execute("SELECT * FROM sa_mp_sources ORDER BY id")
+        rows = [dict(r) for r in cur.fetchall()]
     counts = _unread_map(deps)
     out = []
     for r in rows:
-        src_auth = r[8]
+        src_auth = r.get("auth") or ""
+        uf = r.get("use_fresh")
+        lr, ca = r.get("last_run"), r.get("created_at")
         out.append({
-            "id": r[0], "name": r[1], "kind": r[2], "url": r[3], "feed_id": r[4],
-            "enabled": r[5], "note": r[6],
-            "use_fresh": r[7],
-            "use_fresh_effective": bool(r[7]) if r[7] is not None
+            "id": r["id"], "name": r["name"], "kind": r["kind"], "url": r["url"],
+            "feed_id": r.get("feed_id"), "enabled": r.get("enabled"),
+            "note": r.get("note") or "",
+            "use_fresh": uf,
+            "use_fresh_effective": bool(uf) if uf is not None
                                     else bool(conf.get("use_fresh")),
             # 只回掩码，不吐原文（与 X cookie 同一套处理）
             "has_auth": bool(src_auth or conf.get("auth")),
             "auth_masked": _mask_auth(src_auth or conf.get("auth") or ""),
-            "last_run": r[9].isoformat(timespec="seconds") if r[9] else None,
-            "last_status": r[10], "last_count": r[11], "last_error": r[12],
-            "created_at": r[13].isoformat(timespec="seconds") if r[13] else None,
-            "unread": counts.get(r[0], 0),
+            "last_run": lr.isoformat(timespec="seconds") if lr else None,
+            "last_status": r.get("last_status"),
+            "last_count": r.get("last_count"),
+            "last_error": r.get("last_error") or "",
+            "created_at": ca.isoformat(timespec="seconds") if ca else None,
+            "unread": counts.get(r["id"], 0),
         })
     return out
 
@@ -555,11 +704,19 @@ def mark_read(deps, ids: list[int] | None = None, all_: bool = False) -> int:
 
 # ---------------- 一轮拉取 ----------------
 
-def _fetch_source(deps, src: dict, conf: dict) -> dict:
+def _fetch_source(deps, src: dict, conf: dict,
+                  force_fresh: bool | None = None) -> dict:
+    """拉一个源。force_fresh 由调用方（run_once）用 _should_go_fresh 判好后传入
+    —— 避免在 build_url 内部再判一次：两处各判一次会因秒级时间差与抖动导致
+    「判了要 fresh 却没走 /fresh」这种不一致。"""
     result = {"source_id": src["id"], "name": src["name"], "new": 0,
-              "total": 0, "fresh": []}
+              "total": 0, "fresh": [], "backfilled": 0, "backfilled_titles": []}
     try:
-        url = build_url(src, conf)
+        if force_fresh is None:
+            url = build_url(src, conf)
+        else:
+            # 复用 build_url 的地址拼装，但用调用方已定的 force_fresh
+            url = _build_url_ex(src, conf, bool(force_fresh))
     except ValueError as exc:
         result.update(status="error", error=str(exc))
         return result
@@ -579,19 +736,43 @@ def _fetch_source(deps, src: dict, conf: dict) -> dict:
     now = datetime.now(timezone.utc)
     with deps["get_conn"]() as conn, conn.cursor() as cur:
         for it in items:
+            body = it.get("content_html", "") or ""
+            body_txt = it.get("content_text", "") or ""
             cur.execute(
                 """
                 INSERT INTO sa_mp_articles
-                    (source_id, guid, title, url, author, mp_name, summary, published_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                    (source_id, guid, title, url, author, mp_name, summary,
+                     published_at, content_html, content_text)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (source_id, guid) DO NOTHING
                 """,
                 (src["id"], it["guid"][:512], it["title"], it["url"],
                  it.get("author", "") or "", it.get("mp_name", "") or src["name"],
-                 it.get("summary", ""), it.get("published_at") or now))
+                 it.get("summary", ""), it.get("published_at") or now,
+                 body, body_txt))
             if cur.rowcount:            # rowcount=1 才是真插入（冲突时为 0）
                 result["new"] += 1
                 result["fresh"].append(it)
+                continue
+            # ---- 冲突：已存在。补正文（2026-09-29 加）----
+            # 实测踩到的坑：文章首次被抓到时 WeRSS 往往只有标题+短摘要，正文
+            # 是空的（「百亿龙头昨天涨停…」库里 HTML=0，而几分钟后 WeRSS 那边
+            # 已经有 24,950 字符的正文）。ON CONFLICT DO NOTHING 让这个状态
+            # 永久化 —— 正文永远不会补上。
+            # 所以这里做一次**单向补齐**：只在「库里为空、这次有」时写。
+            # 绝不用新值覆盖已有值 —— 正文被上游改写（微信排版修正、删图）
+            # 时保留先到的原文更符合「存档」语义。
+            if body:
+                cur.execute(
+                    """UPDATE sa_mp_articles
+                       SET content_html = %s,
+                           content_text = COALESCE(NULLIF(content_text,''), %s)
+                       WHERE source_id = %s AND guid = %s
+                         AND COALESCE(content_html,'') = ''""",
+                    (body, body_txt, src["id"], it["guid"][:512]))
+                if cur.rowcount:
+                    result["backfilled"] += 1
+                    result["backfilled_titles"].append(it["title"][:60])
     result["status"] = "ok"
     return result
 
@@ -605,21 +786,41 @@ def run_once(deps) -> dict:
         _state["fetching"] = True
     try:
         with deps["get_conn"]() as conn, conn.cursor() as cur:
-            cur.execute("SELECT id, name, kind, url, feed_id, enabled "
+            cur.execute("SELECT id, name, kind, url, feed_id, enabled, "
+                        "use_fresh, last_fresh_at, idle_rounds "
                         "FROM sa_mp_sources WHERE enabled ORDER BY id")
-            cols = ("id", "name", "kind", "url", "feed_id", "enabled")
+            cols = ("id", "name", "kind", "url", "feed_id", "enabled",
+                    "use_fresh", "last_fresh_at", "idle_rounds")
             sources = [dict(zip(cols, r)) for r in cur.fetchall()]
         if not sources:
             return {"skipped": True, "reason": "没有启用的订阅源", "items": []}
         items = []
         for src in sources:
-            r = _fetch_source(deps, src, conf)
+            # 先判要不要催抓，并把判定结果带进 result 供回写
+            go_fresh, why = _should_go_fresh(src, conf)
+            r = _fetch_source(deps, src, conf, force_fresh=go_fresh)
+            r["fresh_attempted"] = go_fresh
+            r["fresh_deferred"] = why
             items.append(r)
             with deps["get_conn"]() as conn, conn.cursor() as cur:
-                cur.execute("UPDATE sa_mp_sources SET last_run=now(), last_status=%s, "
-                            "last_count=%s, last_error=%s WHERE id=%s",
+                # idle_rounds：连续多少轮没新文章。用于退避 ——
+                # 没更新就别去催微信，有更新嫌疑才值得花风控配额。
+                # 「有新文章」也包括**补到正文**（backfilled>0）：那说明
+                # WeRSS 那边确实在产出，值得继续按原频率催。
+                # 上限 999 防止无限增长（退避倍数另有 8 倍封顶）。
+                cur.execute("""UPDATE sa_mp_sources
+                               SET last_run=now(), last_status=%s,
+                                   last_count=%s, last_error=%s,
+                                   last_fresh_at = CASE WHEN %s THEN now()
+                                                        ELSE last_fresh_at END,
+                                   idle_rounds = CASE WHEN %s > 0 THEN 0
+                                                ELSE LEAST(COALESCE(idle_rounds,0) + 1, 999)
+                                           END
+                               WHERE id=%s""",
                             (r.get("status", ""), r.get("total", 0),
-                             r.get("error", "")[:900], src["id"]))
+                             r.get("error", "")[:900], go_fresh,
+                             r.get("new", 0) + r.get("backfilled", 0),
+                             src["id"]))
         _cleanup(deps, conf)
         fresh = [i for it in items for i in it.get("fresh", [])]
         pushed = 0

@@ -341,22 +341,97 @@ def fetch_for_stock(code: str, name: str, conf: dict | None = None,
     return {"code": code, "name": name, "results": uniq, "errors": errors}
 
 
-def save_to_db(items: list[dict], related_map: dict[str, list[str]] | None = None) -> int:
+# ---------------- 情绪判定（2026-09-29）----------------
+# 为什么加这个：原来 sentiment 只由「用哪个关键词搜到的」决定 —— 只有用
+# keywords_pos 搜出来的才算利好、用 keywords_neg 搜出来的才算利空。而
+# sa_watchlist 35 只票的 keywords_pos/keywords_neg **一个都没配**，于是
+# 关键词轮压根不生成，入库 9852 条的 sentiment 全是空串，
+# paper_trading._build_context 的 {'pos':'利好','neg':'利空'}.get(s or '', '中性')
+# 于是 100% 兜底成「中性」——LLM 看到的是「新闻中性，未见明确利好利空」，
+# 2724 条新闻的语义信息被整体丢弃，只剩标题。
+#
+# 现在改成**按标题文本判定**，与「用哪个 query 搜到的」解耦：
+#   - 用词搜只影响抓取排序（利空词轮的结果照样入库）
+#   - 打标看标题本身，9852 条历史数据可以一次性回填
+# 词表偏利空是有依据的：2025 全年龙虎榜统计里，净卖出信号次日胜率 >50% 的
+# 有 95/100 家，净买入只有 24/100 —— 利空的信息价值显著高于利好。
+DEFAULT_SENTIMENT_NEG = [
+    # 减持/解禁/质押（中金负面信号清单，统计上下行风险偏大）
+    "减持", "解禁", "质押", "冻结", "清仓", "套现", "司法划转", "划转",
+    # 监管（中金清单 + 四类函：关注函/问询函/警示函/监管函）
+    "立案", "问询函", "关注函", "警示函", "监管函", "处罚", "违规", "违法",
+    "调查", "问询", "警示", "责令", "整改", "谴责", "公开谴责", "异常波动",
+    # 业绩暴雷
+    "预亏", "亏损", "业绩下滑", "业绩预降", "商誉减值", "计提", "减记",
+    "下修", "业绩变脸", "爆雷", "退市", "ST", "暂停上市", "财务造假",
+    "由盈转亏", "净利下滑", "营收下滑", "转亏", "减产", "停产",
+    # 经营/交易层面的负面
+    "终止", "失败", "中止", "撤回", "诉讼", "仲裁", "停牌", "跌停", "暴跌",
+    "下滑", "萎缩", "承压", "风险提示", "延期", "裁员", "欠薪", "失效",
+    "辞职", "离任", "被动减持", "下调", "不及预期", "流拍",
+    "大跌", "重挫", "闪崩", "跳水",
+]
+DEFAULT_SENTIMENT_POS = [
+    "回购", "增持", "中标", "预增", "扭亏", "超预期", "获批", "批复",
+    "订单", "中标", "合作", "签约", "战略合作", "投产", "量产", "突破",
+    "创新高", "业绩增长", "净利润增长", "分红", "派息", "收购", "注入",
+    "预升", "新高", "大利好", "利好", "摘牌",
+    "权益分派", "战略融资", "授信", "补助", "补贴", "税收优惠",
+    # 实测漏判后补的词组（务必整个词匹配，别拆成单字）
+    # 刻意不收「入选」「开业」「揭牌」这类泛词 —— 它们在「入选首批…名单」
+    # 「新店开业」里也会命中，污染率高于信号价值。
+    "融资融券", "两融", "配售", "增发", "可转债", "重组", "要约",
+    "控制权变更", "易主", "举牌", "入主", "专精特新", "单项冠军",
+]
+
+
+def classify_sentiment(title: str, pos_words: list[str] | None = None,
+                       neg_words: list[str] | None = None) -> str:
+    """按标题文本判定情绪，返回 'pos' / 'neg' / ''（中性或无法判定）。
+
+    - 利空优先：同时命中时判 neg。理由见 DEFAULT_SENTIMENT_NEG 上面的龙虎榜统计。
+    - 词表 = 通用表 + 调用方传入的个股专属表（sa_watchlist.keywords_pos/neg）。
+    - 匹配用「词 in 标题」，不做分词。中文标题短，误召回可接受；
+      真正的兜底是下游 —— 打不中就是 ''，LLM 看到「中性」而不是错误的情绪。
+    """
+    t = (title or "").strip()
+    if not t:
+        return ""
+    negs = DEFAULT_SENTIMENT_NEG + list(neg_words or [])
+    poss = DEFAULT_SENTIMENT_POS + list(pos_words or [])
+    for w in negs:
+        if w and w in t:
+            return "neg"
+    for w in poss:
+        if w and w in t:
+            return "pos"
+    return ""
+
+
+def save_to_db(items: list[dict], related_map: dict[str, list[str]] | None = None,
+               senti_words: dict | None = None) -> int:
     """新闻写云库 sa_news（URL 唯一去重），并按 URL 聚合关联股票。
 
     related_map: {url: [codes]}，一条新闻命中多只自选股时的关联关系。
     注意：主 code 列保留"第一次发现该 URL 的股票"，全部关联在 sa_news_related。
-    情绪标记：利空词轮抓到的写 sentiment='neg'；已存在的行只在利空时升级
-    （利空优先），其余情况不动（保留首见情绪，避免被后轮冲掉）。
+    情绪标记：优先按**标题文本**判定（classify_sentiment），其次才用
+    「利空词轮抓到的」这个线索（it['_senti']）兜底。利空优先。
+    已存在的行只在利空时升级（保留首见情绪，避免被后轮冲掉）。
+    senti_words: {code: {'pos': [...], 'neg': [...]}} 个股专属词表。
     返回新增条数。
     """
     if not items:
         return 0
     from app import get_conn  # 延迟导入避免循环依赖
+    senti_words = senti_words or {}
     inserted = 0
     with get_conn() as conn, conn.cursor() as cur:
         for it in items:
-            senti = it.get("_senti") or ""
+            sw = senti_words.get(it.get("code")) or {}
+            senti = classify_sentiment(it.get("title") or "",
+                                       sw.get("pos"), sw.get("neg"))
+            if not senti:
+                senti = it.get("_senti") or ""      # 关键词轮的线索兜底
             cur.execute(
                 "INSERT INTO sa_news (code, title, url, source, media, publish_time, sentiment) "
                 "VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (url) DO NOTHING",
@@ -417,6 +492,14 @@ def fetch_watchlist(conf: dict | None = None) -> dict:
     name_index = [(s["code"], s["name"],
                    s["name"].replace("贵州", "").replace("股份", "").replace("-SW", ""))
                   for s in stocks]
+    # 个股专属情绪词表，传给 save_to_db 做标题判定。
+    # 通用表在 classify_sentiment 内部（DEFAULT_SENTIMENT_POS/NEG），
+    # 这里只补 sa_watchlist 上逐只配的那部分 —— 35 只全都没配也不影响通用表生效。
+    senti_words = {
+        s["code"]: {"pos": _split_keywords(s.get("keywords_pos", "")),
+                    "neg": _split_keywords(s.get("keywords_neg", ""))}
+        for s in stocks
+    }
     for s in stocks:
         outcome = fetch_for_stock(s["code"], s["name"], conf,
                                   keywords=_split_keywords(s.get("keywords", "")),
@@ -457,7 +540,7 @@ def fetch_watchlist(conf: dict | None = None) -> dict:
                           "pos_fetched": pos_hits, "neg_fetched": neg_hits,
                           "errors": outcome["errors"]})
     # 全部股票抓完，统一入库一次（含关联），按关联主股票数分摊统计
-    total_new = save_to_db(list(url_items.values()), url_related)
+    total_new = save_to_db(list(url_items.values()), url_related, senti_words)
     return {"fetched_at": datetime.now().isoformat(timespec="seconds"),
             "stocks": per_stock, "total_new": total_new}
 

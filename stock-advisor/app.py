@@ -400,9 +400,12 @@ def init_db():
     --   skipped  = 想动但没成交（钱不够 / 被 T+1 拦 / 持仓已满）
     --   open     = 持有中（buy/sell 成交且未平仓）
     --   resolved = 已结算（含到期平仓写入的反向行）
+    --   closed   = 已卖出平仓（2026-09-29 补）。此前卖出只插 sell 行，buy 仍挂
+    --             'open'，于是止损/T+0 卖出后被平掉的买入会被 settle_and_reflect
+    --             当成未平仓再结一次，_close_trade 里重复 cash += value - fee。
     ALTER TABLE sa_paper_trades DROP CONSTRAINT IF EXISTS sa_paper_trades_status_check;
     ALTER TABLE sa_paper_trades ADD CONSTRAINT sa_paper_trades_status_check
-        CHECK (status IN ('open','resolved','skipped','none'));
+        CHECK (status IN ('open','resolved','skipped','none','closed'));
     UPDATE sa_paper_trades SET status = 'none'
         WHERE side = 'hold' AND status = 'open' AND COALESCE(shares,0) = 0;
     -- 每日资产快照（收益曲线数据源）
@@ -2988,6 +2991,20 @@ def paper_trades(code: str = "", limit: int = 100):
     return rows
 
 
+@app.get("/api/paper/rounds")
+def paper_rounds(code: str = "", only_closed: bool = False,
+                 only_open: bool = False, limit: int = 300):
+    """每笔模拟交易的完整过程：买入 -> 卖出配对，带两边的决策理由。
+
+    与 /api/paper/trades 的区别：后者是**决策流水**（一行一个决策，含大量
+    「观望」），这个是**回合**（一笔交易从建仓到平仓/持有中），直接回答
+    「这笔为什么买、为什么卖、赚了多少」。FIFO 配对，与账务口径一致。
+    """
+    return {"items": paper_trading.rounds(
+        _paper_deps(), code=code, only_closed=only_closed,
+        only_open=only_open)[:max(1, min(limit, 1000))]}
+
+
 @app.get("/api/paper/lessons")
 def paper_lessons(code: str = "", limit: int = 50):
     """经验库（新→旧）。code 传空串=只要全局规则，不传=全部。"""
@@ -4661,10 +4678,16 @@ def mp_source_add(body: MpSourceIn):
 
 @app.patch("/api/mp/sources/{sid}")
 def mp_source_patch(sid: int, body: MpSourcePatchIn):
+    # 2026-09-29 修：原来用 model_dump() 再 `if v is not None` 过滤，
+    # 于是「显式传 null」与「没传这个字段」变得无法区分 —— 而对
+    # use_fresh / auth 来说 null 恰恰是有意义的值（= 交回全局 config.yaml）。
+    # 实际后果：想把某个源改回「跟随全局」时收到 400「没有要改的字段」，
+    # 只能绕过接口直接改数据库。
+    # model_dump(exclude_unset=True) 只返回请求里**真正出现过**的键，
+    # null 也会原样保留，交给 update_source 去写 NULL。
     try:
         return wechat_mp.update_source(_mp_deps(), sid,
-                                       **{k: v for k, v in body.model_dump().items()
-                                          if v is not None})
+                                      **body.model_dump(exclude_unset=True))
     except ValueError as exc:
         raise HTTPException(400, str(exc))
 

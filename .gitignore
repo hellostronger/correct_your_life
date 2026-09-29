@@ -3,6 +3,11 @@
 
 # Stock Advisor 真实配置（含密钥，不入库；模板见 config.example.yaml）
 stock-advisor/config.yaml
+# 改配置前留的备份 —— 内容与 config.yaml 相同，同样含 mp.auth / auth_code /
+# LLM api_key。2026-09-29 发现 config.yaml 被 .gitignore 覆盖了，但 config.yaml.bak-*
+# 没有，备份差点被提交（git status 里是 ?? 未跟踪）。
+stock-advisor/config.yaml.bak-*
+*.yaml.bak*
 
 # Python 运行产物
 __pycache__/

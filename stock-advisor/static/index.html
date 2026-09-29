@@ -1170,15 +1170,42 @@
       <div id="paper-positions-empty" class="empty hide">暂无模拟持仓</div>
     </div>
     <div class="card">
-      <b style="font-size:13px">📜 交易记录（点「理由」看全文）</b>
-      <div class="table-scroll" style="margin-top:6px">
-        <table>
-          <thead><tr><th>日期</th><th>股票</th><th>方向</th><th>价格</th><th>股数</th>
-            <th>状态</th><th>结算</th><th>理由</th></tr></thead>
-          <tbody id="paper-trades"></tbody>
-        </table>
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <b style="font-size:13px">📒 每笔交易（买入→卖出，含决策理由）</b>
+        <div class="row" style="gap:6px">
+          <select id="paper-round-filter" onchange="renderPaperRounds()">
+            <option value="all">全部</option>
+            <option value="closed">已平仓</option>
+            <option value="open">持有中</option>
+            <option value="win">盈利</option>
+            <option value="loss">亏损</option>
+          </select>
+          <input id="paper-round-code" placeholder="代码/名称" style="width:96px"
+                 oninput="renderPaperRounds()">
+        </div>
       </div>
-      <div id="paper-trades-empty" class="empty hide">还没有决策记录。点「立即决策一轮」或等交易日 15:35 自动决策。</div>
+      <div class="muted" style="font-size:12px;margin-top:4px">
+        一行 = 一笔完整交易。买入理由直接显示；点「展开」看 LLM 原始分析报告全文。
+      </div>
+      <div id="paper-rounds" style="margin-top:8px"></div>
+      <div id="paper-rounds-empty" class="empty hide">还没有成交流水。</div>
+    </div>
+    <div class="card">
+      <details>
+        <summary style="cursor:pointer"><b style="font-size:13px">🗒️ 决策流水（含观望，一行一个决策）</b></summary>
+        <div class="muted" style="font-size:12px;margin:6px 0">
+          这是审计用的原始记录：每轮对每只票的判断都有一行，包括「观望」。
+          想看交易本身请用上面的「每笔交易」。
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>时间</th><th>股票</th><th>方向</th><th>价格</th><th>股数</th>
+              <th>状态</th><th>结算</th><th>理由</th></tr></thead>
+            <tbody id="paper-trades"></tbody>
+          </table>
+        </div>
+        <div id="paper-trades-empty" class="empty hide">还没有决策记录。点「立即决策一轮」或等自动决策。</div>
+      </details>
     </div>
     <div class="card">
       <div class="row" style="justify-content:space-between">
@@ -2523,6 +2550,91 @@ function paperSideBadge(side) {
   if (side === 'sell') return '<span class="badge" style="background:#e5f3e2;color:#1e7d32">卖出</span>';
   return '<span class="badge" style="background:#eee;color:#666">观望</span>';
 }
+function renderPaperRounds() {
+  const all = window.__paperRounds || [];
+  const box = $('paper-rounds');
+  if (!box) return;
+  const f = ($('paper-round-filter') || {}).value || 'all';
+  const kw = (($('paper-round-code') || {}).value || '').trim().toLowerCase();
+  let items = all.filter(r => {
+    if (f === 'closed' && !r.exit) return false;
+    if (f === 'open' && r.exit) return false;
+    if (f === 'win' && !(r.pnl_pct != null && r.pnl_pct > 0)) return false;
+    if (f === 'loss' && !(r.pnl_pct != null && r.pnl_pct < 0)) return false;
+    if (kw && !((r.code || '') + ' ' + (r.name || '')).toLowerCase().includes(kw)) return false;
+    return true;
+  });
+  $('paper-rounds-empty').classList.toggle('hide', items.length > 0);
+  if (!items.length) {
+    box.innerHTML = all.length ? '<div class="empty">当前筛选无匹配</div>' : '';
+    return;
+  }
+  const money = v => (v == null ? '—' : '¥' + fmt(Math.round(v)));
+  box.innerHTML = items.map(r => {
+    const e = r.entry, x = r.exit;
+    const pnlCls = r.pnl_pct == null ? 'muted' : cls(r.pnl_pct);
+    const badge = !x
+      ? '<span class="badge" style="background:#e8f0fe;color:#1a56b0">持有中</span>'
+      : (r.settled
+        ? '<span class="badge" style="background:#e5f3e2;color:#1e7d32">已结算</span>'
+        : '<span class="badge" style="background:#eee;color:#666">已平仓</span>');
+    const exitCell = x
+      ? `<div><b>${x.price}</b> × ${fmt(x.shares)}</div>
+         <div class="muted">${x.date}${x.slot ? ' ' + x.slot : ''} · 费 ${x.fee}</div>`
+      : '<span class="muted">尚未卖出</span>';
+    const reasonCell = t => !t || !t.reasoning
+      ? '<span class="muted">（无）</span>'
+      : `<div style="font-size:12px;line-height:1.5">${esc(t.reasoning)}</div>`;
+    return `<div class="card" style="margin:8px 0;padding:10px 12px">
+      <div class="row" style="justify-content:space-between;align-items:center;gap:8px">
+        <div>
+          <b>${esc(r.name || '')}</b>
+          <span class="muted">${r.code}</span>
+          ${badge}
+          ${r.settled && r.raw_return != null
+            ? `<span class="muted" style="margin-left:6px">结算 ${signed((r.raw_return * 100).toFixed(1))}%${r.alpha_return != null ? ' · α' + signed((r.alpha_return * 100).toFixed(1)) + '%' : ''}</span>` : ''}
+        </div>
+        <div class="${pnlCls}" style="text-align:right;font-size:13px">
+          ${r.pnl == null ? '<span class="muted">浮动中</span>'
+            : `${money(r.pnl)}<br><span style="font-size:15px">${signed(r.pnl_pct.toFixed(2))}%</span>`}
+          ${r.holding_days != null ? `<div class="muted" style="font-size:11px">持有 ${r.holding_days} 天</div>` : ''}
+        </div>
+      </div>
+      <div class="table-scroll" style="margin-top:8px">
+        <table style="font-size:12px">
+          <thead><tr><th style="width:64px"></th><th>价格</th><th>股数</th>
+            <th>净投入/回款</th><th>轮次</th><th>置信</th>
+            <th>止损</th><th>决策理由</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><span class="badge" style="background:#ffe2e2;color:#b32424">买入</span></td>
+              <td><b>${e.price}</b></td><td>${fmt(e.shares)}</td>
+              <td>${money(e.net_in)}<div class="muted">含费 ${e.fee}</div></td>
+              <td class="muted">${e.date}${e.slot ? ' ' + e.slot : ''}</td>
+              <td>${e.confidence != null ? e.confidence : '—'}</td>
+              <td>${e.stop_loss_pct != null ? e.stop_loss_pct + '%' : '—'}</td>
+              <td style="white-space:normal;min-width:260px">${reasonCell(e)}</td>
+            </tr>
+            ${x ? `<tr>
+              <td><span class="badge" style="background:#e5f3e2;color:#1e7d32">卖出</span></td>
+              <td><b>${x.price}</b></td><td>${fmt(x.shares)}</td>
+              <td>${money(x.net_out)}<div class="muted">扣费 ${x.fee}</div></td>
+              <td class="muted">${x.date}${x.slot ? ' ' + x.slot : ''}</td>
+              <td>${x.confidence != null ? x.confidence : '—'}</td>
+              <td class="muted">—</td>
+              <td style="white-space:normal;min-width:260px">${reasonCell(x)}</td>
+            </tr>` : ''}
+          </tbody>
+        </table>
+      </div>
+      ${e.report ? `<details style="margin-top:6px">
+        <summary class="muted" style="cursor:pointer;font-size:12px">展开 LLM 原始分析报告</summary>
+        <div style="font-size:12px;line-height:1.6;white-space:normal;margin-top:4px;color:#555">${esc(e.report)}</div>
+      </details>` : ''}
+    </div>`;
+  }).join('');
+}
+
 function paperStatusBadge(t) {
   // 关键：**先看 side 有没有真的持仓**，再看 status。
   // 原来只看 status，于是 side='hold'（shares=0、根本没有持仓）的行也被
@@ -2545,12 +2657,13 @@ function paperStatusBadge(t) {
 }
 async function loadPaper() {
   try {
-    const [ov, trades, lessons, cfg, pstat] = await Promise.all([
+    const [ov, trades, lessons, cfg, pstat, rounds] = await Promise.all([
       api('/api/paper/overview'),
-      api('/api/paper/trades?limit=100'),
+      api('/api/paper/trades?limit=200'),
       api('/api/paper/lessons?limit=50'),
       api('/api/config/all'),
       api('/api/paper/status'),
+      api('/api/paper/rounds?limit=400'),
     ]);
     fillPaperCadence(cfg.sections);
     renderPaperCadenceStatus(pstat);
@@ -2558,20 +2671,33 @@ async function loadPaper() {
     // 账户卡片
     const acc = ov.account || {};
     const st = ov.stats || {};
-    const buy = st.buy || {}, sell = st.sell || {};
-    const winN = (buy.wins || 0) + (sell.wins || 0), totalN = (buy.n || 0) + (sell.n || 0);
-    const avgAlpha = totalN ? ((buy.avg_alpha || 0) * (buy.n || 0) + (sell.avg_alpha || 0) * (sell.n || 0)) / totalN : null;
+    // 2026-09-29 修：后端把 stats 从 {buy:{...},sell:{...}} 改成了扁平
+    // {n,wins,avg_raw,avg_alpha,n_alpha,win_basis}（按**回合**而不是按行统计，
+    // 一行买入不再与它的卖出行分到两个互不相干的口径里），这里没跟着改，
+    // 于是 buy/sell 恒为 {}、totalN 恒为 0 —— 页面上「已结算」永远显示 0 笔。
+    const totalN = st.n || 0;
+    const winN = st.wins || 0;
+    const isAlphaBasis = st.win_basis === 'alpha';
+    const winRate = totalN ? Math.round(winN / totalN * 100) + '%' : '—';
+    const avgAlpha = st.avg_alpha, avgRaw = st.avg_raw;
     $('paper-stats').innerHTML = `
       <div>总资产<div><b>¥${fmt(Math.round(ov.total))}</b></div>
         <div class="${cls(ov.total_pnl_pct)}">${ov.total_pnl_pct != null ? signed(ov.total_pnl_pct) + '%' : '—'}</div></div>
       <div>现金<div>¥${fmt(Math.round(acc.cash || 0))}</div></div>
       <div>持仓市值<div>¥${fmt(Math.round(ov.market_value || 0))}</div></div>
-      <div>已结算<div>${totalN} 笔</div><div class="muted">买 ${buy.n || 0} / 卖 ${sell.n || 0}</div></div>
-      <div>胜率(alpha>0)<div>${totalN ? Math.round(winN / totalN * 100) + '%' : '—'}</div>
-        <div class="muted">${winN}/${totalN}</div></div>
-      <div>平均alpha<div class="${cls(avgAlpha)}">${avgAlpha != null ? signed((avgAlpha * 100).toFixed(1)) + '%' : '—'}</div></div>`;
+      <div>已结算<div>${totalN} 笔</div><div class="muted">赢 ${winN} / 亏 ${totalN - winN}</div></div>
+      <div>胜率<div>${winRate}</div>
+        <div class="muted">${isAlphaBasis ? '按超额收益 alpha 判' : '按绝对涨跌判'}</div></div>
+      <div>已结算均值<div class="${cls(avgAlpha != null ? avgAlpha : avgRaw)}">${
+        avgAlpha != null ? signed((avgAlpha * 100).toFixed(2)) + '%'
+        : avgRaw != null ? signed((avgRaw * 100).toFixed(2)) + '%' : '—'}</div>
+        <div class="muted">${isAlphaBasis ? 'alpha' : '绝对涨跌（无基准）'}</div></div>`;
     $('paper-meta').textContent =
-      `成败按持有期相对基准的超额收益（alpha）判定；观望不计入胜率。初始资金 ¥${fmt(Math.round(acc.initial_cash || 0))}`;
+      `已结算 = 买入且已平仓的回合数（观望不计）。${
+        isAlphaBasis
+          ? '胜负按持有期相对基准指数的超额收益（alpha>0）判定。'
+          : '当前无基准数据（alpha 全部缺失），胜负暂按绝对涨跌判定 —— 已结算满 5 个交易日后会自动用上 alpha。'
+      }初始资金 ¥${fmt(Math.round(acc.initial_cash || 0))}`;
     // 持仓表
     const pos = ov.positions || [];
     $('paper-positions-empty').classList.toggle('hide', pos.length > 0);
@@ -2584,7 +2710,10 @@ async function loadPaper() {
         <td>¥${fmt(Math.round(p.market_value || 0))}</td>
         <td class="${cls(p.pnl_pct)}">${p.pnl_pct != null ? signed(p.pnl_pct) + '%' : '—'}</td>
       </tr>`).join('');
-    // 交易记录（理由 details 展开）
+    // 每笔交易（回合）：这是主要视图，决策流水收进下面的 details
+    window.__paperRounds = (rounds && rounds.items) || [];
+    renderPaperRounds();
+    // 决策流水（审计用，含观望）
     $('paper-trades-empty').classList.toggle('hide', trades.length > 0);
     $('paper-trades').innerHTML = trades.map(t => `
       <tr>

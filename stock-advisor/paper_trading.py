@@ -43,8 +43,29 @@ DEFAULTS = {
     "start_time": "09:35",        # 盘中窗口起（含）；09:30 开盘留 5 分钟等行情稳定
     "end_time": "14:40",          # 盘中窗口止（含）；留 20 分钟尾盘，之后不再开新仓
     "stop_loss_max_pct": 5,       # 止损宽度上限(%)：LLM 定的止损线不得比这更宽
-                                 # （注意是「上限」不是下限：取 max(LLM值, 本值)，
-                                 #   只会把过宽的止损收紧，不会把过窄的放宽）
+                                 # 取 min(LLM值, 本值)：LLM 给 8% 而上限 5% → 实际用 5%。
+                                 # 2026-09-29 修：原来写的是 max(LLM值, 本值)，而
+                                 # max(8,5)=8，等于「取更宽的那个」，上限只在 LLM 给得
+                                 # 更紧时把它**放宽**，与意图完全相反 —— 这个上限从上线
+                                 # 起到发现为止一次都没生效过（溜溜梅 8% 止损即实证）。
+    # —— 追高闸门（2026-09-29 因溜溜梅翻车加）——
+    # 写在代码里而不是只写进经验库：NeurIPS《The Losing Winner》证明 LLM 会
+    # reward-hack 代理目标 —— 把「不要追高」当提示词，LLM 完全可以自己论证
+    # 「但前景光明」把它压过去。风控必须在 LLM 之外。
+    # 实证：06658 溜溜梅 20 日涨 37.7%、距 20 日高点回撤 12.4% 时买入，
+    # 隔夜即止损 8.98%。高位票赔率差：向上空间被压缩，向下有获利盘兑现。
+    # 20% 而非 30%：实测 14 只票，20% 时拦下游族网络(+16% 紧贴高点)与溜溜梅
+    # (+26%)，而茅台/五粮液/平安银行等全部放行。30% 时溜溜梅反而漏网。
+    "max_chase_pct20": 20,        # 近 20 日涨幅超过这个值(%) → 禁止新开仓；0=关闭
+    "max_high_prox_pct": 10,      # 涨幅为正且距20日高点回撤<此值 → 禁止；0=关闭
+    # —— 波动率自适应止损（2026-09-29 加）——
+    # 固定百分比止损对高波动票就是个随机数发生器：日均振幅 6% 的票，
+    # 一天内触及 5% 止损的概率约 18%。止损宽度必须由波动率决定。
+    # 实测 ATR(14)%：茅台 1.37 / 平安 1.73 / 比亚迪 1.99 / 国安 5.57 /
+    # 游族 5.23 / 溜溜梅 12.36 —— 同一张 5% 单对它们含义完全不同。
+    "atr_stop_k": 1.5,            # 止损 = k × ATR(14)；0=关闭（退回固定 %）
+    "atr_stop_floor_pct": 5,      # ATR 止损的下限(%)，防止低波动期止损被压得过窄
+                                  # （k×ATR 还要再与 stop_loss_max_pct 取小）
     # —— 交易规则（模拟成交也必须守，不然统计出来的胜率是假的）——
     "tplus0_extra": "",           # 逗号分隔的代码/关键词，强制当 T+0（覆盖自动判定）
     "tplus1_extra": "",           # 逗号分隔的代码/关键词，强制当 T+1
@@ -514,6 +535,105 @@ def fetch_ohlcv(em_kline_fn, symbol: str, days: int = 60) -> list[dict]:
         return []
 
 
+def atr_pct(bars: list[dict], period: int = 14) -> float | None:
+    """ATR(period) 占现价的百分比 —— 止损宽度的波动率依据。
+
+    真波幅 TR = max(H-L, |H-前收|, |L-前收|)，ATR 取近 period 日均值，
+    再除以现价得到百分比，便于跨价位比较。
+
+    为什么必须有它：固定百分比止损对高波动个股就是随机数发生器。
+    日均振幅 6% 的票，一天内触及 5% 止损的概率约 18%（障碍穿越一阶近似），
+    即每 5~6 笔就有 1 笔被纯噪声扫掉。止损宽度要跟波动率挂钩才谈得上风控。
+
+    数据不够（<period+1 根）返回 None，调用方退回固定百分比。
+    """
+    if not bars or len(bars) < min(period, 5) + 1:
+        return None
+    trs: list[float] = []
+    prev_close = None
+    for b in bars:
+        try:
+            h, l, c = float(b["high"]), float(b["low"]), float(b["close"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if prev_close is None:
+            tr = h - l
+        else:
+            tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
+        trs.append(tr)
+        prev_close = c
+    if len(trs) < min(period, 5) + 1:
+        return None
+    window = trs[-period:] if len(trs) >= period else trs
+    last = float(bars[-1]["close"] or 0)
+    if last <= 0:
+        return None
+    return sum(window) / len(window) / last * 100
+
+
+def vol_adjusted_stop(bars: list[dict], conf: dict) -> tuple[float | None, str]:
+    """按波动率给止损宽度，返回 (止损%, 说明)。未启用或数据不足返回 (None, "")。
+
+    止损% = max(k × ATR%, floor)。floor 兜底是因为 ATR 有个危险特性：
+    低波动期 ATR 会很小，于是止损被压得极窄，然后波动率一扩张就必然被打掉。
+    「低波动常常是暴风雨前的平静」——所以要设下限。
+    """
+    k = float(conf.get("atr_stop_k") or 0)
+    if k <= 0:
+        return None, ""
+    ap = atr_pct(bars)
+    if not ap:
+        return None, ""
+    floor = float(conf.get("atr_stop_floor_pct") or 0)
+    stop = max(k * ap, floor)
+    return stop, (f"ATR14={ap:.2f}%×{k:g}={k * ap:.2f}%，"
+                  f"下限 {floor:g}% → 止损 {stop:.2f}%")
+
+
+def chase_check(bars: list[dict], conf: dict) -> str:
+    """追高闸门：命中返回原因串（禁止新开仓），未命中返回 ""。
+
+    两条独立的判据，命中任一即拦：
+      - 近 20 日涨幅 > max_chase_pct20      —— 已经涨太多，向上空间被压缩
+      - 距 20 日最高价回撤 < max_high_prox_pct —— 紧贴高位，获利盘随时兑现
+
+    这两条用的都是 _kline_summary 已经在算的数字，信息包里本来就有 ——
+    问题从来不是「没采到」，而是「采到了但没有硬约束去挡」。
+    实证：06658 溜溜梅 20 日涨 37.7%、距高点回撤 12.4%，隔夜止损 8.98%。
+    """
+    if len(bars) < 10:
+        return ""
+    closes = [b["close"] for b in bars]
+    last = closes[-1]
+    lim20 = float(conf.get("max_chase_pct20") or 0)
+    lim_prox = float(conf.get("max_high_prox_pct") or 0)
+    if lim20 <= 0 and lim_prox <= 0:
+        return ""
+    hits = []
+    # 判据一：近 20 日涨幅。这个是对的 —— 溜溜梅 +37.7% 会被拦，
+    # 而茅台 -5.0%、宁德 -20.8% 不会。它衡量「已经涨了多少」。
+    if lim20 > 0 and len(closes) > 20:
+        rise = (last / closes[-21] - 1) * 100
+        if rise > lim20:
+            hits.append(f"近20日已涨 {rise:+.1f}%（>{lim20:g}%）")
+    # 判据二：**涨幅大** AND 紧贴近期高点。两个条件必须同时成立。
+    #
+    # 2026-09-29 修正：第一版写成「距 20 日最高价回撤 < 15% 就拦」，实测把
+    # 14 只票里的 10 只全拦了 —— 茅台、五粮液、平安银行无一幸免。原因是
+    # 这个判据**根本区分不了「高位强势股」和「温和下跌股」**：任何票只要近
+    # 20 天没创新高就必然满足（跌 5% 的茅台离前高只有 7.8% 回撤）。
+    # 真正要拦的是「涨了很多**且**还在高位」，两个条件缺一不可。
+    if lim_prox > 0 and len(closes) > 20:
+        rise = (last / closes[-21] - 1) * 100
+        high20 = max(b["high"] for b in bars[-20:])
+        if high20 > 0 and rise > 0:
+            dd = (last / high20 - 1) * 100
+            if dd > -lim_prox and rise >= min(lim_prox, 10):
+                hits.append(f"近20日涨 {rise:+.1f}% 且距20日高点仅回撤 "
+                            f"{dd:.1f}%（<{lim_prox:g}%，高位）")
+    return "；".join(hits)
+
+
 def _kline_summary(bars: list[dict]) -> str:
     """近60日K线摘要文本：区间涨跌幅、20日高点回撤、量能倾向。"""
     if len(bars) < 10:
@@ -648,7 +768,8 @@ def _derive_paper_positions(cur) -> dict[str, dict]:
     的真实盈亏，而不是价差本身 —— 否则总资产和持仓收益永远对不上。
     """
     cur.execute(
-        "SELECT code, name, side, shares, price, fee_total FROM sa_paper_trades "
+          "SELECT code, name, side, shares, price, fee_total, trade_date "
+          "FROM sa_paper_trades "
         "WHERE side IN ('buy','sell') AND status <> 'skipped' "
         "ORDER BY id")
     pos: dict[str, dict] = {}
@@ -656,15 +777,26 @@ def _derive_paper_positions(cur) -> dict[str, dict]:
         if isinstance(row, dict):
             code, name, side = row["code"], row["name"], row["side"]
             shares, price, fee = row["shares"], row["price"], row["fee_total"]
+            tdate = row["trade_date"]
         else:
-            code, name, side, shares, price, fee = row
+            code, name, side, shares, price, fee = row[:6]
+            tdate = row[6] if len(row) > 6 else None
         shares, price = int(shares or 0), float(price or 0)
         fee = float(fee or 0)
         if shares <= 0 or price <= 0:
             continue
-        p = pos.setdefault(code, {"shares": 0, "cost": 0.0, "name": name})
+        p = pos.setdefault(code, {"shares": 0, "cost": 0.0, "name": name,
+                                  "entry_date": None})
         if side == "buy":
             net = price * shares + fee          # 净投入含买入费用
+            # 持仓均价与「加权平均买入日」同步更新 —— alpha 的基准起点
+            # 要用它。只记首次买入日不够：加仓后真实持有期已变长，用
+            # 最早那天算会把基准区间拉长、系统性低估超额收益。
+            if p["entry_date"] and tdate:
+                p["entry_date"] = _weighted_date(p["entry_date"], p["shares"],
+                                               tdate, shares)
+            elif tdate:
+                p["entry_date"] = tdate
             p["cost"] = (p["cost"] * p["shares"] + net) / (p["shares"] + shares)
             p["shares"] += shares
         else:
@@ -672,6 +804,7 @@ def _derive_paper_positions(cur) -> dict[str, dict]:
             p["shares"] -= sell
             if p["shares"] <= 0:
                 p["shares"], p["cost"] = 0, 0.0
+                p["entry_date"] = None
     return {c: p for c, p in pos.items() if p["shares"] > 0}
 
 
@@ -878,6 +1011,15 @@ def _decide_one(deps, conf, stock, today, results, slot: str = ""):
         _free, _held, _rule = sellable_shares(c2, code, name, today)
         _lim = position_limit_status(c2, conf)
     rules = _rule_brief(code, name, positions.get(code) is not None, _free, _lim)
+    # 波动率信息并进交易员提示：让 LLM 自己也能按波动率定止损，而不是拍脑袋。
+    # 代码层会用 min() 再夹一次，但先给它数字比事后纠正更省事。
+    _ap = atr_pct(bars)
+    _vol_hint = ""
+    if _ap:
+        _vol_hint = (f"\n【波动率】ATR(14)={_ap:.2f}%（占现价），"
+                     f"按 1.5×ATR 建议止损宽度约 {_ap * 1.5:.1f}%。"
+                     f"该股日均振幅接近 {_ap * 1.6:.1f}%，止损若明显窄于此，"
+                     f"一天内被噪声打掉的概率约 {_ap * 1.6 * 0.45:.0f}%。")
     raw_trader = _llm_call(
         TRADER_PROMPT,
         f"【分析报告】\n{report}\n\n【账户现状】\n可用现金 {account['cash']:,.0f} 元，"
@@ -887,7 +1029,7 @@ def _decide_one(deps, conf, stock, today, results, slot: str = ""):
         if code in positions else
         f"【分析报告】\n{report}\n\n【账户现状】\n可用现金 {account['cash']:,.0f} 元，"
         f"总资产 {account['total_value']:,.0f} 元，该股无持仓",
-        extra=rules)
+        extra=rules + _vol_hint)
     decision = _validate_decision(_extract_json(raw_trader) or {})
     if decision is None:
         decision = {"action": "hold", "confidence": 1, "target_value_pct": 0,
@@ -896,15 +1038,20 @@ def _decide_one(deps, conf, stock, today, results, slot: str = ""):
     decision["report"] = report
     decision["raw"] = raw_trader
     # 5. 成交执行（资金硬约束代码强制）
-    executed, note = _execute_decision(deps, conf, stock, today, decision, quote, slot)
+    executed, note = _execute_decision(deps, conf, stock, today, decision, quote,
+                                       slot, bars=bars)
     results.append({"code": code, "name": name, "action": decision["action"],
                      "executed": executed, "reasoning": decision["reasoning"],
                      "note": note})
 
 
 def _execute_decision(deps, conf, stock, today, decision, quote,
-                      slot: str = "") -> tuple[bool, str]:
-    """按当前价成交（盘中原价，不再是收盘价）。返回 (是否成交, 备注)。资金约束全部代码强制。"""
+                      slot: str = "", bars: list | None = None) -> tuple[bool, str]:
+    """按当前价成交（盘中原价，不再是收盘价）。返回 (是否成交, 备注)。资金约束全部代码强制。
+
+    bars：近 60 日 OHLCV，供追高闸门与 ATR 止损用（_decide_one 已有，不重复拉）。
+    止损扫描路径调本函数时传 None —— 止损只减仓，不触发新开仓闸门。
+    """
     get_conn = deps["get_conn"]
     code = stock["code"]
     price = float(quote["price"])
@@ -953,6 +1100,32 @@ def _execute_decision(deps, conf, stock, today, decision, quote,
                                f"不再开新仓（记为 skipped；卖出不受此限）")
             budget = account["total_value"] * float(decision["target_value_pct"]) / 100
             budget = min(budget, account["cash"])
+            # 追高闸门：**只拦新开仓**，加仓已持仓的票不受影响（不新增风险敞口）。
+            # 放在这里而不是只写进提示词，是因为 LLM 会自己把「不要追高」论证掉
+            # —— NeurIPS《The Losing Winner》实证 LLM 系统性 reward-hack 代理目标。
+            if not me:
+                _chase = chase_check(bars or [], conf)
+                if _chase:
+                    cur.execute(
+                        _insert_trade_sql(),
+                        (code, stock["name"], today, slot, "buy", 0, price, 0,
+                         decision["confidence"], decision["stop_loss_pct"],
+                         decision["reasoning"], decision.get("report", ""),
+                         json.dumps({"decision": decision, "veto": "chase"},
+                                    ensure_ascii=False), "skipped", 0, "{}"))
+                    conn.commit()
+                    return False, f"追高闸门：{_chase}，禁止新开仓（记为 skipped）"
+            # 波动率自适应止损：ATR 止损与 stop_loss_max_pct 上限取**较小**的那个。
+            # 两者都是「收紧」方向，所以 min；ATR 关掉时退回 LLM 给的值。
+            _bars = bars or []
+            _atr_sl, _atr_note = vol_adjusted_stop(_bars, conf)
+            _sl = float(decision["stop_loss_pct"] or 0)
+            if _atr_sl and _atr_sl > 0:
+                decision["stop_loss_pct"] = min(_sl, _atr_sl) if _sl > 0 else _atr_sl
+            if decision["stop_loss_pct"] is not None:
+                decision["stop_loss_pct"] = min(
+                    float(decision["stop_loss_pct"]),
+                    float(conf.get("stop_loss_max_pct") or 100))
             max_pos_value = account["total_value"] * float(conf["max_position_pct"]) / 100
             if me:
                 budget = min(budget, max(0, max_pos_value - me["shares"] * me["cost"]))
@@ -1039,6 +1212,29 @@ def _execute_decision(deps, conf, stock, today, decision, quote,
                          decision.get("report", ""),
                          json.dumps({"decision": decision}, ensure_ascii=False), "open",
                          fee["total"], json.dumps(fee, ensure_ascii=False)))
+            # 卖出成交了，但它**平掉的那笔买入还没结**。这一行是 2026-09-29 补的，
+            # 补的是止损/T+0 卖出后 buy 一直挂着 status='open' 造成的重复结算：
+            #   - 结算队列（settle_and_reflect）挑的正是 status='open'，
+            #     所以被卖掉的买入 5 个交易日后还会被当「未平仓」再平一次，
+            #     _close_trade 里再 cash += value - fee，凭空多出一笔现金；
+            #   - 持仓推导只认 shares 的买卖净额，不看 status，所以总资产是对的，
+            #     错的只有结算与经验库。
+            # 现在按成交价把被平掉的买入就地结算（raw_return 用真实卖价），
+            # 并把这条卖出行标成 'closed'（不是持仓了，别再进结算队列）。
+            #
+            # alpha = 个股区间收益 - 基准指数区间收益。基准取该股所属市场的
+            # 指数（上证/深成指/恒指），用**买入日到卖出日**的收盘价算。
+            # 胜率统计按 alpha>0 判胜负，所以这里必须算 —— 原来不写 alpha
+            # 导致 4 笔已结算全是 NULL，SUM(CASE WHEN alpha>0) 恒为 NULL，
+            # 页面胜率恒显 0%（2026-09-29 实测）。
+            _alpha, _bench = _alpha_for_round(cur, code, me, price, today, deps)
+            _settle_buy_rows(cur, code, shares, price, today,
+                             decision.get("report", ""), _alpha, _bench)
+            cur.execute("UPDATE sa_paper_trades SET status = 'closed', settle_date = %s, "
+                        "settle_price = %s WHERE id = "
+                        "(SELECT id FROM sa_paper_trades WHERE code=%s AND trade_date=%s "
+                        " AND slot=%s AND side='sell' AND status='open' ORDER BY id DESC LIMIT 1)",
+                        (today, price, code, today, slot))
             # 净回款 = 成交额 - 费用
             cur.execute("UPDATE sa_paper_account SET cash = cash + %s, updated_at = now() "
                         "WHERE id = 1", (value - fee["total"],))
@@ -1068,6 +1264,153 @@ def _insert_trade_sql() -> str:
             "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)")
 
 
+def _weighted_date(d1, shares1, d2, shares2):
+    """按股数加权平均两个交易日，返回 date（或无法计算时返回较晚的那个）。
+
+    加仓后持仓的「真实持有期起点」应该往后移：用最早的买入日算 alpha 会把
+    基准区间拉长、��统性低估超额收益。取加权平均而不是简单取晚值，是为了让
+    起点随仓位结构连续变化，避免加仓一次就跳变。
+    纯函数，不碰数据库；入参可以是 date 或 'YYYY-MM-DD' 字符串。
+    """
+    from datetime import date as _date
+    def _to_ord(d):
+        if d is None:
+            return None
+        if isinstance(d, _date):
+            return d.toordinal()
+        s = str(d)[:10]
+        try:
+            return _date.fromisoformat(s).toordinal()
+        except ValueError:
+            return None
+    o1, o2 = _to_ord(d1), _to_ord(d2)
+    if o1 is None:
+        return d2
+    if o2 is None:
+        return d1
+    s1, s2 = float(shares1 or 0), float(shares2 or 0)
+    tot = s1 + s2
+    if tot <= 0:
+        return _date.fromordinal(max(o1, o2))
+    w = (o1 * s1 + o2 * s2) / tot
+    return _date.fromordinal(int(round(w)))
+
+
+def _alpha_for_round(cur, code: str, me: dict | None, sell_price: float,
+                     today: str, deps: dict) -> tuple[float | None, str]:
+    """算这一回合的超额收益 alpha = 个股区间收益 - 基准指数区间收益。
+
+    返回 (alpha, benchmark_symbol)。拿不到基准（K线不足/接口失败）时返回
+    (None, "")，调用方把 alpha 留空 —— 统计会自动降级成按 raw_return 判胜负，
+    并在返回值里用 win_basis 标明口径，绝不会静默当成 alpha。
+
+    基准口径与 settle_and_reflect 一致：按该股所属市场取指数
+    （A 股沪市=上证、深市=深成指、港股=恒指），用买入日到卖出日的收盘价。
+    """
+    if not me or not me.get("cost"):
+        return None, ""
+    try:
+        em_kline_fn = deps.get("em_kline_fn")
+        tx_symbol_fn = deps.get("tx_symbol_fn")
+        if not em_kline_fn or not tx_symbol_fn:
+            return None, ""
+        bench_sym = benchmark_symbol(code)
+        closes = fetch_close_series(em_kline_fn, bench_sym, days=30)
+        if len(closes) < 2:
+            return None, ""
+        entry_date = str(me.get("entry_date") or "")[:10]
+        if not entry_date:
+            return None, ""
+        # 买入日之后的基准收盘序列（买入日当天的收盘作为起点）
+        later = sorted(d for d in closes if d >= entry_date)
+        if len(later) < 2:
+            return None, ""
+        bench_ret = closes[later[-1]] / closes[later[0]] - 1
+        raw_ret = sell_price / float(me["cost"]) - 1
+        return raw_ret - bench_ret, bench_sym
+    except Exception as exc:
+        print(f"[paper] alpha 计算失败 {code}: {exc}", flush=True)
+        return None, ""
+
+
+def _settle_buy_rows(cur, code: str, sell_shares: int, sell_price: float,
+                     today: str, report: str = "", alpha: float | None = None,
+                     benchmark: str = "") -> int:
+    """卖出成交后，把被平掉的那部分买入就地结算（先进先出）。
+
+    为什么必须有这一步：结算队列 settle_and_reflect 挑的是 status='open'。
+    卖出只插 sell 行、buy 仍挂 'open' 的话，被止损卖掉的买入会在 5 个交易日后
+    被当成「还持有」再结一次 —— _close_trade 会再插一笔反向的「到期平仓」行，
+    并执行 cash += value - fee，而那笔现金卖出当天就已经回过账，等于凭空多钱。
+    2026-09-29 实测：库里当时有 20 笔这样的行等着被重复结算。
+
+    - 先先进出逐笔核销（buy 的 id 升序），与 _derive_paper_positions 的口径一致
+    - 部分平仓时把买入按比例拆成「已平仓的那份」+「仍持有的那份」，不改动原行的
+      shares，避免动到还没卖出的仓位
+    - raw_return 用**真实卖价**算，经验库和收益率统计才是对的
+    - alpha/basename 传入时一并写入。2026-09-29 起必须传：胜率统计按
+      alpha_return>0 判胜负（相对基准才是「胜率」该有的含义），不传 alpha
+      会让统计降级成按 raw_return 判并在返回值里标明口径已降级。
+    """
+    left = int(sell_shares or 0)
+    if left < 1 or sell_price <= 0:
+        return 0
+    cur.execute("""SELECT id, trade_date, slot, shares, price, confidence,
+                          stop_loss_pct, reasoning, report, decision_raw, fee_total
+                   FROM sa_paper_trades
+                   WHERE code=%s AND side='buy' AND status='open'
+                   ORDER BY id""", (code,))
+    rows = cur.fetchall()
+    closed = 0
+    for r in rows:
+        if left <= 0:
+            break
+        bought = int(r["shares"] or 0)
+        if bought < 1:
+            continue
+        entry = float(r["price"] or 0)
+        if not entry:
+            left -= bought
+            continue
+        take = min(bought, left)
+        raw_ret = (sell_price / entry - 1)
+        if take >= bought:
+            # 整笔核销：买入行直接进已结算
+            cur.execute("""UPDATE sa_paper_trades
+                           SET status='resolved', settle_date=%s, settle_price=%s,
+                               raw_return=%s, alpha_return=%s, benchmark=%s,
+                               auto_closed=COALESCE(auto_closed, FALSE)
+                           WHERE id=%s""",
+                        (today, sell_price, raw_ret, alpha, benchmark, r["id"]))
+            closed += 1
+        else:
+            # 部分核销：把没卖出的那部分拆成新行留 'open'，原行变成已平仓的那份
+            keep = bought - take
+            keep_price = entry
+            keep_value = keep * keep_price
+            keep_fee = float(r["fee_total"] or 0) * keep / bought
+            cur.execute("""INSERT INTO sa_paper_trades
+                           (code, name, trade_date, slot, side, shares, price, value,
+                            confidence, stop_loss_pct, reasoning, report, decision_raw,
+                            status, fee_total, fee_detail)
+                           SELECT code, name, trade_date, slot, 'buy', %s, price, %s,
+                                  confidence, stop_loss_pct, reasoning, report,
+                                  decision_raw, 'open', %s, fee_detail
+                           FROM sa_paper_trades WHERE id=%s""",
+                        (keep, keep_value, round(keep_fee, 4), r["id"]))
+            cur.execute("""UPDATE sa_paper_trades
+                           SET status='resolved', settle_date=%s, settle_price=%s,
+                               raw_return=%s, alpha_return=%s, benchmark=%s,
+                               shares=%s, value=%s, fee_total=%s
+                           WHERE id=%s""",
+                        (today, sell_price, raw_ret, alpha, benchmark, take,
+                         take * entry, round(float(r["fee_total"] or 0) * take / bought, 4),
+                         r["id"]))
+            closed += 1
+        left -= take
+    return closed
+
+
 # ---------------- 盘中轮次：免 LLM 止损 + 周期台账 ----------------
 
 def check_stop_loss(deps: dict, slot: str = "", max_pct: float | None = None) -> dict:
@@ -1076,8 +1419,9 @@ def check_stop_loss(deps: dict, slot: str = "", max_pct: float | None = None) ->
     这是「每 N 分钟判断一次」最值钱的一半 —— 止损是最该发生在盘中的动作，
     却完全不需要 LLM（不烧钱、不等 3~10 秒、不会因解析失败而漏掉）。
     止损线取该股最近一笔**未平仓**买入时记录的值（当时 LLM 定的）；
-    max_pct 是止损宽度的**上限**（取 max(LLM值, 上限)），把 LLM 定得过宽的止损
-    收紧 —— 防止它给个 -15% 形同虚设的止损。上限不会把过窄的止损放宽。
+    max_pct 是止损宽度的**上限**：实际止损取 min(LLM给的值, 上限)，把 LLM 定得
+    过宽的止损收紧 —— 防止它给个 -15% 形同虚设的止损。上限只收紧、不会把过窄的
+    止损放宽（min 而非 max，见下面 sl = min(sl, cap) 那行的说明）。
     逐股 try/except 隔离。
     """
     get_conn, quote_fn = deps["get_conn"], deps["quote_fn"]
@@ -1124,7 +1468,13 @@ def check_stop_loss(deps: dict, slot: str = "", max_pct: float | None = None) ->
             row = stops[code]
             sl_raw = row.get("stop_loss_pct")
             sl = float(sl_raw) if sl_raw not in (None, "") else float(conf.get("stop_loss_pct", 8))
-            sl = max(sl, cap)             # 宽度上限：LLM 定得再宽也不放过宽的止损
+            # 宽度上限：把 LLM 定得过宽的止损收紧。**必须是 min 而不是 max**——
+            # 原来写的是 `max(sl, cap)`，而 max(8, 5)=8，等于「取更宽的那个」，
+            # 上限从来只会在 LLM 给得更紧时把它**放宽**，恰好与意图相反
+            # （DEFAULTS 与 config_schema 的注释都写的是「取小值」）。
+            # 2026-09-29 实锤：溜溜梅 LLM 要 8% 止损、配置上限 5%，8% 照走不误，
+            # 隔夜跳空后实际亏 8.98%。min 只会收紧、不会放宽，符合「上限」语义。
+            sl = min(sl, cap)
             cost = positions[code]["cost"]
             pnl_pct = (float(price) / cost - 1) * 100 if cost else 0.0
             if pnl_pct > -sl:
@@ -1438,17 +1788,53 @@ def account_overview(deps: dict) -> dict:
         cur.execute("SELECT snap_date, cash, market_value, total, daily_return "
                     "FROM sa_paper_equity ORDER BY snap_date DESC LIMIT 30")
         equity = [dict(r) for r in cur.fetchall()]
-        # 统计：只算有 alpha 的 resolved 交易；hold 不计
-        cur.execute(
-            "SELECT side, COUNT(*) AS n, AVG(raw_return) AS avg_raw, "
-            "AVG(alpha_return) AS avg_alpha, "
-            "SUM(CASE WHEN alpha_return > 0 THEN 1 ELSE 0 END) AS wins "
-            "FROM sa_paper_trades WHERE status = 'resolved' AND raw_return IS NOT NULL "
-            "AND side IN ('buy','sell') GROUP BY side")
-        stats = {"buy": {}, "sell": {}}
-        for r in cur.fetchall():
-            stats[r["side"]] = {k: (float(v) if v is not None else None)
-                                for k, v in r.items() if k != "side"}
+        # 统计：2026-09-29 重写。原来的口径有三个错，页面显示成「已结算 4 笔 /
+        # 胜率 0%」：
+        #   ① 按**行**统计，不按回合。一笔完整的「买入→卖出」会算成 2 行，
+        #      而且卖出行本来就被排除在分母外，于是买入胜率和卖出胜率是
+        #      两个互不相干的口径，页面却并排显示。
+        #   ② wins 用 SUM(CASE WHEN alpha_return>0 ...)，而主动卖出路径
+        #      （_settle_buy_rows）根本不写 alpha_return，全是 NULL。
+        #      SQL 里 NULL>0 得 NULL，SUM 全 NULL 得 NULL → 前端 ||0 兜成 0
+        #      → 胜率恒为 0%。这就是「胜率显示 0%」的直接原因。
+        #   ③ 只取 status='resolved'，漏了 status='closed'（卖出平仓），
+        #      于是已结算的笔数被系统性低估。
+        # 现在：只认**已平仓的买入**（raw_return 非空，即有了结价），
+        # 一行买入 = 一个回合，分母/分子都不再被 NULL 污染；
+        # alpha 缺失时 wins 退回按 raw_return 判，并在返回值里标明口径。
+        cur.execute("""
+            SELECT COUNT(*)                                   AS n,
+                   COUNT(*) FILTER (WHERE raw_return > 0)     AS wins_raw,
+                   COUNT(*) FILTER (WHERE alpha_return > 0)   AS wins_alpha,
+                   COUNT(*) FILTER (WHERE alpha_return IS NOT NULL) AS n_alpha,
+                   AVG(raw_return)                            AS avg_raw,
+                   AVG(alpha_return)                          AS avg_alpha
+            FROM sa_paper_trades
+            WHERE status IN ('resolved','closed') AND side = 'buy'
+              AND raw_return IS NOT NULL""")
+        r = cur.fetchone()
+        n_all = int(r["n"] or 0)
+        n_alpha = int(r["n_alpha"] or 0)
+        # 有 alpha 就按 alpha 判（相对基准的胜负，这才是「胜率」该有的含义），
+        # 全部缺失时退回 raw_return 判，并把 alpha_wins 置 0 提醒口径已降级。
+        if n_alpha:
+            wins = int(r["wins_alpha"] or 0)
+            basis = "alpha"
+        else:
+            wins = int(r["wins_raw"] or 0)
+            basis = "raw"
+        avg_raw = float(r["avg_raw"]) if r["avg_raw"] is not None else None
+        avg_alpha = float(r["avg_alpha"]) if r["avg_alpha"] is not None else None
+        stats = {
+            "n": n_all,
+            "wins": wins,
+            "avg_raw": avg_raw,
+            "avg_alpha": avg_alpha,
+            "n_alpha": n_alpha,
+            # 前端据此显示「胜率(相对基准)」还是「胜率(绝对收益)」，
+            # 避免把两种口径混为一谈。
+            "win_basis": basis,
+        }
     quotes = quote_fn(list(positions.keys())) if positions else {}
     pos_out = []
     market_value = 0.0
@@ -1512,3 +1898,181 @@ def reset_account(deps: dict, initial_cash: float) -> dict:
                     "VALUES (1, %s, %s, %s)", (initial_cash,) * 3)
         conn.commit()
     return {"ok": True, "initial_cash": initial_cash}
+
+
+# ---------------- 回合配对（页面「每笔交易」列表用） ----------------
+import sys
+from datetime import date, datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+
+def rounds(deps: dict, code: str = "", only_closed: bool = False,
+           only_open: bool = False) -> list[dict]:
+    """配对出每笔模拟交易的完整过程。返回按最近活动倒序。
+
+    only_closed / only_open 可分别只看已平仓 / 持有中。
+    """
+    get_conn = deps["get_conn"]
+    sql = ("SELECT id, code, name, trade_date, slot, side, shares, price, value, "
+           "fee_total, confidence, stop_loss_pct, reasoning, report, decision_raw, "
+           "status, auto_closed, settle_date, settle_price, raw_return, "
+           "alpha_return, benchmark "
+           "FROM sa_paper_trades WHERE side IN ('buy','sell') "
+           "AND status <> 'skipped'")
+    params: list = []
+    if code:
+        sql += "AND code = %s "
+        params.append(code)
+    sql += "ORDER BY code, id"
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+    # ---- 逐只股票独立先进先出核销 ----
+    # 2026-09-29 修：第一版把**全表**按 id 顺序塞进同一个 FIFO 队列，结果
+    # 512710 的卖出行 id=165 去核销了排在它前面的 000839 买入 id=10，
+    # 于是国安股份@2.83 被算成「买入 512710@0.61 卖出」—— 显示成 +29571%。
+    # 持仓是按 code 分别推导的（_derive_paper_positions），配对也必须按 code 分组，
+    # 否则成交价对不上。ORDER BY code, id 让同code连续，再按 code 切分。
+    closed: list[dict] = []
+    by_code: dict[str, list[dict]] = {}
+    for r in rows:
+        by_code.setdefault(r["code"], []).append(r)
+
+    for _code in sorted(by_code):
+        closed.extend(_fifo_rounds(by_code[_code]))
+    return _sort_rounds(closed, only_closed, only_open)
+
+
+def _fifo_rounds(rows: list[dict]) -> list[dict]:
+    """单只股票的先进先出配对（buy 先进队列，sell 从队首扣）。"""
+    open_lots: list[dict] = []      # 未被卖掉的买入
+    closed: list[dict] = []         # 已配对的片段
+    for r in rows:
+        shares = int(r["shares"] or 0)
+        if shares <= 0:
+            continue
+        if r["side"] == "buy":
+            open_lots.append(r)
+            continue
+        # sell：从最早的买入开始扣
+        left = shares
+        while left > 0 and open_lots:
+            lot = open_lots[0]
+            lot_sh = int(lot["shares"] or 0)
+            take = min(lot_sh, left)
+            if take < 1:
+                open_lots.pop(0)
+                continue
+            entry_fee = float(lot["fee_total"] or 0)
+            sell_fee = float(r["fee_total"] or 0)
+            # 费用按股数分摊到本片段，净投入/净回款都算真实值
+            e_in = entry_fee * take / lot_sh if lot_sh else 0.0
+            s_out = sell_fee * take / shares if shares else 0.0
+            net_in = take * float(lot["price"] or 0) + e_in
+            net_out = take * float(r["price"] or 0) - s_out
+            closed.append({
+                "code": r["code"], "name": r["name"] or lot["name"],
+                "entry": {
+                    "id": lot["id"], "date": str(lot["trade_date"])[:10],
+                    "slot": lot["slot"] or "", "price": float(lot["price"] or 0),
+                    "shares": take, "fee": round(e_in, 2),
+                    "net_in": round(net_in, 2),
+                    "confidence": lot["confidence"],
+                    "stop_loss_pct": (float(lot["stop_loss_pct"])
+                                      if lot["stop_loss_pct"] is not None else None),
+                    "reasoning": lot["reasoning"] or "",
+                    "report": (lot["report"] or "")[:1200],
+                },
+                "exit": {
+                    "id": r["id"], "date": str(r["trade_date"])[:10],
+                    "slot": r["slot"] or "", "price": float(r["price"] or 0),
+                    "shares": take, "fee": round(s_out, 2),
+                    "net_out": round(net_out, 2),
+                    "confidence": r["confidence"],
+                    "reasoning": r["reasoning"] or "",
+                },
+                "pnl": round(net_out - net_in, 2),
+                "pnl_pct": round((net_out / net_in - 1) * 100, 2) if net_in else None,
+                "raw_return": (float(lot["raw_return"])
+                               if lot["raw_return"] is not None else None),
+                "alpha_return": (float(lot["alpha_return"])
+                                 if lot["alpha_return"] is not None else None),
+                "benchmark": lot["benchmark"] or "",
+                "settled": bool(lot["settle_date"]),
+                "auto_closed": bool(lot["auto_closed"] or r["auto_closed"]),
+                "_last": str(r["trade_date"]),
+            })
+            left -= take
+            if take >= lot_sh:
+                open_lots.pop(0)
+            else:
+                lot["shares"] = lot_sh - take
+                lot["fee_total"] = entry_fee - e_in
+                break
+    # ---- 剩余未卖出的买入 = 持有中的回合 ----
+    for lot in open_lots:
+        sh = int(lot["shares"] or 0)
+        if sh <= 0:
+            continue
+        fee = float(lot["fee_total"] or 0)
+        closed.append({
+            "code": lot["code"], "name": lot["name"],
+            "entry": {
+                "id": lot["id"], "date": str(lot["trade_date"])[:10],
+                "slot": lot["slot"] or "", "price": float(lot["price"] or 0),
+                "shares": sh, "fee": round(fee, 2),
+                "net_in": round(sh * float(lot["price"] or 0) + fee, 2),
+                "confidence": lot["confidence"],
+                "stop_loss_pct": (float(lot["stop_loss_pct"])
+                                  if lot["stop_loss_pct"] is not None else None),
+                "reasoning": lot["reasoning"] or "",
+                "report": (lot["report"] or "")[:1200],
+            },
+            "exit": None,
+            "pnl": None, "pnl_pct": None,
+            "raw_return": (float(lot["raw_return"])
+                           if lot["raw_return"] is not None else None),
+            "alpha_return": (float(lot["alpha_return"])
+                             if lot["alpha_return"] is not None else None),
+            "benchmark": lot["benchmark"] or "",
+            "settled": bool(lot["settle_date"]),
+            "auto_closed": bool(lot["auto_closed"]),
+            "holding_days": _tdays(str(lot["trade_date"])[:10], today()),
+            "_last": str(lot["trade_date"]),
+        })
+    return closed
+
+
+def _sort_rounds(closed: list[dict], only_closed: bool,
+                 only_open: bool) -> list[dict]:
+    """过滤 + 计算持有天数 + 按最近活动倒序。"""
+    if only_closed:
+        closed = [r for r in closed if r["exit"]]
+    if only_open:
+        closed = [r for r in closed if not r["exit"]]
+    for r in closed:
+        if r["exit"]:
+            r["holding_days"] = _tdays(r["entry"]["date"], r["exit"]["date"])
+        r.pop("_last", None)
+    closed.sort(key=lambda r: (r["exit"]["date"] if r["exit"] else r["entry"]["date"]),
+                reverse=True)
+    return closed
+
+
+def _tdays(d1: str, d2: str) -> int:
+    """两个日期之间的自然日数（>=0）。解析失败返回 None。"""
+    try:
+        a = date.fromisoformat(str(d1)[:10])
+        b = date.fromisoformat(str(d2)[:10])
+        return max(0, (b - a).days)
+    except (ValueError, TypeError):
+        return None
+
+
+def today() -> date:
+    return datetime.now().date()
