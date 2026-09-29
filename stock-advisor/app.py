@@ -215,7 +215,10 @@ def init_db():
     --   stop_loss  止损（现价 <= 成本*(1-target_pct%) 触发，target_pct 存损失%）
     --   ladder     分批止盈（config.steps = [{pct, ratio}...]，到档通知逐档卖出）
     --   time_stop  时间止盈（config.hold_days 个交易日后通知复盘）
-    DROP TABLE IF EXISTS sa_strategies;
+    -- 2026-09-29 移除「每次启动 DROP TABLE sa_strategies」：
+    -- 那条语句会把用户通过 /api/strategies 建的策略**每次重启都清空**（策略表当时是 0 行，一直没暴露），
+    -- 并且在 sa_paper_strategy_bindings 加上外键后直接把启动顶崩（DependentObjectsStillExist）。
+    -- 旧版「按股票建行」的表结构改由 _drop_legacy_strategies() 一次性迁移处理。
     CREATE TABLE IF NOT EXISTS sa_strategies (
         id            BIGSERIAL PRIMARY KEY,
         name          VARCHAR(128) NOT NULL DEFAULT '',
@@ -327,6 +330,57 @@ def init_db():
         created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
         UNIQUE (code, strategy_id)
     );
+    -- ============ 模拟盘策略对照（2026-09-29）============
+    -- 目的：模拟盘的一个重要作用是**探索策略**。同一笔模拟买入并行挂多个策略，
+    -- 各自只记「影子卖出」而**不动真仓**，跑到最后对比谁赚得多。
+    -- 为什么必须影子而不是真卖：真卖一次只能跑一套策略，就没法对照了；
+    -- 影子模式下「策略卖」与「LLM 自己判卖」也能同台比较。
+    -- 触发判定复用 app._eval_strategy（与真实持仓同一套语义）。
+    CREATE TABLE IF NOT EXISTS sa_paper_strategy_bindings (
+        id           BIGSERIAL PRIMARY KEY,
+        strategy_id  BIGINT      NOT NULL REFERENCES sa_strategies(id) ON DELETE CASCADE,
+        code         VARCHAR(8)  NOT NULL,
+        enabled      BOOLEAN     NOT NULL DEFAULT TRUE,
+        -- 影子仓的成本与股数。有实盘模拟持仓时每轮刷新成该持仓的加权成本；
+        -- 实盘持仓被 LLM 平掉后**冻结**在此（frozen_at），策略继续跟踪这只虚拟持仓 ——
+        -- 否则「LLM 隔夜就止损 vs 止盈策略会拿到什么」这个最有价值的对照会中途消失。
+        base_cost    NUMERIC(12,4),
+        base_shares  INTEGER,
+        frozen_at    TIMESTAMPTZ,
+        -- 移动止盈/回撤止盈的峰值基准；随行情单调抬升
+        peak_price   NUMERIC(12,4),
+        -- 分批止盈已到第几档
+        ladder_step  INTEGER     NOT NULL DEFAULT 0,
+        -- 策略终结（触发最后一档 / 固定止盈 / 止损等一次性策略触发后置位）
+        triggered_at TIMESTAMPTZ,
+        note         TEXT        NOT NULL DEFAULT '',
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (strategy_id, code)
+    );
+    CREATE INDEX IF NOT EXISTS idx_sa_paper_sb_open
+        ON sa_paper_strategy_bindings (enabled, triggered_at, code);
+
+    -- 影子卖出记录：策略认为「该卖了」的时刻与价格，**不产生任何真实成交**
+    CREATE TABLE IF NOT EXISTS sa_paper_strategy_exits (
+        id           BIGSERIAL PRIMARY KEY,
+        binding_id   BIGINT      NOT NULL REFERENCES sa_paper_strategy_bindings(id) ON DELETE CASCADE,
+        strategy_id  BIGINT      NOT NULL,
+        code         VARCHAR(8)  NOT NULL,
+        exit_date    DATE        NOT NULL,
+        exit_slot    VARCHAR(8)  NOT NULL DEFAULT '',
+        price        NUMERIC(12,4)   NOT NULL,
+        base_cost    NUMERIC(12,4)   NOT NULL,
+        shares       INTEGER         NOT NULL DEFAULT 0,
+        ratio        NUMERIC(6,4)    NOT NULL DEFAULT 1,
+        pnl_pct      NUMERIC(10,6)   NOT NULL DEFAULT 0,
+        pnl_amount   NUMERIC(14,2)   NOT NULL DEFAULT 0,
+        reason       TEXT        NOT NULL DEFAULT '',
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_sa_paper_se_code
+        ON sa_paper_strategy_exits (code, exit_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_sa_paper_se_bind
+        ON sa_paper_strategy_exits (binding_id, exit_date DESC);
     -- 财经日历手动事件（FOMC/CPI 等非规则日期；规则事件由 econ_calendar 本地生成）
     CREATE TABLE IF NOT EXISTS sa_calendar_events (
         id          BIGSERIAL PRIMARY KEY,
@@ -460,6 +514,12 @@ def init_db():
     -- 板块轮动快照（建表 DDL 以 sector.py 的 SNAPSHOT_TABLE_DDL 为准，那里也幂等）
     """
     last_exc: Exception | None = None
+    # 旧版 sa_strategies 是「按股票建行」的，列结构与现在完全不同，
+    # CREATE TABLE IF NOT EXISTS 修不了它，只能重建。只在确实是旧结构时动手。
+    try:
+        _drop_legacy_strategies()
+    except Exception as exc:
+        print(f"[init_db] 旧策略表迁移跳过: {exc}", flush=True)
     for stmt in [s.strip() for s in ddl.split(";") if s.strip()]:
         # 逐行剥掉注释，不管注释在段首还是段中。
         # 2026-09-29 修：原来只在 `stmt.startswith("--")` 时才剥，而 ddl 是用
@@ -495,9 +555,42 @@ def init_db():
         with get_conn() as conn, conn.cursor() as cur:
             _alter_column_widths(cur)
         _migrate_json_if_any()
+        # 预置三套止盈/止损策略（保守/标准/激进）。sa_strategies 原本是空的 ——
+        # 策略系统建好了但一条策略都没定义过，不预置的话「探索策略」无从下手。
+        # 注意必须另开连接：上面 _alter_column_widths 用的 with 块已关闭。
+        try:
+            with get_conn() as pconn:
+                _added = paper_strategy.preset_strategies(pconn)
+                pconn.commit()
+            if _added:
+                print(f"[init_db] 预置策略 {_added} 条", flush=True)
+        except Exception as exc:
+            print(f"[init_db] 预置策略失败（非致命）: {exc}", flush=True)
     except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
         print(f"[init_db] post-DDL step failed (non-fatal): {exc}", flush=True)
     return
+
+
+def _drop_legacy_strategies() -> None:
+    """旧版 sa_strategies 按股票建行（列是 code/kind/target_pct…），与现结构不兼容。
+
+    只在检测到「缺 kind 列」时才 DROP —— 这是一次性迁移，不能每次启动都跑：
+    用户建的策略会被清空，而且现在 sa_paper_strategy_bindings 有外键依赖它，
+    DROP 会直接让 init_db 抛 DependentObjectsStillExist、服务起不来。
+    """
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""SELECT to_regclass('sa_strategies')""")
+        if not cur.fetchone()[0]:
+            return
+        cur.execute("""SELECT 1 FROM information_schema.columns
+                       WHERE table_name = 'sa_strategies' AND column_name = 'kind'""")
+        if cur.fetchone():
+            return                      # 已是现结构，不动
+        cur.execute("SELECT count(*) FROM sa_strategies")
+        n = cur.fetchone()[0]
+        cur.execute("DROP TABLE IF EXISTS sa_strategies CASCADE")
+    print(f"[init_db] 旧版策略表（{n} 行）已重建为模板表", flush=True)
+
 
 
 def _alter_column_widths(cur):
@@ -2922,7 +3015,14 @@ def _alerts_loop():
 # ---------------- 模拟交易（LLM 决策 + 结算反思沉淀，见 paper_trading.py） ----------------
 
 import paper_trading
+import paper_strategy
 import paper_memory
+
+
+def _paper_strategy_deps() -> dict:
+    """paper_strategy 注入依赖（quote_fn 复用行情，账务复用 paper_trading）。"""
+    return {"get_conn": get_conn, "quote_fn": fetch_quotes,
+            "conf": (_conf_section("paper") or {}).get("strategy") or {}}
 
 
 def _paper_deps(conf: dict | None = None) -> dict:
@@ -3162,6 +3262,71 @@ def paper_cycles(trade_date: str = "", limit: int = 40):
     return {"items": rows}
 
 
+# ---- 模拟盘策略对照的请求模型 ----
+# 必须定义在端点之前：FastAPI 在装饰时就求值注解，定义在后面会直接 NameError 起不来。
+class PaperStrategyBindIn(BaseModel):
+    code: str = Field(min_length=1, max_length=8)
+    strategy_id: int
+    note: str = Field(default="", max_length=200)
+
+
+class PaperStrategyToggleIn(BaseModel):
+    enabled: bool
+
+
+@app.get("/api/paper/strategies")
+def paper_strategies_list():
+    """可用的止盈/止损策略 + 已挂到模拟持仓上的绑定。"""
+    return paper_strategy.list_bindings(_paper_strategy_deps())
+
+
+@app.post("/api/paper/strategies/preset")
+def paper_strategies_preset():
+    """写入预置的三套策略（保守/标准/激进）。已存在同名则跳过。"""
+    return {"ok": True, "added": paper_strategy.ensure_preset()}
+
+
+@app.post("/api/paper/strategies/bind")
+def paper_strategy_bind(body: PaperStrategyBindIn):
+    """给某只票挂上策略（影子模式：只记录，不真卖、不动现金）。"""
+    try:
+        return paper_strategy.bind(_paper_strategy_deps(),
+                                   body.code, body.strategy_id, body.note or "")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.patch("/api/paper/strategies/bind/{bid}")
+def paper_strategy_toggle(bid: int, body: PaperStrategyToggleIn):
+    """临时停用/恢复一条绑定（保留历史影子卖出，不删）。"""
+    ok = paper_strategy.set_enabled(_paper_strategy_deps(), bid, body.enabled)
+    if not ok:
+        raise HTTPException(404, "绑定不存在")
+    return {"ok": True, "enabled": body.enabled}
+
+
+@app.delete("/api/paper/strategies/bind/{bid}")
+def paper_strategy_unbind(bid: int):
+    ok = paper_strategy.unbind(_paper_strategy_deps(), bid)
+    if not ok:
+        raise HTTPException(404, "绑定不存在")
+    return {"ok": True}
+
+
+@app.get("/api/paper/strategy-compare")
+def paper_strategy_compare(code: str = ""):
+    """策略对照：策略卖 vs 持有到今天 vs LLM 实际怎么卖。"""
+    return paper_strategy.compare(_paper_strategy_deps(), code=code)
+
+
+@app.post("/api/paper/strategies/scan")
+def paper_strategy_scan():
+    """手动触发一次扫描。"""
+    hits = paper_strategy.scan_once(
+        _paper_strategy_deps(), slot=_paper_state.get("current_slot") or "manual")
+    return {"ok": True, "triggered": len(hits), "items": hits}
+
+
 @app.get("/api/paper/reconcile")
 def paper_reconcile(fix: bool = False):
     """用成交流水重算现金并与账面比对。fix=true 才改写账面（不可逆，谨慎）。
@@ -3392,6 +3557,19 @@ def _paper_run_cycle(conf: dict, slot: str, kind: str = "intraday",
             else:
                 skipped += 1
         planned = len(decided) + len(sl.get("sold", []))
+        # 顺带扫一遍策略（影子模式：只记录，不动持仓/现金）。
+        # 放在这里而不是独立线程：策略判定要读当前持仓与现价，与本轮决策
+        # 用同一份快照，省一次行情请求，也不会出现「策略看到的持仓是上一轮的」。
+        try:
+            _hits = paper_strategy.scan_once(
+                _paper_strategy_deps(), slot=slot or "round")
+            if _hits:
+                _paper_state["last_strategy_hits"] = _hits
+                print(f"[paper] 策略触发 {len(_hits)} 次（影子记录）: "
+                      + ", ".join(f"{h.get('code')} {h.get('reason','')}" for h in _hits[:5]),
+                      flush=True)
+        except Exception as exc:
+            print(f"[paper] 策略扫描失败: {exc}", flush=True)
         _paper_state["last_decision"] = res
         print(f"[paper] {slot} {me} {kind}: 判断 {planned} 成交 {acted} 观望 {holds} "
               f"未成交 {skipped} 用时 {time.time()-t0:.0f}s", flush=True)

@@ -1190,6 +1190,56 @@
       <div id="paper-rounds" style="margin-top:8px"></div>
       <div id="paper-rounds-empty" class="empty hide">还没有成交流水。</div>
     </div>
+
+    <div class="card">
+      <details>
+        <summary style="cursor:pointer">
+          <b style="font-size:13px">🧪 策略对照（影子模式：策略只记「假如卖出」，不真卖）</b>
+        </summary>
+        <div class="muted" style="font-size:12px;margin:6px 0">
+          模拟盘的一个重要用途是<b>探索策略</b>。同一笔买入并行挂多套止盈策略，各自只记一笔
+          <b>影子卖出</b>，<b>不动持仓、不改现金</b>，跑到最后同台比对。
+          「死拿」是共同对照基准，<b>超额%</b> = 策略% − 死拿%，正数表示这套策略比一直拿着强。
+          <br>
+          模拟仓被 LLM 平掉后策略会<b>冻结影子仓继续跟踪</b>（标「已冻结」），
+          这样才能看出「LLM 卖早了还是卖晚了」。
+          判定规则与真实持仓止盈策略完全一致（复用同一个 <code>_eval_strategy</code>）。
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0">
+          <select id="paper-strat-filter" oninput="renderPaperStrategyCompare()">
+            <option value="all">全部标的</option>
+            <option value="live">仅仍在持仓</option>
+            <option value="triggered">仅已触发策略</option>
+            <option value="edge">仅策略跑赢死拿</option>
+          </select>
+          <input id="paper-strat-code" placeholder="代码/名称" style="width:96px"
+                 oninput="renderPaperStrategyCompare()">
+          <button class="btn" onclick="scanPaperStrategies()">立即扫描一次</button>
+          <button class="btn" onclick="loadPaperStrategyCompare()">刷新</button>
+          <span id="paper-strat-hint" class="muted" style="font-size:12px"></span>
+        </div>
+        <div id="paper-strat-summary" style="margin-bottom:8px"></div>
+        <div id="paper-strat-list"></div>
+        <div id="paper-strat-empty" class="empty hide">
+          还没有策略对照数据。点「立即扫描一次」即可开始积累。<br>
+          <span class="muted">对照数据靠时间攒，建议保持「新持仓自动挂策略」开启
+            （配置 → 模拟盘 → 策略对照）。</span>
+        </div>
+        <details style="margin-top:10px">
+          <summary style="cursor:pointer"><b style="font-size:13px">⚙️ 手动绑定策略</b></summary>
+          <div class="muted" style="font-size:12px;margin:6px 0">
+            默认每轮扫描会给所有模拟持仓自动挂上全部策略，这里用于按需增删。
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0">
+            <input id="paper-strat-bind-code" placeholder="代码" style="width:90px">
+            <select id="paper-strat-bind-sid"></select>
+            <button class="btn" onclick="bindPaperStrategy()">绑定</button>
+          </div>
+          <div id="paper-strat-strategies"></div>
+          <div id="paper-strat-bindings" style="margin-top:8px"></div>
+        </details>
+      </details>
+    </div>
     <div class="card">
       <details>
         <summary style="cursor:pointer"><b style="font-size:13px">🗒️ 决策流水（含观望，一行一个决策）</b></summary>
@@ -2655,6 +2705,245 @@ function paperStatusBadge(t) {
   }
   return '<span class="badge" style="background:#eee;color:#999">—</span>';
 }
+  // ---------- 模拟盘策略对照（2026-09-29）----------
+  // 影子模式：策略触发只记「影子卖出」，不动持仓/现金。同一笔买入并行挂多套策略，
+  // 跑到最后同台比对 —— 这才是「探索策略」要的东西，单看一套策略的收益没有意义。
+  const stratStatusBadge = {
+    triggered: ['已触发', '#fde8e8', '#b42318'],
+    holding:   ['持仓中', '#e8f0fe', '#1a56b0'],
+    frozen:    ['已冻结', '#f4f4f5', '#71717a'],
+    no_base:   ['无基准', '#f4f4f5', '#a1a1aa'],
+  };
+
+  async function loadPaperStrategyCompare() {
+    try {
+      const d = await api('/api/paper/strategy-compare');
+      window.__paperStrat = d;
+      renderPaperStrategyCompare();
+      loadPaperStrategyBindings();
+    } catch (e) {
+      const b = $('paper-strat-list');
+      if (b) b.innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>';
+    }
+  }
+
+  function renderPaperStrategyCompare() {
+    const d = window.__paperStrat || {};
+    const all = d.items || [];
+    const box = $('paper-strat-list');
+    if (!box) return;
+    const f = ($('paper-strat-filter') || {}).value || 'all';
+    const kw = (($('paper-strat-code') || {}).value || '').trim().toLowerCase();
+    let items = all.filter(it => {
+      if (f === 'live' && !(it.live_shares > 0)) return false;
+      if (f === 'triggered' && !it.rows.some(r => r.status === 'triggered')) return false;
+      if (f === 'edge' && !it.rows.some(r => (r.edge || 0) > 0)) return false;
+      if (kw && !((it.code || '') + ' ' + (it.name || '')).toLowerCase().includes(kw)) return false;
+      return true;
+    });
+    $('paper-strat-empty').classList.toggle('hide', all.length > 0);
+    if (!items.length) {
+      box.innerHTML = all.length ? '<div class="empty">当前筛选无匹配</div>' : '';
+      renderPaperStratSummary(d.summary, all);
+      return;
+    }
+    const pct = v => (v == null ? '—' : signed(v) + '%');
+    box.innerHTML = items.map(it => {
+      const head = '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;'
+        + 'margin:10px 0 4px;padding-top:8px;border-top:1px solid var(--border,#eee)">'
+        + '<b style="font-size:13px">' + esc(it.code) + ' ' + esc(it.name || '') + '</b>'
+        + (it.live_shares > 0
+            ? '<span class="badge" style="background:#e8f0fe;color:#1a56b0">持仓 '
+              + fmt(it.live_shares) + ' 股</span>'
+            : '<span class="badge" style="background:#f4f4f5;color:#71717a">'
+              + 'LLM 已平仓</span>')
+        + '<span class="muted" style="font-size:12px">现价 ' + fmt(it.price)
+        + ' · 基准成本 ' + fmt(it.rows[0] && it.rows[0].base_cost) + '</span>'
+        + (it.llm_pct == null ? ''
+            : '<span class="muted" style="font-size:12px">· LLM 实际 '
+              + '<b class="' + cls(it.llm_pct) + '">' + pct(it.llm_pct) + '</b>'
+              + '（' + it.llm_rounds + ' 笔已平）</span>')
+        + '</div>';
+      const rows = it.rows.map(r => {
+        const sb = stratStatusBadge[r.status] || ['—', '#f4f4f5', '#71717a'];
+        const exits = (r.exits || []).map(e =>
+          '<div class="muted" style="font-size:11px;padding-left:8px">'
+          + '└ 影子卖出 ' + esc(e.date) + ' @' + fmt(e.price)
+          + (e.ratio < 1 ? '（卖 ' + (e.ratio * 100).toFixed(0) + '%）' : '')
+          + ' 收益 <b class="' + cls(e.pnl_pct) + '">' + pct(e.pnl_pct) + '</b>'
+          + (e.pnl_amount == null ? ''
+              : ' 金额 ' + (e.pnl_amount > 0 ? '+' : '') + '¥' + fmt(Math.round(e.pnl_amount)))
+          + ' · ' + esc(e.reason || '') + '</div>').join('');
+        return '<tr>'
+          + '<td><b>' + esc(r.name) + '</b><div class="muted" style="font-size:11px">'
+          + esc(r.label) + '</div></td>'
+          + '<td><span class="badge" style="background:' + sb[1] + ';color:' + sb[2] + '">'
+          + sb[0] + '</span>'
+          + (r.frozen ? '<div class="muted" style="font-size:11px">影子仓已冻结</div>' : '')
+          + (r.peak != null
+              ? '<div class="muted" style="font-size:11px">峰值 ' + fmt(r.peak) + '</div>' : '')
+          + (r.ladder_step
+              ? '<div class="muted" style="font-size:11px">已到第 ' + r.ladder_step
+                + ' 档</div>' : '')
+          + '</td>'
+          + '<td class="' + cls(r.strat_pct) + '"><b>' + pct(r.strat_pct) + '</b></td>'
+          + '<td class="muted">' + pct(r.hold_pct) + '</td>'
+          + '<td class="' + cls(r.edge) + '"><b>' + pct(r.edge) + '</b></td>'
+          + '<td style="font-size:11px">' + exits + '</td>'
+          + '</tr>';
+      }).join('');
+      return head + '<div class="table-scroll"><table><thead><tr>'
+        + '<th>策略</th><th>状态</th><th>策略收益</th><th>死拿</th>'
+        + '<th title="策略% − 死拿%，正数 = 这套策略比一直拿着强">超额</th>'
+        + '<th>影子卖出记录</th>'
+        + '</tr></thead><tbody>' + rows + '</tbody></table></div>';
+    }).join('');
+    renderPaperStratSummary(d.summary, all);
+  }
+
+  function renderPaperStratSummary(s, items) {
+    const box = $('paper-strat-summary');
+    if (!box) return;
+    s = s || {};
+    const cards = [
+      ['对照标的', s.codes || 0],
+      ['策略绑定', s.bindings || 0],
+      ['已触发', s.triggered || 0],
+      ['影子仓冻结', s.frozen || 0],
+      ['平均最优超额', s.avg_best_edge == null ? '—' : signed(s.avg_best_edge) + '%'],
+      ['策略间分歧', s.avg_spread == null ? '—' : signed(s.avg_spread) + '%'],
+    ];
+    box.innerHTML = '<div style="display:flex;gap:8px;flex-wrap:wrap">'
+      + cards.map(c =>
+        '<div style="border:1px solid var(--border,#eee);border-radius:6px;'
+        + 'padding:6px 10px;min-width:96px">'
+        + '<div class="muted" style="font-size:11px">' + esc(c[0]) + '</div>'
+        + '<div style="font-size:15px;font-weight:600" class="'
+        + (typeof c[1] === 'string' && c[1].startsWith('-') ? 'down' : '') + '">'
+        + esc(c[1]) + '</div></div>').join('')
+      + '</div>'
+      + '<div class="muted" style="font-size:11px;margin-top:6px">' + esc(s.note || '') + '</div>';
+    const hint = $('paper-strat-hint');
+    if (hint) {
+      const live = (items || []).filter(i => i.live_shares > 0).length;
+      hint.textContent = '显示 ' + (items || []).length + ' 只（其中 ' + live + ' 只仍在持仓）';
+    }
+  }
+
+  async function scanPaperStrategies() {
+    const btn = $('paper-strat-hint');
+    if (btn) btn.textContent = '扫描中…';
+    try {
+      const r = await jsonPost('/api/paper/strategies/scan', {});
+      if (btn) {
+        btn.textContent = r.triggered
+          ? ('本次触发 ' + r.triggered + ' 条影子卖出：'
+             + r.items.map(x => x.code + '（' + x.reason + '）').join('；'))
+          : '本次无触发（策略认为还该拿着）';
+      }
+      await loadPaperStrategyCompare();
+    } catch (e) {
+      if (btn) btn.textContent = '扫描失败：' + e.message;
+    }
+  }
+
+  async function loadPaperStrategyBindings() {
+    try {
+      const d = await api('/api/paper/strategies');
+      const sel = $('paper-strat-bind-sid');
+      if (sel) {
+        sel.innerHTML = (d.strategies || []).map(s =>
+          '<option value="' + s.id + '">' + esc(s.name) + '</option>').join('');
+      }
+      const sbox = $('paper-strat-strategies');
+      if (sbox) {
+        sbox.innerHTML = '<table><thead><tr><th>策略</th><th>类型</th><th>参数</th>'
+          + '<th>说明</th></tr></thead><tbody>'
+          + (d.strategies || []).map(s =>
+            '<tr><td><b>' + esc(s.name) + '</b></td>'
+            + '<td class="muted">' + esc(s.kind) + '</td>'
+            + '<td>' + esc(stratLabel(s)) + '</td>'
+            + '<td class="muted" style="font-size:11px">' + esc(s.note || '') + '</td></tr>'
+          ).join('') + '</tbody></table>';
+      }
+      const bbox = $('paper-strat-bindings');
+      if (bbox) {
+        const bs = d.bindings || [];
+        bbox.innerHTML = '<div class="muted" style="font-size:12px;margin:4px 0">'
+          + '共 ' + bs.length + ' 条绑定</div><div class="table-scroll"><table><thead><tr>'
+          + '<th>代码</th><th>策略</th><th>基准成本</th><th>基准股数</th>'
+          + '<th>峰值</th><th>档位</th><th>影子卖出</th><th>状态</th><th>操作</th>'
+          + '</tr></thead><tbody>'
+          + bs.map(b =>
+            '<tr><td>' + esc(b.code) + '</td>'
+            + '<td>' + esc(b.strategy_name) + '</td>'
+            + '<td>' + fmt(b.base_cost) + '</td>'
+            + '<td>' + fmt(b.base_shares) + '</td>'
+            + '<td>' + fmt(b.peak_price) + '</td>'
+            + '<td>' + (b.ladder_step || 0) + '</td>'
+            + '<td>' + (b.exit_count || 0) + '</td>'
+            + '<td>' + (b.enabled ? '启用' : '<span class="muted">停用</span>')
+            + (b.frozen ? ' · 冻结' : '')
+            + (b.triggered_at ? ' · 已触发' : '') + '</td>'
+            + '<td><button class="btn" onclick="togglePaperStrategyBind(' + b.id + ','
+            + (!b.enabled) + ')">' + (b.enabled ? '停用' : '启用') + '</button> '
+            + '<button class="btn" onclick="unbindPaperStrategy(' + b.id + ')">删除</button>'
+            + '</td></tr>').join('')
+          + '</tbody></table></div>';
+      }
+    } catch (e) {
+      const b = $('paper-strat-strategies');
+      if (b) b.innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>';
+    }
+  }
+
+  // 与后端 paper_strategy.strategy_label 同一口径
+  function stratLabel(s) {
+    const cfg = s.config || {};
+    switch (s.kind) {
+      case 'pct': return '+' + s.target_pct + '% 固定止盈';
+      case 'stop_loss': return '-' + s.target_pct + '% 止损';
+      case 'trailing': return '峰值回撤 ' + s.drawdown_pct + '% 卖出';
+      case 'drawdown': return '盈利>' + s.target_pct + '%后回撤'
+        + s.drawdown_pct + '%卖出';
+      case 'ladder': return (cfg.steps || [])
+        .map(x => '涨' + x.pct + '%卖' + ((x.ratio || 1) * 100) + '%').join(' ');
+      case 'time_stop': return '持有 ' + (cfg.hold_days || s.target_pct) + ' 天';
+      default: return s.kind;
+    }
+  }
+
+  async function bindPaperStrategy() {
+    const code = (($('paper-strat-bind-code') || {}).value || '').trim();
+    const sid = (($('paper-strat-bind-sid') || {}).value || '');
+    if (!code || !sid) { alert('请填代码并选择策略'); return; }
+    try {
+      await jsonPost('/api/paper/strategies/bind',
+        { code: code, strategy_id: parseInt(sid, 10) });
+      $('paper-strat-bind-code').value = '';
+      await loadPaperStrategyCompare();
+    } catch (e) { alert('绑定失败：' + e.message); }
+  }
+
+  async function unbindPaperStrategy(id) {
+    if (!confirm('删除这条绑定？已记录的影子卖出会一并删除。')) return;
+    try {
+      await api('/api/paper/strategies/bind/' + id, { method: 'DELETE' });
+      await loadPaperStrategyCompare();
+    } catch (e) { alert('删除失败：' + e.message); }
+  }
+
+  async function togglePaperStrategyBind(id, enabled) {
+    try {
+      await api('/api/paper/strategies/bind/' + id, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: !!enabled }),
+      });
+      await loadPaperStrategyCompare();
+    } catch (e) { alert('操作失败：' + e.message); }
+  }
+
 async function loadPaper() {
   try {
     const [ov, trades, lessons, cfg, pstat, rounds] = await Promise.all([
@@ -2668,6 +2957,9 @@ async function loadPaper() {
     fillPaperCadence(cfg.sections);
     renderPaperCadenceStatus(pstat);
     loadPaperCycles();
+    // 策略对照单独拉：它要逐票取行情 + 逐 code 做 FIFO 配对，比上面几个重，
+    // 不能塞进 Promise.all 里拖慢模拟盘主体加载。
+    loadPaperStrategyCompare();
     // 账户卡片
     const acc = ov.account || {};
     const st = ov.stats || {};
