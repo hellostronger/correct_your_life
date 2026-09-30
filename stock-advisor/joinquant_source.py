@@ -365,12 +365,13 @@ def stub_score(body: str) -> tuple[int, list[str]]:
     reasons: list[str] = []
     n = 0
     # 1) 函数体只有一个 ... / pass（省略号的典型形态）
-    for m in re.finditer(r"^([ \t]*)def\s+\w+\s*\([^)]*\)\s*(?:->[^:]+)?:\s*\n"
-                         r"((?:[ \t]*\n)*)[ \t]*(\.\.\.|pass)\s*(?:#.*)?$",
+    #    抓**函数名**而不是缩进 —— 第一版把 group(1) 当缩进，输出成
+    #    「函数 def 的函数体是 ...」，等于没说。
+    for m in re.finditer(r"^[ \t]*def\s+(\w+)\s*\([^)]*\)\s*(?:->[^:]+)?:\s*\n"
+                         r"(?:[ \t]*\n)*[ \t]*(\.\.\.|pass)\s*(?:#.*)?$",
                          body, re.M):
         n += 1
-        reasons.append("函数 %s 的函数体是 %s" % (m.group(1).strip() or "def",
-                                              m.group(3)))
+        reasons.append("函数 %s() 的函数体被写成 %s" % (m.group(1), m.group(2)))
     # 2) 独立成行的 ... （连续的省略块）
     n2 = len(re.findall(r"^[ \t]*\.\.\.\s*(?:#.*)?$", body, re.M))
     if n2:

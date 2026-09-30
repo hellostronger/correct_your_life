@@ -23,6 +23,11 @@ import joinquant_source as JS
 
 SOURCE = "joinquant"
 
+# 每篇抓多少条评论。聚宽热门帖 replyCount 能到 7000+，全抓既慢又没用
+# （绝大多数是「谢谢」「学习了」）。抓第一页 50 条，排序交给
+# strategy_extract.load_replies 按信息价值做。
+REPLY_LIMIT = 50
+
 
 def _client(deps):
     conf = deps.get("conf") or {}
@@ -99,11 +104,15 @@ def enqueue(deps: dict, pages: int = 1, limit: int = 20, cate: int = 3,
 # ---------------- 阶段 2：抓详情 + 源码 ----------------
 
 def fetch_details(deps: dict, limit: int = 20, only_with_code: bool = False,
-                  refetch: bool = False) -> dict:
+                  with_replies: bool = True) -> dict:
     """取详情 + 源码并落库。
 
-    only_with_code=True 时只抓列表摘要里就带 ``` 的（快，但漏很多 ——
-    实测摘要被截断，60 篇里 0 篇在摘要带代码，所以**默认 False** 才对）。
+    only_with_code=True 时只保存有源码的（其余标 skipped）—— 可以不抓，
+    因为实测列表摘要是截断的，60 篇里 0 篇在摘要里带代码，所以**默认 False**
+    才对（否则会几乎啥也抓不到）。
+
+    with_replies=True（默认）会连评论区一起抓。**别为了省请求关掉** ——
+    抽取质量直接靠它。
     """
     cli = _client(deps)
     get_conn = deps["get_conn"]
@@ -156,13 +165,20 @@ def fetch_details(deps: dict, limit: int = 20, only_with_code: bool = False,
             txt = JS.md_to_text(md)
             ch = JS.content_hash(txt)
 
-            # 评论区只在正文没找到源码时才拉（省请求）
+            # 评论区什么时候抓？
+            # 原来只在「正文没抽到源码」时才抓，省请求。但那是错的：
+            # 正文有代码的帖子，评论区同样有高价值内容 —— 别人贴的改进版、
+            # 「这策略在XX市况下失效」的实测反馈、作者自己补的参数。
+            # 而 LLM 抽取恰恰最需要这些（你要求「原文与评论区里的源码要
+            # 特别参考」）。所以默认两个都抓，with_replies=False 才省。
             src = JS.extract_source(md, None)
             replies = []
-            if not src["has_code"] and d.get("reply_count"):
+            want_replies = with_replies or (not src["has_code"] and d.get("reply_count"))
+            if want_replies and d.get("reply_count"):
                 try:
-                    replies = cli.replies(d["post_id"], limit=50, page=1)
-                    src = JS.extract_source(md, replies)
+                    replies = cli.replies(d["post_id"], limit=REPLY_LIMIT, page=1)
+                    if not src["has_code"]:
+                        src = JS.extract_source(md, replies)
                 except Exception:          # noqa: BLE001
                     replies = []
             if src["has_code"]:
@@ -203,8 +219,38 @@ def _bump_fail(cur, uh: str, err: str):
     _log(cur, uh, "error", "detail", err)
 
 
+def _store_replies(cur, post_id: str, replies: list[dict], author: str = ""):
+    """落库评论区。
+
+    为什么必须存：**评论区的信息密度常常比正文高**。实测「聚宽新手指南」
+    正文 825 字一个代码块都没有，但下面 7000 多条回复里全是实操问答；
+    也有「源码在哪」的答案是作者自己在评论里贴的。第一版我把 replies
+    拼成个 list 就扔了（拼完没落库），等于把最该看的那部分丢了。
+    """
+    if not replies:
+        return
+    cur.execute("DELETE FROM sa_strategy_reply WHERE article_id=%s", (post_id,))
+    rows = []
+    for e in replies:
+        txt = e.get("content") or ""
+        nblk = len(JS.code_blocks(txt))
+        who = (e.get("author") or "").strip()
+        rows.append((e.get("reply_id") or JS.content_hash(txt),
+                     post_id, who, txt, len(txt), nblk > 0, nblk,
+                     bool(author) and who == author.strip(),
+                     e.get("backtest_id", ""), e.get("backtest_name", ""),
+                     e.get("add_time") or None))
+    cur.executemany(
+        """INSERT INTO sa_strategy_reply
+           (reply_id, article_id, author, content, content_len, has_code,
+            n_code_blocks, is_author, backtest_id, backtest_name, add_time)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+           ON CONFLICT (reply_id) DO NOTHING""", rows)
+
+
 def _store_article(cur, d: dict, uh: str, url: str, md: str, txt: str,
                    ch: str, src: dict, replies: list[dict]):
+    _store_replies(cur, d["post_id"], replies, author=d.get("author", ""))
     s = src.get("source") or {}
     ev = []
     for e in replies[:20]:
@@ -242,6 +288,13 @@ def _store_article(cur, d: dict, uh: str, url: str, md: str, txt: str,
          d["collect_count"], d["clone_count"],
          d["add_time"] or None, d["mod_time"] or None, d["last_active"] or None,
          True))
+    # 抓完就排进 LLM 抽取队列。延迟 import 避免循环依赖
+    # （strategy_extract 不 import 本模块，但它 import llm_advisor）
+    try:
+        import strategy_extract as SX
+        SX.enqueue_extract(cur, d["post_id"])
+    except Exception as exc:                # noqa: BLE001
+        _log(cur, uh, "warn", "enqueue_extract", str(exc)[:200])
     # 源码单独存（内容长，不适合塞 JSONB 字段做检索）
     cur.execute("DELETE FROM sa_strategy_source WHERE post_id=%s", (d["post_id"],))
     if src["has_code"]:

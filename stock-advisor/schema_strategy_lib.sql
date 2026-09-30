@@ -111,6 +111,13 @@ CREATE TABLE IF NOT EXISTS sa_strategy_digest (
     portable_score SMALLINT   NOT NULL DEFAULT 0,
     portable_why  TEXT        NOT NULL DEFAULT '',
     -- ---- 抽取过程的元信息（可追溯：哪次抽取、用的什么模型、多少 token）----
+    -- uncertainty / needs_research / research_hint 这三列是**抽取器自己的
+    -- 产出，不是文章的**。它们回答的是「这份抽取可信吗、还缺什么要补查」。
+    -- 没有它们，被脱敏的帖子抽出来的「实现步骤」看起来和完整源码抽出来的
+    -- 一模一样，我就分不出哪个能拿去跑、哪个只是照着空壳编出来的。
+    uncertainty   TEXT        NOT NULL DEFAULT '',
+    needs_research BOOLEAN    NOT NULL DEFAULT FALSE,
+    research_hint TEXT        NOT NULL DEFAULT '',
     extract_model VARCHAR(128) NOT NULL DEFAULT '',
     extract_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     extract_cost  JSONB       NOT NULL DEFAULT '{}'::jsonb,
@@ -179,6 +186,10 @@ ALTER TABLE sa_strategy_source
     ADD COLUMN IF NOT EXISTS stub_reasons JSONB     NOT NULL DEFAULT '[]'::jsonb,
     ADD COLUMN IF NOT EXISTS blocks      JSONB       NOT NULL DEFAULT '[]'::jsonb,
     ADD COLUMN IF NOT EXISTS n_blocks    INTEGER     NOT NULL DEFAULT 1;
+ALTER TABLE sa_strategy_digest
+    ADD COLUMN IF NOT EXISTS uncertainty    TEXT     NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS needs_research BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS research_hint  TEXT     NOT NULL DEFAULT '';
 ALTER TABLE sa_strategy_article
     ADD COLUMN IF NOT EXISTS src_post_id VARCHAR(64) NOT NULL DEFAULT '';
 
@@ -196,6 +207,35 @@ CREATE TABLE IF NOT EXISTS sa_strategy_extract_queue (
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_sa_eq_state ON sa_strategy_extract_queue (state, next_at);
+
+-- ------------------------------------------------------------------
+-- 评论区（2026-09-30）
+-- ------------------------------------------------------------------
+-- 为什么单独一张表而不是塞进 article 的 JSONB：
+-- **评论区的信息密度往往比正文高**。实测「聚宽新手指南」正文 825 字没代码，
+-- 但下面 7268 条回复里全是实操问答；不少「源码在哪」的答案是作者自己在
+-- 评论里贴的。第一版我把 replies 拼成个列表就扔了（拼完没落库），
+-- 等于把最该看的那部分丢了。
+--
+-- has_code 单独记一列：抽取时优先在评论区找代码块，但要能筛出
+-- 「哪条评论是贴代码的」给 LLM 当重点，而不是把 7000 条全塞进去。
+CREATE TABLE IF NOT EXISTS sa_strategy_reply (
+    reply_id     VARCHAR(64) PRIMARY KEY,
+    article_id   VARCHAR(64) NOT NULL
+                 REFERENCES sa_strategy_article(post_id) ON DELETE CASCADE,
+    author       VARCHAR(128) NOT NULL DEFAULT '',
+    content      TEXT        NOT NULL DEFAULT '',
+    content_len  INTEGER     NOT NULL DEFAULT 0,
+    has_code     BOOLEAN     NOT NULL DEFAULT FALSE,
+    n_code_blocks INTEGER    NOT NULL DEFAULT 0,
+    is_author    BOOLEAN     NOT NULL DEFAULT FALSE,  -- 作者自己回的，权重更高
+    backtest_id  VARCHAR(64) NOT NULL DEFAULT '',
+    backtest_name TEXT       NOT NULL DEFAULT '',
+    add_time     TIMESTAMPTZ,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sa_reply_article ON sa_strategy_reply (article_id);
+CREATE INDEX IF NOT EXISTS idx_sa_reply_code ON sa_strategy_reply (article_id, has_code);
 
 -- ------------------------------------------------------------------
 -- 本地行情数据（供本地回测/验证用，2026-09-30）

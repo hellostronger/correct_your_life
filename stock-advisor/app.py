@@ -3270,6 +3270,7 @@ import market_data
 import backtest
 import joinquant_source
 import strategy_crawler
+import strategy_extract as SX
 import stock_discovery
 import stock_roster
 import paper_memory
@@ -3562,6 +3563,13 @@ class PaperStrategyToggleIn(BaseModel):
 
 
 # ---- 策略库采集 ----
+class JqExtractIn(BaseModel):
+    post_id: str = Field(default="", max_length=64)
+    limit: int = Field(default=3, ge=1, le=20)
+    force: bool = Field(default=False,
+                        description="已抽过也重抽（内容没变时不重复入队）")
+
+
 class JqEnqueueIn(BaseModel):
     pages: int = Field(default=1, ge=1, le=50)
     limit: int = Field(default=20, ge=1, le=100)
@@ -3575,6 +3583,10 @@ class JqFetchIn(BaseModel):
         default=False,
         description="只抓列表摘要就带代码块的。快但会漏很多 —— "
                     "实测摘要被截断，60 篇里 0 篇在摘要带代码，所以默认 False 才对")
+    with_replies: bool = Field(
+        default=True,
+        description="连评论区一起抓。抽取质量直接靠它（别人贴的改进版、"
+                    "失效场景实测、作者补的参数），关掉只省请求不建议")
 
 
 # ---- 本地行情 / 回测 ----
@@ -3702,10 +3714,11 @@ def strategy_lib_fetch(body: JqFetchIn):
 
     正文和源码分开两次拿：列表的 content 是**截断摘要**（实测 123 字符，
     5 篇里 0 篇带代码块），完整正文和代码块只在 detailV2 里。
-    评论区的源码（origin='reply'）在正文没找到时才去拉，省请求。
+    评论区单独一次拿（with_replies，默认开）—— 抽取质量靠它。
     """
     return strategy_crawler.fetch_details(_slib_deps(), limit=body.limit,
-                                         only_with_code=body.only_with_code)
+                                         only_with_code=body.only_with_code,
+                                         with_replies=body.with_replies)
 
 
 @app.get("/api/strategy-lib/articles")
@@ -3775,6 +3788,178 @@ def strategy_lib_article(post_id: str, with_code: bool = True):
                     dig[k] = [] if k != "params" and k != "perf_claimed" \
                         and k != "extract_cost" else {}
     return {"article": art, "source": src, "digest": dig}
+
+
+# ---------- LLM 结构化抽取（文章 -> 可落地的字段）----------
+
+@app.post("/api/strategy-digest/extract")
+def strategy_digest_extract(body: JqExtractIn):
+    """用本地 LLM 把文章抽成结构化字段，落 sa_strategy_digest。
+
+    抽哪几篇：
+    - 传 post_id = 抽这一篇（不管队列状态）
+    - 不传 = 认领队列里待抽的任务（FOR UPDATE SKIP LOCKED 原子认领，
+      两个线程不会抽同一篇 —— 那等于白花钱）
+
+    **每抽一篇真金白银**，所以做了三层省：
+      1. 内容没变（content_hash 相同）且已抽过 -> 不入队（enqueue_extract 拦）
+      2. 失败指数退避，连续 3 次失败标 skip，不再重试
+      3. 不传 post_id 时一次最多认领 limit 篇
+    """
+    conf = llm_advisor.load_llm_conf()
+    if not conf.get("api_key"):
+        raise HTTPException(400, "没配 LLM api_key（配置页「🤖 Claude API」）")
+    done, errs = [], []
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if body.post_id:
+                if not SX.load_article(cur, body.post_id):
+                    raise HTTPException(404, "文章不存在（先抓详情）")
+                ids = [body.post_id]
+            else:
+                ids = SX.claim_batch(cur, body.limit)
+                if not ids:
+                    return {"ok": True, "extracted": 0,
+                            "msg": "队列里没有待抽取的。先抓详情；"
+                                    "内容没变化时不会重复入队"}
+            for pid in ids:
+                t0 = time.time()
+                try:
+                    art = SX.load_article(cur, pid)
+                    src = SX.load_source(cur, pid)
+                    reps = SX.load_replies(cur, pid)
+                    system, user = SX.build_prompt(art, src, reps)
+                    res, cost = SX.call_llm(system, user, conf)
+                    d, comp = SX.save_digest(cur, pid, res, cost, conf["model"])
+                    SX.mark_done(cur, pid)
+                    done.append({"post_id": pid, "title_zh": d["title_zh"],
+                                 "steps": len(d["steps"]),
+                                 "portable_score": d["portable_score"],
+                                 "completeness": comp,
+                                 "needs_research": d["needs_research"],
+                                 "perf_verified": d["perf_verified"],
+                                 "truncated": bool(cost.get("truncated")),
+                                 "tokens": cost.get("input_tokens", 0)
+                                 + cost.get("output_tokens", 0),
+                                 "secs": round(time.time() - t0, 1)})
+                    print("[digest] %s -> %s（%d 步，%d 分，%d tok，%.0fs%s）"
+                          % (pid[:10], d["title_zh"][:18], len(d["steps"]),
+                             d["portable_score"],
+                             cost.get("input_tokens", 0)
+                             + cost.get("output_tokens", 0),
+                             time.time() - t0,
+                             "，被截断" if cost.get("truncated") else ""),
+                          flush=True)
+                except Exception as exc:          # noqa: BLE001
+                    SX.mark_failed(cur, pid, str(exc))
+                    errs.append({"post_id": pid, "error": str(exc)[:200]})
+            conn.commit()
+    return {"ok": not errs, "extracted": len(done), "items": done, "errors": errs}
+
+
+@app.post("/api/strategy-digest/enqueue")
+def strategy_digest_enqueue(body: JqExtractIn):
+    """把已抓的文章排进抽取队列（force=true 时连已抽过的也重排）。"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if body.post_id:
+                if not SX.load_article(cur, body.post_id):
+                    raise HTTPException(404, "文章不存在")
+                n = 1 if SX.enqueue_extract(cur, body.post_id,
+                                            force=body.force) else 0
+                conn.commit()
+                return {"ok": True, "enqueued": n,
+                        "msg": "" if n else "内容没变化且已抽过 —— 没重复排队"}
+            sql = "SELECT post_id FROM sa_strategy_article"
+            args: list = []
+            if not body.force:
+                sql += " WHERE needs_reextract"
+            if only_runnable_cfg():
+                # 只排「有完整源码」的：脱敏帖的函数体是空的，抽出来的
+                # 实现步骤价值低，而且一样要花钱
+                sql += (" AND post_id IN (SELECT post_id FROM sa_strategy_source"
+                        " WHERE NOT redacted)")
+            sql += " ORDER BY clone_count DESC LIMIT %s"
+            args.append(max(1, body.limit) * 10)
+            cur.execute(sql, args)
+            n = 0
+            for (pid,) in cur.fetchall():
+                if SX.enqueue_extract(cur, pid, force=body.force):
+                    n += 1
+            conn.commit()
+    return {"ok": True, "enqueued": n}
+
+
+def only_runnable_cfg() -> bool:
+    """配置「只抽有完整源码的」。读不出来就当 False（全抽）。"""
+    try:
+        return bool((_conf_section("jq") or {}).get("extract", {}).get(
+            "only_runnable", True))
+    except Exception:                       # noqa: BLE001
+        return True
+
+
+@app.get("/api/strategy-digest/list")
+def strategy_digest_list(limit: int = 50, offset: int = 0, min_score: int = 0,
+                         needs_research: bool = False, has_code: bool = False,
+                         q: str = ""):
+    """抽好的摘要列表（前端「策略库」页用）。
+
+    默认按 portable_score 降序 —— 我要的是「最可能能搬进模拟盘的」排最前，
+    不是「最新抓的」。
+    """
+    sql = ("SELECT d.article_id, a.title, a.author, a.url, a.clone_count,"
+           " d.title_zh, d.summary, d.strategy_type, d.portable_score,"
+           " d.portable_why, d.perf_claimed, d.perf_verified, d.applicable,"
+           " d.unsuitable, d.risk_notes, d.completeness, d.needs_research,"
+           " d.uncertainty, d.research_hint, d.extract_at, d.extract_model,"
+           " (s.post_id IS NOT NULL) AS has_code, s.lines AS code_lines,"
+           " s.redacted, s.n_blocks"
+           " FROM sa_strategy_digest d"
+           " JOIN sa_strategy_article a ON a.post_id = d.article_id"
+           " LEFT JOIN sa_strategy_source s ON s.post_id = d.article_id"
+           " WHERE d.portable_score >= %s")
+    args: list = [int(min_score)]
+    if needs_research:
+        sql += " AND d.needs_research"
+    if has_code:
+        sql += " AND s.post_id IS NOT NULL AND NOT s.redacted"
+    if q:
+        sql += (" AND (a.title ILIKE %s OR d.title_zh ILIKE %s"
+                " OR d.summary ILIKE %s)")
+        args += ["%%%s%%" % q] * 3
+    sql += (" ORDER BY d.portable_score DESC, a.clone_count DESC"
+            " LIMIT %s OFFSET %s")
+    args += [int(limit), int(offset)]
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, args)
+        cols = [c[0] for c in cur.description]
+        items = [dict(zip(cols, r)) for r in cur.fetchall()]
+    for it in items:
+        for k in ("perf_claimed", "applicable", "unsuitable", "risk_notes"):
+            if k in it and not isinstance(it[k], (list, dict)):
+                try:
+                    it[k] = json.loads(
+                        it[k] or ("{}" if k == "perf_claimed" else "[]"))
+                except (TypeError, ValueError):
+                    it[k] = {} if k == "perf_claimed" else []
+    return {"items": items, "n": len(items)}
+
+
+@app.get("/api/strategy-digest/queue")
+def strategy_digest_queue():
+    """抽取队列状态（前端显示进度 / 失败原因）。"""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT state, count(*) FROM sa_strategy_extract_queue"
+                    " GROUP BY state")
+        q = {r[0]: r[1] for r in cur.fetchall()}
+        cur.execute("SELECT article_id, state, try_count, left(last_error, 160)"
+                    " FROM sa_strategy_extract_queue"
+                    " WHERE state IN ('failed','skip')"
+                    " ORDER BY updated_at DESC LIMIT 20")
+        cols = [c[0] for c in cur.description]
+        bad = [dict(zip(cols, r)) for r in cur.fetchall()]
+    return {"queue": q, "problems": bad}
 
 
 # ---------- 本地行情数据 + 回测（供策略本地验证）----------

@@ -33,6 +33,7 @@ information_schema.columns，把「代码引用了但库里没有的列」提前
 （拼出来的列名、JSON key），所以只比对 DDL 声明的列 —— 加列时忘了写 ALTER
 这个错，正好能被抓住。
 """
+import ast
 import io
 import re
 import sys
@@ -243,6 +244,225 @@ def check_live_columns(declared: dict[str, set[str]]) -> list[str]:
     return errs
 
 
+def check_prompts() -> list[str]:
+    """自检 LLM 提示词模板：能不能当 format 模板用、字段名齐不齐。
+
+    为什么值得单独做一项检查
+    ----------------------
+    USER_TMPL 里为了输出 JSON 示例，**所有字面花括号都写成双写**（{{ }}）。
+    一旦有人（或脚本）改坏一行，`.format()` 会在运行时抛
+    `ValueError: Single '}' encountered in format string` ——
+    而这个错只在**真调 LLM 的时候**才炸，等于每次都要花钱才发现。
+    更糟的是它长得很像 LLM 配置问题，容易往错的方向排查。
+
+    这里做两件事：① 拿一个假数据真跑一遍 format（不花钱）；
+    ② 检查 normalize() 认识的键和模板里要求的键对得上。
+    """
+    errs: list[str] = []
+    root = Path(__file__).resolve().parent.parent
+    mod = root / "strategy_extract.py"
+    if not mod.exists():
+        return []
+    import importlib
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    try:
+        import strategy_extract as SX
+        importlib.reload(SX)
+    except Exception as exc:                # noqa: BLE001
+        return ["strategy_extract 导入失败：%s" % str(exc)[:160]]
+
+    art = {"title": "T", "author": "A", "published_at": None,
+           "reply_count": 1, "like_count": 2, "clone_count": 3,
+           "content_text": "正文"}
+    for label, src in (("有源码", {"code": "x = 1", "n_blocks": 1,
+                                  "raw_lines": 1, "redacted": False,
+                                  "stub_sites": 0, "stub_reasons": []}),
+                       ("脱敏", {"code": "def f():\n    ...", "n_blocks": 1,
+                               "raw_lines": 2, "redacted": True,
+                               "stub_sites": 1, "stub_reasons": ["省略"]}),
+                       ("无源码", None)):
+        try:
+            SX.build_prompt(art, src, [])
+        except Exception as exc:            # noqa: BLE001
+            errs.append("build_prompt(%s) 失败：%s -> 提示词模板的花括号"
+                        "或占位符坏了（字面花括号必须写成 {{ }}）"
+                        % (label, str(exc)[:140]))
+    # 提示词里要求的段名，必须都在解析器的字典里
+    # （少一个就是「模型填了但我们读不到」，而且不报错，静默丢字段）
+    try:
+        import strategy_sections as SS
+        want = set(re.findall(r"^###([A-Z_]{2,20})$", SX.SYSTEM, re.M))
+        miss = sorted(want - set(SS.SECTION_KEYS))
+        if miss:
+            errs.append("提示词要求了这些段但解析器不认识，字段会被静默丢掉：%s"
+                        % ", ".join("###" + m for m in miss))
+        # 拿一段假输出走一遍，确认解析器本身没坏
+        probe_txt = ("###TITLE\n测试策略\n###SUMMARY\n一二三。\n"
+                     "###TYPE\n打板\n"
+                     "###STEP\n1 | 选股 | 低位三连阳 | 正文原句\n"
+                     "2 | 卖出 | 尾盘 14.1% | get_close_sell\n"
+                     "###PARAM\n持股数: 10\n调仓周期: 每周五\n"
+                     "###PERF\n年化: 14.1%\n最大回撤: -20%\n"
+                     "###APPLICABLE\n- 牛市主升\n###RISK\n- 单票集中度\n"
+                     "###UNCERTAINTY\n无\n###RESEARCH\nfalse\n"
+                     "###SCORE\n4 | 源码完整，只需改写 API\n")
+        d = SS.parse_sections(probe_txt)
+        n = SX.normalize(d)
+        if len(n["steps"]) != 2 or not n["params"] \
+                or n["portable_score"] != 4 or not n["applicable"]:
+            errs.append("分段解析器自检没过：steps=%d params=%d score=%s "
+                        "applicable=%d"
+                        % (len(n["steps"]), len(n["params"]),
+                           n["portable_score"], len(n["applicable"])))
+    except Exception as exc:                # noqa: BLE001
+        errs.append("分段格式解析自检失败：%s" % str(exc)[:140])
+    print("  提示词模板: %s" % ("通过" if not errs else "有问题"))
+    return errs
+    print("  提示词模板: %s" % ("通过" if not errs else "有问题"))
+    return errs
+
+
+def check_sql_params() -> list[str]:
+    """扫 cur.execute(sql, (参数...))，用 ast 精确比对 %s 个数与参数个数。
+
+    为什么值得做
+    ------------
+    psycopg2 在占位符比参数多时报的是
+        IndexError: tuple index out of range
+    ——**跟 SQL、跟数据库、跟数据内容全都无关**，纯看代码根本猜不出是哪句。
+    我在 save_digest 上踩过一次：INSERT 20 列 20 参数，但
+    `ON CONFLICT ... DO UPDATE SET raw_response=%s` 又多了一个占位符。
+    而这个错只在**真的抽完一篇要落库**时才炸 —— 每修一个 bug 都要烧一次
+    LLM 才能发现（一次 140 秒 + 一万 token）。
+
+    **用 ast 而不是正则数逗号**：第一版用正则 + 缩进猜，报 11 条里 10 条是
+    误报。一个天天误报的自检等于没有自检 —— 它只会训练人忽略它的输出。
+    ast 数的是真实 tuple 的元素个数，多行、嵌套、表达式都能算对。
+    """
+    errs: list[str] = []
+    root = Path(__file__).resolve().parent.parent
+    targets = ["strategy_extract.py", "strategy_crawler.py",
+               "joinquant_source.py", "backtest.py", "market_data.py",
+               "stock_discovery.py", "stock_roster.py", "paper_strategy.py"]
+    checked = 0
+    for name in targets:
+        f = root / name
+        if not f.exists():
+            continue
+        try:
+            tree = ast.parse(f.read_text(encoding="utf-8"))
+        except SyntaxError as exc:
+            errs.append("%s 语法错误：%s" % (name, exc))
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or len(node.args) < 2:
+                continue
+            fn = node.func
+            if not (isinstance(fn, ast.Attribute) and fn.attr == "execute"):
+                continue
+            sql_node, arg_node = node.args[0], node.args[1]
+            if isinstance(sql_node, ast.JoinedStr):
+                continue                      # f-string 拼的，静态数不了
+            if not (isinstance(sql_node, ast.Constant)
+                    and isinstance(sql_node.value, str)):
+                continue
+            sql = sql_node.value
+            # **不要剥 SQL 注释再数** —— psycopg2 的插值器不认识 `--` 注释，
+            # 注释里的占位符字面量会被当成真的占位符，然后报
+            # IndexError: tuple index out of range。所以这里必须连注释一起数。
+            # （我曾反过来「修」过一次：把注释剥掉再数，结果自检说没问题，
+            #   运行时照样炸。方向反了。）
+            n_ph = sql.count("%s")
+            # 单独提醒：注释里写占位符字面量
+            for ln in sql.split("\n"):
+                cm = re.match(r"\s*--(.*)$", ln)
+                if cm and ("%s" in cm.group(1) or "%(" in cm.group(1)):
+                    errs.append("%s:%d SQL 注释里出现了占位符字面量 —— "
+                                "psycopg2 不认识注释，会当成真占位符，"
+                                "报 tuple index out of range"
+                                % (name, node.lineno))
+                    break
+            if "%(" in sql:
+                continue                      # 具名占位符，另算
+            if not isinstance(arg_node, (ast.Tuple, ast.List)):
+                continue
+            n_args = len(arg_node.elts)
+            checked += 1
+            if n_ph != n_args:
+                errs.append("%s:%d 占位符 %d 个但参数 %d 个 -> %s"
+                            % (name, node.lineno, n_ph, n_args,
+                               "少了参数（psycopg2 只会报 tuple index out of "
+                               "range，跟 SQL 内容毫无关联，极难查）"
+                               if n_ph > n_args else "多了参数"))
+    print("  SQL 占位符比对: 检查 %d 处 execute，%s"
+          % (checked, "通过" if not errs else "发现 %d 处" % len(errs)))
+    return errs
+
+
+
+def check_insert_columns() -> list[str]:
+    """比对 `INSERT INTO t (a,b,c) ... ON CONFLICT DO UPDATE SET x=...`
+    里出现的列，跟 DDL 声明的列是否一致（缺列 = 数据静默丢进默认值）。
+
+    为什么需要
+    ----------
+    我给 sa_strategy_digest 加了 uncertainty / needs_research /
+    research_hint 三列（因为抽取器要标「这份抽取可不可信」），**DDL 加了、
+    代码里 normalize 也产出了，但忘了写进 INSERT**。结果：
+      - 抽取接口返回 needs_research=true（用的是内存里的值，看着一切正常）
+      - 列表接口返回 needs_research=false（读的是库里的默认值 FALSE）
+    两边对不上，而且**不报任何错**。这种「加了字段但忘了落库」的静默丢失，
+    光看代码和看接口返回值都发现不了。
+    """
+    errs: list[str] = []
+    root = Path(__file__).resolve().parent.parent
+    lib = (root / "schema_strategy_lib.sql").read_text(encoding="utf-8")
+    app = (root / "app.py").read_text(encoding="utf-8")
+    declared = parse_declared_columns(app[app.index('ddl = """'):]
+                                       + lib)
+    ddl_cols = declared.get("sa_strategy_digest", set())
+    f = root / "strategy_extract.py"
+    if not f.exists() or not ddl_cols:
+        return []
+    tree = ast.parse(f.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "execute" and node.args):
+            continue
+        s = node.args[0]
+        if not (isinstance(s, ast.Constant) and isinstance(s.value, str)):
+            continue
+        m = re.search(r"INSERT\s+INTO\s+sa_strategy_digest\s*\((.*?)\)",
+                      s.value, re.S | re.I)
+        if not m:
+            continue
+        used = {c.strip().lower() for c in m.group(1).replace("\n", " ").split(",")
+                if c.strip()}
+        # 只有「在 DO UPDATE 里被 now() 自动填」的列才算没漏 ——
+        # 判定不能放宽成「SET 子句里出现过就算」。放宽过一次就漏报了：
+        # 把 uncertainty 从 INSERT 拿掉（但 UPDATE SET 里还留着它），
+        # 检查器说通过，实际上 INSERT 走的是 DDL 的默认值 ''，
+        # 而 DO UPDATE 在插入时根本不执行 —— 数据静默丢成空串。
+        AUTO = ("extract_at", "created_at", "updated_at")
+        tail = s.value[m.end():]
+        um = re.search(r"DO\s+UPDATE\s+SET(.*?)(?:WHERE|RETURNING|$)",
+                       tail, re.S | re.I)
+        if um:
+            for c in AUTO:
+                if re.search(r"\b%s\s*=\s*now\(\)" % c, um.group(1), re.I):
+                    used.add(c)
+        missing = sorted(ddl_cols - used)
+        if missing:
+            errs.append("strategy_extract.py:%d INSERT 少写了这些列，"
+                        "它们会静默落成默认值：%s"
+                        % (node.lineno, ", ".join(missing)))
+    print("  INSERT 列比对: %s"
+          % ("通过" if not errs else "发现 %d 处" % len(errs)))
+    return errs
+
+
 def main() -> int:
     print("=== DDL 自检 ===")
     all_errs: list[str] = []
@@ -294,6 +514,13 @@ def main() -> int:
     for e in live_errs:
         print("  " + e)
     all_errs.extend(hard)
+
+    # ⑦ 提示词模板自检（不花钱，只验 format 能不能跑通）
+    all_errs.extend(check_prompts())
+    # ⑧ SQL 占位符 vs 参数个数
+    all_errs.extend(check_sql_params())
+    # ⑨ INSERT 列 vs DDL 列（漏写 = 静默丢数据）
+    all_errs.extend(check_insert_columns())
 
     print()
     if all_errs:
