@@ -244,19 +244,40 @@ def _prune_confirms() -> None:
         del _confirms[k]
 
 
-def _run_report(deps, kind: str) -> str:
-    """真的去生成报告。慢（30~90s），失败要说清楚而不是假装成功。"""
+def _generate_report(deps, kind: str) -> None:
+    """后台线程体：真的去生成。异常只记 state，不外抛（线程里抛了没人接）。"""
     app = deps["app"]
+    label = "盘后复盘" if kind == "postmarket" else "盘前简报"
+    try:
+        app.daily_reports.GENERATORS[kind](app._report_deps())
+        print(f"[wx-cmd] {label}生成完成", flush=True)
+    except Exception as exc:
+        _log_error(f"{label}生成失败: {type(exc).__name__}: {exc}")
+
+
+def _run_report(deps, kind: str) -> str:
+    """起后台线程生成报告，**立刻返回**。
+
+    ⚠️ 绝不能同步跑。同步跑的后果不是"慢一点"，而是**入站长轮询线程被占住
+    30~90 秒，期间 bot 完全收不到任何微信消息** —— 你以为它在生成报告，其实在
+    聋着。app.py 的 `/api/reports/{kind}` 也是「查重入 → 起线程 → 立刻返回」，
+    这里保持一致。
+
+    报告本身会在生成完时自己推一条到微信（`daily_reports` 里的 notify_fn），
+    所以用户不需要在这里等结果。
+    """
+    app = deps["app"]
+    label = "盘后复盘" if kind == "postmarket" else "盘前简报"
+    st = getattr(app, "_reports_state", None)
+    if isinstance(st, dict) and st.get(kind):
+        return f"{label}已经在生成中了，别重复触发。等一会儿就好。"
     with _state_lock:
         _state["runs"] += 1
         _state["last_cmd"] = f"report:{kind} @{datetime.now():%H:%M:%S}"
-    try:
-        res = app.daily_reports.GENERATORS[kind](app._report_deps())
-    except Exception as exc:
-        _log_error(f"生成{kind}失败: {exc}")
-        return f"（生成{kind}失败：{exc}）"
-    return (f"{'盘后复盘' if kind == 'postmarket' else '盘前简报'}已生成，"
-            f"完整内容在「分析报告」页，也会推到你微信。")
+    threading.Thread(target=_generate_report, args=(deps, kind), daemon=True).start()
+    return (f"已开始生成{label}，大约 1-3 分钟。\n"
+            f"生成完会自动推到你微信，「分析报告」页也能看。\n"
+            f"（这期间我还在正常收消息，不是卡住了）")
 
 
 # ---------------- 分发 ----------------

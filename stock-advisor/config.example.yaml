@@ -38,6 +38,13 @@ sector:
   interval_minutes: 5
   alert_notify: true
 
+  # 板块数据服务（多厂商聚合，替代已被 WAF 掐断的东财直连）
+  # 部署见 stock-advisor/data_service/README.md
+  # 留空 = 不启用，sector 仍走原东财实现（保持原行为）
+  # docker compose -f data_service/docker-compose.yml up -d
+  # 然后填 http://127.0.0.1:8080
+  data_service_url: ""
+
 # 提款计划（app.py _withdrawal_loop）
 # 交易日 15:10 起每半小时检查一次达标/临期状态，里程碑（可提/剩10·5·1交易日/逾期）推微信
 withdrawal:

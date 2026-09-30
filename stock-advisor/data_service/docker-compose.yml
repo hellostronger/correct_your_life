@@ -1,0 +1,32 @@
+services:
+  sa-data-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sa-data-service:1.0.0
+    container_name: sa-data-service
+    restart: unless-stopped
+    environment:
+      # 同花顺每子域日请求上限。实测原实现 576/日打一个 host 被 WAF 掐死，
+      # 这里保守设 200 并按 host 记账，超预算自动跳过该源而不是硬打。
+      SA_HOST_DAILY_BUDGET: "200"
+      # 快照缓存秒数，避免每次前端刷新都打源
+      SA_CACHE_TTL: "60"
+      NO_PROXY: "*"
+      no_proxy: "*"
+      TZ: Asia/Shanghai
+    ports:
+      # 只绑回环，不暴露公网。外部访问走 SSH 隧道
+      # （与本机 WeRSS 8001 隧道同一模式）
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 40s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

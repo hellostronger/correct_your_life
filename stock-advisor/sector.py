@@ -30,6 +30,8 @@ from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import os
+
 import requests
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -59,13 +61,107 @@ INDEX_POOL = [
     ("1.000688", "科创50"), ("1.000300", "沪深300"), ("0.899050", "北证50"),
 ]
 
-_state = {"snapshooting": False, "last_run": None, "last_result": None}
+_state = {"snapshooting": False, "last_run": None, "last_result": None,
+          # 采集健康度（2026-10-01 加，见 _note_collect_* ）
+          "consec_fail": 0, "last_error": "", "last_error_at": None,
+          "backoff_until": None, "notified_fail": False}
 _state_lock = threading.Lock()
 
 
 def get_status() -> dict:
     with _state_lock:
         return dict(_state)
+
+
+# ---------------- 采集健康度：失败退避 + 告警 ----------------
+#
+# 为什么要这个（2026-09-21 → 10-01 实测）：
+# 东财把 push2* 全封之后，_intraday_loop 并没有停下来 —— 它每 5 分钟照常打 12 个
+# clist 请求，日志里连着 87 轮 "intraday collect failed"。也就是说：
+#   1) 它在给一个已经死掉的端点永久续期，封禁永远不会自己解开；
+#   2) 失败只 print 到日志，页面和微信都静默 —— 板块数据停在 2026-09-21，
+#      用户看到"407 个板块净流出、半导体流出 55 亿"，以为是当天的，其实是 9 天前的。
+# 所以：失败要退避、要上报、要能从接口看见。
+
+FAIL_ALERT_THRESHOLD = 3      # 连续失败几次后推一次告警
+BACKOFF_BASE_SECONDS = 300    # 首次失败后等 5 分钟
+BACKOFF_MAX_SECONDS = 3600    # 最多退到 1 小时
+
+
+def _backoff_seconds(fail: int) -> int:
+    """指数退避：5min -> 10 -> 20 -> 40 … 封顶 1h。"""
+    return min(BACKOFF_BASE_SECONDS * (2 ** max(0, fail - 1)), BACKOFF_MAX_SECONDS)
+
+
+def _note_collect_success() -> None:
+    with _state_lock:
+        was_failing = _state["consec_fail"] > 0
+        _state["consec_fail"] = 0
+        _state["last_error"] = ""
+        _state["backoff_until"] = None
+        _state["notified_fail"] = False
+    if was_failing:
+        print("[sector] collect recovered", flush=True)
+
+
+def _note_collect_failure(exc: Exception) -> int:
+    """记一次失败，返回该睡多久（秒）。连续失败到阈值时推一次告警。"""
+    with _state_lock:
+        _state["consec_fail"] += 1
+        fail = _state["consec_fail"]
+        _state["last_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+        _state["last_error_at"] = datetime.now().isoformat(timespec="seconds")
+        wait = _backoff_seconds(fail)
+        _state["backoff_until"] = (datetime.now()
+                                   + timedelta(seconds=wait)).isoformat(timespec="seconds")
+        should_notify = (fail == FAIL_ALERT_THRESHOLD and not _state["notified_fail"])
+        if should_notify:
+            _state["notified_fail"] = True
+
+    print(f"[sector] collect failed #{fail}, backoff {wait}s: "
+          f"{type(exc).__name__}: {str(exc)[:120]}", flush=True)
+
+    if should_notify:
+        try:
+            import notifier
+            notifier.notify(
+                "🔌 板块采集失败",
+                f"板块数据采集已连续失败 {fail} 次。\n\n"
+                f"最后错误：{type(exc).__name__}: {str(exc)[:200]}\n\n"
+                f"已自动退避到 {wait // 60} 分钟一轮。"
+                f"页面上的板块数据是旧的，不是当天的。\n"
+                f"（来自 stock-advisor 板块监控）",
+                event="sector_collect_failed")
+            print(f"[sector] collect-failure alert sent (fail={fail})", flush=True)
+        except Exception as notify_exc:
+            print(f"[sector] collect-failure alert failed: {notify_exc}", flush=True)
+    return wait
+
+
+def collect_health() -> dict:
+    """给 /api/sector/status 用：采集是否健康 + 数据陈旧几天。"""
+    st = get_status()
+    out = {
+        "consec_fail": st["consec_fail"],
+        "last_error": st["last_error"],
+        "last_error_at": st["last_error_at"],
+        "backoff_until": st["backoff_until"],
+        "healthy": st["consec_fail"] == 0,
+    }
+    try:
+        with _get_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT max(snap_date) FROM sa_sector_snapshots")
+            row = cur.fetchone()
+        latest = row[0] if row else None
+        if latest:
+            out["latest_snap_date"] = latest.isoformat()
+            out["stale_days"] = (date.today() - latest).days
+            out["stale"] = out["stale_days"] >= 2
+    except Exception as exc:                      # 查库失败不该拖垮状态接口
+        out["stale_days"] = None
+        out["stale"] = None
+        out["db_error"] = f"{type(exc).__name__}: {str(exc)[:100]}"
+    return out
 
 
 # ---------------- 拉取：板块快照 ----------------
@@ -112,8 +208,95 @@ def _row_to_snapshot(row: dict, kind: str) -> dict | None:
     }
 
 
+# ---------------- 外部数据服务（多厂商聚合）----------------
+#
+# 2026-10-01 起板块快照优先走 data_service（见 data_service/README.md）。
+# 为什么不再直连东财：sector._sector_intraday_loop 交易时段每 5 分钟一轮，
+# 每轮 12 个 clist 请求全打 push2delay 一个 host = 576 请求/日，触发 WAF；
+# 被封后循环不停继续捶，封禁被永久续期，且失败只进日志，页面静默显示 9 天前
+# 的旧数据（server.log 实测 321 轮 ≈ 3852 个请求）。
+#
+# data_service 内部用同花顺 + 开盘红 + 新浪三家互不相关的源，按 host 记账限额，
+# 任一源挂掉自动降级并在 /boards 的 degraded 字段里明说。
+#
+# 回落到东财而不是直接失败：等东财解封就是免费的双保险。
+
+DATA_SERVICE_URL = os.environ.get("SA_DATA_SERVICE_URL", "").strip()
+
+
+def _load_sector_conf() -> dict:
+    """config.yaml 的 sector 段；缺失用默认。"""
+    try:
+        import yaml
+        text = (BASE_DIR / "config.yaml").read_text(encoding="utf-8")
+        return dict((yaml.safe_load(text) or {}).get("sector") or {})
+    except Exception:
+        return {}
+
+
+def _data_service_url() -> str:
+    """服务地址：环境变量优先于 config.yaml，留空则不启用。"""
+    if DATA_SERVICE_URL:
+        return DATA_SERVICE_URL
+    return str(_load_sector_conf().get("data_service_url") or "").strip()
+
+
+def _boards_via_service() -> list[dict]:
+    """从 data_service 拉全量板块。字段名与 _row_to_snapshot 对齐。"""
+    url = _data_service_url()
+    if not url:
+        raise RuntimeError("未配置 data_service_url")
+    resp = requests.get(f"{url.rstrip('/')}/boards",
+                        params={"refresh": "true"}, timeout=90)
+    resp.raise_for_status()
+    payload = resp.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"服务返回非对象: {type(payload).__name__}")
+    boards = payload.get("boards") or []
+    if not boards:
+        raise RuntimeError("服务返回 0 个板块")
+
+    # 服务已算好评分，这里只做字段收敛 + 记录降级状态
+    degraded = bool(payload.get("degraded"))
+    if degraded:
+        for note in payload.get("notes", []):
+            print(f"[sector] data_service degraded: {note}", flush=True)
+    out = []
+    for b in boards:
+        out.append({
+            "code": b.get("code") or "",
+            "name": b.get("name") or "",
+            "kind": b.get("kind") or "industry",
+            "pct": b.get("pct"),
+            "turnover": b.get("turnover"),
+            "turnover_rate": b.get("turnover_rate"),
+            "main_inflow": b.get("main_inflow"),
+            "up_count": b.get("up_count"),
+            "down_count": b.get("down_count"),
+            "lead_stock": b.get("lead_stock") or "",
+            "lead_stock_code": b.get("lead_stock_code") or "",
+            "lead_stock_pct": b.get("lead_stock_pct"),
+            "quote_ts": b.get("quote_ts"),
+            "score": b.get("score"),
+        })
+    print(f"[sector] data_service: {len(out)} boards, "
+          f"sources={payload.get('sources_used')}, degraded={degraded}", flush=True)
+    return out
+
+
 def fetch_all_boards() -> list[dict]:
-    """全量板块快照（行业+概念+地域），并发分页。"""
+    """全量板块快照。优先 data_service（多厂商），失败回落东财直连。"""
+    if _data_service_url():
+        try:
+            return _boards_via_service()
+        except Exception as exc:
+            print(f"[sector] data_service 不可用，回落东财: "
+                  f"{type(exc).__name__}: {str(exc)[:150]}", flush=True)
+    return _fetch_all_boards_eastmoney()
+
+
+def _fetch_all_boards_eastmoney() -> list[dict]:
+    """东财直连（回落路径）。注意：这条路径已被 WAF 掐断，保留只为解封后可用。"""
     all_rows: list[dict] = []
     with __import__("concurrent.futures", fromlist=["ThreadPoolExecutor"]).ThreadPoolExecutor(
             FETCH_WORKERS) as ex:
@@ -241,12 +424,23 @@ def fetch_market_breadth() -> dict:
 
 
 def fetch_board_constituents(bk_code: str, limit: int = 20) -> list[dict]:
-    """板块成分股（按涨幅降序前 limit 只）。bk_code 如 BK1515。"""
+    """板块成分股（按涨幅降序前 limit 只）。bk_code 如 BK1515 或 881142。
+
+    优先走 data_service（东财 clist 已于 2026-10-01 实测被 WAF 全封）。
+    服务端只给 code/name，没有涨跌幅 —— 涨跌幅用腾讯行情按 code 批量补，
+    这样「点板块行看成分股 + 红绿标注」的功能不丢。
+    """
+    if _data_service_url():
+        items = fetch_board_constituents_via_service(bk_code, limit=limit)
+        if items:
+            return _attach_quotes(items)
+    # 回落东财（等解封即免费双保险）
     try:
         resp = requests.get(
             "https://push2delay.eastmoney.com/api/qt/clist/get",
-            params={"pn": 1, "pz": max(limit, 1), "po": 1, "np": 1, "fltt": 2, "invt": 2,
-                    "fid": "f3", "fs": f"b:{bk_code}", "fields": "f2,f3,f12,f14,f62"},
+            params={"pn": 1, "pz": max(limit, 1), "po": 1, "np": 1, "fltt": 2,
+                    "invt": 2, "fid": "f3", "fs": f"b:{bk_code}",
+                    "fields": "f2,f3,f12,f14,f62"},
             headers=HEADERS, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         diff = (resp.json().get("data") or {}).get("diff") or []
@@ -256,6 +450,35 @@ def fetch_board_constituents(bk_code: str, limit: int = 20) -> list[dict]:
              "price": x.get("f2"), "pct": x.get("f3"),
              "main_inflow": x.get("f62") if isinstance(x.get("f62"), (int, float)) else None}
             for x in diff]
+
+
+def _attach_quotes(items: list[dict]) -> list[dict]:
+    """给只有 code/name 的成分股补涨跌幅。
+
+    用 `app.fetch_quotes`（腾讯 qt.gtimg.cn，**一次请求拿全部代码**）。
+    不要写成「循环里逐只拉 K 线」—— 那就是 20 只 = 20 个请求打同一 host，
+    正是把东财烧死的那种模式（见 _sector_intraday_loop 的注释）。
+
+    取不到就保持 None 而不是 0：前端按「无数据」显示，填 0 会被误读成平盘。
+    """
+    codes = [str(x.get("code") or "") for x in items]
+    codes = [c for c in codes if len(c) == 6]
+    if not codes:
+        return items
+    try:
+        from app import fetch_quotes          # 延迟导入，避免循环依赖
+    except Exception as exc:
+        print(f"[sector] fetch_quotes 不可用: {exc}", flush=True)
+        return items
+    quotes = fetch_quotes(codes)
+    for it in items:
+        q = quotes.get(str(it.get("code") or "")) or {}
+        if q.get("error"):
+            continue                          # 保持 None
+        it["price"] = q.get("price")
+        it["pct"] = q.get("change_pct")
+        it["main_inflow"] = q.get("main_inflow")   # 腾讯快照无此字段，恒 None
+    return items
 
 
 def _em_secid(code: str) -> str | None:
@@ -268,10 +491,41 @@ def _em_secid(code: str) -> str | None:
     return None
 
 
-def fetch_stock_boards(code: str, retries: int = 2) -> list[dict]:
-    """个股所属板块（东财 slist，spt=3）。返回 [{code, name, pct}]，按关联度排（行业在前）。
+def fetch_board_constituents_via_service(bk_code: str,
+                                        limit: int = 20) -> list[dict]:
+    """经 data_service 取板块成分股（个股所属板块的反查在服务端做不了，见下）。
 
-    涨跌幅 f3 顺手带上，前端能直接标注板块红绿。失败重试 2 次后返回 []。
+    注意 code 体系（实测）：
+      - 行业 881xxx -> 服务端 adata 接口直通
+      - 概念 3xxxxx -> 服务端要 886xxx，直喂返回 404
+    """
+    url = _data_service_url()
+    if not url:
+        return []
+    try:
+        resp = requests.get(
+            f"{url.rstrip('/')}/boards/{bk_code}/constituents",
+            params={"limit": limit}, timeout=60)
+        if resp.status_code != 200:
+            print(f"[sector] 成分股 {bk_code}: HTTP {resp.status_code} "
+                  f"{resp.text[:120]}", flush=True)
+            return []
+        return resp.json().get("items") or []
+    except Exception as exc:
+        print(f"[sector] 成分股 {bk_code} 取数失败: "
+              f"{type(exc).__name__}: {str(exc)[:100]}", flush=True)
+        return []
+
+
+def fetch_stock_boards(code: str, retries: int = 2) -> list[dict]:
+    """个股所属板块。返回 [{code, name, pct}]。
+
+    原实现走东财 `push2delay/slist/get`（spt=3），该 host 已于 2026-10-01
+    实测被 WAF 全封（连不带参数都失败）。现在优先走 data_service ——
+    但服务端目前只能按**板块**查成分股，没有「个股 -> 所属板块」的反查接口
+    （需要全市场 code->board 映射，代价高）。所以这里仍走新浪
+    `Market_Center.getHQNodeData` 那条路会太慢，退而求其次：
+    仍尝试东财，等它解封就是免费双保险；失败返回 []，前端按「无板块数据」处理。
     """
     secid = _em_secid(code)
     if not secid:
@@ -350,6 +604,18 @@ def save_snapshot(rows: list[dict], zt: dict, breadth: dict, indexes: list[dict]
     d = snap_date or date.today()
     ensure_tables()
     from psycopg2.extras import Json, execute_values
+
+    # 板块代码可能为空（data_service 的新浪源不给 code，实测 969 个里 664 个有）。
+    # sa_sector_snapshots 的主键是 (snap_date, code)，code 为空会让整批 upsert
+    # 退化成"同一行反复覆盖"，最后只剩 1 个板块。丢掉无 code 的行并计数上报。
+    usable = [r for r in rows if (r.get("code") or "").strip()]
+    dropped = len(rows) - len(usable)
+    if dropped:
+        print(f"[sector] save_snapshot 丢弃 {dropped} 个无 code 的板块"
+              f"（主键需要 code）", flush=True)
+    if not usable:
+        raise RuntimeError(f"全部 {len(rows)} 个板块都没有 code，无法入库")
+
     with _get_conn() as conn, conn.cursor() as cur:
         execute_values(
             cur,
@@ -365,7 +631,8 @@ def save_snapshot(rows: list[dict], zt: dict, breadth: dict, indexes: list[dict]
                  lead_stock_pct=EXCLUDED.lead_stock_pct, quote_ts=EXCLUDED.quote_ts""",
             [(d, r["code"], r["name"], r["kind"], r["pct"], r["turnover"],
               r["turnover_rate"], r["main_inflow"], r["up_count"], r["down_count"],
-              r["lead_stock"], r["lead_stock_pct"], r["quote_ts"]) for r in rows],
+              r["lead_stock"], r["lead_stock_pct"], r["quote_ts"])
+             for r in usable],
             page_size=500)
         cur.execute(
             """INSERT INTO sa_sector_daily
@@ -378,7 +645,8 @@ def save_snapshot(rows: list[dict], zt: dict, breadth: dict, indexes: list[dict]
             (d, zt.get("total"), zt.get("max_lb"), zt.get("sum_zbc"),
              Json(zt.get("by_board") or {}), Json(breadth or {}),
              Json({i["code"]: i for i in indexes or {}})))
-    return {"date": d.isoformat(), "boards": len(rows),
+    return {"date": d.isoformat(), "boards": len(usable),
+            "dropped_no_code": dropped,
             "zt_total": zt.get("total"), "breadth": breadth}
 
 
@@ -506,20 +774,43 @@ def build_overview(with_details: bool = True) -> dict:
             "mom3": round(mom3, 2) if mom3 is not None else None,
             "mom5": round(mom5, 2) if mom5 is not None else None,
             "zt_count": zt_cnt, "score": score,
+            # 分项拆开：排查「为什么这个板块排这么前」时不用去猜。
+            # 字段名与 data_service 的 score_parts 对齐。
+            "score_parts": {"pct": round(score_pct, 1),
+                            "flow": round(score_inflow, 1),
+                            "zt": score_zt, "mom": round(score_mom, 1)},
         })
 
     boards.sort(key=lambda b: b["score"], reverse=True)
     daily_meta = _load_daily_meta(6)
 
+    # 数据陈旧度（2026-10-01 加）。原来只给 snap_date 这么一个普通字段，
+    # 页面上和真实数据混在一起显示 —— 9 月 21 日之后采集一直失败，
+    # 页面照常渲染 9 天前的板块表，没人看出那是旧的。
+    # 库里存的是 date，psycopg2 回来也是 date；但如果哪条路径塞了字符串进来，
+    # 这里会炸在减法上，所以统一规整一次。
+    if isinstance(latest_date, str):
+        latest_date = date.fromisoformat(latest_date[:10])
+    stale_days = (date.today() - latest_date).days
     out = {
         "empty": False,
         "snap_date": latest_date.isoformat(),
+        "stale_days": stale_days,
+        "stale": stale_days >= 2,
+        "stale_note": (f"⚠️ 板块数据停留在 {latest_date.isoformat()}，"
+                       f"已落后 {stale_days} 个自然日，不是当天的。"
+                       f"原因通常是数据源被限流/掐断，采集在静默失败。") if stale_days >= 2 else "",
         "days_collected": len(dates_sorted),
         "indexes": fetch_index_overview(),
         "zt": {k: zt_today[k] for k in ("qdate", "total", "max_lb", "sum_zbc", "by_board")},
         "breadth": (daily_meta[-1].get("breadth") if daily_meta else {}),
         "daily_history": daily_meta,
-        "boards": boards[:200] if with_details else boards[:50],
+        # 全量返回，不截断（2026-09-30 起）。
+        # 原来是 `boards[:200] if with_details else boards[:50]`，前端再 slice(0,60)，
+        # 结果 1031 个板块只露出 60 个 —— 而「净流出板块」恰好总排在后面，
+        # 于是评分榜看上去"一个流出的都没有"，其实是没显示出来。
+        # 页面侧加了搜索/筛选来保证 1000+ 行还能用。
+        "boards": boards,
         "total_boards": len(boards),
         "momentum_note": (f"已积累 {len(dates_sorted)} 个交易日快照"
                           + ("，动量信号完整" if len(dates_sorted) >= 4
@@ -809,6 +1100,9 @@ def _intraday_loop():
     """盘中监控线程：交易时段每 interval_minutes 采样一次 + 急拉/涨停骤增预警。
 
     预警通过 notifier 推送（可配 alert_notify=False 关）。宽度低频（每 30 分钟）刷新。
+
+    失败退避（2026-10-01 加）：源被掐时不能照原节奏捶 —— 每 5 分钟 12 个请求
+    会让封禁永久续期，而且噪音盖掉真实错误。连续失败按 5/10/20/40… 分钟退避。
     """
     last_breadth = 0.0
     while True:
@@ -816,11 +1110,24 @@ def _intraday_loop():
             conf = load_intraday_conf()
             interval = max(int(conf.get("interval_minutes") or 5), 1)
             if conf.get("enabled", True) and _in_trading_session(datetime.now()):
+                # 退避未到就跳过这一轮（不发起任何请求）
+                with _state_lock:
+                    until = _state["backoff_until"]
+                if until:
+                    try:
+                        if datetime.now() < datetime.fromisoformat(until):
+                            time.sleep(60)
+                            continue
+                    except ValueError:
+                        pass
                 try:
                     result = _intraday_collect()
+                    _note_collect_success()
                     print(f"[sector] intraday: {result}", flush=True)
                 except Exception as exc:
-                    print(f"[sector] intraday collect failed: {exc}", flush=True)
+                    wait = _note_collect_failure(exc)
+                    time.sleep(min(wait, 300))
+                    continue
                 if conf.get("alert_notify", True):
                     try:
                         alerts = _intraday_check_alerts()
@@ -876,6 +1183,10 @@ def _sector_auto_loop():
     """交易日收盘后（15:10-23:59 间每小时检查一次）自动采集当日快照；已采过则跳过。
 
     判重：sa_sector_daily 当日已有记录即跳过（整日覆盖 upsert，手动重跑也安全）。
+
+    失败退避（2026-10-01 加）：和 _intraday_loop 共用 _state 的失败计数。
+    收盘后这段时间没有行情压力，源被掐时也没必要反复试 —— 退避到最多 1 小时一轮，
+    并在连续失败到阈值时推一次告警（原来只 print，9 天没人发现）。
     """
     while True:
         try:
@@ -886,8 +1197,21 @@ def _sector_auto_loop():
                                 (now.date(),))
                     done = cur.fetchone()
                 if not done:
+                    # 退避未到就跳过本轮（不发起任何请求）
+                    with _state_lock:
+                        until = _state["backoff_until"]
+                    skip = False
+                    if until:
+                        try:
+                            skip = datetime.now() < datetime.fromisoformat(until)
+                        except ValueError:
+                            skip = False
+                    if skip:
+                        time.sleep(300)
+                        continue
                     try:
                         result = collect_once()
+                        _note_collect_success()
                         print(f"[sector] auto snapshot: {result}", flush=True)
                         # 盘后预警：新主线候选 / 涨停聚集 → 微信/邮件
                         try:
@@ -904,7 +1228,9 @@ def _sector_auto_loop():
                             print(f"[sector] alert failed: {exc}", flush=True)
                         time.sleep(600)  # 采完歇 10 分钟再回主循环
                     except Exception as exc:
-                        print(f"[sector] auto snapshot failed: {exc}", flush=True)
+                        wait = _note_collect_failure(exc)
+                        time.sleep(min(wait, 600))
+                        continue
             time.sleep(1800)  # 半小时检查一次
         except Exception as exc:
             print(f"[sector] loop error: {exc}", flush=True)

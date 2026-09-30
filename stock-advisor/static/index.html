@@ -355,6 +355,7 @@
       <button data-tab="mp">📰 公众号<span id="mp-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="x">🐦 X<span id="x-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="reports">分析报告</button>
+      <button data-tab="paper">🧪 模拟交易</button>
       <button data-tab="jq">📚 策略库/沙箱<span id="jq-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="notify">🔔 通知</button>
       <button data-tab="schedule">⚙️ 调度</button>
@@ -430,6 +431,7 @@
           <label class="muted" style="font-size:12px">
             <input type="checkbox" id="disc-onlynew" onchange="loadDiscover()"> 只看新股/次新
           </label>
+          <span id="disc-meta" class="muted" style="font-size:12px"></span>
         </div>
 
         <div id="disc-stats" style="margin:4px 0 8px"></div>
@@ -525,6 +527,9 @@
       </div>
       <div id="sector-indexes" class="pnl-summary" style="margin-top:8px"></div>
       <div id="sector-sentiment" class="row" style="margin-top:6px;gap:16px;flex-wrap:wrap"></div>
+      <div id="sector-stale-banner" class="hide"
+           style="margin-top:8px;padding:8px 10px;border-radius:6px;font-size:12px;
+                  background:#3b2a12;border:1px solid #7a5a1e;color:#f0c674"></div>
       <div class="muted" style="margin-top:6px" id="sector-collect-note"></div>
     </div>
     <div class="card" id="intraday-card">
@@ -548,7 +553,29 @@
         也可点「手动刷新」立即采一次。</div>
     </div>
     <div class="card">
-      <b style="font-size:13px">🔥 轮动评分榜（主线候选：涨幅+主力资金+涨停+动量综合）</b>
+      <div class="card-head">
+        <b>🔥 轮动评分榜（主线候选：涨幅+主力资金+涨停+动量综合）</b>
+        <span class="muted" id="sector-boards-meta" style="font-size:12px"></span>
+      </div>
+      <div class="row" style="margin:6px 0;gap:8px">
+        <input id="sector-filter-text" placeholder="🔍 搜板块名" style="width:150px"
+               oninput="renderSectorBoards()">
+        <select id="sector-filter-dir" onchange="renderSectorBoards()" style="width:auto">
+          <option value="">资金：全部</option>
+          <option value="in">只看净流入</option>
+          <option value="out">只看净流出</option>
+        </select>
+        <select id="sector-filter-kind" onchange="renderSectorBoards()" style="width:auto">
+          <option value="">类型：全部</option>
+          <option value="industry">行业</option>
+          <option value="concept">概念</option>
+          <option value="region">地域</option>
+        </select>
+        <label class="muted" title="评分为 0 也能看到流出板块"><input type="checkbox"
+          id="sector-filter-zt" onchange="renderSectorBoards()"> 只看有涨停</label>
+        <button class="btn ghost sm" onclick="resetSectorFilter()">重置</button>
+        <span class="faint" id="sector-filter-count"></span>
+      </div>
       <div style="overflow-x:auto">
       <table style="margin-top:6px">
         <thead><tr>
@@ -2681,14 +2708,54 @@ function renderSector(ov) {
     sent.push(`<span>涨停 <b class="up">${zt.total}</b> 家 · 最高 <b>${zt.max_lb}</b> 连板 · 炸板 <b class="down">${zt.sum_zbc}</b> 次</span>`);
   $('sector-sentiment').innerHTML = sent.join('');
   $('sector-meta').textContent = ov.snap_date ? `快照 ${ov.snap_date}` : '';
+  // 数据陈旧告警（2026-10-01 加）。原来 snap_date 是个不起眼的小字，
+  // 采集挂了 9 天页面照常显示旧数据，没人看出那是 9 月 21 号的。
+  const banner = $('sector-stale-banner');
+  if (ov.stale) {
+    banner.textContent = ov.stale_note ||
+      `⚠️ 板块数据停留在 ${ov.snap_date}，已落后 ${ov.stale_days} 天，不是当天的。`;
+    banner.classList.remove('hide');
+  } else {
+    banner.classList.add('hide');
+    banner.textContent = '';
+  }
   $('sector-collect-note').textContent = ov.empty ? (ov.message || '') : (ov.momentum_note || '');
   $('sector-empty').classList.toggle('hide', !ov.empty);
   _sectorBoards = ov.boards || [];
+  $('sector-boards-meta').textContent =
+    ov.total_boards ? `共 ${ov.total_boards} 个板块，全量列出` : '';
+  renderSectorBoards();
+  $('sector-board-detail').classList.add('hide');
+}
+
+/** 轮动评分榜渲染。**全量渲染，不截断**（2026-09-30 起）。
+ *  之前只画前 60 行，而后端也只回 200 个 —— 1031 个板块里净流出的那些
+ *  天然排在后面，于是页面上"一个流出都看不到"。现在靠搜索/筛选缩小范围。 */
+function renderSectorBoards() {
   const tbody = $('sector-boards-body');
-  tbody.innerHTML = _sectorBoards.slice(0, 60).map((b, i) => {
+  if (!tbody) return;
+  const kw = ($('sector-filter-text')?.value || '').trim().toLowerCase();
+  const dir = $('sector-filter-dir')?.value || '';
+  const kind = $('sector-filter-kind')?.value || '';
+  const ztOnly = !!$('sector-filter-zt')?.checked;
+  let list = _sectorBoards || [];
+  if (kw) list = list.filter(b => (b.name || '').toLowerCase().includes(kw));
+  if (dir === 'in') list = list.filter(b => (b.main_inflow || 0) > 0);
+  else if (dir === 'out') list = list.filter(b => (b.main_inflow || 0) < 0);
+  if (kind) list = list.filter(b => b.kind === kind);
+  if (ztOnly) list = list.filter(b => (b.zt_count || 0) > 0);
+  const cnt = $('sector-filter-count');
+  if (cnt) {
+    const all = (_sectorBoards || []).length;
+    const nOut = (_sectorBoards || []).filter(b => (b.main_inflow || 0) < 0).length;
+    cnt.textContent = list.length === all
+      ? `全市场 ${all} 个（净流出 ${nOut} 个）`
+      : `筛出 ${list.length} / ${all} 个（净流出 ${nOut} 个）`;
+  }
+  tbody.innerHTML = list.map((b) => {
     const kindName = { industry: '行业', concept: '概念', region: '地域' }[b.kind] || b.kind;
     return `<tr data-bk="${b.code}" style="cursor:pointer" onclick="toggleBoardDetail('${b.code}')">
-      <td><b>${b.name}</b></td>
+      <td><b>${esc(b.name)}</b></td>
       <td class="muted">${kindName}</td>
       <td class="${cls(b.pct)}">${b.pct !== null && b.pct !== undefined ? signed(b.pct) + '%' : '—'}</td>
       <td class="muted">${b.pct_rank != null ? '前' + (100 - b.pct_rank) + '%' : '—'}</td>
@@ -2696,11 +2763,17 @@ function renderSector(ov) {
       <td class="${cls(b.mom3)}">${b.mom3 != null ? signed(b.mom3) + '%' : '<span class="muted">积累中</span>'}</td>
       <td>${b.zt_count ? `<b class="up">${b.zt_count}</b>` : '<span class="muted">0</span>'}</td>
       <td><b style="color:var(--accent)">${b.score ?? '—'}</b></td>
-      <td class="muted">${b.lead_stock || '—'}${b.lead_stock_pct != null ? ` <span class="${cls(b.lead_stock_pct)}">${signed(b.lead_stock_pct)}%</span>` : ''}</td>
+      <td class="muted">${esc(b.lead_stock || '—')}${b.lead_stock_pct != null ? ` <span class="${cls(b.lead_stock_pct)}">${signed(b.lead_stock_pct)}%</span>` : ''}</td>
       <td class="muted">▾</td>
     </tr>`;
-  }).join('');
-  $('sector-board-detail').classList.add('hide');
+  }).join('') || '<tr><td colspan="10" class="empty">没有符合条件的板块</td></tr>';
+}
+
+function resetSectorFilter() {
+  ['sector-filter-text', 'sector-filter-dir', 'sector-filter-kind']
+    .forEach(id => { const el = $(id); if (el) el.value = ''; });
+  const zt = $('sector-filter-zt'); if (zt) zt.checked = false;
+  renderSectorBoards();
 }
 async function toggleBoardDetail(bk) {
   const box = $('sector-board-detail');

@@ -141,6 +141,14 @@ EVENTS: dict[str, dict[str, Any]] = {
         "help": "盘后快照发现新主线候选 / 涨停聚集时提醒。",
         "source": "sector._sector_auto_loop()",
     },
+    "sector_collect_failed": {
+        "label": "🔌 板块采集失败",
+        "group": "行情异动",
+        "default": {"wx": True, "email": True},
+        "help": "板块快照/盘中采样连续失败时提醒。**这个必须开着** ——"
+                "2026-09-21 起采集静默失败 9 天，页面照常显示旧数据没人发现。",
+        "source": "sector._intraday_loop() / _sector_auto_loop()",
+    },
     "crypto_move": {
         "label": "🪙 币圈 24h 异动",
         "group": "行情异动",

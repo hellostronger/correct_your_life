@@ -4130,7 +4130,18 @@ def sandbox_precheck(body: SandboxPrecheckIn):
                        WHERE trade_date BETWEEN %s AND %s""",
                     (m["start"], m["end"]))
         vdays = cur.fetchone()[0]
-    est = JS.estimate_universe(len(m["codes"]))
+    # estimate_universe 是后加的（内存估算，2026-09-30 沙箱内存标定那次）。
+    # 刻意按可选处理：取不到就传 None —— _precheck_verdict 本来就接受
+    # est=None（两处都判空）并会落到"可以跑。"。直接 JS.estimate_universe(...)
+    # 一旦这个函数不存在，整个 precheck 端点 500，而体检功能本身与它无关。
+    # 顺带说明：77a0b7f 那次提交确实短暂缺过这个函数（当时 app.py 带了调用、
+    # jq_sandbox.py 的实现还没提交），2c3e19a 补齐了；这里留作长期兜底。
+    est = None
+    if hasattr(JS, "estimate_universe"):
+        est = JS.estimate_universe(len(m["codes"]))
+    else:
+        print("[sandbox] jq_sandbox.estimate_universe 不可用，"
+              "precheck 跳过内存估算", flush=True)
     return {"post_id": m["post_id"], "title": m["title"],
             "can_run": m["syntax_ok"], "syntax_state": m["syntax_state"],
             "redacted": m["redacted"], "n_blocks": m["n_blocks"],
@@ -6020,7 +6031,14 @@ import sector as sector_mod
 
 @app.get("/api/sector/overview")
 def sector_overview(details: bool = True):
-    """板块轮动总览：当日榜 + 轮动评分 + 市场情绪（指数/宽度/涨停）。"""
+    """板块轮动总览。**返回全量板块，不截断**（2026-09-30 起）。
+
+    原来后端截到 200、前端再截到 60，1031 个板块只露出 60 个。而「净流出」
+    的板块天然排在后面，于是评分榜看上去一个流出的都没有 —— 是没显示，不是没有。
+    页面侧加了搜索/筛选来保证 1000+ 行仍然可用。
+
+    `details` 参数已废弃、保留只为不打断既有调用方（两种取值现在行为一致）。
+    """
     return sector_mod.build_overview(with_details=details)
 
 
@@ -6044,7 +6062,9 @@ def sector_snapshot():
 
 @app.get("/api/sector/status")
 def sector_status():
-    return {**sector_mod.get_status(), "auto": "交易日收盘后自动采集（15:10 起，半小时一查）"}
+    return {**sector_mod.get_status(),
+            "health": sector_mod.collect_health(),
+            "auto": "交易日收盘后自动采集（15:10 起，半小时一查）"}
 
 
 @app.get("/api/sector/digest")
