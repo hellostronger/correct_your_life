@@ -463,5 +463,6 @@ def check_alerts_once(conn, notify_fn=None, days: int = DEFAULT_DAYS,
             f"减持看最近 {reduce_lookback_days} 天）：\n\n" + "\n\n".join(parts) +
             f"\n\n（解禁=供给冲击，增发上市=股本摊薄，减持=已公告的抛压；"
             f"来自 stock-advisor 事件监控，"
-            f"{datetime.now().strftime('%Y-%m-%d %H:%M')}）")
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M')}）",
+            event="alerts_event")
     return fresh

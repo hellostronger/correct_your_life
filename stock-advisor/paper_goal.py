@@ -343,5 +343,6 @@ def evaluate_active(deps, notify: bool = True) -> list[dict]:
                 f"• {end_line}"
                 f"\n• 时间进度曾走到 {p['time_pct']:g}%"
                 f"（按进度应达 {p['on_track_pct']:+.2f}%）"
-                + note_line)
+                + note_line,
+                event="paper_goal")
     return out

@@ -73,7 +73,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_MP_CONF = {
     "enabled": True,
     "interval_minutes": 30,   # 拉取周期（分钟），0 = 关闭
-    "notify_new": True,       # 有新文章推微信
+    "notify_new": True,       # 有新文章时走通知（发不发、发哪些渠道见 notify_events 矩阵）
     "max_items": 50,          # 每源每轮最多取多少条
     "keep_days": 120,         # 文章保留天数，超期清理
     "timeout": 25,
@@ -824,11 +824,15 @@ def run_once(deps) -> dict:
         _cleanup(deps, conf)
         fresh = [i for it in items for i in it.get("fresh", [])]
         pushed = 0
-        if fresh and conf.get("notify_new", True):
+        # 两道门：本段 notify_new（粗粒度，用户可能整段关掉）与
+        # notifier 内部的事件矩阵（细粒度，notify_events.mp_article）。
+        # 邮箱那一条由矩阵关掉 —— 见 notify_events.py 顶部说明。
+        if fresh and conf.get("notify_new", True) and _pushable():
             try:
-                deps["notify_fn"](_notify_title(len(fresh)),
-                                  _notify_body(fresh))
-                pushed = 1
+                res = deps["notify_fn"](_notify_title(len(fresh)),
+                                        _notify_body(fresh),
+                                        event="mp_article")
+                pushed = 1 if (res or {}).get("sent") else 0
             except Exception as exc:
                 print(f"[mp] notify failed: {exc}", flush=True)
         result = {"items": items, "new": sum(i["new"] for i in items),
@@ -847,6 +851,16 @@ def _cleanup(deps, conf: dict) -> None:
     with deps["get_conn"]() as conn, conn.cursor() as cur:
         cur.execute("DELETE FROM sa_mp_articles "
                     "WHERE fetched_at < now() - make_interval(days => %s)", (keep,))
+
+
+def _pushable() -> bool:
+    """本次新文章还有没有可用渠道（矩阵全关时不必组装正文，省一次拼接）。
+
+    notifier 延迟 import：本模块刻意不 import app（避免循环依赖），
+    notifier 自己也只在被调用时才 import app 的 get_conn。
+    """
+    import notifier
+    return notifier.event_enabled("mp_article")
 
 
 def _notify_title(n: int) -> str:

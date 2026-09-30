@@ -462,7 +462,8 @@ def generate_premarket_brief(deps) -> dict:
         print("[reports] 盘前简报重跑后仍不合格（草稿/截断/缺节），已落盘请人工过目", flush=True)
     push_ok = False
     try:
-        res = deps.get("notify_fn")(f"🌅 盘前简报 {today}", _strip_md_for_push(body))
+        res = deps.get("notify_fn")(f"🌅 盘前简报 {today}", _strip_md_for_push(body),
+                                   event="premarket_report")
         push_ok = bool((res or {}).get("sent"))
     except Exception as exc:
         print(f"[reports] 盘前推送失败: {exc}", flush=True)
@@ -481,7 +482,8 @@ def generate_postmarket_review(deps) -> dict:
         print("[reports] 盘后复盘重跑后仍不合格（草稿/截断/缺节），已落盘请人工过目", flush=True)
     push_ok = False
     try:
-        res = deps.get("notify_fn")(f"📋 盘后复盘 {today}", _strip_md_for_push(body))
+        res = deps.get("notify_fn")(f"📋 盘后复盘 {today}", _strip_md_for_push(body),
+                                   event="postmarket_report")
         push_ok = bool((res or {}).get("sent"))
     except Exception as exc:
         print(f"[reports] 盘后推送失败: {exc}", flush=True)

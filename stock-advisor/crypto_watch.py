@@ -1098,7 +1098,7 @@ def _check_link_alerts(deps, rows: list[dict], conf: dict) -> list[str]:
             f"±{threshold:g}%）：\n" + "\n".join(lines)
             + "\n\n（比价=股票收盘/合约收盘；偏离常来自合约溢价或股票除权，"
                "仅提示，不构成投资建议。数据源 gate.io + 东财/腾讯）")
-    deps.get("notify_fn")("🔗 币股比价偏离", body)
+    deps.get("notify_fn")("🔗 币股比价偏离", body, event="crypto_link")
     return [f"{len(hits)} 条"]
 
 
@@ -1196,7 +1196,7 @@ def _check_alerts(deps, quotes: dict, conf: dict) -> list[str]:
     body = ("gate.io 股票永续 24h 异动（连续交易，与 A 股休市无关）：\n"
             + "\n".join(lines)
             + f"\n\n（阈值 ±{threshold:g}%，仅趋势参考，数据源 gate.io）")
-    deps.get("notify_fn")("🪙 币圈异动（股票永续 24h）", body)
+    deps.get("notify_fn")("🪙 币圈异动（股票永续 24h）", body, event="crypto_move")
     return [title]
 
 

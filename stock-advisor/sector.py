@@ -830,7 +830,8 @@ def _intraday_loop():
                                 "⚡ 板块盘中异动",
                                 "\n\n".join(a[1] for a in alerts[:6])
                                 + f"\n\n（{datetime.now().strftime('%H:%M')} 采样，"
-                                  "来自 stock-advisor 盘中板块监控）")
+                                  "来自 stock-advisor 盘中板块监控）",
+                                event="sector_intraday")
                     except Exception as exc:
                         print(f"[sector] intraday alert failed: {exc}", flush=True)
                 if time.time() - last_breadth >= 1800:
@@ -896,7 +897,8 @@ def _sector_auto_loop():
                                 notifier.notify(
                                     "🧭 板块轮动预警",
                                     "\n\n".join(alerts) + f"\n\n（快照 {result.get('date')}，"
-                                    "来自 stock-advisor 板块监控）")
+                                    "来自 stock-advisor 板块监控）",
+                                    event="sector_rotation")
                                 print(f"[sector] alerts sent: {len(alerts)}", flush=True)
                         except Exception as exc:
                             print(f"[sector] alert failed: {exc}", flush=True)

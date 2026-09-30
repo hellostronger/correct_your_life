@@ -138,6 +138,44 @@
   .b-eastmoney { background: #ffe9d6; color: #b25f00; }
   .b-baidu      { background: #e2ecff; color: #2456b3; }
   .b-sina       { background: #ffe2e2; color: #b32424; }
+
+  /* ---------- 聚宽策略库 / 沙箱页 ---------- */
+  /* 徽标变体。用 CSS 变量而不是硬编码色，这样深浅色主题都跟着变
+     （原来那批 .b-eastmoney 是写死浅色的，深色模式下会突兀）。 */
+  .badge.b-ok   { background: var(--accent-soft); color: var(--accent-ink); }
+  .badge.b-warn { background: var(--up-soft); color: var(--up); }
+  .badge.b-bad  { background: var(--down-soft); color: var(--down); }
+
+  /* 子页切换按钮：复用 .btn.ghost，只多一个选中态 */
+  .jq-sub.active { color: var(--accent); border-color: var(--accent);
+                   background: var(--accent-soft); }
+
+  /* 顶部统计条：数字大、说明小，扫一眼就知道量级 */
+  .jq-stats { display: flex; flex-wrap: wrap; gap: 8px; }
+  .jq-stat  { min-width: 78px; padding: 6px 10px; border-radius: 8px;
+              background: var(--bg-2); border: 1px solid var(--border); }
+  .jq-stat-v { font-family: var(--mono); font-size: 15px; font-weight: 600;
+               font-variant-numeric: tabular-nums; }
+  .jq-stat-k { color: var(--text-3); font-size: 11px; margin-top: 1px; }
+
+  /* 运行结果指标块 */
+  .jq-metrics { display: flex; flex-wrap: wrap; gap: 8px; }
+  .jq-metric  { min-width: 82px; padding: 6px 10px; border-radius: 8px;
+                background: var(--bg-2); border: 1px solid var(--border); }
+  .jq-metric-v { font-family: var(--mono); font-size: 15px; font-weight: 600;
+                 font-variant-numeric: tabular-nums; }
+  .jq-metric-k { color: var(--text-3); font-size: 11px; margin-top: 1px; }
+
+  /* 源码 / 报错。源码要能横向滚而不折行 —— 折行后缩进对不上，
+     读 Python 缩进会读错结构，所以强制 pre + overflow-x。 */
+  .jq-code, .jq-err {
+    font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
+    background: var(--bg-2); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 10px; margin: 4px 0 0;
+    max-height: 460px; overflow: auto; white-space: pre; tab-size: 4;
+  }
+  .jq-err { white-space: pre-wrap; word-break: break-word; max-height: 300px;
+            color: var(--up); }
   .b-duckduckgo { background: #e5f3e2; color: #2e7d32; }
   .b-ok   { background: var(--down-soft); color: var(--down); }
   .b-warn { background: var(--warn-soft); color: var(--warn); }
@@ -258,6 +296,22 @@
   @media (max-width: 640px) { .cfg-grid { grid-template-columns: 1fr; } }
   .spin { display: inline-block; animation: rot .9s linear infinite; }
   @keyframes rot { to { transform: rotate(360deg) } }
+
+  /* ---------- 通知事件矩阵（🔔 通知页） ----------
+     表格里每格一个复选框。整行可点，不必瞄准 15px 的小方框 —— 18 行 × 2 列
+     共 36 个复选框，用鼠标逐个点是折磨。 */
+  .mtx { width: 100%; border-collapse: collapse; }
+  .mtx th, .mtx td { padding: 5px 6px; border-bottom: 1px solid var(--border); }
+  .mtx th { font-size: 11.5px; color: var(--text-3); font-weight: 500; text-align: center; }
+  .mtx th.grp, .mtx td.grp { text-align: left; font-weight: 600; font-size: 12px;
+                             color: var(--text-2); background: var(--bg-2); }
+  .mtx td.ev { white-space: normal; }
+  .mtx tr.ev-row:hover { background: var(--card-2); }
+  .mtx tr.ev-row.off td { opacity: .45; }
+  .mtx td.cb { text-align: center; }
+  .mtx .ev-label { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+  .mtx .ev-help { font-size: 11.5px; color: var(--text-3); line-height: 1.5;
+                  margin-top: 2px; white-space: normal; }
   /* 骨架屏：比转圈更能表达"正在取数"，也避免布局跳动 */
   .skel { background: linear-gradient(90deg, var(--bg-2) 25%, var(--card-2) 37%, var(--bg-2) 63%);
     background-size: 400% 100%; animation: sk 1.3s ease infinite; border-radius: 5px; }
@@ -301,7 +355,7 @@
       <button data-tab="mp">📰 公众号<span id="mp-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="x">🐦 X<span id="x-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="reports">分析报告</button>
-      <button data-tab="paper">🧪 模拟交易</button>
+      <button data-tab="jq">📚 策略库/沙箱<span id="jq-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="notify">🔔 通知</button>
       <button data-tab="schedule">⚙️ 调度</button>
     </div>
@@ -943,6 +997,100 @@
     </div>
   </section>
 
+  <!-- 聚宽策略库 + 沙箱验证 -->
+  <section id="tab-jq" class="hide">
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <b style="font-size:13px">📚 聚宽策略库 · 沙箱验证</b>
+        <span class="row">
+          <input id="jq-post-id" placeholder="post_id（可留空）"
+                 style="width:190px;padding:4px 7px;border-radius:6px;font-size:12px;
+                        border:1px solid var(--border);background:var(--bg-2);color:var(--fg)">
+          <button class="btn ghost" style="font-size:12px" onclick="jqFetch(this)">抓取文章</button>
+          <button class="btn ghost" style="font-size:12px" onclick="jqExtract(this)">LLM 抽取</button>
+          <button class="btn ghost" style="font-size:12px" onclick="loadJqLib()">刷新</button>
+        </span>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:4px">
+        链路：抓文章 → 抽源码 → LLM 结构化抽取 → 静态体检 → 沙箱回测 → 验证图。
+        平台纯自用、不对外发布。
+      </div>
+      <div class="jq-stats" id="jq-stats" style="margin-top:8px"></div>
+      <div class="muted" id="jq-sandbox" style="font-size:12px;margin-top:6px"></div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <span class="row" style="gap:4px">
+          <button class="btn ghost jq-sub active" id="jq-sub-lib" style="font-size:12px"
+                  onclick="jqSwitch('lib')">文章</button>
+          <button class="btn ghost jq-sub" id="jq-sub-digest" style="font-size:12px"
+                  onclick="jqSwitch('digest')">已抽取</button>
+          <button class="btn ghost jq-sub" id="jq-sub-backtest" style="font-size:12px"
+                  onclick="jqSwitch('backtest')">回测</button>
+          <button class="btn ghost jq-sub" id="jq-sub-runs" style="font-size:12px"
+                  onclick="jqSwitch('runs')">沙箱记录</button>
+        </span>
+        <span class="row" style="font-size:12px">
+          <label id="jq-only-code-wrap"><input type="checkbox" id="jq-only-code"
+                 onchange="loadJqList()"> 只看有源码</label>
+          <label id="jq-only-failed-wrap" class="hide"><input type="checkbox" id="jq-only-failed"
+                 onchange="loadJqList()"> 只看失败</label>
+          <span class="muted" id="jq-list-meta"></span>
+        </span>
+      </div>
+      <div id="jq-list" style="margin-top:8px"></div>
+    </div>
+
+    <div class="card hide" id="jq-detail-card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <b style="font-size:13px">文章详情</b>
+        <span class="row" style="font-size:12px">
+          <label class="row" style="gap:3px"><span class="muted">起</span>
+            <input id="jq-start" value="2024-01-01"
+                   style="width:110px;padding:4px 6px;border-radius:6px;font-size:12px;
+                          border:1px solid var(--border);background:var(--bg-2);color:var(--fg)"></label>
+          <label class="row" style="gap:3px"><span class="muted">止</span>
+            <input id="jq-end" placeholder="空=最新"
+                   style="width:110px;padding:4px 6px;border-radius:6px;font-size:12px;
+                          border:1px solid var(--border);background:var(--bg-2);color:var(--fg)"></label>
+          <label class="row" style="gap:3px"><span class="muted">截面</span>
+            <input id="jq-limit" type="number" value="400" min="1" max="3000"
+                   style="width:74px;padding:4px 6px;border-radius:6px;font-size:12px;
+                          border:1px solid var(--border);background:var(--bg-2);color:var(--fg)"></label>
+        </span>
+      </div>
+      <div id="jq-detail" style="margin-top:8px"></div>
+      <div class="row" style="margin-top:10px;gap:6px;flex-wrap:wrap">
+        <button class="btn ghost" style="font-size:12px" onclick="jqPrecheck(this)">静态体检</button>
+        <button class="btn" style="font-size:12px" onclick="jqRun('local', this)">本地试跑</button>
+        <button class="btn" style="font-size:12px" onclick="jqRun('container', this)">容器跑（落库）</button>
+        <button class="btn ghost" style="font-size:12px" onclick="jqCompare(this)">本地 vs 容器对比</button>
+        <span style="width:10px"></span>
+        <span class="muted" style="font-size:12px">批量</span>
+        <input id="jq-batch-n" type="number" value="3" min="1" max="20"
+               style="width:56px;padding:4px 6px;border-radius:6px;font-size:12px;
+                      border:1px solid var(--border);background:var(--bg-2);color:var(--fg)">
+        <span class="muted" style="font-size:12px">篇</span>
+        <button class="btn ghost" style="font-size:12px" onclick="jqBatch(this)">批量本地跑</button>
+      </div>
+      <div class="muted" style="font-size:11px;margin-top:4px">
+        本地试跑无隔离、10~60 秒，用来快速暴露语法/API 用错；容器跑完整隔离，
+        结果才落库。批量刻意串行 —— 每个沙箱运行已吃满 1 核，101 只有 4 核还跑着 9 个容器。
+      </div>
+      <div id="jq-precheck" style="margin-top:8px"></div>
+      <div id="jq-run-out" style="margin-top:8px"></div>
+    </div>
+
+    <div class="card hide" id="jq-curve-card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <b style="font-size:13px">📈 验证图</b>
+        <button class="btn ghost" style="font-size:12px"
+                onclick="$('jq-curve-card').classList.add('hide')">收起</button>
+      </div>
+      <div id="jq-curve" style="margin-top:6px"></div>
+    </div>
+  </section>
   <!-- 通知 -->
   <section id="tab-notify" class="hide">
     <div class="card">
@@ -950,6 +1098,9 @@
       <div class="row" style="margin-top:8px">
         <button class="btn" id="wx-bind-btn" onclick="startWxBind()">扫码登录微信</button>
         <button class="btn ghost" onclick="testNotify('wx')">发送测试消息</button>
+        <button class="btn ghost" onclick="rebuildWxSession()"
+                title="iLink 的会话不是持久状态，服务重启后要重新声明一次。
+不声明的话所有推送都会失败（ret=-2 prepare failed）。">重建会话</button>
         <button class="btn ghost" onclick="unbindWx()">解绑</button>
         <span class="muted" id="wx-bind-status"></span>
       </div>
@@ -966,8 +1117,10 @@
       <div class="muted" style="margin-top:8px">
         走腾讯微信团队官方 iLink Bot 通道（openclaw 微信渠道同款协议），无需注册第三方平台。
         ① 点「扫码登录微信」→ 手机微信扫码（首次可能需输入手机上显示的数字）；
-        ② 登录成功后<b>先在微信里随便给 bot 发一条消息</b>（iLink 是被动会话制，之后才能收到主动推送）；
-        ③ 点「发送测试消息」验证。启用后 Claude 定时任务的报告会自动推送到微信。
+        ② 登录成功后系统会自动向 iLink 声明在线（<code>notifystart</code>），
+        <b>不需要你再手动给 bot 发消息</b>；
+        ③ 点「发送测试消息」验证。若推送失败可点「重建会话」重新声明。
+        注意 iLink 的会话不是持久状态——服务每次重启都会自动重新声明一次。
       </div>
     </div>
     <div class="card">
@@ -1000,6 +1153,51 @@
       <div class="muted" style="margin-top:8px">
         也可以在 Claude 会话里让 Claude 发通知，例如：
         「把今天的复盘报告发到我微信」或「测试一下邮件通知」。
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <b>💬 微信对话</b>
+        <div class="row tight">
+          <button class="btn ghost sm" onclick="refreshWxChat()">刷新</button>
+          <button class="btn ghost sm" onclick="toggleWxChat()"
+                  id="wx-chat-toggle">停用对话</button>
+        </div>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <input id="wx-chat-input" placeholder="对 bot 说点什么（这里发 = 立刻回，不用等微信）"
+               style="flex:1;min-width:180px"
+               onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();askWxChat();}">
+        <button class="btn" id="wx-chat-btn" onclick="askWxChat()">问一句</button>
+      </div>
+      <div class="hint" id="wx-chat-status">加载中…</div>
+      <div class="hint">
+        在微信里给 bot 发消息，服务会读到并用 Claude 回你。入站是 35 秒长轮询，
+        所以发完最多等半分钟。语音/图片暂不解析（只记录不回复）。
+      </div>
+      <div id="wx-chat-log" style="margin-top:8px;max-height:420px;overflow-y:auto"></div>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <b>🎛️ 通知事件开关</b>
+        <div class="row tight">
+          <button class="btn ghost sm" onclick="notifyMatrixBulk('wx', true)">微信全开</button>
+          <button class="btn ghost sm" onclick="notifyMatrixBulk('wx', false)">微信全关</button>
+          <button class="btn ghost sm" onclick="notifyMatrixBulk('email', true)">邮件全开</button>
+          <button class="btn ghost sm" onclick="notifyMatrixBulk('email', false)">邮件全关</button>
+          <button class="btn ghost sm" onclick="notifyMatrixOnly('wx')">只留微信</button>
+        </div>
+      </div>
+      <div class="hint">
+        <b>这里就是全部的通知配置了</b>：一行一个事件，勾上哪个渠道就往哪推。
+        实际发送条件 = <b>上方渠道总开关</b> AND <b>下面的事件·渠道开关</b>（两级与，
+        任一关掉都不发）。点行内任意位置都能切换，勾上立刻生效，不用点保存。<br>
+        为什么要有这一层：<b>同一个事件对不同渠道的价值完全不同</b>。公众号新文章
+        时效性强、量大，进邮箱就是垃圾堆；而盘后复盘是当天的结论，值得归档。
+        以前只有一个全局「启用邮件」，要么全进要么全不进。
+      </div>
+      <div id="nf-matrix" style="margin-top:10px">
+        <div class="muted">加载中…</div>
       </div>
     </div>
   </section>
@@ -1718,10 +1916,646 @@ async function withBusy(btn, label, fn) {
   try { return await fn(); }
   finally { btn.disabled = false; btn.textContent = old; }
 }
+// ---- 聚宽策略库 + 沙箱验证 ----
+// 这一页串起整条链路：抓文章 -> 抽源码 -> LLM 结构化 -> 静态体检 -> 沙箱回测 -> 验证图。
+// 设计上有三处是刻意的：
+//
+// 1) **体检（precheck）和跑（run）分成两个按钮**。容器跑一次要切数据、上传、
+//    跑几十秒。语法错、API 用错、路径写错全在这一步白花，所以先用不花钱的
+//    静态体检拦一道。
+//
+// 2) **本地试跑和容器出数分开**。本地无隔离、10~60 秒，用来快速试错；
+//    容器完整隔离，结果才落库。默认本地，确认能跑通了再上容器。
+//
+// 3) **失败也留痕并显示**。「为什么它没跑」比「跑成功」更需要查，所以沙箱
+//    记录表默认把错误原文显示出来，而不是只给一个红色的失败。
+const JQ_TABS = { lib: '文章', digest: '已抽取', backtest: '回测', runs: '沙箱记录' };
+let JQ_POST = '';        // 当前选中的文章 post_id
+let JQ_VIEW = 'lib';     // 当前子页
+let JQ_CURVE = null;     // 当前画的曲线数据
+let JQ_CURVE_RUN = 0;    // 曲线对应的 backtest run_id
+
+function jqEsc(s) { return esc(s == null ? '' : String(s)); }
+
+/** syntax_state -> 徽标。ok/fragment/syntax_error/empty 一眼看懂差别。 */
+function jqSyntaxBadge(st) {
+  const m = {
+    ok: ['可运行', 'badge b-ok'],
+    fragment: ['分段贴', 'badge b-warn'],
+    syntax_error: ['语法错', 'badge b-bad'],
+    empty: ['无源码', 'badge'],
+  }[st] || [(st || '未知'), 'badge'];
+  return `<span class="${m[1]}">${jqEsc(m[0])}</span>`;
+}
+
+/** 可移植性打分 0~5 -> 直观标签。分数是 LLM 给的，不当权威，只当筛选线索。 */
+function jqScoreBadge(n) {
+  if (n == null) return '<span class="muted">—</span>';
+  const v = Number(n);
+  const c = v >= 4 ? 'badge' : v >= 2 ? 'badge b-warn' : 'badge b-bad';
+  return `<span class="${c}">${v}/5</span>`;
+}
+
+async function loadJqLib() {
+  try {
+    const [st, h] = await Promise.all([
+      api('/api/strategy-lib/stats'), api('/api/sandbox/health')]);
+    const q = st.queue || {}, a = st.articles || {};
+    $('jq-stats').innerHTML = [
+      ['队列', `${q.fetched || 0} 已抓 / ${q.pending || 0} 待抓`],
+      ['文章', a.total != null ? a.total : (st.articles || 0)],
+      ['有源码', st.with_source || 0],
+      ['可运行', st.runnable_source || 0],
+      ['已抽取', st.digested || 0],
+      ['待抽取', st.need_extract || 0],
+      ['抓取率', (st.fetch_rate || 0) + '%'],
+    ].map(([k, v]) => `<div class="jq-stat"><div class="jq-stat-v">${jqEsc(v)}</div>
+        <div class="jq-stat-k">${jqEsc(k)}</div></div>`).join('');
+    // 沙箱状态放在这儿而不是单独一页：跑之前第一眼就该看到「镜像在不在、
+    // 磁盘够不够」，否则每次失败都要人去翻远端日志。
+    $('jq-sandbox').innerHTML = h.ok
+      ? `沙箱就绪 · 镜像 <b>${jqEsc(h.image)}</b> · 磁盘 ${jqEsc(h.disk_free)}
+         · 内存 ${jqEsc(h.mem_available_mb)}MB
+         · 限制 ${jqEsc((h.limits || {}).memory || '')}/${jqEsc((h.limits || {}).cpus || '')}CPU
+         ${h.hint ? '· <b style="color:var(--up)">' + jqEsc(h.hint) + '</b>' : ''}`
+      : `沙箱不可用：${jqEsc(h.hint || h.error || '未知原因')}`;
+  } catch (e) { toast('策略库状态加载失败：' + e.message, 'err'); }
+}
+
+/** 文章列表。三个子页共用这一个 loader，靠 JQ_VIEW 切。 */
+async function loadJqList() {
+  const meta = $('jq-list-meta'), box = $('jq-list');
+  if (!box) return;
+  box.innerHTML = '<div class="muted">加载中…</div>';
+  try {
+    if (JQ_VIEW === 'lib') {
+      const onlyCode = $('jq-only-code') && $('jq-only-code').checked;
+      const d = await api('/api/strategy-lib/articles?limit=100&has_code=' + (!!onlyCode));
+      const items = d.items || [];
+      meta.textContent = `${items.length} 篇${onlyCode ? '（有源码）' : ''}`;
+      if (!items.length) { box.innerHTML = '<div class="muted">没有文章。点「抓取文章」。</div>'; return; }
+      box.innerHTML = `<table><thead><tr>
+        <th>标题</th><th>克隆</th><th>回复</th><th>浏览</th><th>源码</th>
+        <th>抽取</th><th></th></tr></thead><tbody>` + items.map(it => {
+        const sel = it.post_id === JQ_POST;
+        return `<tr style="cursor:pointer;${sel ? 'background:var(--bg-2)' : ''}"
+            onclick="openJqArticle('${it.post_id}')">
+          <td><b>${jqEsc(it.title)}</b>
+            <div class="muted" style="font-size:11px">${jqEsc((it.tags || []).join(' '))}
+              ${it.author ? '· ' + jqEsc(it.author) : ''}</div></td>
+          <td class="mono">${it.clone_count ?? '—'}</td>
+          <td class="mono">${it.reply_count ?? '—'}</td>
+          <td class="mono">${it.view_count ?? '—'}</td>
+          <td>${it.has_code
+            ? `<span class="badge">${it.code_lines || '?'} 行</span>`
+            : '<span class="muted">无</span>'}</td>
+          <td>${it.needs_reextract
+            ? '<span class="badge b-warn">待抽取</span>'
+            : (it.has_code ? '<span class="badge">已抽取</span>' : '<span class="muted">—</span>')}</td>
+          <td class="muted" style="font-size:11px">${sel ? '已选中' : '查看'}</td>
+        </tr>`; }).join('') + '</tbody></table>';
+    } else if (JQ_VIEW === 'digest') {
+      const d = await api('/api/strategy-digest/list?limit=100');
+      const items = d.items || [];
+      meta.textContent = `${items.length} 篇已抽取`;
+      if (!items.length) { box.innerHTML = '<div class="muted">还没有抽取结果。点「LLM 抽取」。</div>'; return; }
+      box.innerHTML = `<table><thead><tr>
+        <th>标题</th><th>类型</th><th>可移植</th><th>完整度</th>
+        <th>声称收益</th><th>有源码</th><th></th></tr></thead><tbody>` + items.map(it => {
+        const pc = it.perf_claimed || {};
+        const claim = Object.entries(pc).slice(0, 2)
+          .map(([k, v]) => `${jqEsc(k)} ${jqEsc(v)}`).join(' · ');
+        return `<tr style="cursor:pointer" onclick="openJqArticle('${it.article_id}')">
+          <td><b>${jqEsc(it.title_zh || it.title)}</b></td>
+          <td class="muted">${jqEsc(it.strategy_type || '—')}</td>
+          <td>${jqScoreBadge(it.portable_score)}</td>
+          <td class="mono">${it.completeness ?? '—'}%</td>
+          <td style="font-size:12px">${claim || '<span class="muted">未声称</span>'}</td>
+          <td>${it.has_code ? `<span class="badge">${it.code_lines || '?'} 行</span>`
+            : '<span class="muted">无</span>'}</td>
+          <td class="muted" style="font-size:11px">查看</td>
+        </tr>`; }).join('') + '</tbody></table>';
+    } else if (JQ_VIEW === 'backtest') {
+      const d = await api('/api/backtest/runs?limit=50');
+      const items = d.items || [];
+      meta.textContent = `${items.length} 条回测`;
+      if (!items.length) { box.innerHTML = '<div class="muted">还没有回测记录。选一篇文章跑一次。</div>'; return; }
+      box.innerHTML = `<table><thead><tr>
+        <th>#</th><th>名称</th><th>区间</th><th>总收益</th><th>年化</th>
+        <th>回撤</th><th>夏普</th><th>胜率</th><th>笔数</th><th></th></tr></thead><tbody>`
+        + items.map(it => `<tr>
+          <td class="mono">${it.id}</td>
+          <td><b>${jqEsc(it.name || '')}</b></td>
+          <td class="mono muted" style="font-size:11px">${jqEsc(it.start_date)} ~ ${jqEsc(it.end_date)}</td>
+          <td class="${cls(it.total_return)} mono"><b>${it.total_return != null ? signed(it.total_return) + '%' : '—'}</b></td>
+          <td class="${cls(it.annual_return)} mono">${it.annual_return != null ? signed(it.annual_return) + '%' : '—'}</td>
+          <td class="down mono">${it.max_drawdown != null ? it.max_drawdown.toFixed(2) + '%' : '—'}</td>
+          <td class="mono">${it.sharpe ?? '—'}</td>
+          <td class="mono">${it.win_rate != null ? it.win_rate.toFixed(1) + '%' : '—'}</td>
+          <td class="mono">${it.trade_count ?? '—'}</td>
+          <td><button class="btn ghost" style="font-size:11px"
+            onclick="showJqCurve(${it.id})">验证图</button></td>
+        </tr>`).join('') + '</tbody></table>';
+    } else {
+      const onlyFailed = $('jq-only-failed') && $('jq-only-failed').checked;
+      const d = await api('/api/sandbox/runs?limit=50&only_failed=' + (!!onlyFailed));
+      const items = d.items || [];
+      meta.textContent = `${items.length} 条${onlyFailed ? '（仅失败）' : ''}`;
+      if (!items.length) { box.innerHTML = '<div class="muted">还没有沙箱记录。</div>'; return; }
+      box.innerHTML = `<table><thead><tr>
+        <th>#</th><th>策略</th><th>环境</th><th>结果</th><th>总收益</th><th>年化</th>
+        <th>回撤</th><th>笔数</th><th>拒单</th><th>耗时</th><th></th></tr></thead><tbody>`
+        + items.map(it => {
+        const where = (it.limits || {}).where || '—';
+        return `<tr>
+          <td class="mono">${it.id}</td>
+          <td><b>${jqEsc(it.strategy_name || '')}</b>
+            <div class="muted" style="font-size:11px">${jqSyntaxBadge(it.syntax_state)}
+              ${it.n_days ? it.n_days + ' 天' : ''}</div></td>
+          <td><span class="badge">${jqEsc(where)}</span></td>
+          <td>${it.ok ? '<span class="badge">成功</span>'
+            : '<span class="badge b-bad">失败</span>'}</td>
+          <td class="${cls(it.total_return)} mono">${it.total_return != null ? signed(it.total_return) + '%' : '—'}</td>
+          <td class="${cls(it.annual_return)} mono">${it.annual_return != null ? signed(it.annual_return) + '%' : '—'}</td>
+          <td class="down mono">${it.max_drawdown != null ? it.max_drawdown.toFixed(2) + '%' : '—'}</td>
+          <td class="mono">${it.n_trades ?? '—'}</td>
+          <td class="mono" title="被 API 拒绝的委托数">${it.n_rejected ?? '—'}</td>
+          <td class="mono">${it.elapsed ? it.elapsed.toFixed(1) + 's' : '—'}</td>
+          <td><button class="btn ghost" style="font-size:11px"
+            onclick="jqShowRun(${it.id})">详情</button></td>
+        </tr>`; }).join('') + '</tbody></table>';
+    }
+  } catch (e) {
+    box.innerHTML = `<div class="muted">加载失败：${jqEsc(e.message)}</div>`;
+  }
+}
+
+function jqSwitch(v) {
+  JQ_VIEW = v;
+  Object.keys(JQ_TABS).forEach(k => {
+    const b = $('jq-sub-' + k);
+    if (b) b.classList.toggle('active', k === v);
+  });
+  // ???????????????????????????????????
+  // ???????????????????
+  const wc = $('jq-only-code-wrap'), wf = $('jq-only-failed-wrap');
+  if (wc) wc.classList.toggle('hide', v !== 'lib');
+  if (wf) wf.classList.toggle('hide', v !== 'runs');
+  loadJqList();
+}
+
+// ---- 文章详情 ----
+const JQ_DIGEST_LABELS = {
+  title_zh: '策略简称', summary: '一句话概括', strategy_type: '策略类型',
+  implementation_steps: '实现步骤', perf_claimed: '作者声称的效果',
+  perf_verified: '效果是否已验证', applicable: '适用场景', unsuitable: '不适用场景',
+  risk_notes: '风险点', portable_score: '可移植性打分', portable_why: '打分理由',
+  completeness: '描述完整度', needs_research: '是否需要再研究',
+  uncertainty: '不确定之处', research_hint: '下一步该查什么',
+};
+
+async function openJqArticle(pid) {
+  JQ_POST = pid;
+  $('jq-detail-card').classList.remove('hide');
+  $('jq-detail').innerHTML = '<div class="muted">加载中…</div>';
+  try {
+    const d = await api('/api/strategy-lib/article?post_id=' + encodeURIComponent(pid));
+    const a = d.article || {}, s = d.source, g = d.digest;
+    let h = `<div class="row" style="justify-content:space-between;align-items:flex-start">
+      <div style="flex:1;min-width:0">
+        <b style="font-size:14px">${jqEsc(a.title || '')}</b>
+        <div class="muted" style="font-size:11px;margin-top:2px">
+          ${jqEsc(a.author || '匿名')} · 浏览 ${a.view_count ?? '—'} · 点赞 ${a.like_count ?? '—'}
+          · 回复 ${a.reply_count ?? '—'} · 克隆 ${a.clone_count ?? '—'}
+          · 发布 ${jqEsc((a.published_at || '').slice(0, 10))}
+        </div>
+        <div style="margin-top:4px">
+          ${(a.tags || []).map(t => `<span class="badge">${jqEsc(t)}</span>`).join(' ')}
+          ${s ? jqSyntaxBadge(s.lines != null ? (s.syntax_state || 'ok') : 'empty') : ''}
+          ${s && s.redacted ? '<span class="badge b-warn">已脱敏</span>' : ''}
+        </div>
+      </div>
+      <a class="btn ghost" style="font-size:11px;flex-shrink:0"
+         href="${jqEsc(a.url || '#')}" target="_blank" rel="noopener">看原文</a>
+    </div>`;
+
+    // 源码
+    if (s && s.code) {
+      h += `<div style="margin-top:10px">
+        <div class="muted" style="font-size:11px">
+          源码 ${s.lines} 行 / ${s.n_blocks} 个代码块 / 语言 ${jqEsc(s.lang || '?')}
+          ${s.stub_sites ? ' · 省略 ' + s.stub_sites + ' 处' : ''}
+        </div>
+        <details ${s.lines > 400 ? '' : 'open'} style="margin-top:4px">
+          <summary class="muted" style="font-size:12px;cursor:pointer">展开源码</summary>
+          <pre class="jq-code">${jqEsc(s.code)}</pre>
+        </details>
+      </div>`;
+    } else {
+      h += '<div class="muted" style="margin-top:8px">这篇文章没抽到源码（多半作者没公开代码）。</div>';
+    }
+
+    // LLM 抽取结果：已知字段给中文标签，未知字段自动兜底，
+    // 这样以后加抽取字段这里不用改。
+    h += '<div style="margin-top:12px"><b style="font-size:12px">🧠 LLM 结构化抽取</b>';
+    if (!g) {
+      h += '<div class="muted" style="font-size:12px">还没抽取。点上面「LLM 抽取」。</div>';
+    } else {
+      h += '<div style="margin-top:6px">';
+      Object.entries(g).forEach(([k, v]) => {
+        if (k === 'article_id' || v == null || v === '' ||
+            (Array.isArray(v) && !v.length)) return;
+        const label = JQ_DIGEST_LABELS[k] || k;
+        let val;
+        if (Array.isArray(v)) {
+          val = '<ul style="margin:2px 0 0 16px;padding:0">' +
+            v.map(x => `<li style="font-size:12px">${jqEsc(x)}</li>`).join('') + '</ul>';
+        } else if (typeof v === 'object') {
+          val = '<table style="margin-top:2px"><tbody>' + Object.entries(v).map(([a2, b2]) =>
+            `<tr><td class="muted" style="font-size:11px;padding:1px 8px 1px 0;white-space:nowrap">${jqEsc(a2)}</td>
+             <td style="font-size:12px">${jqEsc(b2)}</td></tr>`).join('') + '</tbody></table>';
+        } else if (k === 'portable_score') {
+          val = jqScoreBadge(v);
+        } else {
+          val = `<div style="font-size:12px;white-space:pre-wrap">${jqEsc(v)}</div>`;
+        }
+        h += `<div style="margin-top:6px"><span class="muted" style="font-size:11px">${jqEsc(label)}</span>${val}</div>`;
+      });
+      if (g.extract_model) {
+        h += `<div class="muted" style="font-size:11px;margin-top:6px">
+          模型 ${jqEsc(g.extract_model)} · ${jqEsc((g.extract_at || '').slice(0, 19).replace('T', ' '))}</div>`;
+      }
+      h += '</div>';
+    }
+    h += '</div>';
+    $('jq-detail').innerHTML = h;
+    jqPrecheck();
+  } catch (e) {
+    $('jq-detail').innerHTML = `<div class="muted">加载失败：${jqEsc(e.message)}</div>`;
+  }
+}
+
+/** 静态体检：不花钱、不跑容器、不切数据。 */
+async function jqPrecheck(btn) {
+  if (!JQ_POST) return;
+  const box = $('jq-precheck');
+  box.innerHTML = '<div class="muted">体检中…</div>';
+  try {
+    const p = await jsonPost('/api/sandbox/precheck', {
+      post_id: JQ_POST, start: $('jq-start').value,
+      end: $('jq-end').value, limit_codes: Number($('jq-limit').value || 400) });
+    $('jq-precheck').innerHTML = `
+      <div style="font-size:12px">
+        <b>体检结论：</b><span class="${p.can_run ? '' : 'badge b-bad'}">${jqEsc(p.verdict)}</span>
+      </div>
+      <table style="margin-top:6px"><tbody>
+        <tr><td class="muted">源码</td><td>${jqSyntaxBadge(p.syntax_state)}
+          ${p.redacted ? '<span class="badge b-warn">脱敏</span>' : ''}
+          ${p.n_lines} 行 / ${p.n_funcs} 个函数 / ${p.n_blocks} 块</td></tr>
+        <tr><td class="muted">函数</td><td class="mono" style="font-size:11px">${jqEsc((p.funcs || []).join(', ')) || '—'}</td></tr>
+        <tr><td class="muted">风险调用</td><td>${(p.risks || []).length
+          ? p.risks.map(r => `<span class="badge b-warn">${jqEsc(r)}</span>`).join(' ')
+          : '<span class="muted">无</span>'}</td></tr>
+        <tr><td class="muted">截面</td><td>${p.universe_size} 只
+          ${p.needs_all_market ? '<span class="badge b-warn">疑似全市场策略</span>' : ''}
+          ${(p.referenced_codes || []).length
+            ? '<span class="muted">硬编码 ' + jqEsc(p.referenced_codes.join(',')) + '</span>' : ''}</td></tr>
+        <tr><td class="muted">资源估算</td><td>${
+          (p.universe_estimate
+            ? `切片约 ${p.universe_estimate.slice_mb}MB · 峰值内存约
+               ${p.universe_estimate.est_peak_rss_mb}MB / 上限
+               ${p.universe_estimate.memory_cap_mb}MB
+               ${p.universe_estimate.fits
+                 ? '<span class="badge b-ok">装得下</span>'
+                 : '<span class="badge b-bad">装不下，差 '
+                   + Math.abs(p.universe_estimate.headroom_mb)
+                   + 'MB，会被 OOM 杀掉</span>'}`
+            : '<span class="muted">—</span>')}</td></tr>
+        <tr><td class="muted">回测区间</td><td class="mono">${jqEsc(p.period[0])} ~ ${jqEsc(p.period[1])}</td></tr>
+        <tr><td class="muted">估值数据</td><td>${p.valuation_days} 行
+          ${p.valuation_days < 1000
+            ? '<span class="badge b-warn">偏少，市值类策略会缺数据</span>' : ''}</td></tr>
+      </tbody></table>`;
+  } catch (e) {
+    $('jq-precheck').innerHTML = `<div class="muted" style="color:var(--up)">体检失败：${jqEsc(e.message)}</div>`;
+  }
+}
+
+/** 跑一次。where=local 无隔离快速试错；where=container 完整隔离，结果才落库。 */
+async function jqRun(where, btn) {
+  if (!JQ_POST) { toast('先选一篇文章', 'err'); return; }
+  if (where === 'container') {
+    const okRun = await confirmDlg(
+      '容器跑会切数据、上传到 101、启动容器，耗时 1~3 分钟。\n' +
+      '结果只有走容器才建议落库 —— 本地无隔离，代码能碰到你的文件系统。',
+      { title: '确认用容器跑？', okText: '跑' });
+    if (!okRun) return;
+  }
+  const body = {
+    post_id: JQ_POST, start: $('jq-start').value, end: $('jq-end').value,
+    limit_codes: Number($('jq-limit').value || 400), where,
+    save: where === 'container', timeout: 600,
+  };
+  $('jq-run-out').innerHTML = `<div class="muted">${
+    where === 'container' ? '容器' : '本地'}运行中…首次运行要切数据，可能要几十秒。</div>`;
+  await withBusy(btn, where === 'container' ? '容器跑…' : '本地跑…', async () => {
+    try {
+      const d = await jsonPost('/api/sandbox/run', body);
+      renderJqRun(d);
+      toast(d.ok ? '跑完了' : '跑了，但失败（见下方原因）', d.ok ? '' : 'err');
+      loadJqLib();
+    } catch (e) {
+      $('jq-run-out').innerHTML =
+        `<div style="color:var(--up);font-size:12px">运行失败：${jqEsc(e.message)}</div>`;
+    }
+  });
+}
+
+function renderJqRun(d) {
+  const r = d.result || {}, met = r.metrics || {}, ts = r.trade_stats || {};
+  const sl = d.slice || {};
+  let h = `<div class="row" style="gap:6px;flex-wrap:wrap">
+    <span class="badge">${jqEsc(d.where)}</span>
+    <span class="badge">${sl.codes || 0} 只</span>
+    <span class="badge">${sl.days || 0} 天</span>
+    <span class="badge">${(sl.bytes / 1024).toFixed(0)} KB</span>
+    ${sl.val_codes ? `<span class="badge">估值 ${sl.val_codes} 只</span>` : ''}
+    ${r.elapsed ? `<span class="badge">${r.elapsed.toFixed(1)}s</span>` : ''}
+    ${d.run_id ? `<span class="badge">已落库 #${d.run_id}</span>` : ''}
+  </div>`;
+  if (!r.ok) {
+    h += `<div style="margin-top:6px"><b style="color:var(--up);font-size:12px">失败原因</b>
+      <pre class="jq-err">${jqEsc((r.error || '未知') + (r.traceback ? '\n\n' + r.traceback : ''))}</pre></div>`;
+  } else {
+    h += `<div class="jq-metrics" style="margin-top:8px">
+      ${[['总收益', met.total_return != null ? signed(met.total_return) + '%' : '—', met.total_return],
+         ['年化', met.annual_return != null ? signed(met.annual_return) + '%' : '—', met.annual_return],
+         ['最大回撤', met.max_drawdown != null ? met.max_drawdown.toFixed(2) + '%' : '—', null],
+         ['夏普', met.sharpe ?? '—', null],
+         ['交易笔数', r.n_trades_total ?? '—', null],
+         ['胜率', ts.win_rate != null ? ts.win_rate.toFixed(1) + '%' : '—', null],
+         ['被拒委托', r.n_rejected ?? '—', null]]
+        .map(([k, v, c]) => `<div class="jq-metric">
+          <div class="jq-metric-v ${c != null ? cls(c) : ''}">${jqEsc(v)}</div>
+          <div class="jq-metric-k">${jqEsc(k)}</div></div>`).join('')}
+    </div>`;
+  }
+  const warn = r.warnings || [];
+  if (warn.length) {
+    h += `<details style="margin-top:6px"><summary class="muted" style="font-size:11px;cursor:pointer">
+      告警 ${warn.length} 条 / 被拒委托 ${(r.rejected || []).length} 条</summary>
+      <pre class="jq-err">${jqEsc(warn.slice(0, 30).join('\n') + '\n\n' +
+        (r.rejected || []).slice(0, 30).map(x => JSON.stringify(x)).join('\n'))}</pre></details>`;
+  }
+  $('jq-run-out').innerHTML = h;
+}
+
+/** 批量跑。刻意不并发：101 只有 4 核还跑着 9 个容器。 */
+async function jqBatch(btn) {
+  const n = Number($('jq-batch-n').value || 3);
+  $('jq-run-out').innerHTML = `<div class="muted">批量跑 ${n} 篇，串行，每篇可能要 1 分钟…</div>`;
+  await withBusy(btn, '批量跑…', async () => {
+    try {
+      const d = await jsonPost('/api/sandbox/batch', {
+        limit: n, start: $('jq-start').value, limit_codes: Number($('jq-limit').value || 400),
+        where: 'local', save: false, only_ok_syntax: true });
+      $('jq-run-out').innerHTML =
+        `<table><thead><tr><th>策略</th><th>结果</th><th>总收益</th><th>年化</th>
+          <th>回撤</th><th>笔数</th><th>说明</th></tr></thead><tbody>` +
+        (d.items || []).map(it => `<tr>
+          <td><b>${jqEsc(it.title || '')}</b></td>
+          <td>${it.ok ? '<span class="badge">成功</span>' : '<span class="badge b-bad">失败</span>'}</td>
+          <td class="${cls(it.total_return)} mono">${it.total_return != null ? signed(it.total_return) + '%' : '—'}</td>
+          <td class="${cls(it.annual_return)} mono">${it.annual_return != null ? signed(it.annual_return) + '%' : '—'}</td>
+          <td class="down mono">${it.max_drawdown != null ? it.max_drawdown.toFixed(2) + '%' : '—'}</td>
+          <td class="mono">${it.n_trades ?? '—'}</td>
+          <td style="font-size:11px">${jqEsc(it.error || '')}</td>
+        </tr>`).join('') + '</tbody></table>';
+      toast('批量跑完');
+    } catch (e) {
+      $('jq-run-out').innerHTML =
+        `<div style="color:var(--up);font-size:12px">批量失败：${jqEsc(e.message)}</div>`;
+    }
+  });
+}
+
+/** 本地 vs 容器对比。不一致说明有环境依赖，结果不可信。 */
+async function jqCompare(btn) {
+  if (!JQ_POST) { toast('先选一篇文章', 'err'); return; }
+  $('jq-run-out').innerHTML = '<div class="muted">对比中…</div>';
+  await withBusy(btn, '对比…', async () => {
+    try {
+      const d = await api('/api/sandbox/compare?post_id=' + encodeURIComponent(JQ_POST));
+      const rows = d.rows || [];
+      if (!rows.length) { $('jq-run-out').innerHTML = '<div class="muted">这篇文章还没有运行记录。</div>'; return; }
+      $('jq-run-out').innerHTML =
+        `<div class="muted" style="font-size:12px;margin-bottom:4px">${jqEsc(d.verdict || '')}</div>
+        <table><thead><tr><th>#</th><th>环境</th><th>结果</th><th>总收益</th><th>年化</th>
+          <th>回撤</th><th>夏普</th><th>笔数</th><th>时间</th></tr></thead><tbody>` +
+        rows.map(r => `<tr>
+          <td class="mono">${r.id}</td>
+          <td><span class="badge">${jqEsc(r.where_ || '—')}</span></td>
+          <td>${r.ok ? '<span class="badge">成功</span>' : '<span class="badge b-bad">失败</span>'}</td>
+          <td class="${cls(r.total_return)} mono">${r.total_return != null ? signed(r.total_return) + '%' : '—'}</td>
+          <td class="${cls(r.annual_return)} mono">${r.annual_return != null ? signed(r.annual_return) + '%' : '—'}</td>
+          <td class="down mono">${r.max_drawdown != null ? r.max_drawdown.toFixed(2) + '%' : '—'}</td>
+          <td class="mono">${r.sharpe ?? '—'}</td>
+          <td class="mono">${r.n_trades ?? '—'}</td>
+          <td class="mono muted" style="font-size:11px">${jqEsc((r.created_at || '').slice(5, 16).replace('T', ' '))}</td>
+        </tr>`).join('') + '</tbody></table>';
+    } catch (e) {
+      $('jq-run-out').innerHTML =
+        `<div style="color:var(--up);font-size:12px">对比失败：${jqEsc(e.message)}</div>`;
+    }
+  });
+}
+
+async function jqShowRun(id) {
+  try {
+    const d = await api('/api/sandbox/runs?limit=50');
+    const it = (d.items || []).find(x => x.id === id);
+    if (!it) { toast('找不到这条记录', 'err'); return; }
+    infoDlg('沙箱运行 #' + id, `
+      <table><tbody>
+        <tr><td class="muted">策略</td><td><b>${jqEsc(it.strategy_name || '')}</b></td></tr>
+        <tr><td class="muted">文章</td><td class="mono" style="font-size:11px">${jqEsc(it.post_id || '')}</td></tr>
+        <tr><td class="muted">源码状态</td><td>${jqSyntaxBadge(it.syntax_state)}</td></tr>
+        <tr><td class="muted">隔离参数</td><td><pre class="jq-err">${jqEsc(JSON.stringify(it.limits, null, 2))}</pre></td></tr>
+        <tr><td class="muted">结果</td><td>${it.ok ? '成功' : '失败'}
+          ${it.n_days ? ' · ' + it.n_days + ' 天' : ''}
+          ${it.n_trades ? ' · ' + it.n_trades + ' 笔' : ''}
+          ${it.n_rejected ? ' · 拒单 ' + it.n_rejected : ''}
+          ${it.n_callback_errors ? ' · 回调错误 ' + it.n_callback_errors : ''}</td></tr>
+        <tr><td class="muted">错误原文</td><td><pre class="jq-err">${jqEsc(it.error || '（无）')}</pre></td></tr>
+        <tr><td class="muted">告警</td><td><pre class="jq-err">${jqEsc(
+          (it.warnings || []).join('\n') || '（无）')}</pre></td></tr>
+      </tbody></table>`, { wide: true });
+  } catch (e) { toast('加载失败：' + e.message, 'err'); }
+}
+
+// ---- 验证图 ----
+async function showJqCurve(runId) {
+  JQ_CURVE_RUN = runId;
+  $('jq-curve-card').classList.remove('hide');
+  $('jq-curve').innerHTML = '<div class="muted">加载曲线…</div>';
+  try {
+    const d = await api('/api/backtest/curve?run_id=' + runId);
+    const cv = d.curve || [];
+    if (!cv.length) {
+      $('jq-curve').innerHTML =
+        '<div class="muted">这条回测没有逐日数据（可能已被清理，或不是落库的运行）。</div>';
+      return;
+    }
+    JQ_CURVE = cv;
+    const first = cv[0], last = cv[cv.length - 1];
+    const peak = Math.max(...cv.map(p => p.equity || 0));
+    $('jq-curve').innerHTML = `
+      <div class="muted" style="font-size:12px;margin-bottom:4px">
+        回测 #${runId} · ${jqEsc(first.trade_date)} ~ ${jqEsc(last.trade_date)} · ${cv.length} 个交易日
+        · 净值 ${fmt(first.equity)} → ${fmt(last.equity)}
+        · 最低回撤 ${Math.min(...cv.map(p => p.drawdown || 0)).toFixed(2)}%
+        · 峰值 ${fmt(peak)}
+      </div>
+      <canvas id="jq-curve-cv" class="chart" height="300"
+              aria-label="策略逐日净值与回撤曲线"></canvas>`;
+    drawJqCurve(cv);
+  } catch (e) {
+    $('jq-curve').innerHTML = `<div class="muted">加载失败：${jqEsc(e.message)}</div>`;
+  }
+}
+
+/** 净值 + 回撤双面板。回撤单独一个面板是因为它量级小得多，
+    叠在净值上会被压成一条贴底的直线，看不出任何东西。 */
+function drawJqCurve(cv) {
+  const el = document.getElementById('jq-curve-cv');
+  if (!el || !cv || !cv.length) return;
+  const css = getComputedStyle(document.documentElement);
+  const accent = css.getPropertyValue('--accent').trim() || '#2f62f4';
+  // ???????? --up ?????=??????????????????
+  const ddColor = css.getPropertyValue('--up').trim() || '#d92d2d';
+  const grid = css.getPropertyValue('--border').trim() || '#e3e7ee';
+  const text = css.getPropertyValue('--text-3').trim() || '#8b95a7';
+  const dpr = window.devicePixelRatio || 1;
+  const W = Math.max(320, el.clientWidth || el.parentElement.clientWidth || 900);
+  const H = 300;
+  el.width = Math.round(W * dpr); el.height = Math.round(H * dpr);
+  el.style.height = H + 'px';
+  const ctx = el.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+
+  const padL = 52, padR = 52, padT = 12, padB = 22;
+  const iw = W - padL - padR;
+  const eqH = Math.round((H - padT - padB) * 0.62);
+  const ddTop = padT + eqH + 22;
+  const ddH = H - padB - ddTop;
+  const n = cv.length;
+  const X = i => padL + (n < 2 ? iw / 2 : (i / (n - 1)) * iw);
+
+  const eq = cv.map(p => Number(p.equity) || 0);
+  const base = eq.find(v => v > 0) || 1;
+  const eLo = Math.min(...eq), eHi = Math.max(...eq);
+  const em = (eHi - eLo) * 0.06 || base * 0.01;
+  const YE = v => padT + eqH - ((v - (eLo - em)) / ((eHi + em) - (eLo - em))) * eqH;
+
+  const dd = cv.map(p => Number(p.drawdown) || 0);
+  const dLo = Math.min(...dd, -1);
+  const YD = v => ddTop + ddH - ((v - dLo) / (0 - dLo)) * ddH;
+
+  // 网格 + 左右两套刻度（左边净值、右边回撤）
+  ctx.strokeStyle = grid; ctx.fillStyle = text;
+  ctx.lineWidth = 1; ctx.font = '10px system-ui, sans-serif';
+  for (let i = 0; i <= 4; i++) {
+    const v = eLo - em + ((eHi + em) - (eLo - em)) * (i / 4);
+    const y = YE(v);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+    ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    ctx.fillText(fmt(v), padL - 6, y);
+    const dv = dLo * (1 - i / 4);
+    const y2 = YD(dv);
+    ctx.textAlign = 'left';
+    ctx.fillStyle = ddColor;
+    ctx.fillText(dv.toFixed(0) + '%', W - padR + 6, y2);
+    ctx.fillStyle = text;
+  }
+  // 净值首值基准线
+  ctx.strokeStyle = grid; ctx.setLineDash([3, 3]);
+  ctx.beginPath(); ctx.moveTo(padL, YE(base)); ctx.lineTo(W - padR, YE(base)); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // 净值折线 + 渐变填充
+  const g = ctx.createLinearGradient(0, padT, 0, padT + eqH);
+  g.addColorStop(0, accent + '33'); g.addColorStop(1, accent + '00');
+  ctx.beginPath(); ctx.moveTo(X(0), YE(eq[0]));
+  for (let i = 1; i < n; i++) ctx.lineTo(X(i), YE(eq[i]));
+  ctx.lineTo(X(n - 1), padT + eqH); ctx.lineTo(X(0), padT + eqH); ctx.closePath();
+  ctx.fillStyle = g; ctx.fill();
+  ctx.beginPath(); ctx.moveTo(X(0), YE(eq[0]));
+  for (let i = 1; i < n; i++) ctx.lineTo(X(i), YE(eq[i]));
+  ctx.strokeStyle = accent; ctx.lineWidth = 1.6; ctx.stroke();
+
+  // 持仓市值（次要信息，淡画）
+  const pv = cv.map(p => Number(p.position_value) || 0);
+  if (pv.some(v => v > 0)) {
+    ctx.beginPath(); ctx.moveTo(X(0), YE(pv[0]));
+    for (let i = 1; i < n; i++) ctx.lineTo(X(i), YE(pv[i]));
+    ctx.strokeStyle = text; ctx.lineWidth = 1; ctx.setLineDash([4, 3]); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // 回撤填充
+  ctx.beginPath(); ctx.moveTo(X(0), YD(0));
+  for (let i = 0; i < n; i++) ctx.lineTo(X(i), YD(dd[i]));
+  ctx.lineTo(X(n - 1), YD(0)); ctx.closePath();
+  ctx.fillStyle = ddColor + '22'; ctx.fill();
+  ctx.beginPath(); ctx.moveTo(X(0), YD(0));
+  for (let i = 0; i < n; i++) ctx.lineTo(X(i), YD(dd[i]));
+  ctx.strokeStyle = ddColor; ctx.lineWidth = 1.2; ctx.stroke();
+
+  // x 轴日期（首/中/尾）
+  ctx.fillStyle = text; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  [0, Math.floor(n / 2), n - 1].forEach(i => {
+    if (!cv[i]) return;
+    ctx.fillText(String(cv[i].trade_date).slice(0, 7), X(i), H - padB + 4);
+  });
+  // 图例
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = accent; ctx.fillText('■ 净值', padL, padT - 4);
+  ctx.fillStyle = ddColor; ctx.fillText('■ 回撤', padL + 52, padT - 4);
+  ctx.fillStyle = text; ctx.fillText('┄ 持仓市值', padL + 100, padT - 4);
+  ctx.fillStyle = text; ctx.textAlign = 'right';
+  ctx.fillText(`初始 ${fmt(base)} · 峰值 ${fmt(Math.max(...eq))}`, W - padR, padT - 4);
+}
+
+// ---- 抓取 / 抽取 ----
+async function jqFetch(btn) {
+  await withBusy(btn, '抓取中…', async () => {
+    try {
+      const d = await jsonPost('/api/strategy-lib/fetch', { limit: 20 });
+      toast('抓取完成：' + JSON.stringify(d).slice(0, 160));
+      loadJqLib(); loadJqList();
+    } catch (e) { toast('抓取失败：' + e.message, 'err'); }
+  });
+}
+
+async function jqExtract(btn) {
+  const postId = $('jq-post-id').value.trim();
+  if (!postId) { toast('先在上面选一篇文章，或填 post_id', 'err'); return; }
+  await withBusy(btn, '抽取中…', async () => {
+    try {
+      const d = await jsonPost('/api/strategy-digest/extract', { post_id: postId });
+      toast('抽取完成');
+      $('jq-detail').innerHTML = '<div class="muted">重新加载中…</div>';
+      openJqArticle(postId);
+      loadJqLib();
+    } catch (e) { toast('抽取失败：' + e.message, 'err'); }
+  });
+}
 
 // ---- 标签页 ----
 const TABS = ['market', 'sector', 'holdings', 'strategies', 'plans', 'calendar', 'news',
-              'bili', 'wb', 'mp', 'x', 'reports', 'paper', 'notify', 'schedule'];
+              'bili', 'wb', 'mp', 'x', 'reports', 'paper', 'notify', 'schedule',
+              'jq'];
 const TAB_LOADERS = {
   market:    () => { loadWatch(); loadAlerts(); loadCrypto(); loadDiscover(); },
   sector:    () => { loadSector(); loadIntraday(); startIntradayAuto(); },
@@ -1736,7 +2570,8 @@ const TAB_LOADERS = {
   x:         () => { loadXAccounts(); loadXWatch(); loadXTweets(); loadXStatus(); },
   reports:   loadReports,
   paper:     loadPaper,
-  notify:    loadNotifyConf,
+  notify:    () => { loadNotifyConf(); loadNotifyMatrix(); refreshWxChat(); },
+  jq:        () => { loadJqLib(); loadJqList(); },
   schedule:  () => { loadSchedule(); loadConfigAll(); },
 };
 function switchTab(name) {
@@ -4958,11 +5793,26 @@ async function loadNotifyConf() {
     $('nf-from').value = conf.email.from_addr || '';
     $('nf-to').value = conf.email.to_addr || '';
     $('nf-email-enabled').checked = !!conf.email.enabled;
+    $('nf-auth').placeholder = conf.email.has_auth_code
+      ? '已配置（留空=不修改）' : '授权码（不是登录密码）';
     const bits = [];
     bits.push(conf.wx.bound ? '微信已登录 ✓' : '微信未登录');
+    if (conf.wx.bound) {
+      bits.push(conf.wx.session && conf.wx.session.ok
+        ? 'iLink 会话已在线' : 'iLink 会话未声明（点「重建会话」）');
+    }
     bits.push(conf.email.enabled && conf.email.from_addr ? `邮件 → ${conf.email.to_addr || '未填接收邮箱'}` : '邮件未启用');
     $('wx-bind-status').textContent = bits.join(' · ');
   } catch (e) { toastErr('加载通知配置失败: ' + e.message); }
+}
+
+/** 重建 iLink 会话（notifystart）。不需要用户先给 bot 发消息。 */
+async function rebuildWxSession() {
+  try {
+    await jsonPost('/api/notify/wx/session');
+    toastOk('已重新声明在线');
+  } catch (e) { toastErr(e.message); }
+  loadNotifyConf();
 }
 
 async function saveNotifyConf() {
@@ -4974,7 +5824,7 @@ async function saveNotifyConf() {
         smtp_host: $('nf-host').value.trim(),
         smtp_port: +$('nf-port').value || 0,
         from_addr: $('nf-from').value.trim(),
-        auth_code: $('nf-auth').value,
+        auth_code: $('nf-auth').value,   // 空串 = 不修改（后端会忽略）
         to_addr: $('nf-to').value.trim(),
         email_enabled: $('nf-email-enabled').checked,
       })});
@@ -5055,6 +5905,175 @@ async function testNotify(channel) {
   try {
     await api('/api/notify/test?channel=' + channel, { method: 'POST' });
     toast(channel === 'wx' ? '已发送，请查看微信' : '已发送，请查收邮件');
+  } catch (e) {
+    // 后端现在会回传底层真实报错（如 ret=-2 errmsg=prepare failed）与处置建议，
+    // 原样展示出来 —— 之前这里只显示「发送失败」，排查时完全看不出原因。
+    const msg = String(e.message || '发送失败');
+    toastErr(msg.length > 220 ? msg.slice(0, 220) + '…' : msg);
+    if (/prepare failed|会话/.test(msg) && channel === 'wx') {
+      if (await confirmDlg(msg + '\n\n要现在重建 iLink 会话吗？',
+                            { title: '重建会话', okText: '重建' })) rebuildWxSession();
+    }
+  }
+}
+
+// ---- 微信入站 / 对话（wx_inbound.py 收，wx_chat.py 回） ----
+let _wxChatOn = true;
+
+async function refreshWxChat() {
+  try {
+    const d = await api('/api/notify/wx/inbound');
+    const ib = d.inbound || {}, ch = d.chat || {};
+    const bits = [];
+    bits.push(ch.enabled === false ? '对话已停用' : '入站监听中');
+    if (ib.last_poll) bits.push(`上次轮询 ${ib.last_poll.slice(11, 19)}`);
+    if (ib.paused) bits.push(`⚠️ token 过期，冷却中（还剩 ${Math.round((ib.paused_left_s||0)/60)} 分钟，需重新扫码）`);
+    if (ib.last_inbound) bits.push(`最近收到 ${ib.last_inbound.ts}：${ib.last_inbound.text}`);
+    if (ch.last_reply) bits.push(`上次回话 ${ch.last_reply.ts}`);
+    if (ib.last_error) bits.push('⚠️ ' + ib.last_error);
+    if (ch.last_error) bits.push('⚠️ ' + ch.last_error);
+    const st = $('wx-chat-status');
+    if (st) st.textContent = bits.join(' · ');
+    const btn = $('wx-chat-toggle');
+    if (btn) { btn.textContent = ch.enabled === false ? '启用对话' : '停用对话'; }
+  } catch (e) { /* 页面还没加载完时忽略 */ }
+  try {
+    const h = await api('/api/notify/wx/chat?limit=20');
+    const items = (h.items || []).slice().reverse();
+    const box = $('wx-chat-log');
+    if (!box) return;
+    if (!items.length) { box.innerHTML = '<div class="empty">还没有对话记录。</div>'; return; }
+    box.innerHTML = items.map(m => `<div class="mood-entry">
+      <div class="mood-meta">
+        <span class="badge ${m.direction === 'in' ? 'b-info' : 'b-ok'}">${m.direction === 'in' ? '收到' : '回复'}</span>
+        <span class="mono">${esc(String(m.created_at).slice(5, 16).replace('T',' '))}</span>
+        ${m.merged > 1 ? `<span class="faint">合并 ${m.merged} 条</span>` : ''}
+        <span class="faint">${esc(String(m.user_id).slice(0, 22))}</span>
+      </div>
+      <div class="mood-body">${esc(m.text)}</div></div>`).join('');
+  } catch (e) { /* 忽略 */ }
+}
+
+async function askWxChat() {
+  const inp = $('wx-chat-input');
+  const text = inp.value.trim();
+  if (!text) { toast('说点什么'); return; }
+  inp.value = '';
+  return withBusy($('wx-chat-btn'), '想…', async () => {
+    try {
+      const r = await jsonPost('/api/notify/wx/chat', { text, push: false });
+      pushWxChatBubble('bot', r.reply);
+      refreshWxChat();
+    } catch (e) { toastErr(e.message); }
+  });
+}
+
+function pushWxChatBubble(who, text) {
+  const box = $('wx-chat-log');
+  if (!box) return;
+  if (box.querySelector('.empty')) box.innerHTML = '';
+  const el = document.createElement('div');
+  el.className = 'chat-msg ' + (who === 'me' ? 'chat-me' : 'chat-ai');
+  el.textContent = text;
+  box.appendChild(el);
+  box.scrollTop = box.scrollHeight;
+}
+
+async function toggleWxChat() {
+  if (!await confirmDlg(_wxChatOn ? '停用微信对话？' : '启用微信对话？',
+                        { okText: _wxChatOn ? '停用' : '启用' })) return;
+  const r = await jsonPut('/api/config/all', { values: { wx_chat: { enabled: !_wxChatOn } } });
+  _wxChatOn = !_wxChatOn;
+  toastOk(_wxChatOn ? '已启用（下次服务重启后生效）' : '已停用（下次服务重启后生效）');
+  return r;
+}
+
+// ---- 通知事件矩阵（🔔 通知页） ----
+let _nfMatrix = null;
+
+async function loadNotifyMatrix() {
+  const box = $('nf-matrix');
+  if (box) box.innerHTML = '<div class="muted">加载中…</div>';
+  try {
+    _nfMatrix = await api('/api/notify/events');
+    renderNotifyMatrix();
+  } catch (e) {
+    if (box) box.innerHTML = `<div class="hint" style="color:var(--up)">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+function renderNotifyMatrix() {
+  const box = $('nf-matrix');
+  if (!box || !_nfMatrix) return;
+  const chOff = _nfMatrix.channels.filter(c => !c.enabled).map(c => c.key);
+  const offTip = chOff.length
+    ? `<div class="hint" style="color:var(--warn)">⚠️ 渠道总开关关着：${
+        _nfMatrix.channels.filter(c => !c.enabled).map(c => c.label).join('、')
+      }。下面这些渠道即使勾了也不会发。</div>` : '';
+  const head = `<tr><th style="text-align:left">事件</th>${
+    _nfMatrix.channels.map(c =>
+      `<th>${esc(c.label)}${c.enabled ? '' : ' <span class="faint">(总开关关)</span>'}</th>`
+    ).join('')}<th style="width:52px">测试</th></tr>`;
+  const body = _nfMatrix.groups.map(g => `
+    <tr><td class="grp" colspan="${_nfMatrix.channels.length + 2}">${esc(g.group)}</td></tr>
+    ${g.rows.map(r => {
+      const cbs = _nfMatrix.channels.map(c => {
+        const on = !!r.on[c.key];
+        return `<td class="cb"><input type="checkbox" data-ev="${esc(r.key)}" data-ch="${c.key}"
+          ${on ? 'checked' : ''} onchange="toggleNotifyEvent('${esc(r.key)}','${c.key}',this.checked)"></td>`;
+      }).join('');
+      const none = !Object.values(r.on).some(Boolean);
+      return `<tr class="ev-row${none ? ' off' : ''}">
+        <td class="ev"><div class="ev-label"><b>${esc(r.label)}</b>
+          <span class="faint">${esc(r.source)}</span></div>
+          <div class="ev-help">${esc(r.help)}</div></td>
+        ${cbs}
+        <td class="cb"><button class="link-btn" onclick="testNotifyEvent('${esc(r.key)}')">发</button></td>
+      </tr>`;
+    }).join('')}`).join('');
+  box.innerHTML = offTip + `<div class="table-scroll"><table class="mtx">${head}${body}</table></div>`;
+}
+
+async function toggleNotifyEvent(ev, ch, val) {
+  try {
+    _nfMatrix = await api('/api/notify/events/' + encodeURIComponent(ev),
+      { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ on: { [ch]: val } }) });
+    renderNotifyMatrix();
+    const row = _nfMatrix.groups.flatMap(g => g.rows).find(r => r.key === ev);
+    const routes = Object.entries(row.on).filter(([, v]) => v).map(([k]) => k === 'wx' ? '微信' : '邮件');
+    toast(`${row.label} → ${routes.length ? routes.join(' + ') : '不推送'}`);
+  } catch (e) {
+    toastErr(e.message);
+    loadNotifyMatrix();      // 回滚 UI
+  }
+}
+
+async function notifyMatrixBulk(ch, val) {
+  try {
+    await jsonPost('/api/notify/events/bulk', { all: { [ch]: val } });
+    _nfMatrix = await api('/api/notify/events');
+    renderNotifyMatrix();
+    toast(`已把${ch === 'wx' ? '微信' : '邮件'}全部${val ? '打开' : '关闭'}`);
+  } catch (e) { toastErr(e.message); }
+}
+
+/** 只留微信：微信全开 + 邮件全关。最常用的「别再发邮件了」一键操作。 */
+async function notifyMatrixOnly(ch) {
+  const other = ch === 'wx' ? 'email' : 'wx';
+  try {
+    await jsonPost('/api/notify/events/bulk', { all: { [ch]: true, [other]: false } });
+    _nfMatrix = await api('/api/notify/events');
+    renderNotifyMatrix();
+    toast(`已设为只走${ch === 'wx' ? '微信' : '邮件'}`);
+  } catch (e) { toastErr(e.message); }
+}
+
+async function testNotifyEvent(ev) {
+  try {
+    const r = await api(`/api/notify/events/${encodeURIComponent(ev)}/test`, { method: 'POST' });
+    if (r.ok) toast(`已按当前路由发出：${(r.routes || []).map(c => c === 'wx' ? '微信' : '邮件').join(' + ')}`);
+    else toast('没发出去：' + (r.reason || '该事件的渠道都被关了'), 'err');
   } catch (e) { toastErr('发送失败: ' + e.message); }
 }
 

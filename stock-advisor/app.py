@@ -14,6 +14,8 @@ import json
 import os
 import re
 import threading
+import tempfile
+import shutil
 import time
 import traceback          # 守护线程/后台线程的 except 里要打栈（2026-09-25 顺手补：原来漏 import）
 from datetime import datetime, timedelta, timezone
@@ -41,7 +43,11 @@ from pydantic import BaseModel, Field
 import conf_util
 import config_schema
 import crypto_watch
+import ilink_client
+import notify_events
 import wechat_mp
+import wx_chat
+import wx_inbound
 import x_monitor
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -1186,7 +1192,8 @@ def _market_volume_loop():
                     alert = _market_volume_alert(snap)
                     if alert:
                         try:
-                            notifier.notify(alert["title"], alert["content"])
+                            notifier.notify(alert["title"], alert["content"],
+                                            event="market_volume")
                             print(f"[mktvol] alert pushed: {alert['title']}", flush=True)
                         except Exception as exc:
                             print(f"[mktvol] notify failed: {exc}", flush=True)
@@ -2007,7 +2014,8 @@ def check_strategies_once() -> list[dict]:
                 "🎯 止盈/止损触发提醒",
                 f"以下买入笔触发策略条件，请处理：\n\n" + "\n".join(lines) + "\n\n"
                 f"（来自 stock-advisor 策略监控，触发时间 "
-                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}）")
+                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}）",
+                event="take_profit")
         except Exception as exc:
             print(f"[strategy] 触发通知失败: {exc}", flush=True)
     return triggered
@@ -2090,7 +2098,8 @@ def check_position_strategies_once() -> list[dict]:
                 "🎯 持仓策略触发提醒",
                 "以下持仓的整仓策略触发条件，请处理：\n\n" + "\n".join(lines) + "\n\n"
                 f"（来自 stock-advisor 策略监控，触发时间 "
-                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}）")
+                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}）",
+                event="position_strategy")
         except Exception as exc:
             print(f"[strategy] 持仓策略通知失败: {exc}", flush=True)
     return triggered
@@ -2507,7 +2516,8 @@ def check_withdrawal_once(notify: bool = True, auto_ai: bool = False) -> list[di
                            f"（还差 {v['need_now']:,.0f}）"
                            if v.get("realized") is not None else "")
                         + (f"\n• 需涨 {v['required_total_pct']:g}%（剩 {tleft} 个交易日）"
-                           if v.get("required_total_pct") and v["gap"] > 0 else ""))
+                           if v.get("required_total_pct") and v["gap"] > 0 else ""),
+                        event="withdrawal")
                 except Exception as exc:
                     print(f"[withdrawal] 通知失败: {exc}", flush=True)
     if auto_ai and alerts:
@@ -3271,6 +3281,7 @@ import backtest
 import joinquant_source
 import strategy_crawler
 import strategy_extract as SX
+import jq_sandbox as JS
 import stock_discovery
 import stock_roster
 import paper_memory
@@ -3563,6 +3574,42 @@ class PaperStrategyToggleIn(BaseModel):
 
 
 # ---- 策略库采集 ----
+class SandboxRunIn(BaseModel):
+    post_id: str = Field(default="", max_length=64,
+                         description="跑哪篇文章的源码；留空则取克隆数最高的那篇")
+    start: str = Field(default="2024-01-01", max_length=10)
+    end: str = Field(default="", max_length=10,
+                     description="留空 = 数据里最后一天")
+    cash: float = Field(default=1_000_000, gt=0)
+    limit_codes: int = Field(default=400, ge=1, le=3000,
+                             help="最多切多少只。宽基/微盘类策略需要大截面，"
+                                  "但切片太大会拖慢上传")
+    where: str = Field(default="local", pattern="^(local|container)$",
+                       description="local=无隔离快速试错；container=完整隔离，"
+                                  "结果才建议落库")
+    timeout: int = Field(default=300, ge=10, le=1800)
+    save: bool = Field(default=True, description="是否写进 sa_backtest_run")
+
+
+class SandboxBatchIn(BaseModel):
+    limit: int = Field(default=3, ge=1, le=20)
+    start: str = Field(default="2024-01-01", max_length=10)
+    end: str = Field(default="", max_length=10)
+    limit_codes: int = Field(default=400, ge=1, le=3000)
+    where: str = Field(default="local", pattern="^(local|container)$")
+    save: bool = Field(default=False)
+    only_ok_syntax: bool = Field(default=True,
+                                help="只跑 syntax_state='ok' 的。作者分段贴的那种"
+                                     "（fragment）机械拼接跑不出有意义的结果")
+
+
+class SandboxPrecheckIn(BaseModel):
+    post_id: str = Field(default="", max_length=64)
+    start: str = Field(default="2024-01-01", max_length=10)
+    end: str = Field(default="", max_length=10)
+    limit_codes: int = Field(default=400, ge=1, le=3000)
+
+
 class JqExtractIn(BaseModel):
     post_id: str = Field(default="", max_length=64)
     limit: int = Field(default=3, ge=1, le=20)
@@ -3960,6 +4007,347 @@ def strategy_digest_queue():
         cols = [c[0] for c in cur.description]
         bad = [dict(zip(cols, r)) for r in cur.fetchall()]
     return {"queue": q, "problems": bad}
+
+
+def _sandbox_slice(post_id: str, start: str, end: str, limit_codes: int
+                   ) -> dict:
+    """准备一次沙箱运行所需的材料：源码 + 标的清单 + 区间。
+
+    数据从哪来、给多少，都是「沙箱里没有数据库」逼出来的：沙箱只能看到我们
+    显式切给它的 CSV，所以标的范围和区间必须在这儿定好。
+
+    标的按**覆盖天数降序**取，不是按代码序。理由：截面里如果混着一半只有
+    几十天数据的票（新股/停牌久），那些票在「按市值排序取最小的 N 只」时会被
+    当成最便宜，策略优先选中它们，回测结果就失真了。
+    """
+    with get_conn() as conn, conn.cursor() as cur:
+        if post_id:
+            cur.execute("""SELECT a.post_id, a.title, s.code, s.syntax_state,
+                                  s.syntax_ok, s.redacted, s.n_blocks
+                           FROM sa_strategy_article a
+                           LEFT JOIN sa_strategy_source s
+                                  ON s.post_id = a.post_id
+                           WHERE a.post_id = %s""", (post_id,))
+        else:
+            cur.execute("""SELECT a.post_id, a.title, s.code, s.syntax_state,
+                                  s.syntax_ok, s.redacted, s.n_blocks
+                           FROM sa_strategy_article a
+                           JOIN sa_strategy_source s ON s.post_id = a.post_id
+                           WHERE s.syntax_ok
+                           ORDER BY a.clone_count DESC LIMIT 1""")
+        r = cur.fetchone()
+        if not r:
+            raise HTTPException(404, "文章不存在" if post_id else
+                                "库里没有 syntax_ok 的策略源码（先跑采集+抽取）")
+        pid, title, code, syn, syn_ok, red, nblocks = r
+        if not code:
+            raise HTTPException(400, "这篇没抽到源码（syntax_state=%s）"
+                                % (syn or "none"))
+        cur.execute("SELECT min(trade_date), max(trade_date) "
+                    "FROM sa_market_kline")
+        dmin, dmax = cur.fetchone()
+    end = end or str(dmax or "")
+    if not end:
+        raise HTTPException(400, "sa_market_kline 是空的，先灌数据")
+    if dmin and start < str(dmin):
+        start = str(dmin)
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""SELECT code, count(*) FROM sa_market_kline
+                       WHERE trade_date BETWEEN %s AND %s
+                       GROUP BY code ORDER BY count(*) DESC LIMIT %s""",
+                    (start, end, int(limit_codes)))
+        codes = [r[0] for r in cur.fetchall()]
+    if not codes:
+        raise HTTPException(400, "%s ~ %s 区间里没有行情数据" % (start, end))
+    return {"post_id": pid, "title": title, "code": code,
+            "syntax_state": syn or "", "syntax_ok": bool(syn_ok),
+            "redacted": bool(red), "n_blocks": nblocks,
+            "codes": codes, "start": start, "end": end}
+
+
+def _pct_or_none(v):
+    return None if v is None else round(float(v) * 100.0, 4)
+
+
+def _precheck_verdict(m: dict, scan: dict, all_mkt: bool,
+                      est: dict = None) -> str:
+    """给人看的一句话结论 —— 把「为什么不能跑」讲清楚，而不是只给个布尔。"""
+    if m["syntax_state"] == "fragment":
+        return ("不能跑：作者把源码拆成多段贴，机械拼接拼不出可运行文件。"
+                "要跑得先人工或用 LLM 拼回一个完整文件。")
+    if m["syntax_state"] == "syntax_error":
+        return "不能跑：拼接后源码语法错误，需要改写。"
+    if not m["syntax_ok"]:
+        return "不能跑：syntax_state=%s" % (m["syntax_state"] or "未知")
+    if m["redacted"]:
+        return ("能跑但结果不可信：作者用省略号把核心逻辑藏了（脱敏），"
+                "跑出来的净值不代表真实策略。")
+    if all_mkt and scan["n_funcs"] < 3:
+        return ("疑似全市场策略但函数很少 —— 确认一下它是不是靠 "
+                "get_fundamentals 选票（那必须有市值数据）")
+    # 内存放不下要在跑之前说。放不下的表现是**被 OOM killer 直接杀掉**：
+    # 没有 traceback、stdout 全空，从外面看和超时一模一样，排查起来最费时间。
+    if est and not est.get("fits", True):
+        return ("截面 %d 只装不下：估算峰值内存 %.0fMB，容器上限 %dMB"
+                "（差 %.0fMB）。会被 OOM killer 静默杀掉。"
+                "要么调小截面，要么加 JQ_MAX_CODES 并同时调高 memory。"
+                % (est["codes"], est["est_peak_rss_mb"], est["memory_cap_mb"],
+                   -est["headroom_mb"]))
+    if est and all_mkt:
+        return ("可以跑，但注意：这是需要全市场的策略，而沙箱最多只能给它 "
+                "%d 只（容器内存所限）。截断发生在策略自己的选股之前，"
+                "所以它的收益数字**不代表真实表现** —— 实测同一个策略 400 只 "
+                "是 +16.95%%、800 只是 +87.72%%。要看真实表现只能提高内存上限。"
+                % est["codes"])
+    return "可以跑。"
+
+
+@app.get("/api/sandbox/health")
+def sandbox_health_ep():
+    """沙箱通不通。跑之前先看这个 ——「镜像不存在」和「策略跑失败」是两回事，
+    不先分清每次都要人去翻远端日志。"""
+    h = JS.sandbox_health()
+    h["limits"] = JS.SANDBOX_DEFAULTS
+    return h
+
+
+@app.post("/api/sandbox/precheck")
+def sandbox_precheck(body: SandboxPrecheckIn):
+    """跑之前的体检：不花钱、不跑容器、不切数据。
+
+    回答三件事：源码能不能跑 / 有没有危险调用 / 需要多大截面。
+    为什么单独做：容器跑一次要上传 2~3MB、切几秒、跑几十秒。语法错的话这些
+    全是白花 —— 我调 API 语义那一轮，绝大多数错误都是本地干跑阶段暴露的。
+    """
+    m = _sandbox_slice(body.post_id, body.start, body.end, body.limit_codes)
+    scan = JS.static_scan(m["code"])
+    refs = JS.referenced_codes(m["code"])
+    all_mkt = "__ALL_MARKET__" in refs
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""SELECT count(*) FROM sa_stock_valuation
+                       WHERE trade_date BETWEEN %s AND %s""",
+                    (m["start"], m["end"]))
+        vdays = cur.fetchone()[0]
+    est = JS.estimate_universe(len(m["codes"]))
+    return {"post_id": m["post_id"], "title": m["title"],
+            "can_run": m["syntax_ok"], "syntax_state": m["syntax_state"],
+            "redacted": m["redacted"], "n_blocks": m["n_blocks"],
+            "n_lines": scan["n_lines"], "n_funcs": scan["n_funcs"],
+            "funcs": scan["funcs"], "risks": scan["risks"],
+            "looks_redacted": scan["looks_redacted"],
+            "needs_all_market": all_mkt,
+            "referenced_codes": [r for r in refs if not r.startswith("__")],
+            "universe_size": len(m["codes"]),
+            "universe_estimate": est,
+            "period": [m["start"], m["end"]],
+            "valuation_days": vdays,
+            "verdict": _precheck_verdict(m, scan, all_mkt, est)}
+
+
+def _save_sandbox_trace(m: dict, r: dict, where: str, ki: dict, vi: dict,
+                        scan: dict, cash: float, bench: str) -> None:
+    """写 sa_sandbox_run：隔离参数/镜像/被拒订单/告警/失败原因全留档。
+
+    失败的也留 ——「为什么它没跑」比「跑成功」更需要查。
+    """
+    met = r.get("metrics") or {}
+    ts = r.get("trade_stats") or {}
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO sa_sandbox_run
+                       (article_id, post_id, strategy_name, syntax_state, host,
+                        image, limits, ok, error, n_days, n_trades, n_rejected,
+                        n_callback_errors, total_return, annual_return,
+                        max_drawdown, sharpe, win_rate, warnings, rejected,
+                        result, elapsed)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                               %s,%s,%s,%s,%s,%s,%s)""",
+                    (m["post_id"], m["post_id"], m["title"][:200],
+                     m["syntax_state"], JS.DEFAULT_HOST, JS.DOCKER_IMAGE,
+                     json.dumps(dict(JS.SANDBOX_DEFAULTS, where=where,
+                                     universe=len(ki.get("codes") or []),
+                                     days=ki.get("days"),
+                                     val_codes=len(vi.get("codes") or []),
+                                     risks=len(scan["risks"]),
+                                     init_cash=cash, benchmark=bench),
+                                ensure_ascii=False),
+                     bool(r.get("ok")),
+                     ((r.get("error") or "") + "\n"
+                      + (r.get("traceback") or ""))[:4000],
+                     int(r.get("n_days") or 0),
+                     int(r.get("n_trades_total") or 0),
+                     int(r.get("n_rejected") or 0),
+                     int(r.get("n_callback_errors") or 0),
+                     _pct_or_none(met.get("total_return")),
+                     _pct_or_none(met.get("annual_return")),
+                     _pct_or_none(met.get("max_drawdown")),
+                     met.get("sharpe"), _pct_or_none(ts.get("win_rate")),
+                     json.dumps((r.get("warnings") or [])[:40],
+                                ensure_ascii=False),
+                     json.dumps((r.get("rejected") or [])[:50],
+                                ensure_ascii=False),
+                     json.dumps({k: v for k, v in r.items()
+                                 if k not in ("daily", "trades", "traceback")},
+                                ensure_ascii=False, default=str)[:60000],
+                     r.get("elapsed") or 0))
+            conn.commit()
+    except Exception as exc:                    # noqa: BLE001
+        print("[sandbox] 留痕失败: %s" % str(exc)[:150], flush=True)
+
+
+@app.post("/api/sandbox/run")
+def sandbox_run(body: SandboxRunIn):
+    """跑一次沙箱回测。
+
+    where=local     无隔离、快（10~60 秒），用来试错
+    where=container 完整隔离，结果才建议落库
+    两者不是替代关系：调 API 语义的阶段全靠 local 快速暴露问题，
+    确认能跑通了再上 container 出数。
+    """
+    m = _sandbox_slice(body.post_id, body.start, body.end, body.limit_codes)
+    scan = JS.static_scan(m["code"])
+    bench = m["codes"][0] if m["codes"] else ""
+    tdir = tempfile.mkdtemp(prefix="sa_sbx_")
+    try:
+        k_csv = Path(tdir) / "data.csv"
+        v_csv = Path(tdir) / "val.csv"
+        ki = JS.build_slice_csv(get_conn, m["codes"], m["start"], m["end"],
+                                k_csv, benchmark=bench)
+        vi = JS.build_valuation_csv(get_conn, m["codes"], m["start"], m["end"],
+                                    v_csv)
+        if body.where == "container":
+            h = JS.sandbox_health()
+            if not h.get("ok"):
+                raise HTTPException(503, "沙箱不可用：%s"
+                                    % (h.get("hint") or h.get("error")))
+            r = JS.run_in_docker(m["code"], k_csv, m["start"], m["end"],
+                                 body.cash, benchmark=bench,
+                                 timeout=body.timeout, val_csv=v_csv)
+        else:
+            r = JS.run_local(m["code"], k_csv, m["start"], m["end"], body.cash,
+                             benchmark=bench, timeout=body.timeout,
+                             val_csv=v_csv)
+        run_id = None
+        if body.save and r.get("ok"):
+            try:
+                run_id = JS.save_run(get_conn, r, m["title"][:150], m["start"],
+                                     m["end"], m["codes"][:60], {}, body.cash,
+                                     benchmark=bench, article_id=m["post_id"])
+            except Exception as exc:            # noqa: BLE001
+                r["save_error"] = str(exc)[:200]
+        _save_sandbox_trace(m, r, body.where, ki, vi, scan, body.cash, bench)
+        r.pop("daily", None)          # 逐日净值太大，走 sa_backtest_daily 取
+        r.pop("trades", None)
+        return {"ok": r.get("ok"), "run_id": run_id, "post_id": m["post_id"],
+                "title": m["title"], "where": body.where,
+                "slice": {"codes": len(ki["codes"]), "days": ki["days"],
+                          "bytes": ki["bytes"],
+                          "val_codes": len(vi.get("codes") or [])},
+                "result": r}
+    finally:
+        shutil.rmtree(tdir, ignore_errors=True)
+
+
+@app.post("/api/sandbox/batch")
+def sandbox_batch(body: SandboxBatchIn):
+    """批量跑「有完整源码」的策略，挨个跑并汇总。
+
+    刻意**不并发**：每个沙箱运行本身已吃满 1 个 CPU，而 101 只有 4 核且还跑着
+    9 个容器。并发只会互相抢 CPU，墙钟超时反而更容易触发 —— 那时候拿到的是
+    被 timeout 杀掉的半个回测，比慢更糟。
+    """
+    out = []
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""SELECT s.post_id, a.title FROM sa_strategy_source s
+                       JOIN sa_strategy_article a ON a.post_id = s.post_id
+                       WHERE (%s OR s.syntax_ok)
+                       ORDER BY a.clone_count DESC LIMIT %s""",
+                    (body.only_ok_syntax, body.limit * 4))
+        cands = cur.fetchall()
+    for pid, title in cands:
+        if len(out) >= body.limit:
+            break
+        item = {"post_id": pid, "title": title}
+        try:
+            r = sandbox_run(SandboxRunIn(
+                post_id=pid, start=body.start, end=body.end,
+                limit_codes=body.limit_codes, where=body.where,
+                save=body.save))
+            res = r.get("result") or {}
+            met = res.get("metrics") or {}
+            item.update({"ok": r.get("ok"), "run_id": r.get("run_id"),
+                         "total_return": _pct_or_none(met.get("total_return")),
+                         "annual_return": _pct_or_none(
+                             met.get("annual_return")),
+                         "max_drawdown": _pct_or_none(met.get("max_drawdown")),
+                         "n_trades": res.get("n_trades_total"),
+                         "error": (res.get("error") or "")[:180]})
+        except HTTPException as exc:
+            item.update({"ok": False, "error": str(exc.detail)[:200]})
+        except Exception as exc:                # noqa: BLE001
+            item.update({"ok": False, "error": str(exc)[:200]})
+        out.append(item)
+    return {"n": len(out), "items": out}
+
+
+@app.get("/api/sandbox/runs")
+def sandbox_runs(limit: int = 30, offset: int = 0, only_failed: bool = False):
+    """沙箱运行留痕。失败的也留着 —— 那才是需要查的。"""
+    sql = ("SELECT id, post_id, strategy_name, syntax_state, host, image,"
+           " limits, ok, left(error, 400) AS error, n_days, n_trades,"
+           " n_rejected, n_callback_errors, total_return, annual_return,"
+           " max_drawdown, sharpe, win_rate, warnings, elapsed, created_at"
+           " FROM sa_sandbox_run")
+    args: list = []
+    if only_failed:
+        sql += " WHERE NOT ok"
+    sql += " ORDER BY id DESC LIMIT %s OFFSET %s"
+    args += [int(limit), int(offset)]
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, args)
+        cols = [c[0] for c in cur.description]
+        items = [dict(zip(cols, r)) for r in cur.fetchall()]
+    for it in items:
+        for k in ("limits", "warnings"):
+            if k in it and not isinstance(it[k], (dict, list)):
+                try:
+                    it[k] = json.loads(it[k] or ("{}" if k == "limits" else "[]"))
+                except (TypeError, ValueError):
+                    it[k] = {} if k == "limits" else []
+    return {"items": items, "n": len(items)}
+
+
+@app.get("/api/sandbox/compare")
+def sandbox_compare(post_id: str, limit: int = 8):
+    """同一篇文章的多次运行对比，重点是看「本地 vs 容器」是否一致。
+
+    不一致意味着有环境依赖（时区、浮点精度、库版本、随机数），
+    那这个结果就不能信 —— 所以这里直接把差异字段名列出来。
+    """
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""SELECT id, limits->>'where' AS where_, ok, n_trades,
+                              total_return, annual_return, max_drawdown,
+                              sharpe, elapsed, created_at
+                       FROM sa_sandbox_run WHERE post_id = %s
+                       ORDER BY id DESC LIMIT %s""", (post_id, int(limit)))
+        cols = [c[0] for c in cur.description]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    verdict = ""
+    if len(rows) >= 2:
+        loc = next((r for r in rows if r["where_"] == "local"), None)
+        ctn = next((r for r in rows if r["where_"] == "container"), None)
+        if loc and ctn:
+            keys = ("total_return", "annual_return", "max_drawdown", "sharpe",
+                    "n_trades")
+            diff = [k for k in keys
+                    if loc[k] is None or ctn[k] is None
+                    or abs(float(loc[k]) - float(ctn[k])) > 1e-6]
+            verdict = ("本地与容器完全一致" if not diff else
+                       "本地与容器在 %s 上有差异 -> 存在环境依赖，结果不可信"
+                       % ", ".join(diff))
+    return {"post_id": post_id, "rows": rows, "verdict": verdict}
 
 
 # ---------- 本地行情数据 + 回测（供策略本地验证）----------
@@ -4360,7 +4748,8 @@ def _paper_strategy_scan(trigger: str, quiet: bool = False) -> dict:
                 notifier.notify(
                     f"🧪 策略对照触发 {len(hits)} 次: "
                     + "、".join(f"{h.get('code')}({h.get('reason','')[:20]})"
-                                for h in hits[:5]))
+                                for h in hits[:5]),
+                    event="paper_strategy")
             except Exception:
                 pass
         elif not quiet:
@@ -4905,26 +5294,73 @@ class NotifySendIn(BaseModel):
     title: str
     content: str = ""
     channels: list[str] | None = None  # ["wx","email"]，空 = 按启用渠道广播
+    event: str | None = None           # 给了就按该事件的渠道矩阵发
 
 
 class IlinkVerifyIn(BaseModel):
     verify_code: str = ""  # need_verifycode 时手机上显示的数字
 
 
+class NotifyChatIn(BaseModel):
+    text: str = Field(default="", max_length=20000)
+    user_id: str = Field(default="", max_length=128)
+    push: bool = Field(default=False, description="true=顺便推给该 user_id")
+    dry_run: bool = Field(default=False, description="true=只生成不落库不推送")
+
+
 _bind_state = {"qrcode": None, "created_at": None,
                "status": None, "bound": False, "error": None}
+
+# 最近一次 notifystart（iLink 会话声明）的结果。进程级即可：iLink 侧的会话
+# 本来就只活在服务端连接里，重启必然要重新声明一次。
+_wx_session_state: dict = {"ok": None, "note": "尚未声明（服务启动时会自动做一次）"}
 
 
 @app.get("/api/notify/config")
 def notify_get_config():
-    """通知配置。微信绑定关系（iLink 凭据）在云库，只返回「是否已登录」。"""
+    """通知配置。微信绑定关系（iLink 凭据）在云库，只返回「是否已登录」。
+
+    auth_code 是邮箱授权码，**不回显明文**（只回 has_auth_code）。原实现直接
+    把 load_notify_conf() 的结果原样返回，等于把授权码塞进每个 /api/notify/config
+    响应里 —— 本地服务没有鉴权，别把它当无害。
+
+    wx.session 报的是最近一次 notifystart 的结果：iLink 侧的「会话」只按
+    内存记，**服务重启后会丢**，必须重新声明。所以这个值只在服务刚起来时
+    有效，不能当成持久状态展示给用户。
+    """
     conf = notifier.load_notify_conf()
-    conf["wx"]["bound"] = bool(notifier.ilink_creds().get("bot_token"))
+    creds = notifier.ilink_creds()
+    conf["wx"]["bound"] = bool(creds.get("bot_token"))
+    conf["wx"]["session"] = _wx_session_state
+    code = conf["email"].pop("auth_code", "") or ""
+    conf["email"]["has_auth_code"] = bool(code)
     return conf
+
+
+@app.post("/api/notify/wx/session")
+def notify_wx_session():
+    """重建 iLink 会话（notifystart）。不需要用户先发消息。
+
+    服务重启后 iLink 侧不认为本客户端在线，出站会 ret=-2 prepare failed；
+    调一次这个接口即可恢复。返回 {ok, ret, errmsg}。
+    """
+    global _wx_session_state
+    _wx_session_state = notifier.ensure_session()
+    _wx_session_state["at"] = datetime.now().isoformat(timespec="seconds")
+    if not _wx_session_state.get("ok"):
+        raise HTTPException(502, _wx_session_state.get("error")
+                            or f"notifystart 失败 ret={_wx_session_state.get('ret')}")
+    return {"ok": True, "session": _wx_session_state}
 
 
 @app.put("/api/notify/config")
 def notify_update_config(body: NotifyConfIn):
+    """改渠道配置（总开关 + SMTP 参数）。事件矩阵走 /api/notify/events 单独改。
+
+    ⚠️ auth_code 传空串一律视为「不修改」：前端的授权码输入框是 type=password，
+    页面刷新后是空的（loadNotifyConf 刻意不回显），用户改别的东西顺手点保存时
+    必然带上空串 —— 当成新值写下去就把真授权码抹了，之后邮件全部认证失败。
+    """
     conf = notifier.load_notify_conf()
     wx, email = conf["wx"], conf["email"]
     if body.wx_enabled is not None:
@@ -4935,8 +5371,8 @@ def notify_update_config(body: NotifyConfIn):
         email["smtp_port"] = body.smtp_port
     if body.from_addr is not None:
         email["from_addr"] = body.from_addr.strip()
-    if body.auth_code is not None:
-        email["auth_code"] = body.auth_code
+    if body.auth_code and body.auth_code.strip():
+        email["auth_code"] = body.auth_code.strip()
     if body.to_addr is not None:
         email["to_addr"] = body.to_addr.strip()
     if body.email_enabled is not None:
@@ -5016,7 +5452,12 @@ def notify_wx_bind_verify(body: IlinkVerifyIn):
 
 @app.post("/api/notify/test")
 def notify_test(channel: str = "wx"):
-    """给指定渠道发一条测试消息（wx / email）。"""
+    """给指定渠道发一条测试消息（wx / email）。
+
+    失败时**回显底层的真实报错**（如 `sendmessage ret=-2 errmsg=prepare failed`）
+    与处置建议。原来只回「发送失败」，把原因全吞了 —— 2026-09-30 排查
+    「微信通知失效」时被这个误导，绕去查了 token 有效性、端口、服务状态。
+    """
     title = "Stock Advisor 通知测试"
     if channel == "wx":
         res = notifier.send_wx(title, "微信通知配置成功 ✓\n收到此消息说明绑定已生效。")
@@ -5025,22 +5466,196 @@ def notify_test(channel: str = "wx"):
     else:
         raise HTTPException(400, "channel 仅支持 wx / email")
     if not res.get("ok"):
-        raise HTTPException(400, res.get("error", "发送失败"))
+        detail = res.get("error", "发送失败")
+        if res.get("hint"):
+            detail += "\n\n" + res["hint"]
+        if res.get("results"):
+            detail += "\n\n" + json.dumps(
+                [{"uid": r.get("uid"), "ok": r.get("ok"), "error": r.get("error")}
+                 for r in res["results"]], ensure_ascii=False)
+        raise HTTPException(400, detail)
     return res
 
 
 @app.post("/api/notify/send")
 def notify_send(body: NotifySendIn):
-    """通用通知入口（供 Claude 定时任务 / 脚本 curl 调用），按启用渠道广播。"""
-    return notifier.notify(body.title, body.content, channels=body.channels)
+    """通用通知入口（供 Claude 定时任务 / 脚本 curl 调用），按启用渠道广播。
+
+    传了 event 就走该事件的渠道矩阵（跟各守护线程同一条路径）；不传则广播给
+    所有已启用渠道 —— 手工发的消息不该被事件开关误伤。
+    """
+    if body.event and body.event not in notify_events.EVENTS:
+        raise HTTPException(400, f"未知事件：{body.event}")
+    return notifier.notify(body.title, body.content, channels=body.channels,
+                           event=body.event)
+
+
+# ---- 事件 → 渠道开关矩阵（notify_events.py 登记表驱动的可视化配置） ----
+
+@app.get("/api/notify/events")
+def notify_events_get():
+    """事件矩阵当前状态。给前端 🔔通知 页直接渲染成复选框表格。
+
+    每行多回一个 `effective`（该渠道总开关 + 事件开关的与），页面据此把
+    「渠道总开关关掉了」的行标灰 —— 否则用户会以为自己开了却没收到通知。
+    """
+    conf = notifier.load_notify_conf()
+    events = conf.get("events") or {}
+    out = []
+    for group in notify_events.channels_json():
+        rows = []
+        for row in group["rows"]:
+            key = row["key"]
+            cur = events.get(key) or notify_events.event_default(key)
+            on = {ch: bool(cur.get(ch)) for ch in notify_events.CHANNELS}
+            rows.append({**row, "on": on,
+                         "effective": {ch: on[ch] and bool((conf.get(ch) or {}).get("enabled"))
+                                       for ch in notify_events.CHANNELS}})
+        out.append({**group, "rows": rows})
+    return {"channels": [{"key": ch,
+                          "label": "📲 微信" if ch == "wx" else "✉️ 邮件",
+                          "enabled": bool((conf.get(ch) or {}).get("enabled"))}
+                         for ch in notify_events.CHANNELS],
+            "groups": out}
+
+
+class NotifyEventIn(BaseModel):
+    on: dict = Field(default_factory=dict, description="{渠道: bool}")
+
+
+@app.put("/api/notify/events/{event}")
+def notify_events_put(event: str, body: NotifyEventIn):
+    """改单个事件的渠道开关。只接受已登记的事件（防止前端拼错静默写坏 yaml）。"""
+    if event not in notify_events.EVENTS:
+        raise HTTPException(404, f"未登记的通知事件：{event}")
+    unknown = [c for c in body.on if c not in notify_events.CHANNELS]
+    if unknown:
+        raise HTTPException(400, f"未知渠道：{', '.join(unknown)}")
+    events = notifier.load_notify_conf()["events"]
+    cur = events.get(event) or notify_events.event_default(event)
+    events[event] = {ch: bool(body.on[ch] if ch in body.on else cur.get(ch))
+                     for ch in notify_events.CHANNELS}
+    try:
+        notifier.save_notify_events(events)
+    except RuntimeError as exc:      # config.yaml 坏了，拒绝写入
+        raise HTTPException(500, str(exc))
+    return notify_events_get()
+
+
+@app.post("/api/notify/events/bulk")
+def notify_events_bulk(body: dict = None):
+    """批量改：{"on": {事件: {渠道: bool}}, "all": {渠道: bool|null}}。
+
+    `all` 用于「这一列全开/全关」与「只留微信」：null = 不动。
+    一次整段重渲染（notifier.save_notify_events），不做 38 次行级手术 ——
+    后者在三层嵌套路径上会把 config.yaml 写坏，详见该函数注释。
+    """
+    body = body or {}
+    on = body.get("on") or {}
+    allc = body.get("all") or {}
+    unknown_ch = [c for c in allc if c not in notify_events.CHANNELS]
+    if unknown_ch:
+        raise HTTPException(400, f"未知渠道：{', '.join(unknown_ch)}")
+    for ev, chans in on.items():
+        if ev not in notify_events.EVENTS:
+            raise HTTPException(404, f"未登记的通知事件：{ev}")
+        unknown = [c for c in (chans or {}) if c not in notify_events.CHANNELS]
+        if unknown:
+            raise HTTPException(400, f"{ev} 未知渠道：{', '.join(unknown)}")
+    events = notifier.load_notify_conf()["events"]
+    for ev in notify_events.EVENTS:
+        cur = events.get(ev) or notify_events.event_default(ev)
+        for ch in notify_events.CHANNELS:
+            if ch in allc and allc[ch] is not None:
+                cur[ch] = bool(allc[ch])
+            if ch in (on.get(ev) or {}):
+                cur[ch] = bool(on[ev][ch])
+        events[ev] = {ch: bool(cur.get(ch)) for ch in notify_events.CHANNELS}
+    try:
+        notifier.save_notify_events(events)
+    except RuntimeError as exc:
+        raise HTTPException(500, str(exc))
+    return {**notify_events_get(), "written": len(notify_events.EVENTS)}
+
+
+@app.post("/api/notify/events/{event}/test")
+def notify_events_test(event: str):
+    """按该事件当前的路由发一条测试消息（不发也会告诉你为什么没发）。"""
+    if event not in notify_events.EVENTS:
+        raise HTTPException(404, f"未登记的通知事件：{event}")
+    conf = notifier.load_notify_conf()
+    routes = notifier.resolve_channels(event, conf)
+    meta = notify_events.EVENTS[event]
+    res = notifier.notify(f"Stock Advisor 测试 · {meta['label']}",
+                          f"这是「{meta['label']}」的通知测试。\n"
+                          f"当前路由：{('、'.join(routes)) or '（无可用渠道）'}",
+                          conf=conf, event=event)
+    if not res.get("sent"):
+        return {"ok": False, "event": event, "routes": routes, **res}
+    return {"ok": True, "event": event, "routes": routes, **res}
 
 
 @app.get("/api/notify/wx/unbind")
 def notify_wx_unbind():
-    """解绑：清空云库里的 iLink 凭据与用户缓存，需重新扫码。"""
+    """解绑：清空云库里的 iLink 凭据与用户缓存，需重新扫码。
+
+    **顺带清掉入站游标**：换了微信号/账号后还拿旧游标去问服务端，拿不到新消息，
+    表现就是「解绑重绑之后微信发消息服务没反应」。
+    """
     removed = notifier.ilink_creds_clear()
+    wx_inbound.clear_cursor()
     _bind_state.update(qrcode=None, status=None, bound=False, error=None)
     return {"ok": True, "removed": removed}
+
+
+# ---------------- 微信入站 / 对话（wx_inbound.py 收，wx_chat.py 回） ----------------
+
+def _wx_deps() -> dict:
+    """给 wx_inbound / wx_chat 注入依赖（它们不 import app，避免循环依赖）。"""
+    return {"get_conn": get_conn}
+
+
+@app.get("/api/notify/wx/inbound")
+def notify_wx_inbound_status():
+    """入站轮询状态：有没有在跑、最近收到什么、上次回什么。"""
+    return {"inbound": wx_inbound.get_status(), "chat": wx_chat.get_status(),
+            "commands": sorted(set(wx_chat.COMMANDS.values()))}
+
+
+@app.get("/api/notify/wx/chat")
+def notify_wx_chat_history(limit: int = 30):
+    """最近对话留档。LLM 对话最容易出的问题是"它到底说了什么"，
+    没这个接口就只能去 WeChat 里翻。"""
+    return {"items": wx_chat.recent(_wx_deps(), limit)}
+
+
+@app.post("/api/notify/wx/chat")
+def notify_wx_chat_send(body: NotifyChatIn):
+    """让 bot 现在就说一句话（不等你在微信里发）。
+
+    用途有二：验证 LLM 通不通（比"在微信里发一句再等 35 秒"快得多），
+    以及给自己发长文本（微信输入框不好用）。
+    """
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(400, "说点什么吧")
+    uid = body.user_id or "manual@local"
+    reply = wx_chat.build_reply(_wx_deps(), uid, text)
+    if reply is None:
+        raise HTTPException(400, "对话已关闭（wx_chat.reply=false），不生成回复")
+    if not body.dry_run:
+        creds = notifier.ilink_creds()
+        if body.push and creds.get("bot_token"):
+            try:
+                ilink_client.send_message(
+                    creds["bot_token"],
+                    creds.get("baseurl") or ilink_client.BASE_URL,
+                    body.user_id or (creds.get("ilink_user_id") or ""),
+                    reply, context_token=notifier._context_token_for(
+                        body.user_id or (creds.get("ilink_user_id") or "")))
+            except Exception as exc:
+                raise HTTPException(502, f"已生成回复但推送失败：{exc}")
+    return {"reply": reply}
 
 
 # ---------------- 自动抓取后台线程 ----------------
@@ -6137,7 +6752,8 @@ def _discover_loop():
                             notifier.notify(
                                 f"🔭 挖到 {added} 只高置信新标的，已加自选："
                                 + "、".join(f"{x['name']}({x['code']})"
-                                           for x in aa.get("items", [])[:8]))
+                                           for x in aa.get("items", [])[:8]),
+                                event="discover")
                         except Exception:
                             pass
                 msg = (f"[discover] 候选 {result.get('candidates', 0)} 只，"
@@ -6280,6 +6896,24 @@ if _BOOTSTRAP:
     except Exception as exc:
         print(f"[paper_goal] init tables failed: {exc}", flush=True)
 
+    # 微信对话留档表（幂等 DDL）
+    try:
+        wx_chat.ensure_table(_wx_deps())
+    except Exception as exc:
+        print(f"[wx_chat] init tables failed: {exc}", flush=True)
+
+# 声明微信客户端在线（iLink notifystart）。
+# **必须在每次服务启动时做**：iLink 侧的「会话」不是持久状态，重启后不重新
+# 声明的话，所有出站推送都会 ret=-2 prepare failed —— 表现为「微信通知突然
+# 全没了」，但代码里没有任何地方会告诉你原因。抄官方 channel.ts::startAccount。
+if _BOOTSTRAP:
+    _wx_session_state = notifier.ensure_session()
+    if _wx_session_state.get("ok"):
+        print("[wx] iLink 会话已声明在线（notifystart ok）", flush=True)
+    elif notifier.ilink_creds().get("bot_token"):
+        print(f"[wx] notifystart 未成功（{_wx_session_state.get('error')}），"
+              f"微信推送可能失败", flush=True)
+
 # 自动新闻抓取后台线程（fetch_interval_minutes=0 时轮内直接跳过）
 _start_daemon(_auto_fetch_loop, "sa_auto_fetch")
 
@@ -6330,6 +6964,11 @@ _start_daemon(_mp_loop, "sa_mp")
 # X(Twitter) 指定用户发言监控线程（x_monitor.py；x.interval_minutes=0 或未配账号时跳过）
 _start_daemon(_x_loop, "sa_x")
 _start_daemon(_discover_loop, "sa_discover")
+
+# 微信入站长轮询线程（wx_inbound.py + wx_chat.py）。
+# 它同时负责**给 iLink token 保活** —— 没有持续的长轮询，token 几小时内就会失效，
+# 所以即使把 wx_chat.enabled 关掉，这个线程也不能停。
+_start_daemon(wx_chat.run_forever, "sa_wx_inbound", args=(_wx_deps(),))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8686)

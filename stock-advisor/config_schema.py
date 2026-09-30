@@ -26,11 +26,16 @@
 
 from typing import Any
 
+import notify_events  # 通知事件登记表（零依赖模块，config_schema 需要它生成字段）
+
 # 字段简写：
 #   t=int/float/bool/str/list/time/password/url
 #   d=默认值  lo/hi=取值范围（int/float）  req=是否必填
 #   secret=True  接口只回掩码，PUT 时留空=不修改
 #   adv=True     「高级」项，默认折叠（不常用但要能改）
+#   hidden=True  **不出现在通用表单里**，但仍可被 /api/config/all 读写与校验。
+#                用来登记那些「在别的页面有专门 UI，在这里只想别报成未覆盖」的键
+#                （如 notify.events.*：40 个复选框塞进 ⚙️调度 的通用表单没法看）
 #   choices=[..] 枚举
 
 SCHEMAS: dict[str, dict[str, Any]] = {
@@ -526,7 +531,11 @@ SCHEMAS: dict[str, dict[str, Any]] = {
     # ---------------- 通知 ----------------
     "notify": {
         "label": "🔔 通知渠道",
-        "help": "微信走腾讯官方 iLink Bot（凭据存云库，不在 yaml 里）。",
+        "help": "微信走腾讯官方 iLink Bot（凭据存云库，不在 yaml 里）。"
+                "**events 段是「事件 → 渠道」开关矩阵**，共 %d 个事件；"
+                "实际发送条件 = 渠道总开关 AND 该事件的该渠道开关（两级与）。"
+                "**这一段建议去 🔔通知 页用表格勾选**，那里有说明文案和"
+                "「只推微信 / 全部渠道」这类批量操作。" % len(notify_events.EVENTS),
         "fields": [
             {"key": "wx.enabled", "t": "bool", "d": True, "label": "微信 启用"},
             {"key": "email.enabled", "t": "bool", "d": False, "label": "邮件 启用"},
@@ -540,6 +549,47 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             {"key": "email.auth_code", "t": "password", "d": "", "secret": True,
              "label": "邮箱授权码",
              "help": "QQ/163 需在邮箱设置里开 SMTP 后生成，**不是登录密码**"},
+        ] + [
+            # 事件矩阵逐项注册，_unknown_keys 才不会把它们报成「未纳入页面管理」；
+            # hidden 让它们不出现在 ⚙️调度 的通用表单里（那里 40 个复选框没法看），
+            # 主入口是 🔔通知 页的矩阵表格。
+            {"key": f"events.{ev}.{ch}", "t": "bool",
+             "d": bool((meta.get("default") or {}).get(ch, True)),
+             "label": f"{meta['label']} → {'微信' if ch == 'wx' else '邮件'}",
+             "adv": True, "hidden": True}
+            for ev, meta in notify_events.EVENTS.items()
+            for ch in notify_events.CHANNELS
+        ],
+    },
+    # ---------------- 微信入站 / 对话 ----------------
+    "wx_chat": {
+        "label": "💬 微信对话",
+        "help": "在微信里给 bot 发消息，服务会读到并用 Claude 回你。"
+                "**入站长轮询不能关**（它同时给 iLink token 保活，关久了 token 会失效，"
+                "出站推送也会跟着挂）。关掉「自动回复」只是不再回话，仍然会收、"
+                "并且照常缓存 context_token。",
+        "fields": [
+            {"key": "enabled", "t": "bool", "d": True,
+             "label": "启用入站监听",
+             "help": "关掉后不再长轮询。**除非你在排查问题，否则别关** —— "
+                     "token 保活依赖它"},
+            {"key": "reply", "t": "bool", "d": True,
+             "label": "自动用 Claude 回复",
+             "help": "关掉则只收不回（消息仍会出现在对话记录里，便于排查）。"
+                     "需要 llm 段已配置 api_key"},
+            {"key": "merge_seconds", "t": "int", "d": 60, "lo": 0, "hi": 300,
+             "label": "消息合并窗口(秒)",
+             "help": "这个窗口内的多条消息合并成一次 LLM 调用再回一条。"
+                     "人在微信里打字常分三条发，逐条调既慢又贵。0=不合并"},
+            {"key": "cooldown_seconds", "t": "int", "d": 20, "lo": 0, "hi": 600,
+             "label": "回复最小间隔(秒)", "adv": True, "help": "防刷屏"},
+            {"key": "history_turns", "t": "int", "d": 6, "lo": 0, "hi": 30,
+             "label": "带最近几轮历史", "help": "0=不带历史（每条独立回答）"},
+            {"key": "max_chars", "t": "int", "d": 2000, "lo": 100, "hi": 20000,
+             "label": "单条消息截断(字)", "adv": True},
+            {"key": "max_reply_chars", "t": "int", "d": 1200, "lo": 100, "hi": 8000,
+             "label": "回复截断(字)", "adv": True,
+             "help": "微信不渲染 Markdown，长表格会变成乱码，回复本来就该短"},
         ],
     },
     # ---------------- 定时任务时间点 ----------------
@@ -623,7 +673,7 @@ def coerce(sec: str, key: str, raw, field: dict):
 
 
 def schema_json() -> list[dict]:
-    """给前端的模式（去掉内部字段）。"""
+    """给前端的模式（去掉内部字段与 hidden 字段）。"""
     out = []
     for sec, meta in SCHEMAS.items():
         out.append({
@@ -636,6 +686,6 @@ def schema_json() -> list[dict]:
                 "help": f.get("help", ""),
                 "default": f.get("d"), "min": f.get("lo"), "max": f.get("hi"),
                 "secret": bool(f.get("secret")), "adv": bool(f.get("adv")),
-            } for f in meta["fields"]],
+            } for f in meta["fields"] if not f.get("hidden")],
         })
     return out

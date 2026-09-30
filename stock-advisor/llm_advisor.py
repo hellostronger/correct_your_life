@@ -124,8 +124,18 @@ def mask_key(key: str) -> dict:
     return {"has_key": bool(key), "key_tail": key[-4:] if key else ""}
 
 
-def ask_advice(context_text: str, conf: dict | None = None) -> str:
-    """调 Claude 生成提款建议，返回 Markdown 文本。失败抛 RuntimeError。"""
+def ask(system: str, user: str, conf: dict | None = None,
+        max_tokens: int = 4096, thinking: bool = True) -> str:
+    """调 Claude 拿一段文本。**本项目所有 LLM 调用的统一出口**。
+
+    只有 ask_advice 时不需要这个函数；抽出它是因为微信对话（wx_chat.py）
+    要用同一套配置和同一套降级链，只是 system prompt 与 max_tokens 不同。
+    复制一份降级逻辑只会让两份代码各自漂移。
+
+    降级策略：带 thinking/betas/fallbacks 的完整特性**仅 Anthropic 官方端点**
+    支持，代理网关（配了 base_url）会挂到超时 —— 所以 base_url 非空时直接走
+    最简调用，不做无谓的尝试。
+    """
     conf = conf or load_llm_conf()
     if not conf["api_key"]:
         raise RuntimeError("未配置 Anthropic API key（config.yaml llm.api_key "
@@ -133,44 +143,48 @@ def ask_advice(context_text: str, conf: dict | None = None) -> str:
     client_kwargs = {"api_key": conf["api_key"], "timeout": 120.0, "max_retries": 2}
     if conf.get("base_url"):
         client_kwargs["base_url"] = conf["base_url"]
-    messages = [{"role": "user",
-                 "content": f"以下是本次提款计划的完整上下文，请生成建议：\n\n{context_text}"}]
     try:
         from anthropic import Anthropic
     except ImportError as exc:
         raise RuntimeError("anthropic SDK 未安装：pip install 'anthropic>=1.5'") from exc
     client = Anthropic(**client_kwargs)
+    messages = [{"role": "user", "content": user}]
     msg = None
     errors = []
-    # 逐级降级：带 thinking/betas/fallbacks 的完整特性仅 Anthropic 官方端点支持，
-    # 代理网关（如 api.b.ai）会挂到超时——base_url 非空时直接走最简调用。
     attempts = []
-    if not conf.get("base_url"):
-        attempts.append(("full", dict(thinking={"type": "adaptive"},  # 权衡买卖顺序，开自适应思考
-                                      betas=["server-side-fallback-2026-07-01"],  # 拒答自动改路 Opus 4.8
+    if thinking and not conf.get("base_url"):
+        attempts.append(("full", dict(thinking={"type": "adaptive"},
+                                      betas=["server-side-fallback-2026-07-01"],
                                       fallbacks="default")))
     attempts.append(("basic", None))
     for label, kwargs in attempts:
         try:
             if label == "full":
                 # betas/fallbacks 仅 beta.messages 命名空间支持（SDK 1.5 实测）
-                msg = client.beta.messages.create(model=conf["model"], max_tokens=4096,
-                                                  system=SYSTEM_PROMPT, messages=messages,
+                msg = client.beta.messages.create(model=conf["model"], max_tokens=max_tokens,
+                                                  system=system, messages=messages,
                                                   **kwargs)
             else:
-                msg = client.messages.create(model=conf["model"], max_tokens=4096,
-                                             system=SYSTEM_PROMPT, messages=messages)
+                msg = client.messages.create(model=conf["model"], max_tokens=max_tokens,
+                                             system=system, messages=messages)
             break
         except Exception as exc:
             errors.append(f"{label}: {type(exc).__name__}: {exc}")
     if msg is None:
         raise RuntimeError(f"Claude API 调用失败: {' | '.join(errors)}")
     if msg.stop_reason == "refusal":
-        raise RuntimeError("请求被安全策略拒绝（stop_reason=refusal），请调整上下文后重试")
+        raise RuntimeError("请求被安全策略拒绝（stop_reason=refusal）")
     text = "".join(b.text for b in msg.content if b.type == "text").strip()
     if not text:
         raise RuntimeError(f"Claude 返回空内容（stop_reason={msg.stop_reason}）")
     return text
+
+
+def ask_advice(context_text: str, conf: dict | None = None) -> str:
+    """调 Claude 生成提款建议，返回 Markdown 文本。失败抛 RuntimeError。"""
+    return ask(SYSTEM_PROMPT,
+               f"以下是本次提款计划的完整上下文，请生成建议：\n\n{context_text}",
+               conf)
 
 
 def build_context_text(view: dict, held: list[dict], news_titles: list[str],

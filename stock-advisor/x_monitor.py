@@ -56,7 +56,7 @@ os.environ.setdefault("TWS_HTTP_BACKEND", "curl")
 DEFAULT_X_CONF = {
     "enabled": True,
     "interval_minutes": 30,    # 抓取周期（分钟），0 = 关闭
-    "notify_new": True,        # 新推文推微信
+    "notify_new": True,        # 有新推文时走通知（发不发、发哪些渠道见 notify_events 矩阵）
     "max_tweets": 40,          # 每人每轮最多取多少条
     "keep_days": 90,
     "include_retweets": False, # 是否收录转发（默认不收，噪音大）
@@ -473,10 +473,12 @@ def run_once(deps) -> dict:
                             (it.get("display_name", ""), it["watch_id"]))
         fresh = [f for it in items for f in it.get("fresh", [])]
         pushed = 0
-        if fresh and conf.get("notify_new", True):
+        # 两道门：本段 notify_new（粗粒度）+ notifier 内的 x_tweet 渠道矩阵（细粒度）
+        if fresh and conf.get("notify_new", True) and _pushable():
             try:
-                deps["notify_fn"](_notify_title(len(fresh)), _notify_body(fresh))
-                pushed = 1
+                res = deps["notify_fn"](_notify_title(len(fresh)), _notify_body(fresh),
+                                        event="x_tweet")
+                pushed = 1 if (res or {}).get("sent") else 0
             except Exception as exc:
                 print(f"[x] notify failed: {exc}", flush=True)
         _cleanup(deps, conf)
@@ -510,6 +512,12 @@ def _cleanup(deps, conf: dict) -> None:
     with deps["get_conn"]() as conn, conn.cursor() as cur:
         cur.execute("DELETE FROM sa_x_tweets "
                     "WHERE fetched_at < now() - make_interval(days => %s)", (keep,))
+
+
+def _pushable() -> bool:
+    """x_tweet 事件还有没有可用渠道（矩阵全关时不必组装正文）。"""
+    import notifier
+    return notifier.event_enabled("x_tweet")
 
 
 def _notify_title(n: int) -> str:

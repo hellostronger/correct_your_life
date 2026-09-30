@@ -1728,7 +1728,8 @@ def settle_and_reflect(deps: dict) -> dict:
             + (f"，alpha {(s['alpha']) * 100:+.1f}%" if s.get("alpha") is not None else "")
             for s in settled)
         try:
-            notify_fn("🧪 模拟交易结算", f"今日结算 {len(settled)} 笔：\n{lines}")
+            notify_fn("🧪 模拟交易结算", f"今日结算 {len(settled)} 笔：\n{lines}",
+                      event="paper_settle")
         except Exception:
             pass
     return {"date": today, "settled": settled, "pending": pending, "equity": snap}

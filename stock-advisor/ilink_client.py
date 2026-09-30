@@ -125,6 +125,37 @@ def get_updates(token: str, base_url: str, get_updates_buf: str = "",
                  token=token, timeout=timeout_s + 10)
 
 
+def notify_start(token: str, base_url: str, timeout: float = 15) -> dict:
+    """POST ilink/bot/msg/notifystart —— **声明本客户端在线、可收发**。
+
+    这是「拿不到会话时怎么自己拿到会话」的答案（2026-09-30 实测 + 抄官方源码）。
+
+    背景：iLink Bot 是被动会话制。之前 `notifier.py` 的文档字符串写着
+    「绑定后先在微信里随便给 bot 发一句，之后才能收到推送」—— 于是每次
+    重新扫码绑定后，用户不主动发那条消息，出站就全灭，报
+    `sendmessage ret=-2 errmsg=prepare failed`。实测这个说法是**错的**：
+    官方 @tencent-weixin/openclaw-weixin 在 gateway 启动时会先无条件调
+    这个接口（见其 src/channel.ts：`await notifyStart({baseUrl, token})`，
+    之后才启动 getUpdates 长轮询），它是**纯服务端调用，不需要任何入站消息**。
+
+    实测本机：notifystart → `{'ret': 0}`；随后无 context_token 的 sendmessage
+    正常送达。所以「必须让用户手动发一条」这一步可以省掉。
+    """
+    return _post(base_url, "ilink/bot/msg/notifystart",
+                 {"base_info": _base_info()}, token=token, timeout=timeout)
+
+
+def notify_stop(token: str, base_url: str, timeout: float = 15) -> dict:
+    """POST ilink/bot/msg/notifystop —— 关停时告知服务端（官方在 stopAccount 里调）。
+
+    本项目只有单向推送，进程被杀时通常来不及调（官方为此还用独立超时而非
+    abortSignal，以便 gateway 已经在 abort 长轮询后仍能把这条请求发完）。
+    保留它是为了让「解绑」这条路干净：解绑前先告知服务端。
+    """
+    return _post(base_url, "ilink/bot/msg/notifystop",
+                 {"base_info": _base_info()}, token=token, timeout=timeout)
+
+
 def send_message(token: str, base_url: str, to_user_id: str, text: str,
                  context_token: str = "", client_id: str = "") -> dict:
     """发文本消息：message_type=2(BOT)、message_state=2(FINISH)、item type=1(TEXT)。

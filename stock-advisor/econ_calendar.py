@@ -194,7 +194,7 @@ def check_calendar_once(conn, notify_fn=None) -> list[dict]:
     if notify_fn:
         for a in alerts:
             try:
-                notify_fn(a["title"], a["content"])
+                notify_fn(a["title"], a["content"], event="calendar")
             except Exception as exc:
                 print(f"[calendar] 通知失败: {exc}", flush=True)
     return alerts
