@@ -3268,6 +3268,8 @@ import paper_trading
 import paper_strategy
 import market_data
 import backtest
+import joinquant_source
+import strategy_crawler
 import stock_discovery
 import stock_roster
 import paper_memory
@@ -3559,6 +3561,22 @@ class PaperStrategyToggleIn(BaseModel):
     enabled: bool
 
 
+# ---- 策略库采集 ----
+class JqEnqueueIn(BaseModel):
+    pages: int = Field(default=1, ge=1, le=50)
+    limit: int = Field(default=20, ge=1, le=100)
+    cate: int = Field(default=3, ge=0, le=9)
+    type_: str = Field(default="isNew", max_length=20)
+
+
+class JqFetchIn(BaseModel):
+    limit: int = Field(default=20, ge=1, le=200)
+    only_with_code: bool = Field(
+        default=False,
+        description="只抓列表摘要就带代码块的。快但会漏很多 —— "
+                    "实测摘要被截断，60 篇里 0 篇在摘要带代码，所以默认 False 才对")
+
+
 # ---- 本地行情 / 回测 ----
 class KlineSyncIn(BaseModel):
     codes: list[str] = Field(min_length=1, max_length=200)
@@ -3650,6 +3668,113 @@ def paper_strategy_unbind(bid: int):
 def paper_strategy_compare(code: str = ""):
     """策略对照：策略卖 vs 持有到今天 vs LLM 实际怎么卖。"""
     return paper_strategy.compare(_paper_strategy_deps(), code=code)
+
+
+# ---------- 策略库采集（聚宽社区，防重复爬取）----------
+
+def _slib_deps() -> dict:
+    return {"get_conn": get_conn, "conf": _conf_section("jq") or {}}
+
+
+@app.get("/api/strategy-lib/stats")
+def strategy_lib_stats():
+    """采集统计：队列状态 / 已抓文章 / 有源码的 / 待抽取的。"""
+    return strategy_crawler.stats(_slib_deps())
+
+
+@app.post("/api/strategy-lib/enqueue")
+def strategy_lib_enqueue(body: JqEnqueueIn):
+    """抓聚宽社区列表页并入队。
+
+    **防重复爬取就在这一步**：每条帖子算 url_hash（sha1），
+    INSERT ... ON CONFLICT DO NOTHING —— 命中冲突说明之前见过，
+    连详情请求都不会发。命中唯一键而不是「先查再插」是因为后者是竞态
+    （两个进程同时插都会成功）。
+    """
+    return strategy_crawler.enqueue(_slib_deps(), pages=body.pages,
+                                    limit=body.limit, cate=body.cate,
+                                    type_=body.type_)
+
+
+@app.post("/api/strategy-lib/fetch")
+def strategy_lib_fetch(body: JqFetchIn):
+    """取详情 + 源码并落库。
+
+    正文和源码分开两次拿：列表的 content 是**截断摘要**（实测 123 字符，
+    5 篇里 0 篇带代码块），完整正文和代码块只在 detailV2 里。
+    评论区的源码（origin='reply'）在正文没找到时才去拉，省请求。
+    """
+    return strategy_crawler.fetch_details(_slib_deps(), limit=body.limit,
+                                         only_with_code=body.only_with_code)
+
+
+@app.get("/api/strategy-lib/articles")
+def strategy_lib_articles(has_code: bool = False, limit: int = 50,
+                          offset: int = 0):
+    """已抓文章列表（带是否含源码、是否待抽取）。"""
+    sql = ("SELECT a.post_id, a.title, a.author, a.clone_count, a.reply_count,"
+           " a.like_count, a.view_count, a.tags, a.published_at, a.url,"
+           " length(a.content_text) AS chars, a.needs_reextract,"
+           " (s.post_id IS NOT NULL) AS has_code, s.lines AS code_lines,"
+           " s.origin AS code_origin, s.redacted, s.stub_sites,"
+           " d.title_zh, d.portable_score"
+           " FROM sa_strategy_article a"
+           " LEFT JOIN sa_strategy_source s ON s.post_id = a.post_id"
+           " LEFT JOIN sa_strategy_digest d ON d.article_id = a.post_id"
+           " WHERE 1=1")
+    args = []
+    if has_code:
+        sql += " AND s.post_id IS NOT NULL"
+    sql += " ORDER BY a.clone_count DESC, a.like_count DESC LIMIT %s OFFSET %s"
+    args += [int(limit), int(offset)]
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, args)
+        cols = [d[0] for d in cur.description]
+        items = [dict(zip(cols, r)) for r in cur.fetchall()]
+        for it in items:
+            it["tags"] = it["tags"] if isinstance(it["tags"], list) else []
+    return {"items": items, "n": len(items)}
+
+
+@app.get("/api/strategy-lib/article")
+def strategy_lib_article(post_id: str, with_code: bool = True):
+    """单篇文章详情（可选带源码全文）。"""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM sa_strategy_article WHERE post_id=%s",
+                    (post_id,))
+        r = cur.fetchone()
+        if not r:
+            raise HTTPException(404, "文章不存在（先抓详情）")
+        art = dict(zip([d[0] for d in cur.description], r))
+        cur.execute("SELECT lang, code, lines, origin, origin_author,"
+                    " redacted, stub_sites, stub_reasons, n_blocks, blocks,"
+                    " other_blocks"
+                    " FROM sa_strategy_source WHERE post_id=%s", (post_id,))
+        sr = cur.fetchone()
+        src = dict(zip([d[0] for d in cur.description], sr)) if sr else None
+        cur.execute("SELECT * FROM sa_strategy_digest WHERE article_id=%s",
+                    (post_id,))
+        dr = cur.fetchone()
+        dig = dict(zip([d[0] for d in cur.description], dr)) if dr else None
+    for k in ("tags",):
+        if k in art and not isinstance(art[k], list):
+            art[k] = json.loads(art[k] or "[]")
+    if src:
+        for k in ("other_blocks", "stub_reasons", "blocks"):
+            if k in src and not isinstance(src[k], list):
+                src[k] = json.loads(src[k] or "[]")
+        if not with_code:
+            src["code"] = src["code"][:2000] + "\n…(已截断)"
+    if dig:
+        for k in ("steps", "universe", "params", "perf_claimed", "applicable",
+                  "unsuitable", "risk_notes", "dependencies", "extract_cost"):
+            if k in dig and not isinstance(dig[k], (list, dict)):
+                try:
+                    dig[k] = json.loads(dig[k])
+                except (TypeError, ValueError):
+                    dig[k] = [] if k != "params" and k != "perf_claimed" \
+                        and k != "extract_cost" else {}
+    return {"article": art, "source": src, "digest": dig}
 
 
 # ---------- 本地行情数据 + 回测（供策略本地验证）----------

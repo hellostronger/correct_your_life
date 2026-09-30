@@ -39,7 +39,11 @@ CREATE INDEX IF NOT EXISTS idx_sa_crawl_next
 CREATE INDEX IF NOT EXISTS idx_sa_crawl_url ON sa_crawl_queue (url);
 
 CREATE TABLE IF NOT EXISTS sa_strategy_article (
-    post_id       VARCHAR(64) PRIMARY KEY,   -- 站点内的稳定 ID
+    post_id       VARCHAR(64) PRIMARY KEY,   -- 站点内的稳定 ID（聚宽=uniqueKey）
+    -- 站点每次请求重新签发的那个 id（聚宽的 postId）。**不能做主键** ——
+    -- 实测同一篇帖两次请求拿到的 postId 完全不同。留着只为了出问题时
+    -- 能对照原始响应看。
+    src_post_id   VARCHAR(64) NOT NULL DEFAULT '',
     site          VARCHAR(32) NOT NULL DEFAULT 'joinquant',
     url_hash      CHAR(40) NOT NULL REFERENCES sa_crawl_queue(url_hash) ON DELETE CASCADE,
     url           TEXT        NOT NULL,
@@ -114,6 +118,84 @@ CREATE TABLE IF NOT EXISTS sa_strategy_digest (
     completeness  SMALLINT    NOT NULL DEFAULT 0,
     raw_response  TEXT        NOT NULL DEFAULT ''
 );
+
+-- ------------------------------------------------------------------
+-- 策略源码（2026-09-30）
+-- ------------------------------------------------------------------
+-- 为什么单独一张表而不是塞进 sa_strategy_article 的 JSONB 字段：
+-- 源码动辄几百上千行，塞 JSONB 之后每次列表查询都要读它；而且源码需要
+-- 「按语言/行数检索」和「重新解析」，独立表更合适。
+--
+-- **origin 一定要记**：实测社区帖里源码有两个来源 ——
+--   body  = 原文正文里的 ``` 代码块
+--   reply = 评论区里的（你提的那点，不少帖子源码只在评论区）
+-- 两者混在一起会分不清代码到底可不可信（作者贴的 vs 别人贴的）。
+CREATE TABLE IF NOT EXISTS sa_strategy_source (
+    post_id       VARCHAR(64) PRIMARY KEY
+                  REFERENCES sa_strategy_article(post_id) ON DELETE CASCADE,
+    lang          VARCHAR(16)  NOT NULL DEFAULT '',
+    code          TEXT         NOT NULL DEFAULT '',
+    lines         INTEGER      NOT NULL DEFAULT 0,
+    -- body / reply
+    origin        VARCHAR(8)   NOT NULL DEFAULT 'body',
+    origin_author VARCHAR(128) NOT NULL DEFAULT '',   -- reply 时是谁贴的
+    origin_reply_id VARCHAR(64) NOT NULL DEFAULT '',
+    -- **脱敏标记**：社区里不少「复现年化XXX%」的帖，代码块里核心函数体
+    -- 是 `...`（Python Ellipsis，语法合法但逻辑是空的）—— 作者防抄袭。
+    -- 实测《实测复现年化526%的低吸连阳首板策略》整篇就是这么写的。
+    -- 照样入库（变量名和选股思路有参考价值），但必须打标记，否则后面
+    -- LLM 抽「实现步骤」时会照着空壳脑补出一套不存在的策略。
+    redacted      BOOLEAN     NOT NULL DEFAULT FALSE,
+    stub_sites    INTEGER     NOT NULL DEFAULT 0,
+    stub_reasons  JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    -- **逐块的结构化记录**。为什么必须有：`code` 是把正文里所有代码块
+    -- 拼起来的一份完整源码（作者常把一个策略拆成 initialize / 因子 /
+    -- 选股 / 调仓 几段贴 —— 实测《多因子LightGBM选股策略》有 9 块，
+    -- 单块都只有 12 行，只留一块等于把选股逻辑整段丢掉）。
+    -- 拼接后看不出边界，回填二次抽取、单独喂 LLM、定位某一块都靠它。
+    blocks         JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    n_blocks       INTEGER     NOT NULL DEFAULT 1,
+    -- 其它非策略的代码块（回测日志/SQL/HTML），留着但不参与抽取
+    other_blocks  JSONB        NOT NULL DEFAULT '[]'::jsonb,
+    extracted_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sa_src_lang ON sa_strategy_source (lang, lines DESC);
+
+-- ------------------------------------------------------------------
+-- 演进用的 ALTER（2026-09-30）
+-- ------------------------------------------------------------------
+-- **为什么需要这一段**：上面全是 CREATE TABLE IF NOT EXISTS，而
+-- IF NOT EXISTS 只判断「表在不在」，**不会给已存在的表补新列**。
+-- 我加 redacted/stub_sites 时就踩了：表早就建好了，DDL 跑一遍「全部通过」，
+-- 但运行时 psycopg2 报 column "redacted" does not exist。
+-- 这跟之前 init_db 里 DROP TABLE IF EXISTS 顶崩启动是同一类问题：
+-- 「幂等的 DDL」不等于「能演进的 DDL」。
+--
+-- 所以规矩是：**加列 = 在这里加一条 ALTER ... ADD COLUMN IF NOT EXISTS**，
+-- 跟 CREATE 写在同一个文件里，保证 check_ddl 跑一遍就知道库对不对。
+ALTER TABLE sa_strategy_source
+    ADD COLUMN IF NOT EXISTS redacted    BOOLEAN     NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS stub_sites  INTEGER     NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS stub_reasons JSONB     NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS blocks      JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS n_blocks    INTEGER     NOT NULL DEFAULT 1;
+ALTER TABLE sa_strategy_article
+    ADD COLUMN IF NOT EXISTS src_post_id VARCHAR(64) NOT NULL DEFAULT '';
+
+-- ------------------------------------------------------------------
+-- 抽取任务：把待抽取的文章排成队，逐条跑，成功/失败都记
+-- （否则失败的文章会每轮重试，浪费 LLM 调用）
+-- ------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS sa_strategy_extract_queue (
+    article_id  VARCHAR(64) PRIMARY KEY
+                REFERENCES sa_strategy_article(post_id) ON DELETE CASCADE,
+    state       VARCHAR(16) NOT NULL DEFAULT 'pending',  -- pending/done/failed/skip
+    try_count   INTEGER     NOT NULL DEFAULT 0,
+    next_at     TIMESTAMPTZ,             -- 退避用
+    last_error  TEXT        NOT NULL DEFAULT '',
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sa_eq_state ON sa_strategy_extract_queue (state, next_at);
 
 -- ------------------------------------------------------------------
 -- 本地行情数据（供本地回测/验证用，2026-09-30）
