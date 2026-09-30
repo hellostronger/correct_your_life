@@ -1325,6 +1325,7 @@
           <button class="btn" onclick="loadPaperStrategyCompare()">刷新</button>
           <span id="paper-strat-hint" class="muted" style="font-size:12px"></span>
         </div>
+        <div id="paper-strat-sched" class="muted" style="font-size:12px;margin-bottom:6px"></div>
         <div id="paper-strat-summary" style="margin-bottom:8px"></div>
         <div id="paper-strat-list"></div>
         <div id="paper-strat-empty" class="empty hide">
@@ -3233,6 +3234,7 @@ function paperStatusBadge(t) {
   async function loadPaperStrategyBindings() {
     try {
       const d = await api('/api/paper/strategies');
+      renderPaperStratSchedule(d);
       const sel = $('paper-strat-bind-sid');
       if (sel) {
         sel.innerHTML = (d.strategies || []).map(s =>
@@ -3281,6 +3283,37 @@ function paperStatusBadge(t) {
       const b = $('paper-strat-strategies');
       if (b) b.innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>';
     }
+  }
+
+  // 展示定时扫描的运行态与调度信息（策略对照是独立守护线程，
+  // 不依赖 paper.enabled / 交易时段 / LLM —— 原来挂在交易轮次里，
+  // LLM 一抛异常就不扫了）
+  function renderPaperStratSchedule(d) {
+    const box = $('paper-strat-sched');
+    if (!box) return;
+    const rt = d.runtime || {};
+    const sch = d.schedule || {};
+    const on = sch.scan_enabled !== false;
+    let s = on
+      ? '⏱ 定时扫描：<b>每 ' + (sch.scan_interval_minutes || 30) + ' 分钟</b>一轮'
+        + '，服务启动时立刻先扫一轮。独立线程，<b>不依赖</b> paper.enabled /'
+        + ' 交易时段 / LLM。'
+      : '⏸ <b>定时扫描已关闭</b>（只在手动点「立即扫描一次」时跑）。';
+    if (rt.last_run) {
+      s += '<br>上次扫描 ' + esc(rt.last_run)
+        + '（' + esc(rt.last_trigger || '?') + '，耗时 '
+        + (rt.elapsed_s == null ? '?' : rt.elapsed_s) + 's）'
+        + (rt.running ? '，<b>正在跑…</b>' : '');
+    } else {
+      s += '<br><span style="color:#b54708">还没有扫描记录</span>';
+    }
+    if (rt.last_count) {
+      s += '，触发 <b>' + rt.last_count + '</b> 次影子卖出';
+    }
+    if (rt.last_error) {
+      s += '<br><span style="color:#b42318">上次失败：' + esc(rt.last_error) + '</span>';
+    }
+    box.innerHTML = s;
   }
 
   // 与后端 paper_strategy.strategy_label 同一口径

@@ -393,6 +393,16 @@ SCHEMAS: dict[str, dict[str, Any]] = {
              "adv": True,
              "help": "模拟仓被 LLM 平掉后，策略会冻结影子仓继续跟踪（这样才能"
                      "对照「LLM 卖早了还是卖晚了」）。关掉则对照表只显示仍在持仓的票"},
+            {"key": "strategy.scan_enabled", "t": "bool", "d": True,
+             "label": "定时扫描策略",
+             "help": "独立守护线程 sa_paper_strategy，每 scan_interval_minutes 扫一轮，"
+                     "服务启动时立刻先扫一轮。刻意**不依赖** paper.enabled、交易时段"
+                     "和 LLM：策略对照是用来探索的，LLM 挂了或你关掉模拟交易时，"
+                     "它都该照常工作（原来挂在交易轮次里，LLM 一抛异常就不扫了）。"},
+            {"key": "strategy.scan_interval_minutes", "t": "int", "d": 30,
+             "lo": 5, "hi": 720, "label": "扫描间隔(分钟)",
+             "help": "每轮约 6 秒（一次批量行情 + 一次库往返）。价格不变时幂等，"
+                     "不会重复记影子卖出，也不会重复抬峰值，所以不必压得太短。"},
             {"key": "judge_holdings_only", "t": "bool", "d": False,
              "label": "每轮只判已持仓",
              "help": "开启后每轮只重新判断持仓股（最省，止损+止盈照常）；"

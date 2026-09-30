@@ -3261,6 +3261,14 @@ import paper_memory
 import paper_goal
 
 
+# 策略对照的运行态（页面「上次扫描」用）。独立于 _paper_state ——
+# 交易循环停了它也照跑，所以不能挂在 _paper_state 下面。
+_paper_strategy_state: dict = {
+    "running": False, "last_run": None, "last_trigger": None,
+    "last_count": 0, "last_hits": [], "last_error": None, "elapsed_s": None,
+}
+
+
 def _paper_strategy_deps() -> dict:
     """paper_strategy 注入依赖（quote_fn 复用行情，账务复用 paper_trading）。"""
     return {"get_conn": get_conn, "quote_fn": fetch_quotes,
@@ -3561,8 +3569,17 @@ class DiscoverDecideIn(BaseModel):
 
 @app.get("/api/paper/strategies")
 def paper_strategies_list():
-    """可用的止盈/止损策略 + 已挂到模拟持仓上的绑定。"""
-    return paper_strategy.list_bindings(_paper_strategy_deps())
+    """可用的止盈/止损策略 + 已挂到模拟持仓上的绑定 + 扫描运行态。"""
+    d = paper_strategy.list_bindings(_paper_strategy_deps())
+    sc = (_conf_section("paper") or {}).get("strategy") or {}
+    d["runtime"] = dict(_paper_strategy_state)
+    d["schedule"] = {
+        "scan_enabled": bool(sc.get("scan_enabled", True)),
+        "scan_interval_minutes": int(sc.get("scan_interval_minutes", 30) or 30),
+        "note": "独立守护线程 sa_paper_strategy，不依赖 paper.enabled / 交易时段 / LLM；"
+                "服务启动即扫一轮，之后按间隔循环。价格不变时幂等。",
+    }
+    return d
 
 
 @app.post("/api/paper/strategies/preset")
@@ -3711,10 +3728,10 @@ def discover_new_listings(days: int = 30, only_unwatched: bool = True,
 
 @app.post("/api/paper/strategies/scan")
 def paper_strategy_scan():
-    """手动触发一次扫描。"""
-    hits = paper_strategy.scan_once(
-        _paper_strategy_deps(), slot=_paper_state.get("current_slot") or "manual")
-    return {"ok": True, "triggered": len(hits), "items": hits}
+    """手动触发一次扫描。与守护线程复用同一个函数，运行态也会更新。"""
+    hits = _paper_strategy_scan("manual", quiet=True)
+    return {"ok": True, "triggered": len(hits), "items": hits,
+            "runtime": dict(_paper_strategy_state)}
 
 
 @app.get("/api/paper/reconcile")
@@ -3824,6 +3841,76 @@ def paper_status():
                 t.name for t in threading.enumerate() if t.name.startswith("sa_")),
             "last_decision": _paper_state["last_decision"],
             "last_settle": _paper_state["last_settle"]}
+
+
+def _paper_strategy_loop():
+    """策略对照扫描守护线程（独立于交易循环，2026-09-30）。
+
+    为什么不能挂在交易轮次里：见文件里那段说明的四点。核心是**策略探索不该
+    依赖 LLM 的可用性**，也不该被「用户关掉模拟交易」或「现在不是交易时段」
+    这些与探索无关的条件挡住。
+
+    开销：每轮一次批量行情（腾讯，不封 IP）+ 一次远程库往返，实测约 6 秒。
+    价格不变时完全幂等 —— 已触发的绑定被 triggered_at 排除，peak 也不会重复抬。
+    """
+    # 启动先扫一轮，不要让用户重启后干等一个间隔
+    _paper_strategy_scan("startup")
+    while True:
+        try:
+            conf = _conf_section("paper") or {}
+            sc = conf.get("strategy") or {}
+            if not sc.get("scan_enabled", True):
+                time.sleep(600)
+                continue
+            iv = max(1, int(sc.get("scan_interval_minutes", 30) or 30))
+            time.sleep(iv * 60)
+            _paper_strategy_scan("timer")
+        except Exception as exc:
+            print(f"[paper_strategy] loop error: {exc}", flush=True)
+            time.sleep(300)
+
+
+def _paper_strategy_scan(trigger: str, quiet: bool = False) -> dict:
+    """跑一轮策略扫描并记账（守护线程与手动按钮共用）。
+
+    quiet=True 时只在有触发时打印（手动点按钮，每次都刷一行没意义）；
+    定时任务则每轮都留一行 —— 后台任务静默干活，出问题时无从下手。
+    """
+    t0 = time.time()
+    _paper_strategy_state["running"] = True
+    try:
+        hits = paper_strategy.scan_once(_paper_strategy_deps(), slot=trigger)
+        _paper_strategy_state.update({
+            "last_run": datetime.now().isoformat(timespec="seconds"),
+            "last_trigger": trigger,
+            "last_count": len(hits),
+            "last_hits": hits[:20],
+            "last_error": None,
+            "elapsed_s": round(time.time() - t0, 1),
+        })
+        if hits:
+            print(f"[paper_strategy] {trigger} 触发 {len(hits)} 次影子卖出: "
+                  + ", ".join(f"{h.get('code')} {h.get('reason', '')}"
+                              for h in hits[:5]), flush=True)
+            try:
+                notifier.notify(
+                    f"🧪 策略对照触发 {len(hits)} 次: "
+                    + "、".join(f"{h.get('code')}({h.get('reason','')[:20]})"
+                                for h in hits[:5]))
+            except Exception:
+                pass
+        elif not quiet:
+            print(f"[paper_strategy] {trigger} 扫描完成，0 触发，"
+                  f"用时 {_paper_strategy_state['elapsed_s']}s", flush=True)
+        return hits
+    except Exception as exc:
+        _paper_strategy_state["last_error"] = str(exc)
+        _paper_strategy_state["last_run"] = datetime.now().isoformat(timespec="seconds")
+        print(f"[paper_strategy] 扫描失败: {exc}", flush=True)
+        return []
+    finally:
+        _paper_strategy_state["running"] = False
+
 
 
 def _paper_loop():
@@ -4003,19 +4090,6 @@ def _paper_run_cycle(conf: dict, slot: str, kind: str = "intraday",
             else:
                 skipped += 1
         planned = len(decided) + len(sl.get("sold", []))
-        # 顺带扫一遍策略（影子模式：只记录，不动持仓/现金）。
-        # 放在这里而不是独立线程：策略判定要读当前持仓与现价，与本轮决策
-        # 用同一份快照，省一次行情请求，也不会出现「策略看到的持仓是上一轮的」。
-        try:
-            _hits = paper_strategy.scan_once(
-                _paper_strategy_deps(), slot=slot or "round")
-            if _hits:
-                _paper_state["last_strategy_hits"] = _hits
-                print(f"[paper] 策略触发 {len(_hits)} 次（影子记录）: "
-                      + ", ".join(f"{h.get('code')} {h.get('reason','')}" for h in _hits[:5]),
-                      flush=True)
-        except Exception as exc:
-            print(f"[paper] 策略扫描失败: {exc}", flush=True)
         _paper_state["last_decision"] = res
         print(f"[paper] {slot} {me} {kind}: 判断 {planned} 成交 {acted} 观望 {holds} "
               f"未成交 {skipped} 用时 {time.time()-t0:.0f}s", flush=True)
@@ -5763,6 +5837,7 @@ _start_daemon(_market_volume_loop, "sa_market_volume")
 # 模拟交易线程（交易日盘中每 interval_minutes 判断一轮 / 16:10 结算复盘；
 # paper.enabled=false 轮内跳过）
 _start_daemon(_paper_loop, "sa_paper")
+_start_daemon(_paper_strategy_loop, "sa_paper_strategy")
 
 # 每日报告线程（盘前简报 / 盘后复盘；时间点见 config.yaml schedule 段，网页可改）
 _start_daemon(_daily_reports_loop, "sa_daily_reports")
