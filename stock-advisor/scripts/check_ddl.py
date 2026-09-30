@@ -67,14 +67,29 @@ def check_text(src: str, name: str) -> list[str]:
     """检查一段 DDL 文本。name 只用于统计输出。"""
     errs: list[str] = []
 
-    # ① 非 SQL 起始字符（拼接写错的症状）
+    # ① 每条语句（剥掉注释后）必须以 SQL 关键字开头
+    #
+    # 为什么改成「关键字白名单」而不是「首字符不是 +%\"'」
+    # ------------------------------------------------
+    # init_db 是 `ddl.split(";")` **逐条 execute**。所以只要注释里出现一个
+    # 分号，一条 CREATE TABLE 就会被切成两半，后半截以运算符开头 ->
+    # 全新部署时建表失败、服务起不来。
+    # 我就在 DDL 注释里写了一句含分号的中文说明，踩了这个坑：
+    # 报错是 "syntax error at or near "=""，跟「注释里有分号」毫无关联，
+    # 光看报错根本联想不到。改成白名单之后能直接报出「第 N 条以 = 开头」。
+    SQL_START = re.compile(
+        r"^(CREATE|ALTER|DROP|INSERT|UPDATE|DELETE|SELECT|WITH|SET|TRUNCATE|"
+        r"COMMENT|GRANT|REVOKE|BEGIN|COMMIT|DO|COPY|VACUUM|ANALYZE)\b",
+        re.I)
     for i, s in enumerate(split_statements(src), 1):
         t = strip_comments(s)
         if not t:
             continue
-        if t[0] in "+%\"'":
-            errs.append("%s 第 %d 条语句以 %r 开头 —— 像是拼接写错被当成了 SQL"
-                        % (name, i, t[0]))
+        if not SQL_START.match(t):
+            first = t.split()[0] if t.split() else t[:12]
+            errs.append("%s 第 %d 条语句以 %r 开头，不是 SQL 关键字 —— "
+                        "多半是**注释里混进了分号**把一条语句切成了两半"
+                        % (name, i, first[:20]))
             errs.append("    %s" % t[:90].replace("\n", " "))
 
     # ② 列定义位置的类型名

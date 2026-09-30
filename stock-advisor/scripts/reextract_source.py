@@ -72,6 +72,7 @@ def main() -> int:
 
     n_code = n_red = 0
     grew = 0
+    n_run: dict = {}
     for pid, title, md, _aid in rows:
         md = md or ""
         src = JS.extract_source(md, None)
@@ -91,8 +92,9 @@ def main() -> int:
         cur.execute(
             """INSERT INTO sa_strategy_source
                (post_id, lang, code, lines, origin, redacted, stub_sites,
-                stub_reasons, n_blocks, blocks, other_blocks)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                stub_reasons, n_blocks, blocks, other_blocks,
+                syntax_state, syntax_ok, syntax_detail, warnings)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                ON CONFLICT (post_id) DO UPDATE SET
                  lang=EXCLUDED.lang, code=EXCLUDED.code,
                  lines=EXCLUDED.lines, origin=EXCLUDED.origin,
@@ -100,6 +102,10 @@ def main() -> int:
                  stub_reasons=EXCLUDED.stub_reasons,
                  n_blocks=EXCLUDED.n_blocks, blocks=EXCLUDED.blocks,
                  other_blocks=EXCLUDED.other_blocks,
+                 syntax_state=EXCLUDED.syntax_state,
+                 syntax_ok=EXCLUDED.syntax_ok,
+                 syntax_detail=EXCLUDED.syntax_detail,
+                 warnings=EXCLUDED.warnings,
                  extracted_at=now()""",
             (pid, s.get("lang", ""), s["code"], s["lines"], s.get("origin", ""),
              bool(s["redacted"]), int(s["stub_sites"]),
@@ -108,21 +114,31 @@ def main() -> int:
              __import__("json").dumps(slim, ensure_ascii=False),
              __import__("json").dumps(
                  [{k: v for k, v in b.items() if k != "code"}
-                  for b in src["other_blocks"]], ensure_ascii=False)))
+                  for b in src["other_blocks"]], ensure_ascii=False),
+             s.get("syntax_state", "ok"), bool(s.get("syntax_ok")),
+             (s.get("syntax_detail") or "")[:800],
+             __import__("json").dumps(src.get("warnings") or [],
+                                      ensure_ascii=False)))
         n_code += 1
         if s["redacted"]:
             n_red += 1
+        state = s.get("syntax_state", "ok")
+        n_run[state] = n_run.get(state, 0) + 1
         flag = ""
         if s["lines"] > old_lines:
             flag = "  <- 比原来多 %d 行" % (s["lines"] - old_lines)
             grew += 1
-        print("  %-14s %3d->%3d行 %d块 %-30s%s%s" % (
+        mark = "" if state == "ok" else "  [%s: %s]" % (
+            state, (s.get("syntax_detail") or "")[:60])
+        print("  %-14s %3d->%3d行 %d块 %-28s%s%s%s" % (
             pid[:12], old_lines, s["lines"], s.get("n_blocks", 1),
-            (title or "")[:30], "  [脱敏]" if s["redacted"] else "", flag))
+            (title or "")[:28], "  [脱敏]" if s["redacted"] else "", mark, flag))
     conn.commit()
 
-    print("\n  有源码 %d 篇（脱敏 %d 篇），补回 %d 篇丢失的代码"
-          % (n_code, n_red, grew))
+    print("\n  有源码 %d 篇（脱敏 %d 篇），补回 %d 篇丢失的代码" % (n_code, n_red, grew))
+    print("  能不能直接跑：%s" % ("、".join("%s %d 篇" % (k, v)
+                                        for k, v in sorted(n_run.items()))
+                                 or "（无）"))
     conn.close()
     return 0
 

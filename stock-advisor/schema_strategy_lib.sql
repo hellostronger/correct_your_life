@@ -155,6 +155,19 @@ CREATE TABLE IF NOT EXISTS sa_strategy_source (
     redacted      BOOLEAN     NOT NULL DEFAULT FALSE,
     stub_sites    INTEGER     NOT NULL DEFAULT 0,
     stub_reasons  JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    -- 能不能直接跑（这是**一等公民字段**，不是等真跑挂了才知道）。
+    -- 实测 5 篇有源码的策略，结论很扎心：
+    --   2 篇语法正确能跑
+    --   1 篇正文有 5 个代码块，拼接后第 4 块是个只有 return 的函数片段
+    --   1 篇原文里是「小于号 被 HTML 转义后与等号之间多一个空格」
+    --   1 篇整个代码块其实是中文说明，被误判成了代码
+    -- 不把这件事量化出来，用户就只能一份份试跑才知道哪些能用。
+    -- 取值：ok / syntax_error / fragment / empty
+    syntax_state  VARCHAR(16)  NOT NULL DEFAULT 'ok',
+    syntax_ok     BOOLEAN     NOT NULL DEFAULT FALSE,
+    syntax_detail TEXT        NOT NULL DEFAULT '',
+    -- 抽取时的告警（拼接后跑不了、中文说明被排除等）
+    warnings      JSONB       NOT NULL DEFAULT '[]'::jsonb,
     -- **逐块的结构化记录**。为什么必须有：`code` 是把正文里所有代码块
     -- 拼起来的一份完整源码（作者常把一个策略拆成 initialize / 因子 /
     -- 选股 / 调仓 几段贴 —— 实测《多因子LightGBM选股策略》有 9 块，
@@ -185,7 +198,11 @@ ALTER TABLE sa_strategy_source
     ADD COLUMN IF NOT EXISTS stub_sites  INTEGER     NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS stub_reasons JSONB     NOT NULL DEFAULT '[]'::jsonb,
     ADD COLUMN IF NOT EXISTS blocks      JSONB       NOT NULL DEFAULT '[]'::jsonb,
-    ADD COLUMN IF NOT EXISTS n_blocks    INTEGER     NOT NULL DEFAULT 1;
+    ADD COLUMN IF NOT EXISTS n_blocks    INTEGER     NOT NULL DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS syntax_state VARCHAR(16) NOT NULL DEFAULT 'ok',
+    ADD COLUMN IF NOT EXISTS syntax_ok    BOOLEAN     NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS syntax_detail TEXT       NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS warnings     JSONB       NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE sa_strategy_digest
     ADD COLUMN IF NOT EXISTS uncertainty    TEXT     NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS needs_research BOOLEAN NOT NULL DEFAULT FALSE,

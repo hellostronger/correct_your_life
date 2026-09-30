@@ -215,13 +215,136 @@ def _norm_reply(x: dict) -> dict:
 
 FENCE_RE = re.compile(r"```([a-zA-Z+#]*)\s*\n(.*?)```", re.S)
 
+# 正文里代码块的内容是 **HTML 转义**过的。实测《万得微盘股指数复刻策略》
+# 抽出来是 `if is_st_df is not None and len(is_st_df) &gt; 0:`，
+# 直接 exec 就是 SyntaxError。而社区策略里 `>` `<` `&` 满地都是
+# （`a > b`、`df[x & y]`、`<=`），所以这一条不修，**几乎每篇带源码的
+# 策略都会因语法错误跑不起来**。
+_ENTITY_RE = re.compile(r"&(gt|lt|amp|quot|apos|nbsp|#\d+|#x[0-9a-fA-F]+);")
+
+
+def unescape_code(text: str) -> str:
+    """把代码块里的 HTML 实体还原，并修掉「实体与运算符之间多空格」的损伤。
+
+    两件事，都实测过：
+
+    1) HTML 实体。实测《万得微盘股指数复刻策略》抽出来是
+       `len(is_st_df) &gt; 0:`，直接 exec 就是 SyntaxError。而社区策略里
+       `>` `<` `&` 满地都是（`a > b`、`df[x & y]`、`<=`），所以这一条
+       不修，**几乎每篇带源码的策略都会因语法错误跑不起来**。
+
+    2) 实体还原完之后的**空格损伤**。原文里真的是
+       `today &lt; = sf`（`&lt;` 与 `=` 之间有空格，码点核对过），
+       还原后变成 `today < = sf`，还是语法错误。这是站点 HTML 序列化
+       留下的机械损伤（`<=` 被当成 `<` 转义再拆开），可以安全地修掉：
+       只合并「比较运算符被空格拆开」这一种形态，不动别的空格。
+
+    只做**代码安全的**那几类实体（gt/lt/amp/quot/apos/nbsp/数字实体），
+    不用完整的 html.unescape —— 后者会把不认识的实体悄悄吞掉，
+    而我们要的是确定性的还原。
+    """
+    if not text:
+        return ""
+    if "&" not in text:
+        return text
+    import html
+
+    def sub(m):
+        e = m.group(1)
+        try:
+            return html.unescape("&%s;" % e)
+        except Exception:                   # noqa: BLE001
+            return m.group(0)
+    out = _ENTITY_RE.sub(sub, text)
+    # < = / > = / ! =  ->  <= / >= / !=
+    out = re.sub(r"([<>!])\s+=(?!=)", r"\1=", out)
+    return out
+
+
+# 判定「这个块其实是中文说明，不是代码」
+_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
+_PY_TOKENS = re.compile(r"(?:^|\s)(?:def |class |import |from |return |if |"
+                        r"for |while |try:|with |lambda |None|True|False|"
+                        r"self\.|print\(|len\(|range\(|==|!=|>=|<=)")
+
+
+def looks_like_prose(body: str) -> bool:
+    """这个块是不是**中文说明**而不是代码。
+
+    为什么要专门判：实测《【基础研究】【小市值】低涨幅策略》正文里一个
+    代码块是这么写的：
+
+        指数成分股（中小综指 399101.XSHE）
+        历史 3 年最小市值 > 30 亿 → 进入月度定池
+
+    全角括号 `（）`、箭头 `→`、中文描述 —— 但它里面有 `399101.XSHE` 这种
+    「像代码的」片段，被我原来的 is_code_block 判成了代码，于是抽出来的
+    源码第一行就是 `（`，整个策略 SyntaxError。
+
+    判据：**中文字符占比**，并且**几乎没有 Python 语法特征**。
+    注释里全是中文的代码块不会误判 —— 因为它们同时有 def/import/return
+    这类 Python 记号。
+    """
+    if not body.strip():
+        return True
+    cjk = len(_CJK_RE.findall(body))
+    total = len(body)
+    if total == 0:
+        return True
+    ratio = cjk / total
+    py_hits = len(_PY_TOKENS.findall(body))
+    # 中文占比高、且几乎没有 Python 记号 -> 说明文
+    return ratio > 0.28 and py_hits <= 1
+
+
+def syntax_verdict(code: str) -> dict:
+    """编译一遍，给出「这份源码能不能直接跑」的诚实判断。
+
+    这不是一个可选的锦上添花 —— 它是整个「抓来��验证」链路里最关键的一
+    个信号。实测 5 篇有源码的策略：
+
+      - 2 篇语法正确，能跑
+      - 1 篇《多因子LightGBM》正文有 5 个代码块，拼接后第 4 块是个
+        **只有 `return` 的函数片段** -> `return` outside function。
+        这不是 bug，是作者把一个策略拆成几段贴，机械拼接必然出错。
+      - 1 篇《万得微盘股指数》`today < = sf`（实体空格损伤，可修）
+      - 1 篇整块是中文说明（被误判成代码）
+
+    所以「能不能跑」必须是**一等公民字段**，而不是等真跑挂了才知道。
+    状态取值：
+      ok            编译通过
+      syntax_error  编译失败，且能给出可自动修的提示
+      fragment      编译失败，且特征像是「多段拼接」（有裸 return/裸缩进块）
+      empty         没抽到源码
+    """
+    import ast
+    if not (code or "").strip():
+        return {"state": "empty", "ok": False, "detail": "没有源码"}
+    try:
+        ast.parse(code)
+        return {"state": "ok", "ok": True, "detail": ""}
+    except SyntaxError as exc:
+        msg = "%s (行%s)" % (exc.msg, exc.lineno)
+        # 裸 return / 裸缩进块 = 典型「作者分段贴」的特征
+        frag = bool(re.search(r"^\s*return\b", code, re.M)) or \
+            bool(re.search(r"^\s{4,}\w", code, re.M))
+        if frag:
+            return {"state": "fragment", "ok": False,
+                    "detail": msg + "；看起来是作者把源码拆成多段贴的，"
+                                    "机械拼接无法还原成可运行文件"}
+        return {"state": "syntax_error", "ok": False, "detail": msg}
+
 
 def code_blocks(md: str) -> list[dict]:
-    """抽出 markdown 里的所有代码块，标出语言与行数。"""
+    """抽出 markdown 里的所有代码块，标出语言与行数。
+
+    代码内容会做 HTML 实体还原（见 unescape_code 的说明）—— 不还原的话
+    含 `>` `<` 的策略全是语法错误。
+    """
     out = []
     for m in FENCE_RE.finditer(md or ""):
         lang = (m.group(1) or "").strip().lower()
-        body = m.group(2)
+        body = unescape_code(m.group(2))
         out.append({"lang": lang, "code": body,
                     "lines": body.count("\n") + 1,
                     "chars": len(body)})
@@ -252,6 +375,9 @@ def is_code_block(blk: dict) -> bool:
     body = blk["code"]
     if len(body.strip()) < 20:
         return False
+    # 中文说明块（实测社区里真的有人把说明用 ``` 包起来）
+    if looks_like_prose(body):
+        return False
     # 回测日志特征：大量时间戳行且没有任何代码结构
     log_lines = len(re.findall(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s+-",
                                body, re.M))
@@ -266,6 +392,11 @@ def is_code_block(blk: dict) -> bool:
     if any(k in body for k in PY_HINTS):
         return True
     return has_code_shape
+
+
+# extract_source 收集的告警（拼接后源码跑不了之类）。
+# 每次调用开头会清空，所以不会跨篇累积。
+JQ_WARN: list = []
 
 
 def extract_source(md: str, replies: list[dict] | None = None) -> dict:
@@ -304,6 +435,7 @@ def extract_source(md: str, replies: list[dict] | None = None) -> dict:
                                        reply_id=rp.get("reply_id")))
     blocks.sort(key=lambda b: -(b["lines"] * 1000 + b["chars"] // 100))
     other = [b for b in code_blocks(md or "") if not is_code_block(b)]
+    del JQ_WARN[:]
 
     if not blocks:
         return {"has_code": False, "source": None, "blocks": [],
@@ -334,6 +466,12 @@ def extract_source(md: str, replies: list[dict] | None = None) -> dict:
     for b in blocks:
         for w in b["stub_reasons"]:
             why_all.append("块%d: %s" % (b["idx"], w))
+
+    # 编译一遍，给出诚实判断（这才是「能不能拿去验证」的答案）
+    verdict = syntax_verdict(merged_text)
+    if not verdict["ok"]:
+        JQ_WARN.append("拼接后源码 %s：%s" % (verdict["state"], verdict["detail"]))
+
     return {"has_code": True,
             "source": {"lang": blocks[0].get("lang", ""),
                        "code": merged_text,
@@ -345,8 +483,12 @@ def extract_source(md: str, replies: list[dict] | None = None) -> dict:
                        "stub_sites": sum(b["stub_sites"] for b in blocks),
                        "stub_reasons": why_all[:8],
                        "n_blocks": len(blocks),
-                       "raw_lines": sum(b["lines"] for b in blocks)},
-            "blocks": blocks, "other_blocks": other}
+                       "raw_lines": sum(b["lines"] for b in blocks),
+                       "syntax_state": verdict["state"],
+                       "syntax_ok": verdict["ok"],
+                       "syntax_detail": verdict["detail"]},
+            "blocks": blocks, "other_blocks": other,
+            "warnings": list(JQ_WARN)}
 
 
 def stub_score(body: str) -> tuple[int, list[str]]:
