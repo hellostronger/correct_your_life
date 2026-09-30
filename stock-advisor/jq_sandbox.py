@@ -82,6 +82,14 @@ SANDBOX_DEFAULTS = {
 
 FIELDS = ["open", "high", "low", "close", "volume"]
 
+# 估值字段（切到沙箱里）。列名同样是 `code.字段`。
+# 为什么 K 线和估值分两个 CSV 而不是一张：字段语义完全不同（价格 vs 市值），
+# 更新频率也不同；合成一张会让 pivot 逻辑变复杂，而两个文件用同一个
+# pivot 函数处理，保持简单。
+VAL_FIELDS = ["total_market_cap", "circulating_market_cap", "pe_ttm",
+              "pb", "ps_ttm", "turnover_rate", "total_shares",
+              "free_shares"]
+
 
 class SandboxError(Exception):
     pass
@@ -136,6 +144,50 @@ def build_slice_csv(get_conn, codes: list, start: str, end: str,
                 # psycopg2 把 NUMERIC 列取成 decimal.Decimal，不是 float 也不是
                 # str，直接 join 会报
                 # "sequence item 1: expected str instance, decimal.Decimal found"
+                v = r[2 + j] if r else None
+                cells.append("" if v is None else str(v))
+        out.write(",".join(cells) + "\n")
+    out_path.write_text(out.getvalue(), encoding="utf-8")
+    return {"codes": sorted(by_code), "days": len(days), "rows": len(rows),
+            "path": str(out_path), "bytes": out_path.stat().st_size}
+
+
+def build_valuation_csv(get_conn, codes: list, start: str, end: str,
+                        out_path: Path) -> dict:
+    """切估值切片。没有数据就**返回空标记而不是报错** ——
+    因为「这只票没有估值数据」是常态（ETF、部分新票），
+    而真正该报错的是「策略要用市值但整个切片一条都没有」，
+    那个判断在 jq_api.get_fundamentals 里做（报明确的错）。"""
+    codes = sorted({str(c) for c in codes if c})
+    if not codes:
+        out_path.write_text("date\n", encoding="utf-8")
+        return {"codes": [], "days": 0, "rows": 0, "path": str(out_path)}
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """SELECT code, trade_date, %s
+               FROM sa_stock_valuation
+               WHERE code = ANY(%%s) AND trade_date BETWEEN %%s AND %%s
+               ORDER BY code, trade_date"""
+            % ", ".join(VAL_FIELDS),
+            (codes, start, end))
+        rows = cur.fetchall()
+    if not rows:
+        out_path.write_text("date\n", encoding="utf-8")
+        return {"codes": [], "days": 0, "rows": 0, "path": str(out_path),
+                "note": "sa_stock_valuation 里这些票在 %s~%s 无数据" % (start, end)}
+    by_code: dict = {}
+    for r in rows:
+        by_code.setdefault(r[0], []).append(r)
+    cols = ["%s.%s" % (c, f) for c in sorted(by_code) for f in VAL_FIELDS]
+    out = io.StringIO()
+    out.write("date," + ",".join(cols) + "\n")
+    days = sorted({r[1] for r in rows})
+    idx = {c: {r[1]: r for r in v} for c, v in by_code.items()}
+    for d in days:
+        cells = [str(d)]
+        for c in sorted(by_code):
+            r = idx[c].get(d)
+            for j in range(len(VAL_FIELDS)):
                 v = r[2 + j] if r else None
                 cells.append("" if v is None else str(v))
         out.write(",".join(cells) + "\n")
@@ -230,27 +282,42 @@ def _pack(workdir: Path, code: str, start: str, end: str, cash: float,
     # 第一版两个路径都写死成 /work/...，本地干跑连着两个
     # FileNotFoundError（先 data.csv 后 strategy.py）。
     work = "/work" if in_container else str(workdir)
+    # 必须 return 这一份 cfg —— 我在给下面加 "val" 字段时把 return 弄丢了，
+    # 于是 _pack 返回 None，而报错是 subprocess 里的
+    # "expected str, bytes or os.PathLike object, not NoneType"，
+    # 指向的参数位置跟真正的问题（少一个 return）完全不沾边。
+    # 这类「返回值被改坏」的错，靠读报错是读不出来的。
     return json.dumps({"data": "%s/data.csv" % work,
                        "strategy": "%s/strategy.py" % work,
+                       "val": "%s/val.csv" % work,
                        "start": str(start), "end": str(end),
                        "cash": cash, "benchmark": benchmark or ""},
                       ensure_ascii=False)
 
 
 def _stage(code: str, data_csv: Path, start: str, end: str, cash: float,
-           benchmark: str, in_container: bool) -> tuple:
-    """准备工作目录并返回 (临时目录对象, cfg)。临时目录必须由调用方持有。"""
+           benchmark: str, in_container: bool,
+           val_csv: Path = None) -> tuple:
+    """准备工作目录并返回 (临时目录对象, 工作目录, cfg)。临时目录必须由调用方持有。"""
     td = tempfile.TemporaryDirectory(prefix="jqsb_")
     w = Path(td.name)
     shutil.copyfile(str(data_csv), str(w / "data.csv"))
+    # 估值切片可选：没有就写一个只有表头的空文件，runner 读出来是空 dict，
+    # get_fundamentals 会明确报「切片里没有估值数据」而不是崩在读文件上
+    if val_csv and Path(val_csv).exists():
+        shutil.copyfile(str(val_csv), str(w / "val.csv"))
+    else:
+        (w / "val.csv").write_text("date\n", encoding="utf-8")
     cfg = _pack(w, code, start, end, cash, benchmark, in_container)
     return td, w, cfg
 
 
 def run_local(code: str, data_csv: Path, start: str, end: str, cash: float,
-              benchmark: str = "", timeout: int = 120) -> dict:
+              benchmark: str = "", timeout: int = 120,
+              val_csv: Path = None) -> dict:
     """在本机跑一遍（**无隔离**）。只用于快速失败，正式结果必须过容器。"""
-    td, w, cfg = _stage(code, data_csv, start, end, cash, benchmark, False)
+    td, w, cfg = _stage(code, data_csv, start, end, cash, benchmark, False,
+                        val_csv)
     try:
         env = dict(os.environ)
         env["PYTHONIOENCODING"] = "utf-8"
@@ -296,7 +363,7 @@ def docker_cmd(cfg: str, host_workdir: str, limits: dict = None) -> list:
 def run_in_docker(code: str, data_csv: Path, start: str, end: str,
                   cash: float, benchmark: str = "", host: str = DEFAULT_HOST,
                   ssh_key: str = None, timeout: int = None,
-                  limits: dict = None) -> dict:
+                  limits: dict = None, val_csv: Path = None) -> dict:
     """把工作目录传到远端，docker run，再把结果拿回来。"""
     L = dict(SANDBOX_DEFAULTS)
     L.update(limits or {})
@@ -307,20 +374,29 @@ def run_in_docker(code: str, data_csv: Path, start: str, end: str,
     ssh = ["ssh", "-i", ssh_key, "-o", "BatchMode=yes",
            "-o", "ConnectTimeout=20", host]
 
-    td, w, cfg = _stage(code, data_csv, start, end, cash, benchmark, True)
+    td, w, cfg = _stage(code, data_csv, start, end, cash, benchmark, True,
+                        val_csv)
     try:
-        b64 = base64.b64encode(_tar_dir(w)).decode("ascii")
-        prep = ("mkdir -p %s && cd %s && echo %s | base64 -d | tar xzf -"
-                % (remote_dir, remote_dir, b64))
-        p = subprocess.run(ssh + [prep], capture_output=True, timeout=300)
+        # **必须用 stdin 管道传 tar，不能塞进命令行参数**。
+        # 工作目录里有行情+估值两个 CSV（实测 950KB + 1.7MB），tar 完
+        # base64 约 3.5MB，而 Windows 的命令行上限是 32767 字符 ——
+        # 直接报 [WinError 206] 文件名或扩展名太长。
+        # 小文件时用参数没问题（我最早就是这么写的），数据一多就炸。
+        tar = _tar_dir(w)
+        p = subprocess.run(
+            ssh + ["mkdir -p %s && cd %s && cat > .w.tar.gz && "
+                   "tar xzf .w.tar.gz && rm -f .w.tar.gz && ls"
+                   % (remote_dir, remote_dir)],
+            input=tar, capture_output=True, timeout=600)
         if p.returncode != 0:
-            raise SandboxError("上传工作目录失败：%s"
-                               % p.stderr.decode("utf-8", "replace")[:300])
+            raise SandboxError("上传工作目录失败（%d 字节）：%s"
+                               % (len(tar),
+                                  p.stderr.decode("utf-8", "replace")[:300]))
         cmd = " ".join(shlex.quote(x) for x in docker_cmd(cfg, remote_dir, limits))
         try:
             p = subprocess.run(ssh + ["cd %s && timeout %d %s"
                                       % (remote_dir, tmo, cmd)],
-                               capture_output=True, timeout=tmo + 120)
+                               capture_output=True, timeout=tmo + 180)
         except subprocess.TimeoutExpired:
             return {"ok": False, "error": "沙箱超时（>%ds）" % tmo,
                     "killed_by": "wall-clock", "truncated": True}
@@ -370,34 +446,47 @@ def _parse(stdout: str, stderr: str, rc: int) -> dict:
     return res
 
 
-def sandbox_health(host: str = DEFAULT_HOST,
-                    ssh_key: str = None) -> dict:
-    """查沙箱那边通不通：镜像在不在、docker 能不能用、磁盘余量。
+def sandbox_health(host: str = DEFAULT_HOST, ssh_key: str = None) -> dict:
+    """查沙箱那边通不通：镜像在不在、磁盘余量、内存余量。
 
-    跑之前先调它 —— 「容器不存在」和「策略跑失败」是两回事，
+    跑之前先调它 ——「容器不存在」和「策略跑失败」是两回事，
     不先分清的话每次都要人去翻远端日志。
+
+    输出用分隔符而不是逐行解析：第一版按行取位置，结果
+    `docker images` 空输出时把 '---' 当成了镜像名，还报 ok=true ——
+    自己骗自己最糟，所以这里改成「值缺失就是缺失」。
     """
     ssh_key = ssh_key or str(Path.home() / ".ssh" / "sa_deploy_ed25519")
-    script = (
-        "docker images %s --format '{{{{.Repository}}}}:{{{{.Tag}}}} "
-        "{{{{.Size}}}}' ; echo '---'; "
-        "df -h / | tail -1 | awk '{print $4}'; echo '---'; "
-        "free -m | awk '/Mem:/{print $7}'" % DOCKER_IMAGE)
+    # 脚本走 **stdin 管道**（`ssh ... bash -s`），不要塞进命令行参数：
+    # 这段里有 `awk '/Mem:/{print $7}'`、`printf 'IMG=%s\n'`、以及
+    # docker 的 `{{.Tag}}` 模板 —— 走 ssh 参数时被 Windows 的 list2cmdline
+    # 和远端 shell 反复转义，实测解析出来是空的（还误报 ok=true）。
+    # 和 tar 上传同理：带复杂引号的脚本一律走 stdin。
+    sh = (
+        "img=$(docker images %s --format '{{.Repository}}:{{.Tag}} {{.Size}}'"
+        " 2>/dev/null | head -1)\n"
+        "disk=$(df -h / | awk 'NR==2{print $4}')\n"
+        "mem=$(free -m | awk '/Mem:/{print $7}')\n"
+        "printf 'IMG=%%s\\nDISK=%%s\\nMEM=%%s\\n' \"$img\" \"$disk\" \"$mem\"\n"
+        % DOCKER_IMAGE)
     p = subprocess.run(["ssh", "-i", ssh_key, "-o", "BatchMode=yes",
-                        "-o", "ConnectTimeout=20", host, script],
-                       capture_output=True, timeout=60)
+                        "-o", "ConnectTimeout=20", host, "bash -s"],
+                       input=sh.encode("utf-8"), capture_output=True,
+                       timeout=90)
     if p.returncode != 0:
         return {"ok": False,
                 "error": p.stderr.decode("utf-8", "replace")[:300]}
-    lines = p.stdout.decode("utf-8", "replace").strip().split("\n")
-    img = lines[0].strip() if lines and lines[0].strip() else ""
-    disk = lines[2].strip() if len(lines) > 2 else ""
-    mem = lines[4].strip() if len(lines) > 4 else ""
-    return {"ok": bool(img), "image": img, "disk_free": disk,
-            "mem_available_mb": mem,
-            "hint": "" if img else
-            "镜像 %s 不存在，先在 101 上构建（见 /opt/jq-sandbox/Dockerfile）"
-            % DOCKER_IMAGE}
+    kv = {}
+    for ln in p.stdout.decode("utf-8", "replace").split("\n"):
+        if "=" in ln:
+            k, _, v = ln.partition("=")
+            kv[k.strip()] = v.strip()
+    img = kv.get("IMG", "")
+    return {"ok": bool(img and img != "---"), "image": img,
+            "disk_free": kv.get("DISK", ""), "mem_available_mb": kv.get("MEM", ""),
+            "hint": "" if img and img != "---" else
+                     "镜像 %s 不存在，先在 101 上构建（见 /opt/jq-sandbox/Dockerfile）"
+                     % DOCKER_IMAGE}
 
 
 # ==========================================================================

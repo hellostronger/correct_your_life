@@ -27,18 +27,33 @@ import time
 import traceback
 from contextlib import redirect_stdout, redirect_stderr
 
+# 容器里用 `python -I` 启动。isolated mode = -E（忽略 PYTHONPATH 等环境变量）
+# + -s（忽略用户 site-packages）+ 不把脚本目录放进 sys.path。
+# 所以这里显式把脚本目录加回去，jq_api 才 import 得到。
+#
+# **不要加 -S**：它会跳过 site 模块，而正是 site 负责把 site-packages 加进
+# sys.path —— 结果 numpy/pandas/lightgbm 全部 ModuleNotFoundError。
+# 隔离的关键是 -I，-S 的收益（不跑 .pth 文件）远小于它的代价。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 RESULT_TAG = "#RESULT "
 
 
 def _load_data(path: str) -> dict:
-    """读数据切片。
+    """读行情切片。
 
     格式（由 sandbox_runner.py 写出）：CSV，第一列 date，其余列
     `code.open` / `code.high` / ... 的宽表。用 pivot 拆成 {code: DataFrame}。
     """
+    return _load_wide(path, fill=True)
+
+
+def _load_wide(path: str, fill: bool = True) -> dict:
     import pandas as pd
+    if not path or not os.path.exists(path):
+        return {}
     df = pd.read_csv(path, parse_dates=["date"])
-    if df.empty:
+    if df.empty or len(df.columns) < 2:
         return {}
     df = df.set_index("date").sort_index()
     out = {}
@@ -50,11 +65,22 @@ def _load_data(path: str) -> dict:
     res = {}
     for code, fields in out.items():
         d = pd.DataFrame(fields)
-        # 复权/停牌导致的缺失用前值补：聚宽默认 fill_paused=True
-        d = d.ffill()
+        if fill:
+            # 复权/停牌导致的缺失用前值补：聚宽默认 fill_paused=True
+            d = d.ffill()
         d.index.name = "date"
         res[code] = d
     return res
+
+
+def _load_valuation(path: str) -> dict:
+    """读估值切片 -> {code: DataFrame[date, total_market_cap, ...]}。
+
+    **不 ffill**：市值/PE 缺一天就该是缺一天。如果 ffill，一个停牌或
+    缺数据的票会被填上前一天的市值，而「取市值最小的 N 只」正好会
+    挑中这类票 —— 于是最缺数据的那批票反而被当成最便宜。
+    """
+    return _load_wide(path, fill=False)
 
 
 def _emit(payload: dict):
@@ -221,9 +247,11 @@ def main() -> int:
     try:
         data = _load_data(data_path)
         if not data:
-            raise RuntimeError("数据切片为空：%s" % data_path)
+            raise RuntimeError("行情切片为空：%s" % data_path)
+        valuation = _load_valuation(cfg.get("val"))
         codes = sorted(data)
-        jq_api.setup(data, codes, bench, start, end, cash)
+        jq_api.setup(data, codes, bench, start, end, cash,
+                     valuation=valuation)
         jq_api.JQ["start_cash"] = cash
 
         # ---- 加载策略源码 ----
@@ -392,6 +420,7 @@ def main() -> int:
             "callback_traceback": {k: v for k, v in list(cb_tb.items())[:5]},
             "elapsed": round(time.time() - t0, 2),
             "n_codes": len(codes),
+            "n_codes_with_valuation": len(valuation),
         }
         _emit(payload)
         return 0

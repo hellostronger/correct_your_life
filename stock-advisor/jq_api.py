@@ -100,8 +100,13 @@ class JQError(Exception):
 
 
 def setup(data: dict, codes: list, benchmark: str | None, start, end,
-          cash: float) -> None:
-    """runner.py 调一次，把数据灌进来。"""
+          cash: float, valuation: dict = None) -> None:
+    """runner.py 调一次，把数据灌进来。
+
+    `valuation` 是 {code: DataFrame[date, total_market_cap, pe_ttm, ...]}，
+    给 get_fundamentals 用。没有它（市值类策略就跑不了），
+    get_fundamentals 会明确报错而不是返回假数据。
+    """
     JQ["data"] = data
     JQ["codes"] = list(codes)
     JQ["benchmark"] = benchmark
@@ -109,6 +114,8 @@ def setup(data: dict, codes: list, benchmark: str | None, start, end,
     JQ["end"] = pd.Timestamp(end)
     JQ["cash"] = float(cash)
     JQ["total_value"] = float(cash)
+    JQ["valuation"] = valuation or {}
+    JQ["st_codes"] = (valuation or {}).get("__st_codes__") or {}
     JQ["g"] = _StrategyGlobal()
     JQ["portfolio"] = Portfolio()
     JQ["context"] = Context()
@@ -136,8 +143,114 @@ def _set_prev_trade_day(day):
     JQ["_prev_trade_day"] = day
 
 
+class Position:
+    """`context.portfolio.positions[code]` 拿到的对象。
+
+    字段按聚宽来（实测社区策略用的是 `p.amount` / `p.avg_cost` /
+    `p.close`），另外补几个聚宽也有、我算得出来的。
+    `value` 每次访问现算，因为它依赖当日价格。
+    """
+
+    __slots__ = ("code", "amount", "avg_cost", "close")
+
+    def __init__(self, code, amount, avg_cost, close):
+        self.code = code
+        self.amount = amount
+        self.avg_cost = avg_cost
+        self.close = close
+
+    @property
+    def price(self):
+        return self.close
+
+    @property
+    def last_price(self):
+        return self.close
+
+    @property
+    def value(self):
+        return self.amount * self.close
+
+    @property
+    def market_value(self):
+        return self.value
+
+    @property
+    def pnl(self):
+        return (self.close - self.avg_cost) * self.amount
+
+    @property
+    def profit_ratio(self):
+        return (self.close / self.avg_cost - 1.0) if self.avg_cost else 0.0
+
+    @property
+    def enable_amount(self):
+        return self.amount      # T+1 规则没实现（见 warnings）
+
+    def __repr__(self):
+        return ("<Position %s x%d 成本%.3f 现价%.3f>"
+                % (self.code, self.amount, self.avg_cost, self.close))
+
+
+class _Positions(dict):
+    """`context.portfolio.positions`。
+
+    必须是 **dict**，不是 list —— 实测社区策略写的是
+        for sec in list(context.portfolio.positions.keys()):
+    我第一版返回 list，于是 `AttributeError: 'list' object has no
+    attribute 'keys'`。键用聚宽形态（带后缀），但取值两种形态都行。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._pos = {}
+
+    def __missing__(self, key):
+        p = self._pos.get(_norm_code(key))
+        if p is None:
+            raise KeyError(key)
+        return p
+
+    def __contains__(self, key):
+        return super().__contains__(key) or _norm_code(key) in self._pos
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
 class Portfolio:
     """`context.portfolio` 的实现。"""
+
+    def _build(self):
+        out = _Positions()
+        out._pos = {c: Position(c, p["amount"], p["avg_cost"], p["close"])
+                    for c, p in JQ["positions"].items()}
+        for c, p in JQ["positions"].items():
+            out[_to_jq_code(c)] = out._pos[c]
+        return out
+
+    @property
+    def positions(self):
+        """{代码: Position}。**每次访问重建**，因为 Position 的字段
+        （close/value）随行情变，返回缓存会拿到旧价格。"""
+        return self._build()
+
+    @property
+    def holdings(self):
+        """持仓**代码列表**。聚宽的 holdings 是 list-like，
+        既能 `for s in holdings` 也能 `holdings[code]`，我用 list 覆盖
+        绝大多数社区策略的用法。"""
+        return [_to_jq_code(c) for c in JQ["positions"]]
+
+    def get_positions(self):
+        return list(self._build().values())
+
+    def position_cost_price(self, code):
+        p = JQ["positions"].get(_norm_code(code))
+        return p["avg_cost"] if p else 0.0
 
     @property
     def available_cash(self):
@@ -156,22 +269,13 @@ class Portfolio:
         return sum(p["amount"] * p["close"] for p in JQ["positions"].values())
 
     @property
-    def positions(self):
-        return list(JQ["positions"].values())
-
-    @property
-    def holdings(self):
-        return self.positions
-
-    @property
     def start_cash(self):
-        return JQ["start_cash"]
+        return JQ.get("start_cash", 0.0)
 
     @property
     def returns(self):
-        if not JQ["start_cash"]:
-            return 0.0
-        return JQ["total_value"] / JQ["start_cash"] - 1.0
+        s = self.start_cash
+        return (JQ["total_value"] / s - 1.0) if s else 0.0
 
     @property
     def daily_returns(self):
@@ -180,13 +284,6 @@ class Portfolio:
     @property
     def portfolio_value(self):
         return JQ["total_value"]
-
-    def get_positions(self):
-        return self.positions
-
-    def position_cost_price(self, code):
-        p = JQ["positions"].get(code)
-        return p["avg_cost"] if p else 0.0
 
     # 聚宽的 Portfolio 是一组只读属性，用 __getattr__ 兜住剩下的
     def __getattr__(self, name):
@@ -425,8 +522,17 @@ def get_all_securities(types=(), date=None):
     """
     rows = []
     for c in JQ["codes"]:
-        rows.append({"display_name": c, "name": c, "start_date": None,
-                     "end_date": None, "type": "stock"})
+        # start_date 用**这只票在切片里的第一天**近似「上市日」。
+        # 为什么不给 None：策略会写
+        #     start_d = all_sec.loc[c, 'start_date']
+        #     if (date - start_d).days >= MIN_LIST_DAYS: ...
+        # 给 None 它就 AttributeError，而我们明明能从数据里推出来。
+        # 注意这是**近似**（真实上市日更早），所以 MIN_LIST_DAYS 这个
+        # 「上市满 N 天」的过滤在本地会偏松 —— 在 warnings 里说明。
+        df = JQ["data"].get(c)
+        sd = df.index[0].date() if (df is not None and len(df)) else None
+        rows.append({"display_name": _to_jq_code(c), "name": c,
+                     "start_date": sd, "end_date": None, "type": "stock"})
     if not rows:
         return pd.DataFrame(columns=["display_name", "name", "start_date",
                                      "end_date", "type"])
@@ -434,13 +540,16 @@ def get_all_securities(types=(), date=None):
     if types:
         want = {str(t) for t in (types if isinstance(types, (list, tuple))
                                  else [types])}
-        # 本地没有 bond/fund/etf 的分类，只能按代码前缀粗分
+        # 本地没有 bond/fund/etf 的分类表，只能按代码前缀粗分：
+        # 5/15/16/18/50 开头是沪市 ETF/LOF，1 开头是深市 ETF/LOF
         if "stock" in want:
-            df = df[df.index.map(
-                lambda c: not str(c).startswith(("5", "15", "16", "50")))]
+            df = df[~df.index.map(
+                lambda c: _norm_code(c).startswith(("5", "15", "16", "18",
+                                                     "50")))]
         JQ["warnings"].append(
-            "get_all_securities(types=%s) 的分类是按代码前缀近似的，"
-            "本地没有证券类型表" % (list(want),))
+            "get_all_securities：证券类型按代码前缀近似（本地没有类型表），"
+            "start_date 用的是**切片里第一天**而不是真实上市日 —— "
+            "所以「上市满 N 天」这类过滤在本地偏松")
     return df
 
 
@@ -464,9 +573,10 @@ def get_current_data():
         if d.empty:
             continue
         row = d.iloc[-1]
-        cur[c] = _CurrentData(c, row, _is_st_code(c))
-    JQ["_curdata_cache"] = (dt, cur)
-    return cur
+        # 键用聚宽形态（带后缀），但用 _CodeMap 所以 6 位码也能取到
+        cur[_to_jq_code(c)] = _CurrentData(c, row, _is_st_code(c))
+    JQ["_curdata_cache"] = (dt, _CodeMap(cur))
+    return JQ["_curdata_cache"][1]
 
 
 class _CurrentData:
@@ -491,8 +601,19 @@ class _CurrentData:
 
 
 def _is_st_code(code: str) -> bool:
-    """用 JQ 的 ST 标记表判断（由数据切片注入）。没有表就当 False。"""
-    return bool((JQ.get("st_codes") or set()).get(_norm_code(code)))
+    """用 ST 标记表判断（由数据切片注入）。没有表就当 False。
+
+    注意这里必须写 `or {}` 而不是 `or set()`：空 dict 是 falsy，
+    `or set()` 会真的返回 set，而 set 没有 .get ->
+    AttributeError: 'set' object has no attribute 'get'。
+    这个错被策略的 try/except 吞掉、只 warn 一句「is_st 过滤失败」
+    然后继续跑，于是**所有 ST 股都没被过滤**、回测「成功」但偏乐观。
+    """
+    tbl = JQ.get("st_codes") or {}
+    if not isinstance(tbl, dict):
+        tbl = set(tbl)          # 也接受 set 形态（切片注入时可能给集合）
+        return _norm_code(code) in tbl
+    return bool(tbl.get(_norm_code(code)))
 
 
 # ==========================================================================
@@ -559,11 +680,11 @@ def _is_limit_down(code: str) -> bool:
 
 
 def _norm_code(code) -> str:
-    """把 '000905.XSHG' / 'sh600519' 归一成 '600519' / '000905'。
+    """把 '000905.XSHG' / 'sh600519' 归一成 '600519' / '000905'（内部形态）。
 
-    聚宽的代码带交易所后缀，我本地只存 6 位。**不归一的话
-    `set_benchmark('000905.XSHG')` 之后的每一次取数都会落空**，
-    而且不报错 —— 基准永远是空的，超额收益算出来是 0，看着还挺正常。
+    聚宽的代码带交易所后缀，我本地只存 6 位，所以内部一律用 6 位。
+    **不归一的后果很隐蔽**：set_benchmark('000905.XSHG') 之后的每次取数
+    都落空，而基准收益算出来是 0，看着还挺正常。
     """
     s = str(code).strip()
     if "." in s:
@@ -571,6 +692,53 @@ def _norm_code(code) -> str:
     if len(s) == 8 and s[:2].isalpha():
         s = s[2:]
     return s
+
+
+def _to_jq_code(code) -> str:
+    """内部 6 位码 -> 聚宽形态 '600519.XSHG'。
+
+    为什么必须加后缀（实测踩出来的）：社区策略几乎都会按后缀判断交易所，
+    比如那篇微盘股复刻策略：
+        codes = [c for c in all_sec.index
+                 if c.endswith('.XSHE') or c.endswith('.XSHG')]
+    我第一版 get_all_securities 直接返回 6 位码，于是这个列表**恒为空**，
+    选出来 0 只、0 笔成交、净值一条直线，而回测报的是 ok=true、
+    收益 0.00% —— 又是「看起来正常其实没跑」的那类静默失败。
+    """
+    s = _norm_code(code)
+    if len(s) != 6 or not s.isdigit():
+        return str(code)
+    if s[0] in ("5", "6", "9"):          # 沪市（ETF 5 开头也是沪）
+        return s + ".XSHG"
+    if s[0] in ("4", "8"):               # 北交所
+        return s + ".BJSE"
+    return s + ".XSHE"                   # 0/1/2/3 开头 = 深市
+
+
+class _CodeMap(dict):
+    """既能按 6 位码、也能按带后缀的码取值的 dict。
+
+    社区策略里 `current_data[sec]` 的 sec 有时带后缀、有时不带
+    （取决于它是从 get_all_securities 还是从自己写的列表来的）。
+    两种都支持比强迫策略改写法省事得多。
+
+    注意 `get()` **必须自己重写**：dict.get 不会触发 `__missing__`
+    （那是 `__getitem__` 独有的机制）。我第一版只实现了 `__missing__`，
+    结果策略里 `current_data[sec]` 正常、一到 `_price_now` 里的
+    `current_data.get(code)` 就返回 None，于是报「取不到当前价」。
+    """
+    def __missing__(self, key):
+        n = _norm_code(key)
+        for k in self.keys():
+            if _norm_code(k) == n:
+                return self[k]
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]          # 走 __getitem__ -> __missing__
+        except KeyError:
+            return default
 
 
 def _fee(code: str, price: float, shares: float, is_buy: bool) -> float:
@@ -903,12 +1071,19 @@ def is_suspended(code, count=1, date=None):
 
 def get_extras(info, code_list, df=True, start_date=None, end_date=None,
                **kw):
-    """`get_extras('is_st', codes, df=True)` —— 小市值策略必用。
+    """`get_extras('is_st', codes, df=True)` —— 小市值/市值类策略几乎必用。
 
-    只支持 is_st：本地没有 ST 标记表，所以 ST 是从数据切片注入的
-    `st_codes` 里查（切片生成时会带上）。**查不到就当 False**，
-    也就是「假装没有 ST 股」—— 这里必须在 warnings 里明说，
-    因为它会让策略**多买一些本来买不到的票**，收益偏高。
+    **返回方向必须是 index=证券代码、columns=日期**。这不是我拍脑袋定的，
+    是实测撞出来的：社区策略的写法是
+        is_st_df = get_extras('is_st', codes, start_date=d, end_date=d, df=True)
+        last = is_st_df.iloc[-1]              # 取最后一个日期的截面
+        st_codes = set(last[last == True].index)
+    我第一版返回的是 `pd.DataFrame([dict], index=['is_st'])`（转置了），
+    于是 `.iloc[-1]` 拿到的是 dict 那行，`last == True` 报错 ——
+    策略 try/except 捕获后只 warn 一句「is_st 过滤失败」然后**继续跑**，
+    于是所有 ST 股都没被过滤掉，回测「成功」但结果偏乐观。
+
+    本地只有当天快照，所以列只有 1 个日期；日期用 end_date 或当前模拟日。
     """
     info = str(info)
     if info not in ("is_st", "paused", "is_halted"):
@@ -921,17 +1096,20 @@ def get_extras(info, code_list, df=True, start_date=None, end_date=None,
         JQ["warnings"].append(
             "get_extras(%s) 拿不到 ST 标记（数据切片没带 st_codes）—— "
             "所有标的都按非 ST 处理，回测收益会偏高" % info)
-    codes = [_norm_code(c) for c in (code_list or [])]
-    out = {}
+    codes = [_to_jq_code(c) for c in (code_list or [])]
+    day = str(end_date or (JQ["current_dt"].date() if JQ["current_dt"]
+                           is not None else ""))
+    data = {}
     for c in codes:
+        n6 = _norm_code(c)
         if info == "is_st":
-            out[c] = 1 if _is_st_code(c) else 0
-        elif info in ("paused", "is_halted"):
-            cur = get_current_data().get(c)
-            out[c] = 1 if (cur and cur.paused) else 0
-    if df:
-        return pd.DataFrame([out], index=["is_st" if info == "is_st" else info])
-    return out
+            val = 1 if _is_st_code(n6) else 0
+        else:
+            cur = get_current_data().get(n6)
+            val = 1 if (cur and cur.paused) else 0
+        data[c] = {day: val}
+    out = pd.DataFrame(data).T if data else pd.DataFrame()
+    return out if df else data
 
 
 class _Query:
@@ -983,32 +1161,127 @@ fundamentals = _Field("fundamentals")
 market = _Field("market")
 
 
-def get_fundamentals(query, **kw):
-    """财务/估值数据。**未实现，必须报错。**
+def get_fundamentals(query, date=None, **kw):
+    """估值/财务数据。**目前只支持 `valuation` 这张表**。
 
-    实测有三篇社区策略都是靠它选股的：
-      q = query(valuation.code, valuation.market_cap)   # 微盘/小市值类
-      q = query(valuation.code, valuation.pe_ratio)     # 低估值类
+    社区策略最常见的用法（实测三篇都是这个形态）：
+        q = query(valuation.code, valuation.market_cap)
+        df = get_fundamentals(q, date=signal_date)
+        df = df.sort_values('market_cap').head(400)
 
-    为什么必须报错而不是瞎填：返回一个假的 market_cap（比如「价格 ×
-    常数」），策略会按它排序，选出来的票完全随机，而回测照样「成功」
-    返回一个漂亮的数字。那比直接报错糟糕得多 —— 报错会让我去补数据，
-    假数据会让我相信一个完全无意义的结论。
+    返回 DataFrame，第一列 `code`，其余按 query 里要的字段。
+    **字段名去掉了 `valuation.` 前缀**（聚宽返回的列名就是
+    `market_cap` 而不是 `valuation.market_cap`）。
+
+    仍然不支持的：`income` / `balance` / `cash_flow` / `fundamentals`
+    （财报、TTM 净利润这些）。那些要真正的财务数据表，我没有 ——
+    所以明确报错，**不用现价凑一个假的 PE 出来**。
+
+    语义对齐的两点（都是实测撞出来的）：
+    - `date` 是**信号日**，取 <= date 的最后一条（聚宽的 valuation 表
+      按交易日存，策略常传「上一交易日」）。
+    - 估值**不做 ffill**。缺就是 NaN。理由在 runner._load_valuation 里：
+      市值缺失的票会被「取市值最小的 N 只」优先挑中，ffill 反而让
+      最缺数据的那批票被当成最便宜。
     """
     fields = getattr(query, "fields", None)
     if fields is None:
         fields = [str(query)]
-    raise JQError(
-        "get_fundamentals(%s) 未实现：本地没有财务/估值数据表。"
-        "**不能拿假数据凑** —— 小市值/低估值类策略靠这些字段排序，"
-        "填假值等于随机选股，回测照样「成功」但结果毫无意义。"
-        "补齐办法：把估值数据（总市值/流通市值/PE/PB）灌进 "
-        "sa_stock_valuation 表，再扩展本函数。"
-        % ", ".join(str(f) for f in fields))
+    want = []
+    for f in fields:
+        s = str(f)
+        if s.startswith("valuation."):
+            s = s[len("valuation."):]
+        want.append(s)
+    unsupported = [s for s in want
+                   if s.split(".")[0] in ("income", "balance", "cash_flow",
+                                          "fundamentals", "market")]
+    if unsupported:
+        raise JQError(
+            "get_fundamentals 暂不支持 %s：需要真正的财务数据表（TTM 净利润、"
+            "净资产、经营现金流…），本地没有。"
+            "**不会拿别的东西凑一个数出来** —— 那样策略会照着假数据选股，"
+            "回测「成功」但结论毫无意义。"
+            "可用字段：%s" % (", ".join(unsupported),
+                            "code / market_cap / circulating_market_cap / "
+                            "pe_ttm / pb / ps_ttm / turnover_rate / "
+                            "close / total_shares / free_shares"))
+
+    val = JQ.get("valuation") or {}
+    if not val:
+        raise JQError(
+            "get_fundamentals(%s) 需要估值数据，但沙箱切片里没有 —— "
+            "跑回测前先用 build_valuation_csv 把 sa_stock_valuation "
+            "切进数据切片。" % ", ".join(want))
+    if date is not None and not isinstance(date, str):
+        date = getattr(date, "date", lambda: date)()
+        date = date.isoformat() if hasattr(date, "isoformat") else str(date)
+
+    # 字段别名：聚宽的名字 vs 我存的名字。
+    # 这个别名**不是小事**：聚宽叫 valuation.market_cap，我存的是
+    # total_market_cap。不映射的话整列全 NaN，策略里一句
+    #     df.dropna(subset=['market_cap'])
+    # 就把 36 行全删光，于是「未选出成份股」、0 笔成交、回测报
+    # ok=true 收益 0.00% —— 又是一次「看起来正常的静默失败」。
+    ALIAS = {"market_cap": "total_market_cap",
+             "close": "last_price",
+             "day": "trade_date"}
+    avail = set()
+    for df0 in val.values():
+        if hasattr(df0, "columns"):
+            avail |= set(df0.columns)
+    resolved = []
+    for f in want:
+        if f == "code":
+            continue                    # code 单独处理，不进字段映射
+        real = ALIAS.get(f, f)
+        if real not in avail:
+            # 未知字段必须报错，不能默默给 NaN —— 上面那个坑就是这么来的
+            raise JQError(
+                "get_fundamentals 要的字段 %r 不存在。切片里实际有的字段：%s"
+                "（聚宽字段名的别名：%s）"
+                % (f, ", ".join(sorted(avail)) or "（空）",
+                   ", ".join("%s->%s" % kv for kv in sorted(ALIAS.items()))))
+        resolved.append(real)
+    value_fields = [f for f in want if f != "code"]
+
+    data = {}
+    for code, df in val.items():
+        if code.startswith("__"):
+            continue
+        d = df[df.index <= date] if date else df
+        if d.empty:
+            continue
+        row = d.iloc[-1]
+        rec = {"code": _to_jq_code(code)}
+        # zip 的两边都只含非 code 字段。这里第一版把 "code" 也塞进了
+        # resolved，于是错位一格：market_cap 配上了 real="code"，
+        # 结果整列消失（KeyError: 'market_cap'）。
+        for orig, real in zip(value_fields, resolved):
+            v = row.get(real)
+            rec[orig] = (float(v)
+                         if v is not None and str(v) != ""
+                         else float("nan"))
+        data[_to_jq_code(code)] = rec
+    if not data:
+        raise JQError(
+            "get_fundamentals(%s) 在 %s 那天一条估值都没有 —— "
+            "检查 sa_stock_valuation 的覆盖范围" % (", ".join(want), date))
+    out = pd.DataFrame(data).T
+    # **索引也必须是聚宽形态**（带后缀）。第一版索引还是 6 位、只有 code 列
+    # 带后缀，于是 df[df['code'].isin(universe)] 和 df.loc['600519.XSHG'] 两种
+    # 写法只有一种能用，另一种静默返回空。
+    out.index = pd.Index(out["code"], name="code")
+    out["code"] = out.index
+    return out
 
 
 def get_fundamentals_continuously(query, **kw):
-    raise JQError("get_fundamentals_continuously 未实现")
+    raise JQError(
+        "get_fundamentals_continuously 未实现：它返回的是「每个截面一行」的"
+        "长表，需要逐日重放整个股票池。社区策略里用得少"
+        "（实测抓来的几篇都用 get_fundamentals 取单日截面）。"
+        "要支持的话得把估值切片按日重放，注意不能用 ffill。")
 
 
 def get_money_flow(day=None):

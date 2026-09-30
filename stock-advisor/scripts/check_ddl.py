@@ -93,9 +93,18 @@ def check_text(src: str, name: str) -> list[str]:
             errs.append("    %s" % t[:90].replace("\n", " "))
 
     # ② 列定义位置的类型名
+    #
+    # 排除以约束关键字开头的行 —— 实测踩到过：
+    #     REFERENCES sa_strategy_article(post_id) ON DELETE CASCADE,
+    # 这行会被当成「列名 ON、类型 DELETE」而误报类型不合法。
+    # 修法是跳过这些关键字开头的行（它们是约束子句，不是列定义）。
+    COL_CONSTRAINT_KW = {"ON", "PRIMARY", "FOREIGN", "UNIQUE", "CONSTRAINT",
+                         "CHECK", "REFERENCES", "EXCLUDE", "LIKE", "DEFERRABLE"}
     for k, l in enumerate(src.split("\n"), 1):
         m = re.match(r"^\s+(\w+)\s+([A-Z][A-Z0-9_]*)\s*(,|$|\s)", l)
         if not m:
+            continue
+        if m.group(1).upper() in COL_CONSTRAINT_KW:
             continue
         t = m.group(2)
         if t in VALID_TYPES or t in KEYWORDS:

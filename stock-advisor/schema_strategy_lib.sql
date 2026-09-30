@@ -255,6 +255,79 @@ CREATE INDEX IF NOT EXISTS idx_sa_reply_article ON sa_strategy_reply (article_id
 CREATE INDEX IF NOT EXISTS idx_sa_reply_code ON sa_strategy_reply (article_id, has_code);
 
 -- ------------------------------------------------------------------
+-- 估值/市值日频（2026-09-30）
+-- ------------------------------------------------------------------
+-- 为什么必须有：实测抓来的社区策略里，「小市值/微盘/低估值」这一大类
+-- 核心因子就是市值 —— 比如《万得微盘股指数复刻策略》整篇靠
+--     q = query(valuation.code, valuation.market_cap)
+--     df = get_fundamentals(q, date=signal_date)
+--     df.sort_values('market_cap').head(400)
+-- 选票。没有市值数据，这类策略在我这里**一个都跑不了**。
+--
+-- 为什么不拿假市值凑：填一个「价格 × 常数」的假市值，策略照样能排序、
+-- 照样能跑完、回测照样「成功」返回一个数字 —— 但选出来的票是随机的，
+-- 那个数字完全无意义。**报错让我去补数据，假数据让我相信一个假的结论。**
+--
+-- 数据源（两个独立源交叉验证过，600519 总市值两边都是 15733.78 亿）：
+--   主：东财 datacenter-web 的 RPT_VALUEANALYSIS_DET
+--       带 TRADE_DATE -> 能取历史序列；有 TOTAL_SHARES / FREE_SHARES_A；
+--       单位是「元」。**这个源 push2 封我的时候它照常工作**，
+--       所以选它当主力。
+--   备：腾讯 qt.gtimg.cn（无日期、单位是「亿元」，只用于补当天快照）
+CREATE TABLE IF NOT EXISTS sa_stock_valuation (
+    code                  VARCHAR(16) NOT NULL,
+    trade_date            DATE        NOT NULL,
+    last_price            NUMERIC(14,4),
+    total_shares          NUMERIC(20,2),   -- 总股本（股）
+    free_shares           NUMERIC(20,2),   -- 流通股本（股）
+    total_market_cap      NUMERIC(20,2),   -- 总市值（元）
+    circulating_market_cap NUMERIC(20,2),  -- 流通市值（元）
+    pe_ttm                NUMERIC(12,4),
+    pb                    NUMERIC(12,4),
+    ps_ttm                NUMERIC(12,4),
+    turnover_rate         NUMERIC(12,4),   -- 换手率 %
+    source                VARCHAR(24) NOT NULL DEFAULT '',
+    fetched_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (code, trade_date)
+);
+CREATE INDEX IF NOT EXISTS idx_sa_val_date ON sa_stock_valuation (trade_date);
+
+-- ------------------------------------------------------------------
+-- 沙箱运行记录（2026-09-30）
+-- ------------------------------------------------------------------
+-- 为什么单独一张：沙箱跑出来的结果和本地引擎跑出来的要能对比，而
+-- 差异来源必须留痕 —— 是「同一个策略两种引擎」还是「两个不同策略」。
+-- 隔离参数、镜像版本、被拒的订单数都要能查，否则复现不了。
+CREATE TABLE IF NOT EXISTS sa_sandbox_run (
+    id            BIGSERIAL PRIMARY KEY,
+    article_id    VARCHAR(64) REFERENCES sa_strategy_article(post_id)
+                  ON DELETE SET NULL,
+    post_id       VARCHAR(64) NOT NULL DEFAULT '',
+    strategy_name VARCHAR(200) NOT NULL DEFAULT '',
+    syntax_state  VARCHAR(16) NOT NULL DEFAULT '',   -- 抽出来的源码能不能跑
+    host          VARCHAR(64) NOT NULL DEFAULT '',
+    image         VARCHAR(64) NOT NULL DEFAULT '',
+    limits        JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    ok            BOOLEAN     NOT NULL DEFAULT FALSE,
+    error         TEXT        NOT NULL DEFAULT '',
+    n_days        INTEGER     NOT NULL DEFAULT 0,
+    n_trades      INTEGER     NOT NULL DEFAULT 0,
+    n_rejected    INTEGER     NOT NULL DEFAULT 0,
+    n_callback_errors INTEGER NOT NULL DEFAULT 0,
+    total_return  NUMERIC(12,4),
+    annual_return NUMERIC(12,4),
+    max_drawdown  NUMERIC(12,4),
+    sharpe        NUMERIC(10,4),
+    win_rate      NUMERIC(10,4),
+    warnings      JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    rejected      JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    result        JSONB       NOT NULL DEFAULT '{}'::jsonb,  -- 完整 payload
+    elapsed       NUMERIC(10,2) NOT NULL DEFAULT 0,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sa_sb_post ON sa_sandbox_run (post_id, created_at DESC);
+
+-- ------------------------------------------------------------------
 -- 本地行情数据（供本地回测/验证用，2026-09-30）
 -- ------------------------------------------------------------------
 -- 为什么必须落库：一个 3 年回测、5 只标的、调 20 组参数 = 300 次取数，
