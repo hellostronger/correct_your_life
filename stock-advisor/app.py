@@ -575,6 +575,17 @@ def init_db():
         ON sa_paper_trades (trade_date, slot);
     -- 板块轮动快照（建表 DDL 以 sector.py 的 SNAPSHOT_TABLE_DDL 为准，那里也幂等）
     """
+    # ---- 追加：量化策略库 / 本地行情 / 回测的建表（schema_strategy_lib.sql）----
+    # 用 `+=` 而不是把 SQL 塞进上面那个三引号里，也不是 `%`-格式化：
+    #   1) 上面那个大字符串的注释里有大量 `%`，改成 %-格式化要全部转义成 %%，
+    #      几百处注释漏一个就崩；
+    #   2) `+=` 完全不碰原字符串，零转义风险。
+    # 别再写成字符串内部的 `+ (STRATEGY_LIB_DDL or '')`：那行会落在闭合引号
+    # 之外成为独立语句，被下面的 split(";") 当成一条 SQL 执行 ->
+    # `syntax error at or near "+"`，init_db 整体失败、8 张表一张都没建。
+    # 顺带：防重复爬取靠 sa_crawl_queue.url_hash 唯一键，不是「先查再插」
+    #（那是竞态：两个进程同时插都会成功）。
+    ddl += STRATEGY_LIB_DDL
     last_exc: Exception | None = None
     # 旧版 sa_strategies 是「按股票建行」的，列结构与现在完全不同，
     # CREATE TABLE IF NOT EXISTS 修不了它，只能重建。只在确实是旧结构时动手。
@@ -3255,6 +3266,8 @@ def _alerts_loop():
 
 import paper_trading
 import paper_strategy
+import market_data
+import backtest
 import stock_discovery
 import stock_roster
 import paper_memory
@@ -3546,6 +3559,23 @@ class PaperStrategyToggleIn(BaseModel):
     enabled: bool
 
 
+# ---- 本地行情 / 回测 ----
+class KlineSyncIn(BaseModel):
+    codes: list[str] = Field(min_length=1, max_length=200)
+    years: float = Field(default=3.0, gt=0, le=20)
+
+
+class BacktestIn(BaseModel):
+    universe: list[str] = Field(min_length=1, max_length=100)
+    start: str = Field(min_length=8, max_length=10)
+    end: str = Field(min_length=8, max_length=10)
+    hold_days: int = Field(default=5, ge=1, le=250)
+    rebalance: str = Field(default="period")     # period/daily/never
+    init_cash: float = Field(default=1000000.0, gt=0)
+    benchmark: str = Field(default="", max_length=8)
+    save: bool = Field(default=True, description="是否把结果落库（可做验证图）")
+
+
 # ---- 挖新股（discover）的请求模型 ----
 class DiscoverRosterIn(BaseModel):
     pass          # 目前无参，留着以后加「只刷某个市场」
@@ -3620,6 +3650,102 @@ def paper_strategy_unbind(bid: int):
 def paper_strategy_compare(code: str = ""):
     """策略对照：策略卖 vs 持有到今天 vs LLM 实际怎么卖。"""
     return paper_strategy.compare(_paper_strategy_deps(), code=code)
+
+
+# ---------- 本地行情数据 + 回测（供策略本地验证）----------
+
+def _bt_deps() -> dict:
+    return {"get_conn": get_conn}
+
+
+@app.get("/api/market/kline/coverage")
+def market_kline_coverage(codes: str):
+    """看数据覆盖：缺数据就别开回测。codes 逗号分隔。"""
+    cs = [c.strip() for c in codes.split(",") if c.strip()][:200]
+    return {"items": market_data.coverage(_bt_deps(), cs)}
+
+
+@app.post("/api/market/kline/sync")
+def market_kline_sync(body: KlineSyncIn):
+    """同步 K 线到库（增量，已有的日期不会重复拉）。"""
+    return market_data.sync_many(_bt_deps(), body.codes, years=body.years)
+
+
+@app.post("/api/backtest/run")
+def backtest_run(body: BacktestIn):
+    """本地回测。返回汇总指标 + **逐日净值/回撤序列**（= 验证图的数据源）。
+
+    为什么不直接信文章里的「年化 100%」：社区文章普遍有幸存者偏差/未来函数/
+    过拟合/不算成本。实测一页 21 条策略帖有 7 条标题直接吹年化 100%~710%。
+    本地重跑是唯一能验证的办法。
+    """
+    strat = {"universe": body.universe, "hold_days": body.hold_days,
+             "rebalance": body.rebalance}
+    r = backtest.run(_bt_deps(), strat, body.start, body.end,
+                     init_cash=body.init_cash, benchmark=body.benchmark)
+    if r.get("ok") and body.save:
+        try:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO sa_backtest_run
+                       (name, start_date, end_date, universe, params, init_cash,
+                        total_return, annual_return, max_drawdown, sharpe,
+                        win_rate, trade_count, turnover, benchmark,
+                        bench_return, excess, elapsed_ms)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       RETURNING id""",
+                    ("回测 %s" % body.universe[0], body.start, body.end,
+                     json.dumps(body.universe), json.dumps(
+                         {"hold_days": body.hold_days, "rebalance": body.rebalance}),
+                     body.init_cash, r["summary"]["total_return"],
+                     r["summary"]["annual_return"], r["summary"]["max_drawdown"],
+                     r["summary"]["sharpe"], r["summary"]["win_rate"],
+                     r["summary"]["trade_count"], r["summary"]["turnover"],
+                     r["summary"]["benchmark"], r["summary"]["bench_return"],
+                     r["summary"]["excess"], r["summary"]["elapsed_ms"]))
+                run_id = cur.fetchone()[0]
+                from psycopg2.extras import execute_values
+                if r["daily"]:
+                    execute_values(
+                        cur,
+                        """INSERT INTO sa_backtest_daily
+                           (run_id, trade_date, equity, cash, position_value,
+                            drawdown, holdings) VALUES %s""",
+                        [(run_id, d["trade_date"], d["equity"], d["cash"],
+                          d["position_value"], d["drawdown"],
+                          json.dumps(d["holdings"], ensure_ascii=False))
+                         for d in r["daily"]], page_size=1000)
+                conn.commit()
+            r["run_id"] = run_id
+        except Exception as exc:       # noqa: BLE001
+            r["save_error"] = str(exc)[:150]
+    return r
+
+
+@app.get("/api/backtest/runs")
+def backtest_runs(limit: int = 50):
+    """历史回测（按时间倒序）。"""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """SELECT id, name, start_date, end_date, universe, total_return,
+                      annual_return, max_drawdown, sharpe, win_rate,
+                      trade_count, benchmark, bench_return, excess, created_at
+               FROM sa_backtest_run ORDER BY created_at DESC LIMIT %s""",
+            (int(limit),))
+        cols = [d[0] for d in cur.description]
+        return {"items": [dict(zip(cols, r)) for r in cur.fetchall()]}
+
+
+@app.get("/api/backtest/curve")
+def backtest_curve(run_id: int):
+    """取某次回测的逐日净值与回撤 —— 前端「验证图」直接画这个。"""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT trade_date, equity, drawdown, position_value "
+                    "FROM sa_backtest_daily WHERE run_id=%s ORDER BY trade_date",
+                    (int(run_id),))
+        cols = [d[0] for d in cur.description]
+        return {"run_id": run_id,
+                "curve": [dict(zip(cols, r)) for r in cur.fetchall()]}
 
 
 # ---------- 挖新股：全市场发现 ----------
@@ -4146,6 +4272,18 @@ def _paper_run_cycle(conf: dict, slot: str, kind: str = "intraday",
 
 import news_fetcher
 import notifier
+
+# 量化策略库 / 本地行情 / 回测的建表 DDL（见 schema_strategy_lib.sql）。
+# 放独立文件的原因：init_db 的 ddl 用 split(";") 拆语句，长段 DDL 塞进
+# 几千行的主字符串里很难维护。**注释必须逐行以 -- 开头**（用 # 会让 init_db
+# 报 syntax error at or near "#" —— 这个坑本仓库踩过三次）。
+# 位置必须在 init_db() 被调用之前：顶部的常量区最稳，不依赖任何调用顺序。
+try:
+    STRATEGY_LIB_DDL = (Path(__file__).resolve().parent
+                        / "schema_strategy_lib.sql").read_text(encoding="utf-8")
+except Exception as _exc:
+    STRATEGY_LIB_DDL = ''
+    print(f"[schema] 策略库 DDL 读取失败，相关功能不可用: {_exc}", flush=True)
 
 CONFIG_FILE = BASE_DIR / "config.yaml"
 

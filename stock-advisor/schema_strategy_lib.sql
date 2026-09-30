@@ -1,0 +1,221 @@
+-- 量化策略库：原始文章（聚宽社区等）落库 + 防重复爬取
+-- 设计要点（2026-09-30）：
+--   1) 「防重复爬取」靠 **url_hash 唯一键**，不是靠「先查再插」——
+--      那是竞态（两个进程同时插会都成功）。唯一键让重复插入直接失败。
+--   2) **content_md 与 content_text 分离**：原文 markdown 存一份（保真），
+--      剥掉 HTML/图片/裸 URL 后的纯文本另存一份，专供 LLM 抽取用。
+--      直接把带 `![](https://...)` 的原文喂 LLM 是浪费 token 也污染输出。
+--   3) **crawl_state 与 fetch_time 解耦**：状态机用枚举字符串（人可读、
+--      便于 SQL 里筛「卡在哪一步」），时间戳单独存（用于算退避间隔）。
+--   4) 每篇文章的原文与抽取结果**分表存**（sa_strategy_article / sa_strategy_digest），
+--      这样重新抽取不会动原文，重爬原文也不会丢抽取结果。
+
+CREATE TABLE IF NOT EXISTS sa_crawl_queue (
+    -- ---------------- 防重复爬取的核心 ----------------
+    -- URL 规范化后的 sha1。同一个 URL 无论从列表页、搜索还是推荐哪条路来，
+    -- 撞到同一个 hash 就不会再爬第二遍。
+    url_hash      CHAR(40) PRIMARY KEY,
+    url           TEXT        NOT NULL,
+    site          VARCHAR(32) NOT NULL DEFAULT '',
+    -- 列表页给的排序依据（热度/最新），用来挑「先爬哪个」
+    rank_hint     INTEGER     NOT NULL DEFAULT 0,
+    title_hint    VARCHAR(255) NOT NULL DEFAULT '',
+    -- pending / fetching / fetched / failed / skipped
+    crawl_state   VARCHAR(16) NOT NULL DEFAULT 'pending',
+    fetch_time    TIMESTAMPTZ,           -- 最近一次尝试（成功或失败都记）
+    next_retry_at TIMESTAMPTZ,           -- 退避：失败后多久再试
+    retry_count   INTEGER     NOT NULL DEFAULT 0,
+    last_error    TEXT        NOT NULL DEFAULT '',
+    note          TEXT        NOT NULL DEFAULT '',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sa_crawl_state
+    ON sa_crawl_queue (crawl_state, rank_hint DESC);
+CREATE INDEX IF NOT EXISTS idx_sa_crawl_next
+    ON sa_crawl_queue (crawl_state, next_retry_at);
+-- 同一篇文章可能被多个入口发现（列表页 + 详情页相关推荐）。
+-- 这个索引用于「这条我已经见过了」的快速判断。
+CREATE INDEX IF NOT EXISTS idx_sa_crawl_url ON sa_crawl_queue (url);
+
+CREATE TABLE IF NOT EXISTS sa_strategy_article (
+    post_id       VARCHAR(64) PRIMARY KEY,   -- 站点内的稳定 ID
+    site          VARCHAR(32) NOT NULL DEFAULT 'joinquant',
+    url_hash      CHAR(40) NOT NULL REFERENCES sa_crawl_queue(url_hash) ON DELETE CASCADE,
+    url           TEXT        NOT NULL,
+
+    title         VARCHAR(512) NOT NULL DEFAULT '',
+    author        VARCHAR(128) NOT NULL DEFAULT '',
+    author_id     VARCHAR(64)  NOT NULL DEFAULT '',
+
+    -- ---- 正文三件套 ----
+    -- 原文 markdown：保真存档，不动它
+    content_md    TEXT        NOT NULL DEFAULT '',
+    -- 剥掉 HTML/图片/裸 URL/代码块后的纯文本，**专供 LLM 抽取**
+    content_text  TEXT        NOT NULL DEFAULT '',
+    -- 纯文本的 sha1：判断「内容是否变了」。没变就不必重新抽取（省 LLM 调用）
+    content_hash  CHAR(40)    NOT NULL DEFAULT '',
+
+    tags          JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    -- ---- 站点自带的指标 ----
+    view_count    INTEGER     NOT NULL DEFAULT 0,
+    like_count    INTEGER     NOT NULL DEFAULT 0,
+    reply_count   INTEGER     NOT NULL DEFAULT 0,
+    collect_count INTEGER     NOT NULL DEFAULT 0,
+    clone_count   INTEGER     NOT NULL DEFAULT 0,   -- 被克隆次数 = 实用度代理指标
+    published_at  TIMESTAMPTZ,
+    updated_at_s  TIMESTAMPTZ,           -- 站点的最后修改时间
+    last_active_at TIMESTAMPTZ,          -- 最后有人回复的时间
+
+    is_strategy   BOOLEAN     NOT NULL DEFAULT FALSE,  -- 是否「策略类」文章
+    fetched_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- 文章可能被编辑过；变了就置 false 以便重新抽取
+    needs_reextract BOOLEAN   NOT NULL DEFAULT FALSE,
+    UNIQUE (site, post_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sa_article_hash ON sa_strategy_article (content_hash);
+CREATE INDEX IF NOT EXISTS idx_sa_article_strategy
+    ON sa_strategy_article (is_strategy, published_at DESC);
+
+-- ------------------------------------------------------------------
+-- LLM 抽取的结构化结果（与原文分表：重新抽取不丢原文，重爬原文不丢抽取）
+-- ------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS sa_strategy_digest (
+    article_id    VARCHAR(64) PRIMARY KEY
+                  REFERENCES sa_strategy_article(post_id) ON DELETE CASCADE,
+
+    -- ---- 一句话概括 ----
+    title_zh      VARCHAR(512) NOT NULL DEFAULT '',   -- LLM 归纳的策略名
+    summary       TEXT        NOT NULL DEFAULT '',   -- 2~4 句讲清它干什么
+    strategy_type VARCHAR(32)  NOT NULL DEFAULT '',   -- 多因子/择时/轮动/网格/打板…
+    -- ---- 实现步骤（LLM 拆出来的可执行步骤，按顺序）----
+    steps         JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    -- ---- 标的与参数 ----
+    universe      JSONB       NOT NULL DEFAULT '[]'::jsonb,  -- 选股范围/池子
+    params        JSONB       NOT NULL DEFAULT '{}'::jsonb,  -- 周期/阈值/权重/仓位
+    -- ---- 作者自述的运行效果（**关键：标注这是自述还是推断**）----
+    perf_claimed  JSONB       NOT NULL DEFAULT '{}'::jsonb,  -- 年化/回撤/胜率/夏普
+    perf_verified VARCHAR(16) NOT NULL DEFAULT '',  -- claimed / verified / none
+    backtest_period TEXT      NOT NULL DEFAULT '',  -- 回测区间
+    -- ---- 适用场景 ----
+    applicable    JSONB       NOT NULL DEFAULT '[]'::jsonb,  -- 适用市场/市况/资金体量
+    unsuitable    JSONB       NOT NULL DEFAULT '[]'::jsonb,  -- 明确不适用的场景
+    risk_notes    JSONB       NOT NULL DEFAULT '[]'::jsonb,  -- 风险与坑
+    dependencies  JSONB       NOT NULL DEFAULT '[]'::jsonb,  -- 依赖的数据/库/环境
+    -- ---- 可落地性评估（我们自己打的分，不是文章自述）----
+    -- 能不能搬进本系统的模拟盘：1~5
+    portable_score SMALLINT   NOT NULL DEFAULT 0,
+    portable_why  TEXT        NOT NULL DEFAULT '',
+    -- ---- 抽取过程的元信息（可追溯：哪次抽取、用的什么模型、多少 token）----
+    extract_model VARCHAR(128) NOT NULL DEFAULT '',
+    extract_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    extract_cost  JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    -- 抽取质量自评：有几个必填字段没抽到
+    completeness  SMALLINT    NOT NULL DEFAULT 0,
+    raw_response  TEXT        NOT NULL DEFAULT ''
+);
+
+-- ------------------------------------------------------------------
+-- 本地行情数据（供本地回测/验证用，2026-09-30）
+-- ------------------------------------------------------------------
+-- 为什么必须落库：一个 3 年回测、5 只标的、调 20 组参数 = 300 次取数，
+-- 直接打行情接口必被风控（东财 push2 我今天已被封过一次，6 个镜像主机全挂）。
+-- UNIQUE(code, trade_date) 同时解决「防重复拉取」：K 线只追加，
+-- 重复拉到同一天只是 ON CONFLICT 幂等覆盖，不会产生重复行。
+CREATE TABLE IF NOT EXISTS sa_market_kline (
+    code         VARCHAR(8)  NOT NULL,
+    trade_date   DATE        NOT NULL,
+    open         NUMERIC(14,4),
+    high         NUMERIC(14,4),
+    low          NUMERIC(14,4),
+    close        NUMERIC(14,4),
+    volume       NUMERIC(20,2),   -- 手
+    amount       NUMERIC(20,2),   -- 元；腾讯源没有，留 NULL 不填 0
+    pct          NUMERIC(8,4),    -- 当日涨跌幅 %
+    turnover_rate NUMERIC(8,4),   -- 换手率 %；腾讯源没有
+    source       VARCHAR(8) NOT NULL DEFAULT '',
+    fetched_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (code, trade_date)
+);
+CREATE INDEX IF NOT EXISTS idx_sa_kline_date ON sa_market_kline (trade_date);
+
+-- ------------------------------------------------------------------
+-- 策略定义（从文章抽出来的，或自己写的）
+-- ------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS sa_strategy_def (
+    id             BIGSERIAL PRIMARY KEY,
+    name           VARCHAR(160) NOT NULL,
+    strategy_type  VARCHAR(32)  NOT NULL DEFAULT '',  -- 多因子/择时/轮动/网格/打板…
+    -- 来源（可空：自己写的不挂在任何文章上）
+    article_id     VARCHAR(64) REFERENCES sa_strategy_article(post_id) ON DELETE SET NULL,
+    -- 可执行形态：'rules'（规则化，能进模拟盘/策略对照）
+    --           'backtest'（回测脚本，需 backtest.py 支持）
+    --           'idea'（只有思路，暂不可跑）
+    runnable       VARCHAR(16)  NOT NULL DEFAULT 'idea',
+    -- 规则化策略的参数（直接可映射到 sa_strategies 的 6 种 kind）
+    params         JSONB        NOT NULL DEFAULT '{}'::jsonb,
+    universe       JSONB        NOT NULL DEFAULT '[]'::jsonb,
+    -- 回测脚本（Python，runnable='backtest' 时用）
+    code           TEXT         NOT NULL DEFAULT '',
+    -- 我们自己打的分：能否搬进本系统模拟盘 1~5
+    portable_score SMALLINT     NOT NULL DEFAULT 0,
+    note           TEXT         NOT NULL DEFAULT '',
+    enabled        BOOLEAN      NOT NULL DEFAULT FALSE,
+    created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sa_sd_type ON sa_strategy_def (strategy_type, enabled);
+
+-- ------------------------------------------------------------------
+-- 回测运行 + 逐日净值（「验证图」的数据源）
+-- ------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS sa_backtest_run (
+    id           BIGSERIAL PRIMARY KEY,
+    strategy_id  BIGINT REFERENCES sa_strategy_def(id) ON DELETE CASCADE,
+    name         VARCHAR(160) NOT NULL DEFAULT '',
+    -- 回测口径（记清楚，否则结果没法比）
+    start_date   DATE NOT NULL,
+    end_date     DATE NOT NULL,
+    universe     JSONB NOT NULL DEFAULT '[]'::jsonb,
+    params       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    init_cash    NUMERIC(14,2) NOT NULL DEFAULT 1000000,
+    -- 汇总指标
+    total_return NUMERIC(12,4),   -- 区间总收益 %
+    annual_return NUMERIC(12,4),  -- 年化 %
+    max_drawdown NUMERIC(12,4),   -- 最大回撤 %（正数表示回撤幅度）
+    sharpe       NUMERIC(8,4),
+    win_rate     NUMERIC(8,4),    -- 胜率 %
+    trade_count  INTEGER,
+    turnover     NUMERIC(12,4),   -- 换手率
+    benchmark    VARCHAR(16) NOT NULL DEFAULT '',  -- 基准代码
+    bench_return NUMERIC(12,4),   -- 同期基准收益 %
+    excess       NUMERIC(12,4),   -- 超额 = annual_return - bench_return
+    error        TEXT NOT NULL DEFAULT '',
+    elapsed_ms   INTEGER NOT NULL DEFAULT 0,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sa_bt_strategy ON sa_backtest_run (strategy_id, created_at DESC);
+
+-- 逐日净值/回撤/持仓 —— 前端的「验证图」直接画这个，不从文章爬图
+CREATE TABLE IF NOT EXISTS sa_backtest_daily (
+    run_id     BIGINT NOT NULL REFERENCES sa_backtest_run(id) ON DELETE CASCADE,
+    trade_date DATE NOT NULL,
+    equity     NUMERIC(16,4) NOT NULL,   -- 总资产
+    cash       NUMERIC(16,4) NOT NULL,   -- 现金
+    position_value NUMERIC(16,4) NOT NULL,
+    drawdown   NUMERIC(8,4) NOT NULL DEFAULT 0,   -- 当前回撤 %
+    holdings   JSONB NOT NULL DEFAULT '[]'::jsonb,
+    PRIMARY KEY (run_id, trade_date)
+);
+
+-- 抓取与抽取的日志，便于排查「为什么这篇没被处理」
+CREATE TABLE IF NOT EXISTS sa_crawl_log (
+    id         BIGSERIAL PRIMARY KEY,
+    url_hash   CHAR(40) NOT NULL,
+    level      VARCHAR(8) NOT NULL DEFAULT 'info',  -- info/warn/error
+    stage      VARCHAR(32) NOT NULL DEFAULT '',     -- list/detail/extract/recursion
+    message    TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sa_crawl_log_hash
+    ON sa_crawl_log (url_hash, created_at DESC);
