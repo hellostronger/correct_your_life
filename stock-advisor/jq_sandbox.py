@@ -99,8 +99,65 @@ class SandboxError(Exception):
 # ① 切数据
 # ==========================================================================
 
+# 一次最多切多少只标的。
+#
+# 原来写死 400，理由是「真用到几百只的多半是宽基轮动，那种用指数 ETF 代替」。
+# 但**微盘/小市值类策略是反例**：它的逻辑就是「取全市场、按市值排序、买最小的
+# N 只」，所以它需要的是**全市场**而不是被截断的截面。截断发生在策略自己的
+# 选股之前，顺序反了 —— 给它 400 只，它就变成「在 400 只里买最小的 400 只」，
+# 等于全买，没有选股。
+#
+# 真正的天花板不是磁盘也不是 tmpfs（数据是只读 bind mount 进去的，fsize 和
+# tmpfs 都管不到它），而是容器的 `--memory`。而超限的表现是**被 OOM killer
+# 直接杀掉**，连 traceback 都没有，看起来跟超时一模一样。
+# 所以上限用实测标定：runner 现在会在结果里报 peak_rss_mb，
+# 拿它反推这里该写多少。默认保守，需要时用 JQ_MAX_CODES 覆盖。
+MAX_UNIVERSE = int(os.environ.get("JQ_MAX_CODES", "400"))
+
+
+# 实测标定出来的常数（scripts/calibrate_universe.py 可复现，真的会启动容器）：
+#    400 只 -> 切片  9.9 MB / 峰值 RSS 153.3 MB / 策略总收益 +16.95%
+#    800 只 -> 切片 19.4 MB / 峰值 RSS 263.7 MB / 策略总收益 +87.72%
+#   1600 只 -> 切片 38.8 MB / 峰值 RSS 424.0 MB / 策略总收益 +128.57%
+# 三点最小二乘：峰值MB ≈ 63.0 + 0.2257 * 只数（略亚线性，因为索引/字典有共享）
+# 切片每只约 24.8 KB（1600 只 × 650 天实测 38.8MB）。
+#
+# 为什么必须实测：超内存的表现是**被 OOM killer 直接杀掉** —— 没有 traceback、
+# stdout 全空，从外面看和「超时」一模一样。不测就只能靠猜，而猜错的代价是
+# 「以为策略跑不动，其实是内存不够」。
+RSS_FIXED_MB = 63.0
+RSS_PER_CODE_MB = 0.2257
+SLICE_KB_PER_CODE = 24.8
+
+# 512MB 上限下实测能跑通 1600 只（424MB），留一点余量取 1200 作默认：
+# 默认路径不该有 OOM 风险，真要更大截面用 JQ_MAX_CODES 显式覆盖并同时调 memory。
+# 想跑全市场（5284 只）需要约 63 + 5284*0.2257 = 1256MB，容器 memory 得给到
+# 1600m 以上 —— 101 只有 3.7G 内存且还跑着 9 个容器，给不起。
+MAX_UNIVERSE = int(os.environ.get("JQ_MAX_CODES", "1200"))
+
+
+def estimate_universe(n_codes: int, days: int = 650) -> dict:
+    """估算 n_codes 只标的的切片体积和沙箱峰值内存。
+
+    返回 fits=False 时**不要直接拒绝** —— 只在体检/端点里提示，让用户自己
+    决定要不要调 JQ_MAX_CODES 或加内存。硬拒绝会挡住那些「就是要试试」的用法。
+    """
+    n = max(int(n_codes), 1)
+    cap_mb = int(str(SANDBOX_DEFAULTS.get("memory", "512m")).rstrip("m").rstrip("M"))
+    rss = RSS_FIXED_MB + RSS_PER_CODE_MB * n
+    return {
+        "codes": n, "days": days,
+        "slice_mb": round(n * SLICE_KB_PER_CODE * days / 650.0 / 1024.0, 1),
+        "est_peak_rss_mb": round(rss, 1),        "memory_cap_mb": cap_mb,
+        # 留 20% 余量：OOM 边界附近会因为碎片/峰值波动被杀，宁可早点说不行
+        "fits": rss <= cap_mb * 0.8,
+        "headroom_mb": round(cap_mb * 0.8 - rss, 1),
+    }
+
+
 def build_slice_csv(get_conn, codes: list, start: str, end: str,
-                    out_path: Path, benchmark: str = "") -> dict:
+                    out_path: Path, benchmark: str = "",
+                    max_codes: int = None) -> dict:
     """从云库切一段日线写成宽表 CSV（列名 `code.field`，runner 靠它 pivot 回去）。
 
     只切策略**声明要用的**那些票 —— 沙箱里没有数据库，给多少传多少。
@@ -111,11 +168,13 @@ def build_slice_csv(get_conn, codes: list, start: str, end: str,
         codes.append(benchmark)
     if not codes:
         raise SandboxError("没有要回测的标的（codes 为空）")
-    if len(codes) > 400:
+    cap = int(max_codes or MAX_UNIVERSE)
+    if len(codes) > cap:
         raise SandboxError(
-            "一次最多切 400 只（当前 %d）—— 数据切片会太大，"
-            "而且真用到几百只的多半是宽基轮动，那种应该用指数 ETF 代替"
-            % len(codes))
+            "一次最多切 %d 只（当前 %d）—— 容器内存上限 %s，超了会被 OOM killer "
+            "直接杀掉（表现为无输出/超时，看不出是内存爆了）。"
+            "真需要更大截面就调 JQ_MAX_CODES，但先看 runner 报的 peak_rss_mb"
+            % (cap, len(codes), SANDBOX_DEFAULTS.get("memory")))
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """SELECT code, trade_date, open, high, low, close, volume

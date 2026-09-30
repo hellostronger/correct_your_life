@@ -85,6 +85,15 @@ def fetch_em_valuation(code: str, start: str, end: str,
                                                    "Referer": "https://data.eastmoney.com/"})
         with urllib.request.urlopen(req, timeout=20) as r:
             d = json.loads(r.read().decode("utf-8", "replace"))
+        # **必须先看 success**：东财对「字段名写错」这类错误是 HTTP 200 +
+        # success=false + result=null（实测 code=9501 返回字段不存在），
+        # 不是 HTTP 错误。所以如果只判 `res.get("data")`，接口报错会被
+        # 当成「这只票这段时间没有估值数据」静默跳过 —— 缺口看起来像正常，
+        # 等到策略报「需要估值数据」时已经晚了一整轮灌库。
+        if not d.get("success", True):
+            raise RuntimeError("东财估值接口报错 code=%s: %s（URL: %s）"
+                               % (d.get("code"), str(d.get("message"))[:150],
+                                  url))
         res = (d.get("result") or {})
         rows = res.get("data") or []
         if not rows:

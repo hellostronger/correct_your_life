@@ -83,8 +83,33 @@ def _load_valuation(path: str) -> dict:
     return _load_wide(path, fill=False)
 
 
+def _peak_rss_mb() -> float:
+    """本次运行的峰值常驻内存（MB），读 /proc/self/status 的 VmHWM。
+
+    为什么要报这个：容器有 `--memory=512m` 硬上限，而**超限的表现是
+    被 OOM killer 杀掉，进程直接消失，连 traceback 都没有** ——
+    表现就是「沙箱超时/无输出」，跟真正的超时一模一样，看不出是内存爆了。
+
+    有了这个数，「跑了多少只标的用多少内存」就成了可测量的：
+    可以拿它反推 512MB 能撑多大的截面，而不用一次次试错。
+    """
+    try:
+        with open("/proc/self/status", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmHWM:"):
+                    return round(int(line.split()[1]) / 1024.0, 1)
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0.0
+
+
 def _emit(payload: dict):
-    """把结果作为最后一行输出。ensure_ascii=False 让中文可读。"""
+    """把结果作为最后一行输出。ensure_ascii=False 让中文可读。
+
+    自动带上耗时和峰值内存，这样每次运行都自带资源画像，
+    不用另外去查。
+    """
+    payload.setdefault("peak_rss_mb", _peak_rss_mb())
     sys.stdout.write("\n" + RESULT_TAG
                      + json.dumps(payload, ensure_ascii=False,
                                   default=str) + "\n")
