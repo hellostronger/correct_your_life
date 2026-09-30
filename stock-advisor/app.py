@@ -3266,6 +3266,7 @@ import paper_goal
 _paper_strategy_state: dict = {
     "running": False, "last_run": None, "last_trigger": None,
     "last_count": 0, "last_hits": [], "last_error": None, "elapsed_s": None,
+    "next_due": None, "current_interval": None,
 }
 
 
@@ -3846,28 +3847,55 @@ def paper_status():
 def _paper_strategy_loop():
     """策略对照扫描守护线程（独立于交易循环，2026-09-30）。
 
-    为什么不能挂在交易轮次里：见文件里那段说明的四点。核心是**策略探索不该
-    依赖 LLM 的可用性**，也不该被「用户关掉模拟交易」或「现在不是交易时段」
-    这些与探索无关的条件挡住。
+    为什么不能挂在交易轮次里：见下面那四点。核心是**策略探索不该依赖 LLM
+    的可用性**，也不该被「用户关掉模拟交易」或「现在不是交易时段」这些与探索
+    无关的条件挡住。
 
-    开销：每轮一次批量行情（腾讯，不封 IP）+ 一次远程库往返，实测约 6 秒。
-    价格不变时完全幂等 —— 已触发的绑定被 triggered_at 排除，peak 也不会重复抬。
+    频率是前端可配的（配置 → 模拟交易 → 策略扫描间隔），所以这里用短轮询
+    盯「下次该扫的时间点」而不是直接 sleep 整个间隔 —— 否则把 30 分钟改成
+    5 分钟要干等完原来那 30 分钟才生效，等于配了没用。
     """
     # 启动先扫一轮，不要让用户重启后干等一个间隔
     _paper_strategy_scan("startup")
+    # 上一次读到的好配置。config.yaml 是整文件读写，PUT 保存的瞬间可能读到
+    # 半截而让 _conf_section 返回 {}；那时若直接取默认值，会把间隔悄悄改回
+    # 30 分钟，用户以为自己设了 5 分钟。
+    last = {"enabled": True, "iv": 30}
+    next_due = time.time() + last["iv"] * 60
     while True:
         try:
-            conf = _conf_section("paper") or {}
-            sc = conf.get("strategy") or {}
-            if not sc.get("scan_enabled", True):
-                time.sleep(600)
-                continue
-            iv = max(1, int(sc.get("scan_interval_minutes", 30) or 30))
-            time.sleep(iv * 60)
-            _paper_strategy_scan("timer")
+            sc = (_conf_section("paper") or {}).get("strategy")
+            if isinstance(sc, dict) and sc:
+                enabled = bool(sc.get("scan_enabled", True))
+                iv = max(1, int(sc.get("scan_interval_minutes", 30) or 30))
+                if enabled != last["enabled"] or iv != last["iv"]:
+                    # 配置变了。调短间隔要把 due 提前（min 自然做到：
+                    # 调长时 min 会保留原来更早的 due，不会推迟已排好的那次）；
+                    # 从关到开则立刻扫一轮，不用等。
+                    if enabled and not last["enabled"]:
+                        next_due = time.time()
+                    elif iv != last["iv"]:
+                        next_due = min(next_due, time.time() + iv * 60)
+                    print(f"[paper_strategy] 调度变更: "
+                          f"{'开启' if enabled else '关闭'}, 间隔 {last['iv']} -> {iv} 分钟",
+                          flush=True)
+                last = {"enabled": enabled, "iv": iv}
+            now = time.time()
+            if last["enabled"] and now >= next_due:
+                _paper_strategy_scan("timer")
+                next_due = time.time() + last["iv"] * 60
+            elif not last["enabled"]:
+                next_due = now + 60
+            _paper_strategy_state["current_interval"] = last["iv"]
+            _paper_strategy_state["scan_enabled"] = last["enabled"]
+            _paper_strategy_state["next_due"] = (
+                datetime.fromtimestamp(next_due).isoformat(timespec="seconds")
+                if last["enabled"] else None)
+            time.sleep(min(15, max(1.0, next_due - time.time())))
         except Exception as exc:
             print(f"[paper_strategy] loop error: {exc}", flush=True)
-            time.sleep(300)
+            time.sleep(30)
+
 
 
 def _paper_strategy_scan(trigger: str, quiet: bool = False) -> dict:

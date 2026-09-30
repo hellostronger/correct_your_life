@@ -1323,6 +1323,23 @@
                  oninput="renderPaperStrategyCompare()">
           <button class="btn" onclick="scanPaperStrategies()">立即扫描一次</button>
           <button class="btn" onclick="loadPaperStrategyCompare()">刷新</button>
+          <span style="display:inline-flex;align-items:center;gap:4px;font-size:12px">
+            <label class="muted" for="paper-strat-iv">扫描频率</label>
+            <select id="paper-strat-iv" style="padding:3px 6px;font-size:12px"
+                    onchange="savePaperStratScan()">
+              <option value="5">每 5 分钟</option>
+              <option value="10">每 10 分钟</option>
+              <option value="15">每 15 分钟</option>
+              <option value="30">每 30 分钟</option>
+              <option value="60">每 1 小时</option>
+              <option value="120">每 2 小时</option>
+              <option value="240">每 4 小时</option>
+            </select>
+            <label class="muted" title="关掉后只在手动点「立即扫描一次」时跑">
+              <input type="checkbox" id="paper-strat-on"
+                     onchange="savePaperStratScan()"> 启用定时
+            </label>
+          </span>
           <span id="paper-strat-hint" class="muted" style="font-size:12px"></span>
         </div>
         <div id="paper-strat-sched" class="muted" style="font-size:12px;margin-bottom:6px"></div>
@@ -3293,12 +3310,25 @@ function paperStatusBadge(t) {
     if (!box) return;
     const rt = d.runtime || {};
     const sch = d.schedule || {};
-    const on = sch.scan_enabled !== false;
+    const on = rt.scan_enabled !== false && sch.scan_enabled !== false;
+    // 把当前生效值回填到控件（配置页改的也能对上）
+    const ivSel = $('paper-strat-iv');
+    const iv = rt.current_interval || sch.scan_interval_minutes || 30;
+    if (ivSel && ![...ivSel.options].some(o => o.value === String(iv))) {
+      // 配置里是 schema 允许但下拉里没有的值（比如 45），补一个免得显示成 30
+      const o = document.createElement('option');
+      o.value = String(iv);
+      o.textContent = '每 ' + iv + ' 分钟（自定义）';
+      ivSel.appendChild(o);
+    }
+    if (ivSel) ivSel.value = String(iv);
+    const onBox = $('paper-strat-on');
+    if (onBox) onBox.checked = on;
+
     let s = on
-      ? '⏱ 定时扫描：<b>每 ' + (sch.scan_interval_minutes || 30) + ' 分钟</b>一轮'
-        + '，服务启动时立刻先扫一轮。独立线程，<b>不依赖</b> paper.enabled /'
-        + ' 交易时段 / LLM。'
-      : '⏸ <b>定时扫描已关闭</b>（只在手动点「立即扫描一次」时跑）。';
+      ? '⏱ 定时扫描：<b>每 ' + iv + ' 分钟</b>一轮，独立线程'
+        + '<b>不依赖</b> paper.enabled / 交易时段 / LLM；服务启动时立刻先扫一轮。'
+      : '⏸ <b>定时扫描已关闭</b>，只在手动点「立即扫描一次」时跑。';
     if (rt.last_run) {
       s += '<br>上次扫描 ' + esc(rt.last_run)
         + '（' + esc(rt.last_trigger || '?') + '，耗时 '
@@ -3307,13 +3337,42 @@ function paperStatusBadge(t) {
     } else {
       s += '<br><span style="color:#b54708">还没有扫描记录</span>';
     }
-    if (rt.last_count) {
-      s += '，触发 <b>' + rt.last_count + '</b> 次影子卖出';
-    }
+    if (rt.next_due && on) s += '，下次 ' + esc(rt.next_due.replace('T', ' ').slice(5));
+    if (rt.last_count) s += '，触发 <b>' + rt.last_count + '</b> 次影子卖出';
     if (rt.last_error) {
       s += '<br><span style="color:#b42318">上次失败：' + esc(rt.last_error) + '</span>';
     }
+    s += ' <span class="muted">（改频率后最多 15 秒生效）</span>';
     box.innerHTML = s;
+  }
+
+  // 频率就地改。**契约必须是 {values: {paper: {"strategy.xxx": 值}}}** ——
+  // 扁平点号键、且包在 values 里。写成嵌套 {"paper":{strategy:{...}}} 会被
+  // Pydantic 丢弃成空 body，服务端返回 ok:true 但什么都没写（我踩过）。
+  async function savePaperStratScan() {
+    const iv = parseInt((($('paper-strat-iv') || {}).value || '30'), 10) || 30;
+    const on = !!($('paper-strat-on') || {}).checked;
+    const hint = $('paper-strat-hint');
+    const body = { values: { paper: {
+      'strategy.scan_interval_minutes': iv,
+      'strategy.scan_enabled': on,
+    } } };
+    try {
+      const r = await jsonPut('/api/config/all', body);
+      const wrote = (r && r.written) || [];
+      const skipped = (r && r.skipped) || [];
+      if (!wrote.length) {
+        // 什么都没写：值与现值相同（coerce 会 skip），或键名写错了
+        if (hint) hint.textContent = skipped.length
+          ? '值未变化（' + skipped.join('、') + '）'
+          : '⚠️ 没有键被写入，请检查键名';
+        return;
+      }
+      if (hint) hint.textContent = '已保存 ' + iv + ' 分钟，15 秒内生效…';
+      setTimeout(loadPaperStrategyCompare, 1600);
+    } catch (e) {
+      if (hint) hint.textContent = '保存失败：' + e.message;
+    }
   }
 
   // 与后端 paper_strategy.strategy_label 同一口径
