@@ -60,12 +60,14 @@ SYSTEM = """\
 5. 如果他问的是需要查系统数据的事（持仓、行情、报告），告诉他用指令而不是猜。
 
 可以识别的指令（其余当作闲聊）：
-  复盘 / 盘后       → 生成盘后复盘报告
-  简报 / 盘前       → 生成盘前简报
-  持仓              → 列出当前持仓与浮动盈亏
-  自选              → 列出自选股
-  情绪 / 日记 / 记一下 → 记录今天的心情（情绪洞察）
-  帮助 / ?          → 列出上面这些指令
+  持仓 / 自选 / 状态 / 帮助   → 立刻返回真实数据，不用你解释
+  复盘 / 盘后                → 生成盘后复盘（会先要一次确认）
+  简报 / 盘前                → 生成盘前简报（会先要一次确认）
+
+**还没做的，不要假装能做**：记录心情 / 日记 / 情绪洞察。如果他要求这个，
+直接说「记心情这个功能还在规划里，现在还没上线」，然后**别编**说已经记下了 ——
+他会以为真记了，隔几天回头找不到，比直接说没有糟糕得多。
+同理，也不要主动劝他去用「记一下」这类还不存在的指令。
 
 语气：平实、简短、像同事。不要 emoji 堆砌，不要过度热情。
 """
@@ -145,25 +147,16 @@ def recent(deps, limit: int = 30) -> list[dict]:
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
-# ---------------- 指令路由（为 C 预留） ----------------
-# 现在只回一句「功能在建」，不做实际动作 —— 但入口先留好，因为 C 落地时
-# 就挂在这里，而不是去改 wx_inbound 或 notifier。
-COMMANDS = {
-    "复盘": "盘后复盘", "盘后": "盘后复盘",
-    "简报": "盘前简报", "盘前": "盘前简报",
-    "持仓": "持仓", "自选": "自选",
-    "情绪": "情绪", "日记": "情绪", "记一下": "情绪",
-    "帮助": "帮助", "?": "帮助",
-}
-
-
+# ---------------- 指令路由 ----------------
+# 识别逻辑与别名表都在 wx_commands（单一真源）。这里只做转发 ——
+# 曾经两边各写一份别名表，结果 handle() 忽略了这里的归一化结果，导致「复盘」
+# 这个最自然的写法匹配不到规范名、回复变成"指令没接上"。别再拆开。
 def match_command(text: str) -> str | None:
-    """识别开头的指令词。刻意要求「短且贴近整条消息」——
-    否则"帮我看看复盘怎么做"这种问法会被误判成要执行复盘。"""
-    t = (text or "").strip()
-    if len(t) > 12:
+    try:
+        import wx_commands
+        return wx_commands.canonical(text)
+    except Exception:
         return None
-    return COMMANDS.get(t) or COMMANDS.get(t.lstrip("/").strip())
 
 
 # ---------------- 回复 ----------------
@@ -184,16 +177,23 @@ def _history(deps, user_id: str, turns: int) -> str:
 def build_reply(deps, user_id: str, text: str) -> str | None:
     """生成一条回复。返回 None 表示「不回」（静默）。
 
-    这是给 wx_inbound 用的 reply_fn 之外的同步版本，测试也直接调它。
+    顺序：**指令优先**。用户在微信里打「持仓」是要数据，不是要闲聊 ——
+    让 LLM 去"理解"这两个字既慢又贵，还可能答歪。
     """
     conf = load_chat_conf()
     if not conf.get("reply"):
         return None
     cmd = match_command(text)
     if cmd:
-        return (f"「{cmd}」指令还没接上（C 阶段做）。\n\n"
-                f"现在能做的：直接用文字跟我说就行，比如问我行情、问某只票的逻辑、"
-                f"或者让我帮你想事情。\n\n发送「帮助」随时能看当前支持什么。")
+        try:
+            import wx_commands
+            out = wx_commands.handle({**deps, "cmd_uid": user_id}, user_id, text)
+        except Exception as exc:
+            print(f"[wx-chat] 指令执行失败: {type(exc).__name__}: {exc}", flush=True)
+            return "（这个指令我执行出错了，稍后再试）"
+        if out:
+            return out
+        return "（指令没接上，说人话也行）"
     try:
         import llm_advisor
     except Exception:

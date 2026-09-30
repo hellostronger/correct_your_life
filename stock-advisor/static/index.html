@@ -1175,6 +1175,7 @@
         在微信里给 bot 发消息，服务会读到并用 Claude 回你。入站是 35 秒长轮询，
         所以发完最多等半分钟。语音/图片暂不解析（只记录不回复）。
       </div>
+      <div id="wx-chat-cmds" class="row tight" style="margin-top:8px"></div>
       <div id="wx-chat-log" style="margin-top:8px;max-height:420px;overflow-y:auto"></div>
     </div>
     <div class="card">
@@ -5932,10 +5933,21 @@ async function refreshWxChat() {
     if (ch.last_reply) bits.push(`上次回话 ${ch.last_reply.ts}`);
     if (ib.last_error) bits.push('⚠️ ' + ib.last_error);
     if (ch.last_error) bits.push('⚠️ ' + ch.last_error);
+    if (d.commands && d.commands.runs) bits.push(`指令已执行 ${d.commands.runs} 次`);
+    if (d.commands && d.commands.last_error) bits.push('⚠️ 指令：' + d.commands.last_error);
     const st = $('wx-chat-status');
     if (st) st.textContent = bits.join(' · ');
     const btn = $('wx-chat-toggle');
     if (btn) { btn.textContent = ch.enabled === false ? '启用对话' : '停用对话'; }
+    const cmds = $('wx-chat-cmds');
+    if (cmds && d.supported) {
+      const COSTLY = ['盘前简报', '盘后复盘'];
+      cmds.innerHTML = '<span class="faint">微信里直接发：</span>' +
+        d.supported.map(c => `<span class="badge ${COSTLY.includes(c) ? 'b-warn' : 'b-info'}"
+           style="cursor:pointer" onclick="askWxChat('${esc(c)}')">${esc(c)}</span>`).join('') +
+        '<span class="faint" style="width:100%;margin-top:4px">' +
+        '橙色那两个会花钱，发起后 bot 会回一条确认码，再发一次才真执行</span>';
+    }
   } catch (e) { /* 页面还没加载完时忽略 */ }
   try {
     const h = await api('/api/notify/wx/chat?limit=20');
@@ -5954,8 +5966,9 @@ async function refreshWxChat() {
   } catch (e) { /* 忽略 */ }
 }
 
-async function askWxChat() {
+async function askWxChat(preset) {
   const inp = $('wx-chat-input');
+  if (preset) inp.value = preset;
   const text = inp.value.trim();
   if (!text) { toast('说点什么'); return; }
   inp.value = '';

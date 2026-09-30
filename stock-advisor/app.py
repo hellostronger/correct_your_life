@@ -47,6 +47,7 @@ import ilink_client
 import notify_events
 import wechat_mp
 import wx_chat
+import wx_commands
 import wx_inbound
 import x_monitor
 
@@ -4094,10 +4095,11 @@ def _precheck_verdict(m: dict, scan: dict, all_mkt: bool,
                 % (est["codes"], est["est_peak_rss_mb"], est["memory_cap_mb"],
                    -est["headroom_mb"]))
     if est and all_mkt:
-        return ("可以跑，但注意：这是需要全市场的策略，而沙箱最多只能给它 "
+        return ("可以跑，但注意：这是需要全市场的策略，而沙箱只能给它 "
                 "%d 只（容器内存所限）。截断发生在策略自己的选股之前，"
-                "所以它的收益数字**不代表真实表现** —— 实测同一个策略 400 只 "
-                "是 +16.95%%、800 只是 +87.72%%。要看真实表现只能提高内存上限。"
+                "所以它的收益数字**不代表真实表现** —— 实测同一个策略："
+                "400 只 +16.95%%、800 只 +87.72%%、1600 只 +128.57%%，"
+                "截面一变结果就大变。要看真实表现只能提高内存上限。"
                 % est["codes"])
     return "可以跑。"
 
@@ -5611,15 +5613,22 @@ def notify_wx_unbind():
 # ---------------- 微信入站 / 对话（wx_inbound.py 收，wx_chat.py 回） ----------------
 
 def _wx_deps() -> dict:
-    """给 wx_inbound / wx_chat 注入依赖（它们不 import app，避免循环依赖）。"""
-    return {"get_conn": get_conn}
+    """给 wx_inbound / wx_chat / wx_commands 注入依赖（它们不 import app，避免循环依赖）。
+
+    `app` 指向本模块自身：wx_commands 要复用 _holdings_with_pnl / fetch_quotes /
+    daily_reports 这些函数。这些都是**已存在的成熟函数**，重写一份只会让两边
+    算出不同的数字 —— 微信里看到的持仓必须和「我的持仓」页完全一致。
+    """
+    import sys
+    return {"get_conn": get_conn, "app": sys.modules[__name__]}
 
 
 @app.get("/api/notify/wx/inbound")
 def notify_wx_inbound_status():
     """入站轮询状态：有没有在跑、最近收到什么、上次回什么。"""
     return {"inbound": wx_inbound.get_status(), "chat": wx_chat.get_status(),
-            "commands": sorted(set(wx_chat.COMMANDS.values()))}
+            "commands": wx_commands.get_status(),
+            "supported": sorted(set(wx_commands.ALIASES.values()))}
 
 
 @app.get("/api/notify/wx/chat")
