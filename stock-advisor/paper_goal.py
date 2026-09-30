@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS sa_paper_goals (
     start_date        DATE          NOT NULL,
     end_date          DATE          NOT NULL,
     -- 建目标那一刻的实时总资产。**必须存快照**而不是回查 sa_paper_equity：
-    # reset_account 会 DELETE 掉 equity 表，回查就找不到起点了
+    -- reset_account 会 DELETE 掉 equity 表，回查就找不到起点了
     base_value        NUMERIC(14,2) NOT NULL,
     mode              VARCHAR(10)   NOT NULL DEFAULT 'observe'
                       CHECK (mode IN ('observe', 'constrain')),
