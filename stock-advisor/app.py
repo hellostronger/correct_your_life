@@ -43,7 +43,13 @@ from pydantic import BaseModel, Field
 import conf_util
 import config_schema
 import crypto_watch
+import holiday_calendar
 import ilink_client
+import ipo_calendar
+import ipo_llm
+import ipo_market
+import ipo_strategy
+import macro_rates
 import notify_events
 import wechat_mp
 import wx_chat
@@ -1083,8 +1089,13 @@ VOL_PUSH_MAX_PER_DAY = 4        # 每日最多推送条数
 
 
 def _a_share_session(now: datetime) -> bool:
-    """A股交易时段（9:15–11:35 / 12:55–15:05，工作日）。"""
-    if now.weekday() >= 5:
+    """A股交易时段（9:15–11:35 / 12:55–15:05，交易日）。
+
+    交易日来自 holiday_calendar（国务院放假公告 + 交易所日历交叉校验），
+    不再是「周一~周五」—— 法定长假期间行情源返回的是上一交易日数据，
+    当交易日跑会用陈旧价判止盈。
+    """
+    if not holiday_calendar.is_trading(now.date()):
         return False
     hm = (now.hour, now.minute)
     return (9, 15) <= hm <= (11, 35) or (12, 55) <= hm <= (15, 5)
@@ -1871,7 +1882,7 @@ def _trading_days_between(start: str, end: datetime) -> int:
     days, d = 0, d0
     while d < end.date():
         d = d.fromordinal(d.toordinal() + 1)
-        if d.weekday() < 5:  # 周末不计（节假日从简）
+        if holiday_calendar.is_trading(d):
             days += 1
     return days
 
@@ -2111,7 +2122,7 @@ def _strategy_loop():
     while True:
         try:
             now = datetime.now()
-            is_weekday = now.weekday() < 5
+            is_weekday = holiday_calendar.is_trading(now.date())
             in_session = is_weekday and (
                 now.hour > 9 or (now.hour == 9 and now.minute >= 15)
             ) and (now.hour < 15 or (now.hour == 15 and now.minute <= 5))
@@ -2171,7 +2182,7 @@ def _trading_days_until(end_date: str) -> int:
     days, d = 0, today
     while d < d1:
         d = d.fromordinal(d.toordinal() + 1)
-        if d.weekday() < 5:
+        if holiday_calendar.is_trading(d):
             days += 1
     return days
 
@@ -2570,7 +2581,7 @@ def _withdrawal_loop():
             now = datetime.now()
             ch, cm = _sched_time("withdrawal", "check_time")
             if (_conf_enabled("withdrawal", True)
-                    and now.weekday() < 5
+                    and holiday_calendar.is_trading(now.date())
                     and (now.hour, now.minute) >= (ch, cm)):
                 check_withdrawal_once(auto_ai=True)
             time.sleep(1800)
@@ -2860,6 +2871,247 @@ def calendar_upcoming(months: int = 3):
         return {"events": econ_calendar.upcoming_events(conn, months=months)}
 
 
+@app.get("/api/macro/rates")
+def macro_rates_view(days: int = 60):
+    """中美国债收益率（页面画曲线 + 显示日变动）。
+
+    一定带 stat_date 返回：美债按**美国交易日**更新，A 股早上打开时往往是
+    前天的值，当成「今日」读会得出错误的结论。
+    """
+    with get_conn() as conn:
+        return macro_rates.snapshot(conn, compare=1) if days >= 0 else \
+            macro_rates.snapshot(conn, compare=abs(days))
+
+
+@app.get("/api/macro/digest")
+def macro_digest():
+    """给报告用的 markdown 摘要（LLM 引用时带数据日）。"""
+    with get_conn() as conn:
+        return {"markdown": macro_rates.digest(conn)}
+
+
+@app.post("/api/macro/rates/sync")
+def macro_rates_sync(days: int = 400):
+    """手动同步收益率（每天一次足够；页面「刷新」用）。"""
+    try:
+        with get_conn() as conn:
+            return {"ok": True, **macro_rates.sync(conn, days=days)}
+    except Exception as exc:
+        raise HTTPException(502, f"{type(exc).__name__}: {str(exc)[:200]}")
+
+
+def _ipo_strategy_deps() -> dict:
+    """打新策略需要的实时数据：持仓（算各市场市值）+ 自选股（筛底仓候选）。"""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT code, name, shares, avg_cost FROM sa_holdings")
+        raw = cur.fetchall()
+    holdings = [{"code": r[0], "name": r[1], "shares": float(r[2] or 0),
+                 "avg_cost": float(r[3] or 0)} for r in raw]
+    # 行情用本模块既有的 fetch_quotes（app.py:752，腾讯 A股 + 新浪港股），
+    # 不要绕去 market_data —— 那是给 K 线用的，字段名不通用
+    quotes = fetch_quotes([h["code"] for h in holdings]) if holdings else {}
+    for h in holdings:
+        q = quotes.get(h["code"]) or {}
+        h["quote"] = {"price": q.get("price"), "change_pct": q.get("change_pct"),
+                      "name": q.get("name") or h.get("name")}
+    watchlist = list_watchlist()          # 自带行情，且已有 dividend_yield 字段
+    return {"holdings": holdings, "watchlist": watchlist,
+            "samples": ipo_calendar._load().get("items") or []}
+
+
+def _holdings_for_ipo() -> list[dict]:
+    """给打新额度算市值用的持仓（只取 code/shares/quote.price）。
+
+    额度基数来自 `ipo_quota.avg_market_cap`，它只用 `code` 和 `shares`
+    （现价市值只用于对比，不参与额度计算）。这里照样带 quote，
+    是为了让降级路径下 `ipo_strategy.current_market_cap` 仍可用。
+    """
+    try:
+        return _ipo_strategy_deps()["holdings"]
+    except Exception as exc:
+        print(f"[ipo] 取持仓失败（额度会算成 0 并标注降级）: {exc}", flush=True)
+        return []
+
+
+@app.get("/api/ipo/strategy")
+def ipo_strategy_view(days: int = 30, target_ratio: float = 1.0,
+                      use_llm: bool = True):
+    """打新策略：未来 N 天待申购新股的逐只决策 + 挪仓计划。
+
+    三层分工，界面上也分开显示：
+      · 数字（配号数/中签率/期望收益/涨幅基准）—— 全部来自实测统计，无硬编码
+      · 挪仓计划 —— 规则算
+      · 值不值得为它挪 / 风险点 —— LLM 判断（use_llm=false 可关）
+
+    只读，不改任何持仓 —— 真正下单仍由你手动决定。
+    """
+    deps = _ipo_strategy_deps()
+    with get_conn() as conn:
+        plans = ipo_strategy.strategy_for_upcoming(
+            holdings=deps["holdings"], watchlist=deps["watchlist"],
+            days=days, samples=deps["samples"], target_ratio=target_ratio,
+            conn=conn, use_llm=use_llm)
+        ctx = ipo_market.cached_context(conn, deps["samples"])
+    cap = ipo_strategy.current_market_cap(deps["holdings"])
+    return {"plans": plans, "days": days, "target_ratio": target_ratio,
+            "market_context": {
+                "median_gain": ((ctx.get("gain_stats") or {}).get("primary") or {}).get("median"),
+                "adjusted_gain": ctx.get("adjusted_gain"),
+                "adjusted_note": ctx.get("adjusted_note"),
+                "broke_rate": ((ctx.get("gain_stats") or {}).get("primary") or {}).get("broke_rate"),
+                "sample_n": ((ctx.get("gain_stats") or {}).get("primary") or {}).get("n"),
+                "sentiment": ctx.get("sentiment"),
+                "low_confidence": ctx.get("low_confidence"),
+                "source": "近期已上市新股实测统计 × 当期赚钱效应，无硬编码收益率",
+            },
+            "market_cap": {k: cap[k] for k in ("sh", "sz", "bj")},
+            "positions": cap["positions"],
+            "excluded": cap["excluded"],
+            "rules": {"lot_value": ipo_strategy.LOT_VALUE,
+                      "min_market_cap": ipo_strategy.MIN_MARKET_CAP,
+                      "note": "市值按 T-2 日定格；只认本市场市值；"
+                              "深市持仓不能用于打沪市新股"}}
+
+
+@app.get("/api/ipo/gain-model")
+def ipo_gain_model(board: str = ""):
+    """新股首日涨幅模型：用**已上市新股**的真实数据校准，含破发率与情绪折算。"""
+    samples = ipo_calendar._load().get("items") or []
+    with get_conn() as conn:
+        return {"model": ipo_market.market_context(conn, samples, board=board),
+                "digest": ipo_market.digest_for_llm(conn, samples, board=board),
+                "total_samples": len(samples)}
+
+
+@app.post("/api/ipo/base-pool")
+def ipo_base_pool(min_dividend_yield: float = 0.035, max_drawdown: float = 0.25):
+    """沪市底仓候选（高股息 + 低波动 + 上市满 1 年）。"""
+    wl = list_watchlist()
+    return {"candidates": ipo_strategy.base_pool_candidates(
+                wl, min_dividend_yield=min_dividend_yield,
+                max_drawdown=max_drawdown),
+            "filters": {"min_dividend_yield": min_dividend_yield,
+                        "max_drawdown": max_drawdown,
+                        "note": "只选沪市（60/601/603/605/688），"
+                                "深市与北交所不计入打新市值"}}
+
+
+@app.get("/api/ipo/quota")
+def ipo_quota_view(days: int = 45):
+    """打新额度现状 + 该提前多久补仓（2026-10-01 加）。
+
+    额度按交易所口径：**T-2 日前 20 个交易日日均市值 ÷ 5000**。
+    所以「提前几天提醒」不是拍脑袋的常数，而是按
+    「补到目标市值后，配号数涨到目标需要几个交易日」倒推出来的。
+    """
+    import ipo_quota
+    import ipo_quota_alert
+    holdings = _holdings_for_ipo()
+    avg = ipo_quota.avg_market_cap(holdings)
+    alerts = ipo_quota_alert.build_alerts(holdings=holdings, days=days,
+                                         notify=False)
+    return {
+        "avg_market_cap": avg,
+        "quota_by_market": {m: ipo_quota.quota_from_cap(avg, m)
+                            for m in ("sh", "sz", "bj")},
+        "alerts": alerts,
+        "should_notify_now": [a for a in alerts if a["should_notify"]],
+        "markdown": ipo_quota_alert.format_wx(
+            [a for a in alerts if a["should_notify"]]),
+        "rule": ("额度 = T-2 日前 20 个交易日日均市值 ÷ 5000，"
+                 "向下取整。只算非限售 A 股普通股市值"),
+    }
+
+
+@app.post("/api/ipo/quota/notify")
+def ipo_quota_notify(days: int = 45):
+    """立刻推一次打新额度提醒（手工触发用，不等守护线程）。"""
+    import ipo_quota_alert
+    alerts = ipo_quota_alert.build_alerts(
+        holdings=_holdings_for_ipo(), days=days, notify=True)
+    if not alerts:
+        return {"ok": True, "sent": 0,
+                "note": "当前没有到提醒时机的票（提前量未到，或该档位已提醒过）"}
+    _notifier_notify_safe(f"🎫 打新额度提醒（{len(alerts)} 只）",
+                          ipo_quota_alert.format_wx(alerts),
+                          event="ipo_quota")
+    return {"ok": True, "sent": len(alerts),
+            "codes": [a["code"] for a in alerts]}
+
+
+@app.get("/api/ipo/status")
+def ipo_status():
+    return ipo_calendar.status()
+
+
+@app.get("/api/ipo/upcoming")
+def ipo_upcoming(days: int = 30, market: str = ""):
+    return {"items": ipo_calendar.upcoming(days=days, market=market)}
+
+
+@app.get("/api/ipo/digest")
+def ipo_digest(days: int = 30):
+    return {"markdown": ipo_calendar.digest(days)}
+
+
+@app.post("/api/ipo/sync")
+def ipo_sync():
+    try:
+        return {"ok": True, **ipo_calendar.sync()}
+    except Exception as exc:
+        raise HTTPException(502, f"{type(exc).__name__}: {str(exc)[:200]}")
+
+
+@app.get("/api/holiday/status")
+def holiday_status():
+    """节假日/交易日历状态：覆盖年份、来源 URL、抽取方式(LLM/兜底)、与交易所对账。
+
+    页面用它显示「今天是否交易日 / 当前节日 / 下一个交易日」，也让
+    「日历到底从哪来的」随时可核验（source_url + fetched_at + used）。
+    """
+    return holiday_calendar.status()
+
+
+@app.get("/api/holiday/year/{year}")
+def holiday_year(year: int):
+    """某一年完整日历（假期区间 + 调休上班日 + 校验告警 + 对账结果）。"""
+    cal = holiday_calendar.calendar(year)
+    if not cal:
+        raise HTTPException(404, f"{year} 年日历尚未构建（通知通常每年 11 月上旬发布）")
+    return cal
+
+
+@app.post("/api/holiday/check-alert")
+def holiday_check_alert():
+    """手动触发休市/调休提醒检查（推送仍走事件矩阵开关）。"""
+    with get_conn() as conn:
+        try:
+            return {"alerts": holiday_calendar.check_holiday_alert(
+                notify_fn=_notifier_notify_safe)}
+        except Exception as exc:
+            raise HTTPException(502, f"{type(exc).__name__}: {str(exc)[:200]}")
+
+
+@app.post("/api/macro/check-alert")
+def macro_check_alert(threshold: float = 0.05):
+    """手动触发美债异动检查。"""
+    with get_conn() as conn:
+        return {"alerts": macro_rates.check_alert(
+            conn, notify_fn=_notifier_notify_safe, threshold=threshold)}
+
+
+@app.post("/api/holiday/refresh")
+def holiday_refresh(payload: dict | None = None):
+    """强制重建指定年份（默认今年+明年）。会真的抓公告 + 调 LLM，约 30 秒。"""
+    years = (payload or {}).get("years")
+    if years is not None and not isinstance(years, list):
+        raise HTTPException(400, "years 应为数组，如 [2027]")
+    try:
+        return {"ok": True, "result": holiday_calendar.refresh(years)}
+    except Exception as exc:
+        raise HTTPException(502, f"{type(exc).__name__}: {str(exc)[:200]}")
+
+
 @app.post("/api/calendar/events")
 def calendar_add_event(e: CalendarEventIn):
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", e.event_date.strip()):
@@ -2896,7 +3148,7 @@ def _calendar_loop():
             now = datetime.now()
             sh, sm = _sched_time("calendar", "start_time")
             eh, em = _sched_time("calendar", "end_time")
-            if now.weekday() < 5 and (now.hour, now.minute) >= (sh, sm) \
+            if holiday_calendar.is_trading(now.date()) and (now.hour, now.minute) >= (sh, sm) \
                     and (now.hour, now.minute) < (eh, em) \
                     and _conf_enabled("calendar", True):
                 with get_conn() as conn:
@@ -3253,7 +3505,7 @@ def _alerts_loop():
             now = datetime.now()
             conf = _alerts_conf()
             ah, am = _sched_time("alerts", "check_time")
-            if (conf.get("enabled", True) and now.weekday() < 5
+            if (conf.get("enabled", True) and holiday_calendar.is_trading(now.date())
                     and (now.hour, now.minute) >= (ah, am) and now.hour < 21
                     and last_day != now.date()):
                 with get_conn() as conn:
@@ -4671,7 +4923,7 @@ def paper_status():
             "current_slot": _paper_state["current_slot"],
             "interval_minutes": iv,
             "in_window": in_win,
-            "trading_day": now.weekday() < 5,
+            "trading_day": holiday_calendar.is_trading(now.date()),
             "next_in_minutes": nxt,
             "trading": paper_trading.market_session_state("", now),
             "latest_trade_time": _hhmm(conf.get("latest_trade_time"), 15, 5),
@@ -4801,7 +5053,7 @@ def _paper_loop():
         try:
             now = datetime.now()
             conf = _conf_section("paper")
-            if conf.get("enabled") and now.weekday() < 5:
+            if conf.get("enabled") and holiday_calendar.is_trading(now.date()):
                 dh, dm = _sched_time("paper", "decide_time")
                 sh, sm = _sched_time("paper", "settle_time")
                 iv = max(1, int(conf.get("interval_minutes", 30) or 30))
@@ -6244,7 +6496,7 @@ def _daily_reports_loop():
     while True:
         try:
             now = datetime.now()
-            if now.weekday() < 5:
+            if holiday_calendar.is_trading(now.date()):
                 for kind, group, key in (("premarket", "premarket_report", "time"),
                                          ("postmarket", "postmarket_report", "time")):
                     group_conf = _conf_section("schedule").get(group) or {}
@@ -6275,6 +6527,25 @@ class CryptoRefreshIn(BaseModel):
 
 def _crypto_deps() -> dict:
     return {"get_conn": get_conn, "notify_fn": notifier.notify}
+
+
+def _notifier_notify_safe(title: str, content: str, event: str = "") -> None:
+    """包一层 notifier.notify，**不让推送失败把调用方的循环带崩**。
+
+    背景：holiday/macro/ipo 的巡检都在守护线程里调 notify，一个 SMTP 超时
+    或微信 token 过期不该让整个日历/收益率线程退出（原 calendar loop 里的
+    notify 失败也是 try 过的，这里保持同一口径）。
+    """
+    try:
+        notifier.notify(title, content, event=event or None)
+    except TypeError:
+        # notifier.notify 的 event 是关键字参数的老签名，退回不带 event
+        try:
+            notifier.notify(title, content)
+        except Exception as exc:
+            print(f"[notify] {title} 推送失败: {exc}", flush=True)
+    except Exception as exc:
+        print(f"[notify] {title} 推送失败: {exc}", flush=True)
 
 
 @app.get("/api/crypto/quotes")
@@ -6872,6 +7143,119 @@ def _bootstrap_once() -> bool:
     return True
 
 
+def _macro_loop():
+    """宏观（美债/中债收益率）+ 新股排期 守护线程。
+
+    频率与理由：
+    - 收益率**每个交易日开盘后**同步一次即可（美债按美国交易日更新，一天一版），
+      再加异动检查（10Y 日变动超阈值推微信，同向冷却 12 小时）。
+    - 新股排期每天一次：申购/上市排期会调整，但不会盘中改。
+    - 休市/调休提醒每天查一次：长假前最后一个交易日 + 调休上班的周末。
+
+    三件事放一个线程里，因为都是「一天一次」的轻活，各自起线程没意义。
+    """
+    last_rate_day = None
+    last_ipo_day = None
+    last_holiday_day = None
+    while True:
+        try:
+            today = datetime.now().date()
+            mconf = _conf_section("macro")
+
+            # ① 收益率同步 + 异动检查
+            if mconf.get("enabled", True) and last_rate_day != today:
+                last_rate_day = today
+                if holiday_calendar.is_trading(today):
+                    try:
+                        with get_conn() as conn:
+                            macro_rates.sync(conn, days=400)
+                            macro_rates.check_alert(
+                                conn, notify_fn=_notifier_notify_safe,
+                                threshold=float(mconf.get("alert_threshold_bp", 5)) / 100,
+                                cooldown_hours=int(mconf.get("alert_cooldown_hours", 12)))
+                    except Exception as exc:
+                        print(f"[macro] 收益率同步失败: {exc}", flush=True)
+
+            # ② 新股排期同步 + 上市提醒 + 打新额度提醒
+            if mconf.get("ipo_enabled", True) and last_ipo_day != today:
+                last_ipo_day = today
+                try:
+                    ipo_calendar.sync()
+                    for a in ipo_calendar.listing_alerts(
+                            lead_days=int(mconf.get("ipo_alert_lead_days", 1))):
+                        _notifier_notify_safe(a["title"], a["content"],
+                                              event="ipo_listing")
+                except Exception as exc:
+                    print(f"[ipo] 排期同步失败: {exc}", flush=True)
+
+                # 打新额度提醒（2026-10-01 加）
+                # 额度按 T-2 日前 20 个交易日日均市值算，所以**必须提前很多天**：
+                # 补仓只占 20 日窗口的 1/20，等 T-2 才动手日均爬不上去。
+                # 提前量是按「配号数涨到目标需要几个交易日」倒推的，不是拍脑袋的常数。
+                if mconf.get("ipo_quota_alert_enabled", True):
+                    try:
+                        import ipo_quota_alert
+                        qa_alerts = ipo_quota_alert.build_alerts(
+                            holdings=_holdings_for_ipo(),
+                            days=int(mconf.get("ipo_quota_lookahead_days", 45)),
+                            notify=True)
+                        if qa_alerts:
+                            _notifier_notify_safe(
+                                f"🎫 打新额度提醒（{len(qa_alerts)} 只）",
+                                ipo_quota_alert.format_wx(qa_alerts),
+                                event="ipo_quota")
+                        else:
+                            print("[ipo] 今天没有到提醒时机的打新额度提醒",
+                                  flush=True)
+                    except Exception as exc:
+                        print(f"[ipo] 额度提醒失败: {exc}", flush=True)
+
+            # ③ 休市/调休提醒
+            if last_holiday_day != today:
+                last_holiday_day = today
+                try:
+                    holiday_calendar.check_holiday_alert(
+                        notify_fn=_notifier_notify_safe)
+                except Exception as exc:
+                    print(f"[holiday] 休市提醒失败: {exc}", flush=True)
+        except Exception as exc:
+            print(f"[macro] loop error: {exc}", flush=True)
+        time.sleep(1800)
+
+
+def _holiday_loop():
+    """节假日日历守护线程：确保今年/明年覆盖，每天查一次。
+
+    为什么需要它：国务院办公厅的放假通知**每年 11 月上旬才发布**，跨年时
+    新一年的日历还不存在。`holiday_calendar.is_trading()` 在没有当年日历时
+    会退回「周一~周五」，等于长假期间又会把休市日当交易日。
+
+    刻意不在启动路径上同步构建：build() 要抓公告 + 调 LLM（约 30 秒），
+    放模块导入里会把整个服务启动阻塞掉。这里放到独立线程，缺了就补，
+    有缓存就什么都不做。
+    """
+    last_check = None
+    while True:
+        try:
+            today = datetime.now().date()
+            if last_check != today:
+                last_check = today
+                missing = [y for y in (today.year, today.year + 1)
+                           if holiday_calendar.calendar(y) is None]
+                if missing:
+                    print(f"[holiday] 缺 {missing} 年日历，尝试从国务院公告构建", flush=True)
+                    res = holiday_calendar.refresh(missing)
+                    if res.get("ok"):
+                        print(f"[holiday] 已补齐 {res['ok']}", flush=True)
+                    for y, err in (res.get("failed") or {}).items():
+                        # 正常情况：次年通知还没发。降级成周一~周五，日志说清即可
+                        print(f"[holiday] {y} 年构建失败（该年通知通常 11 月才发布）: "
+                              f"{err}", flush=True)
+        except Exception as exc:
+            print(f"[holiday] loop error: {exc}", flush=True)
+        time.sleep(3600)
+
+
 def _start_daemon(target, name: str, args=()) -> bool:
     """按名字启动守护线程，**同一进程内每个名字只启动一次**。
     import sys 放在函数内：模块级已经有不少 import，这里不引入新的模块级依赖。
@@ -6966,6 +7350,13 @@ _start_daemon(_withdrawal_loop, "sa_withdrawal")
 
 # 财经日历盘前提醒线程（交易日早 8–12 点窗口，今明事件/重要预告推微信）
 _start_daemon(_calendar_loop, "sa_calendar")
+
+# 节假日/交易日历（真源=国务院放假公告，LLM 抽取）。放最后起：它可能触发一次
+# 抓公告+LLM 的慢操作，不该排在其它守护线程前面拖慢它们就绪。
+_start_daemon(_holiday_loop, "sa_holiday")
+
+# 宏观（美债收益率异动 + 新股排期 + 休市提醒），每半小时一轮
+_start_daemon(_macro_loop, "sa_macro")
 
 # 自选股事件告警线程（工作日 8:30 后每日一轮：解禁/增发上市新事件推微信）
 _start_daemon(_alerts_loop, "sa_alerts")

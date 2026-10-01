@@ -185,8 +185,43 @@ EVENTS: dict[str, dict[str, Any]] = {
         "label": "📅 财经日历",
         "group": "事件 / 日历",
         "default": {"wx": True, "email": True},
-        "help": "非农 / 交割日 / 四巫 / LPR 本地推算，以及手动补录的 FOMC / CPI。",
+        "help": "非农 / 交割日 / 四巫 / LPR 本地推算，美国中期选举、两会开幕，"
+                "以及手动补录的 FOMC / CPI。",
         "source": "econ_calendar.check_calendar_once()",
+    },
+    "macro_rate": {
+        "label": "📉 美债收益率异动",
+        "group": "事件 / 日历",
+        "default": {"wx": True, "email": False},
+        "help": "美债 10Y 单日变动超阈值（默认 5bp）时提醒，并附期限利差方向。"
+                "**默认只推微信**。",
+        "source": "macro_rates.check_alert()",
+    },
+    "ipo_listing": {
+        "label": "🆕 新股上市",
+        "group": "事件 / 日历",
+        "default": {"wx": True, "email": False},
+        "help": "A/H 股新股上市日前一天提醒（含发行价、顶格申购需配市值）。"
+                "**默认只推微信**。",
+        "source": "ipo_calendar.listing_alerts()",
+    },
+    "ipo_quota": {
+        "label": "🎫 打新额度提醒",
+        "group": "事件 / 日历",
+        "default": {"wx": True, "email": False},
+        "help": "按「T-2 日前 **20 个交易日日均市值** ÷ 5000」算配号数，"
+                "并在**该补仓的时间点**提醒（提前量是倒推的，不是固定天数）。"
+                "补仓只占 20 日窗口的 1/20，所以等 T-2 才动手日均爬不上去。"
+                "**默认只推微信**。",
+        "source": "ipo_quota_alert.build_alerts()",
+    },
+    "market_holiday": {
+        "label": "🌴 休市/调休提醒",
+        "group": "事件 / 日历",
+        "default": {"wx": True, "email": False},
+        "help": "法定长假前最后一个交易日提醒「明日休市 N 天」，"
+                "以及调休上班的周末提醒。**默认只推微信**。",
+        "source": "holiday_calendar 巡检",
     },
 
     # ---------------- 模拟盘 ----------------

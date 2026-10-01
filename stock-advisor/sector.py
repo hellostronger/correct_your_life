@@ -34,6 +34,8 @@ import os
 
 import requests
 
+import holiday_calendar
+
 BASE_DIR = Path(__file__).resolve().parent
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -619,8 +621,17 @@ def ensure_tables():
 
 
 def _is_trading_day(d: date) -> bool:
-    """周末不算交易日；法定节假日不判断（快照空跑一天无副作用）。"""
-    return d.weekday() < 5
+    """交易日（法定长假不再是「从简」）。
+
+    原先是 `d.weekday() < 5`，注释写「节假日不判断（快照空跑一天无副作用）」——
+    实际有副作用：长假里行情源返回的是**上一交易日**的数据，快照会按当天日期入库，
+    在 sa_sector_snapshots 写进错标日期的行，动量/评分全错。
+
+    真源是 holiday_calendar（国务院放假公告 + akshare 交易所日历交叉校验，
+    实测 2026 年 242 天逐日一致）。注意它与 remote data_service 返回的
+    `data_date` 是两件事：这里判「今天该不该采集」，入库日期仍按 data_date。
+    """
+    return holiday_calendar.is_trading(d)
 
 
 def save_snapshot(rows: list[dict], zt: dict, breadth: dict, indexes: list[dict],
@@ -1019,7 +1030,7 @@ _intraday_alert_cool: dict[str, float] = {}   # 板块名 -> 上次预警时间�
 
 def _in_trading_session(now: datetime) -> bool:
     """A 股交易时段（含集合竞价 9:15 起、收盘 15:05 止；午休不算）。"""
-    if now.weekday() >= 5:
+    if not _is_trading_day(now.date()):
         return False
     hm = (now.hour, now.minute)
     if (9, 15) <= hm <= (11, 35) or (12, 55) <= hm <= (15, 5):
@@ -1198,7 +1209,7 @@ def _snapshot_time() -> tuple[int, int]:
 
 def _is_after_close(now: datetime) -> bool:
     """收盘后（默认 15:10 之后，可网页改）才算当日快照时间。"""
-    if now.weekday() >= 5:
+    if not _is_trading_day(now.date()):
         return False
     sh, sm = _snapshot_time()
     return (now.hour, now.minute) >= (sh, sm)
