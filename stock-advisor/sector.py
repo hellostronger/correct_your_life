@@ -280,8 +280,33 @@ def _boards_via_service() -> list[dict]:
             "score": b.get("score"),
         })
     print(f"[sector] data_service: {len(out)} boards, "
-          f"sources={payload.get('sources_used')}, degraded={degraded}", flush=True)
+          f"sources={payload.get('sources_used')}, degraded={degraded}, "
+          f"data_date={payload.get('data_date')}"
+          f"{' (非交易日)' if payload.get('is_trading_day') is False else ''}",
+          flush=True)
     return out
+
+
+def service_data_date() -> date | None:
+    """问服务要真实数据日（休市日 != 今天）。
+
+    用途：`save_snapshot` 入库日期。休市日采集到的是上一交易日的数据，
+    用今天入库会在 sa_sector_snapshots 写进错标日期的行。
+    拿不到就返回 None，调用方退回当天（保持原行为）。
+    """
+    url = _data_service_url()
+    if not url:
+        return None
+    try:
+        resp = requests.get(f"{url.rstrip('/')}/health", timeout=30)
+        resp.raise_for_status()
+        h = resp.json()
+        # /health 不带 data_date，改从 boards 的缓存快照里取
+        if not h.get("is_trading_day"):
+            return None
+        return date.fromisoformat(h["data_date"][:10])
+    except Exception:
+        return None
 
 
 def fetch_all_boards() -> list[dict]:

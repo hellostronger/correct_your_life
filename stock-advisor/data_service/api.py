@@ -30,6 +30,10 @@ from . import aggregate as A
 app = FastAPI(title="SA 板块数据服务", version=__version__,
               description="多厂商板块行情服务，替代被 WAF 掐断的东财直连采集器")
 
+# 交易日 / 数据日：collect 时写在这里，供 /health 暴露
+# （调用方在休市日需要知道该按哪一天入库）
+_market_clock: dict = {"is_trading_day": None, "data_date": None, "at": None}
+
 _lock = threading.Lock()
 _cache: dict = {"snap": None, "at": 0.0}
 CACHE_TTL = float(os.environ.get("SA_CACHE_TTL", "60"))
@@ -48,6 +52,9 @@ def _get_snap(force: bool = False, **kw) -> dict:
     with _lock:
         _cache["snap"] = d
         _cache["at"] = time.time()
+        _market_clock.update({"is_trading_day": d.get("is_trading_day"),
+                              "data_date": d.get("data_date"),
+                              "at": d.get("collected_at")})
     return d
 
 
@@ -69,6 +76,10 @@ def health() -> dict:
         "last_degraded": (snap or {}).get("degraded"),
         "last_notes": (snap or {}).get("notes", []),
         "last_cross_check": (snap or {}).get("cross_check"),
+        # 交易日感知：休市日 data_date != trade_date，调用方按 data_date 入库
+        "is_trading_day": (snap or {}).get("is_trading_day"),
+        "data_date": (snap or {}).get("data_date") or _market_clock["data_date"],
+        "collected_at": _market_clock["at"],
     }
 
 
@@ -98,6 +109,10 @@ def boards(include_concept: bool = Query(True),
     out = {
         "collected_at": snap["collected_at"],
         "trade_date": snap["trade_date"],
+        # 休市日 trade_date 是今天，data_date 是真实数据日。
+        # 调用方入库请用 data_date，否则历史表会写进错标日期的行。
+        "is_trading_day": snap.get("is_trading_day"),
+        "data_date": snap.get("data_date") or snap["trade_date"],
         "total_boards": len(rows),
         "boards": rows[:limit] if limit else rows,
         "zt": snap.get("zt", {}),

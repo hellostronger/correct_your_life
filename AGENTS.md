@@ -122,7 +122,7 @@
 | 源 | 状态 | 备注 |
 |---|---|---|
 | `push2*.eastmoney.com`（clist/kline/ulist.np） | ❌ **全封** | 覆盖 `push2` `push2delay` `push2his` `17.push2` 等全部子域 |
-| `push2ex.eastmoney.com` | ❌ **也已封**（10-01） | 早先可用；连 `d=` 回溯 8 天、两个 UT token 全空。涨停池已改走同花顺行业榜反推 |
+| `push2ex.eastmoney.com` | ✅ **可用**（我一度误判为已封） | 涨停池通。**必须用 akshare 的 `stock_zt_pool_em`**，见下方「假失败」 |
 | `datacenter-web.eastmoney.com` | ⚠️ **不可靠** | 实测 5 个函数只成 1 个，别当可靠源 |
 | `q.10jqka.com.cn` / `data.` / `d.` | ✅ 可用 | 同花顺三子域，**同属一家，轮询别只压一个** |
 | `vip.stock.finance.sina.com.cn` | ✅ 可用 | **有资金流**，见下方「新浪板块资金流」 |
@@ -131,6 +131,55 @@
 **已封的根因（不是 IP 信誉问题）**：`_sector_intraday_loop` 交易时段每 5 分钟一轮，
 每轮翻全量 1031 板块 = **12 个 clist 请求**，即 576 请求/日打同一个 host。
 被封后**不会停**，继续每 5 分钟捶 12 次，永久续期 —— 所以它永远不会自己恢复。
+
+### ⚠️ 最阴的一个「假失败」：HTTP 200 + 参数名写错 = 看起来像被封
+
+2026-10-01 我误判「push2ex 已封」，写进了 AGENTS.md 和提交信息，**是错的**。
+真因是我手写 requests 时**参数名写错了**：
+
+```
+我传的:    ?d=20261001&ut=fa5fd1943c7b386f172d6893dbfba10b
+正确的:    ?date=20261001&ut=7eea3edcaed734bea9cbfc24409ed989
+                    ^^^^^^          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                    是 date 不是 d    这是 zt 池专用 token，不是 push2 clist 的
+```
+
+用 `d=` 会命中一个**仍然存在但语义不同的旧接口**，返回
+**HTTP 200 + `{"rc":102,"rt":1,"data":null}`** —— 状态码正常、有 JSON、
+`data` 为空。任何「检查状态码」「检查返回非空 JSON」的逻辑都会认为
+「源活着但今天没数据」→ 误判成被封。
+
+**教训**：
+1. 私有接口不要手写封装。`ak.stock_zt_pool_em` 的参数是现成的、已验证的。
+2. 「某源被封」这个结论**必须有 `ConnectionError`/`403`/`timeout` 之类
+   明确的失败证据**。`200 + data:null` 只能说明「参数或日期不对」，
+   因为同期 `ak.stock_zt_pool_em(date="20260930")` 同一个 host 返回 52 行。
+
+### ⚠️ 交易日/休市：三处必查（A股长假会让数据整体错位）
+
+2026-10-01 国庆实测，三个坑叠在一起：
+
+1. **push2ex 忽略 `date` 参数，固定返回最新交易日**
+   ```
+   date=20261001 -> 52 条, qdate=20260930
+   date=20260930 -> 52 条, qdate=20260930   （与上行 52/52 完全相同）
+   date=20260929 -> 57 条, qdate=20260930   （传 0929 却给 0930 的数据！）
+   ```
+   → **只有响应里的 `qdate` 可信**，自己传进去的日期一律不信。
+   akshare 会把 `qdate` 丢掉（只保留重命名后的业务列），需要就读原始接口。
+
+2. **levistock 休市日返回 0**
+   `sector_ranking_kph(date="2026-10-01")` 三个类别全 0，
+   `date="2026-09-30"` 有 405 条。必须回溯，否则误判成源挂。
+
+3. **入库日期必须用「真实数据日」**
+   休市日采集到的是上一交易日数据，用 `date.today()` 入库会在
+   `sa_sector_snapshots` 写进**错标日期**的行（AGENTS.md 记过这个坑）。
+   `data_service` 的 `/boards` 和 `/health` 都返回
+   `is_trading_day` + `data_date`，调用方按 `data_date` 入库。
+   交易日历用 `ak.tool_trade_date_hist_sina()`；
+   **日历不可用时 `is_trading_day` 返回 `None` 而非 `False`** ——
+   分不清「休市」和「日历挂了」时绝不能当休市，否则交易时段会跳过采集。
 
 ### 新浪板块资金流（2026-10-01 采纳为第三数据源）
 
@@ -168,12 +217,15 @@ http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ss
 
 - 部署在 **101.43.25.101**：`/opt/sa-data-service`，容器 `sa-data-service`，
   只绑 `127.0.0.1:8080`（不暴露公网），外部走 SSH 隧道
-- 已实测：容器内 `/boards` 返回 **969 板块**，`degraded=False`，四个源全部参与
+- 已实测：容器内 `/boards` 返回 **969 板块**，`degraded=False`，四个源全部参与。
+  涨停池走档 1（push2ex）实测 **52 家**、最高连板 7、炸板 34、32 个板块有涨停家数。
+- **交易日感知**：`/boards` 和 `/health` 都返回 `is_trading_day` + `data_date`。
+  休市日 `data_date` 是最近交易日，**调用方入库要用 `data_date` 而不是今天**。
 - 接入：`sector.py` 的 `fetch_all_boards()` 优先走服务，失败回落东财（解封即双保险）
   —— 配置项 `config.yaml` 的 `sector.data_service_url`，留空则保持原行为
-- 测试：`python -m data_service.selftest`（离线 89）
+- 测试：`python -m data_service.selftest`（离线 116）
   + `data_service.tests.{test_budget,test_pipeline,test_sector_integration,test_service_api}`
-  = **167 断言全过**
+  = **194 断言全过**
 - 详细调研见 `docs/data-source-survey.md`（16 个开源方案逐项实测），服务说明见
   `stock-advisor/data_service/README.md`
 

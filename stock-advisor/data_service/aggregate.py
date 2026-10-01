@@ -15,6 +15,7 @@ import collections
 from datetime import date, datetime, timedelta
 
 from . import normalize as N
+from . import sources as S
 from .sources import KPH, METER, SINA, THS, ZT, SourceError
 
 
@@ -49,6 +50,11 @@ class Snapshot:
     def __init__(self) -> None:
         self.collected_at = datetime.now().isoformat(timespec="seconds")
         self.trade_date = date.today().isoformat()
+        # 交易日感知：休市日 trade_date 是今天，但 data_date 是最近交易日。
+        # 调用方（sector.save_snapshot）应该用 data_date 入库，否则历史表
+        # 会写进错标日期的行。
+        self.is_trading_day: bool | None = None
+        self.data_date: str | None = None
         self.boards: list[dict] = []
         self.zt: dict = {}
         self.sources_used: list[str] = []
@@ -61,6 +67,8 @@ class Snapshot:
         out = {
             "collected_at": self.collected_at,
             "trade_date": self.trade_date,
+            "is_trading_day": self.is_trading_day,
+            "data_date": self.data_date,
             "board_count": len(self.boards),
             "boards": self.boards,
             "zt": self.zt,
@@ -79,6 +87,20 @@ def collect(include_aux: bool = True, include_concept: bool = True,
             include_zt: bool = True, include_sina: bool = True) -> Snapshot:
     """采集一轮。任一源失败都**不抛异常**，而是降级并记录 —— 绝不静默。"""
     snap = Snapshot()
+
+    # ---- 交易日感知 ----
+    # 休市日各源返回的都是最近交易日的数据。若把休市日当采集日，
+    # sa_sector_snapshots 会写进错标日期的行（AGENTS.md 记过这个坑）。
+    snap.is_trading_day = S.is_trading_day()
+    snap.data_date = snap.trade_date
+    if snap.is_trading_day is False:
+        last = S.last_trading_day()
+        snap.data_date = last.isoformat() if last else snap.trade_date
+        snap.notes.append(
+            f"今天（{snap.trade_date}）非交易日，各源返回的是最近交易日 "
+            f"{snap.data_date} 的数据；data_date 已标出，调用方应据此入库")
+    elif snap.is_trading_day is None:
+        snap.notes.append("交易日历不可用，无法判定今天是否交易日")
 
     # ---- 主源：同花顺 ----
     ths_rows: list[dict] = []

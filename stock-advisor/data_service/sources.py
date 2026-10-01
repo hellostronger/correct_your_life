@@ -10,6 +10,10 @@
    概念名列表单次要 41 个请求，必须缓存。
 4. **不静默失败**：每个源都记 last_error / last_ok / 连续失败数，
    降级时通过 degraded 字段告诉调用方"这份数据是降级的"。
+5. **交易日感知**（2026-10-01 加）：A 股有长假，休市日各源返回的是
+   最近交易日的数据。若直接把休市日当采集日，历史表会写进错标日期的行。
+   涨停池接口尤其坑：它**忽略 date 参数、固定返回最新交易日**，所以必须
+   读响应里的 `qdate`，不能信自己传进去的日期。详见 ZtPoolSource。
 """
 from __future__ import annotations
 
@@ -21,6 +25,60 @@ import traceback
 from datetime import date, datetime, timedelta
 
 from . import normalize as N
+
+# ---------------------------------------------------------------- 交易日历
+# 用 akshare 的官方交易日历（新浪源），缓存到当日。
+# 为什么必须缓存：这个函数要打新浪接口，而采集本身是每 5 分钟一轮的。
+_TRADE_DAYS: set[str] | None = None
+_TRADE_DAYS_DAY: str = ""
+_trade_lock = threading.Lock()
+
+
+def trade_days() -> set[str]:
+    """交易日集合（YYYY-MM-DD 字符串）。失败时抛异常，调用方自行决定降级。"""
+    global _TRADE_DAYS, _TRADE_DAYS_DAY
+    today = date.today().isoformat()
+    with _trade_lock:
+        if _TRADE_DAYS is not None and _TRADE_DAYS_DAY == today:
+            return _TRADE_DAYS
+    import warnings
+    warnings.filterwarnings("ignore")
+    import akshare as ak
+    df = ak.tool_trade_date_hist_sina()
+    days = {str(d)[:10] for d in df["trade_date"]}
+    with _trade_lock:
+        _TRADE_DAYS = days
+        _TRADE_DAYS_DAY = today
+    return days
+
+
+def is_trading_day(d: date | None = None) -> bool | None:
+    """今天（或指定日）是否交易日。日历不可用时返回 **None**（不是 False）。
+
+    返回 None 的意义：分不清「休市」和「日历挂了」时，绝不能当成休市，
+    否则会在交易时段错误地跳过采集。
+    """
+    d = d or date.today()
+    try:
+        return d.isoformat() in trade_days()
+    except BaseException as exc:                          # noqa: BLE001
+        print(f"[data_service] 交易日历不可用，is_trading_day 返回 None: {exc}",
+              flush=True)
+        return None
+
+
+def last_trading_day(d: date | None = None) -> date | None:
+    """d（含）往前的最近交易日。日历不可用时返回 None。"""
+    d = d or date.today()
+    try:
+        days = trade_days()
+    except BaseException:                                 # noqa: BLE001
+        return None
+    for i in range(0, 40):
+        cand = d - timedelta(days=i)
+        if cand.isoformat() in days:
+            return cand
+    return None
 
 # 同花顺三家子域的本机实测日预算。576/日 打在单一 host 上会被烧死，
 # 这里保守设成 200/日/子域，留足余量。
@@ -290,66 +348,190 @@ class KphSource(_BaseSource):
 
 
 class ZtPoolSource(_BaseSource):
-    """涨停池（东财 push2ex，未被封）。含连板数 lbc / 炸板 zbc。
+    """涨停池。档 1 走 akshare 的 `stock_zt_pool_em`（东财 push2ex）。
 
-    坑：url 必须显式传 date，否则返回 200 + 空数组。
-    坑：假日传 date 会返回上一交易日集合 —— 所以要按返回的 qdate 自纠。
+    ⚠️ **2026-10-01 更正**：我之前断定「push2ex 已被 WAF 封禁」，**那是错的**。
+    真实原因是我手写 requests 时把参数名写错了：
+
+      我传的:  ?d=20260930&ut=fa5fd1943c7b386f172d6893dbfba10b
+      正确的:  ?date=20260930&ut=7eea3edcaed734bea9cbfc24409ed989
+               &dpt=wz.ztzt&Pageindex=0&pagesize=10000&sort=fbt:asc
+
+    两个差异：
+      1. 参数名是 **`date=`** 不是 `d=`。用 `d=` 会命中一个仍然存在但语义不同的
+         旧接口，**返回 HTTP 200 + `{"rc":102,"data":null}`** —— 看起来像被封，
+         实际是参数不对。这是个危险的假失败：HTTP 200 骗过了所有「状态码正常」
+         的检查。
+      2. `ut` token 也不对（我用的是 push2 clist 的 token，不是 zt 池的）。
+
+    而且少的那 4 个参数（dpt/Pageindex/pagesize/sort）不传会被默认成
+    只回第一页 / 不排序。
+
+    所以：**不再手写 requests，直接调 akshare**。这既用对了参数，
+    又符合 AGENTS.md 第 1 条「优先用开源方案，不要自己封装私有接口」。
+
+    坑（仍然成立）：
+    - 必须显式传 `date`，否则返回 200 + 空数组
+    - **假日传 date 会返回上一交易日的集合** —— 所以按返回的 `qdate` 自纠，
+      绝不把休市日的数据写成当天的
     """
 
     name = "ztpool"
     URL = "https://push2ex.eastmoney.com/getTopicZTPool"
-    UT = "fa5fd1943c7b386f172d6893dbfba10b"
 
     def fetch(self) -> dict:
-        # ---- 档 1：push2ex 原生池（有连板高度，信息最全）----
+        # ---- 档 1：akshare -> 东财 push2ex 原生池（有连板高度，信息最全）----
         if METER.allow("push2ex.eastmoney.com", 2):
-            r1 = self._from_push2ex()
+            r1 = self._from_akshare()
             if r1:
                 r1["tier"] = "push2ex"
                 self._ok()
                 return r1
-        # ---- 档 2：同花顺行业榜反推 ----
+        # ---- 档 2：同花顺行业榜反推（部分覆盖，见 _from_ths_rankings 的说明）----
         r2 = self._from_ths_rankings()
         if r2:
             self._ok()
             return r2
-        raise SourceError("涨停池：push2ex 已封，同花顺行业榜也取不到")
+        raise SourceError("涨停池：push2ex 与同花顺行业榜都取不到")
 
-    def _from_push2ex(self) -> dict | None:
+    def _from_akshare(self) -> dict | None:
+        """走 akshare 而不是手写 requests。
+
+        ⚠️ **这个接口忽略 date 参数，固定返回「最新交易日」的集合**
+        （2026-10-01 实测）：
+            date=20261001 -> 52 条, qdate=20260930
+            date=20260930 -> 52 条, qdate=20260930   （与上行完全相同，52/52 交集）
+            date=20260929 -> 57 条, qdate=20260930   （传 0929 却给 0930 的数据！）
+
+        所以**绝不能信自己传进去的日期**，只能信响应里的 `qdate`。
+        akshare 把 qdate 丢掉了（只保留重命名后的业务列），所以这里
+        直接打原始接口读 qdate —— 参数已按 akshare 源码逐字照抄
+        （`date` 不是 `d`，且 `ut` 是 zt 池专用 token）。
+
+        休市日的正确表现：
+          - 用交易日历判断今天是否交易日
+          - 非交易日 -> 标 `is_trading_day=False`，把 qdate 如实报出去，
+            并在 note 里说明「这是最近交易日的数据，不是当天」
+        """
         import requests
-        for back in range(0, 6):
-            d = (date.today() - timedelta(days=back)).strftime("%Y%m%d")
-            try:
-                r = requests.get(self.URL, params={"d": d, "ut": self.UT},
-                                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-                                 timeout=15)
-                j = r.json()
-            except BaseException:                         # noqa: BLE001
-                return None
-            data = j.get("data") or {}
-            pool = data.get("pool") or []
-            if pool:
-                s = self._to_summary(pool, data.get("qdate") or d)
-                s["coverage"] = {"stocks_seen": len(pool), "full_market": True}
-                return s
+        today = date.today()
+        trading = is_trading_day(today)
+        last = last_trading_day(today) if trading is False else today
+
+        for d in ([last] if last else [today]):
+            q = d.strftime("%Y%m%d")
+            data = self._raw(q)
+            pool = (data or {}).get("pool") or []
+            if not pool:
+                continue
+            # **以响应里的 qdate 为准**，不信请求参数
+            real_qdate = str((data or {}).get("qdate") or q)
+            s = self._pool_to_summary(pool, qdate=real_qdate)
+            s["requested_date"] = q
+            s["is_trading_day"] = trading
+            if real_qdate != q:
+                # 请求日与真实数据日不一致 -> 一定是休市/非交易日
+                s["is_holiday_rollback"] = True
+                s["note"] = (f"请求 date={q}，实际返回 qdate={real_qdate} 的集合"
+                             f"（该接口固定返回最新交易日，忽略 date 参数）。"
+                             f"这是 {real_qdate} 的数据，不是 {q}。")
+                print(f"[data_service] 涨停池：非交易日，"
+                      f"实际数据日 {real_qdate}（请求 {q}）", flush=True)
+            else:
+                s["is_holiday_rollback"] = False
+            return s
         return None
 
-    def _from_ths_rankings(self) -> dict | None:
-        """push2ex 挂掉后的降级：用同花顺行业榜反推涨停家数。
+    def _raw(self, d: str) -> dict | None:
+        """打 push2ex 原始接口读 qdate。参数照抄 akshare 源码。"""
+        import requests
+        params = {
+            # 注意是 date 不是 d —— 用 d 会命中一个语义不同的旧接口，
+            # 返回 HTTP 200 + {"rc":102,"data":null}，**看起来像被封实际是参数错**。
+            "date": d,
+            "ut": "7eea3edcaed734bea9cbfc24409ed989",
+            "dpt": "wz.ztzt",
+            "Pageindex": "0",
+            "pagesize": "10000",
+            "sort": "fbt:asc",
+        }
+        try:
+            r = requests.get(self.URL, params=params,
+                             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                             timeout=20)
+            return r.json().get("data")
+        except BaseException as exc:                      # noqa: BLE001
+            print(f"[data_service] push2ex {d} 请求异常: {exc}", flush=True)
+            return None
 
-        实测 `stock_rank_cxsl_ths`(680 行) / `stock_rank_cxfl_ths`(180 行)
-        这两个 ranking **同时带 `所属行业` 和 `涨跌幅`**，把涨幅触及涨停阈值的
-        按行业计数即可。覆盖是部分的（这两榜本身是缩量/放量筛选，不是全市场），
-        所以 coverage 里如实写明覆盖多少只，不冒充全量。
+    def _pool_to_summary(self, pool: list, qdate: str) -> dict:
+        """push2ex 原始 pool（16 个字段）-> 内部摘要。
+
+        原始字段名：c=代码 n=名称 zdp=涨跌幅 lbc=连板数 zbc=炸板次数
+                    fbt=首封时间 lbt=最后封板时间 hybk=所属行业 zttj=涨停统计
+        """
+        by_board: dict[str, int] = collections.Counter()
+        max_lb = 0
+        sum_zbc = 0
+        for row in pool:
+            hybk = str(row.get("hybk") or "").strip()
+            lbc = N.int_or_none(row.get("lbc")) or 1
+            zbc = N.int_or_none(row.get("zbc")) or 0
+            if hybk:
+                by_board[hybk] += 1
+            max_lb = max(max_lb, lbc)
+            sum_zbc += zbc
+        return {"qdate": str(qdate), "total": len(pool),
+                "max_lb": max_lb, "sum_zbc": sum_zbc,
+                "by_board": dict(by_board),
+                "coverage": {"stocks_seen": len(pool), "full_market": True}}
+
+    @staticmethod
+    def _records_to_summary(records: list[dict], qdate: str) -> dict:
+        """akshare 的重命名后列 -> 内部摘要。"""
+        by_board: dict[str, int] = collections.Counter()
+        max_lb = 0
+        sum_zbc = 0
+        for row in records:
+            # 行业列实测叫「所属行业」
+            hybk = str(row.get("所属行业") or "").strip()
+            lbc = N.int_or_none(row.get("连板数")) or 1
+            zbc = N.int_or_none(row.get("炸板次数")) or 0
+            if hybk:
+                by_board[hybk] += 1
+            max_lb = max(max_lb, lbc)
+            sum_zbc += zbc
+        return {"qdate": str(qdate), "total": len(records),
+                "max_lb": max_lb, "sum_zbc": sum_zbc,
+                "by_board": dict(by_board),
+                "coverage": {"stocks_seen": len(records), "full_market": True}}
+
+    def _from_ths_rankings(self) -> dict | None:
+        """档 2 降级：用同花顺**放量**榜反推涨停家数。
+
+        ⚠️ **只能用放量榜，不能用缩量榜**（2026-10-01 实测，我一开始写错了）
+
+        `stock_rank_cxfl_ths`（放**量**天榜，180 行）：涨跌幅最高 15.85%，
+        `>=9.8%` 的有 10 只 → 涨停股在这里能找到。
+        `stock_rank_cxsl_ths`（**缩量**天榜，680 行）：涨跌幅
+        **区间 -7.11% ~ 4.98%，`>=9.8%` 的有 0 只** → 一只涨停股都没有。
+
+        原因很直白：涨停当天必然巨量成交，而缩量榜按定义就是「成交萎缩」的股票，
+        两个集合几乎不相交。我第一版把两个榜都用上，等于 680 只白拉、
+        还多花 9 个请求，实际只靠 180 只的放量榜在出货 —— 覆盖率因此很低。
+
+        覆盖率仍是部分的（放量榜 180 只 vs 全市场 7423 只 = 2.4%），
+        所以 coverage 里如实写明，不冒充全量。
         """
         import warnings
         warnings.filterwarnings("ignore")
         import akshare as ak
-        if not METER.allow("q.10jqka.com.cn", 4):
+        if not METER.allow("q.10jqka.com.cn", 3):
             return None
         by_board: dict[str, int] = collections.Counter()
         seen: set[str] = set()
-        for fn_name in ("stock_rank_cxsl_ths", "stock_rank_cxfl_ths"):
+        # 只用放量榜。缩量榜实测一只涨停都没有，加进来纯属浪费请求。
+        for fn_name in ("stock_rank_cxfl_ths",):
             f = getattr(ak, fn_name, None)
             if f is None:
                 continue
@@ -386,8 +568,9 @@ class ZtPoolSource(_BaseSource):
             "by_board": dict(by_board),
             "tier": "ths_rankings",
             "coverage": {"stocks_seen": len(seen), "full_market": False,
-                         "note": "由同花顺缩量/放量行业榜反推，只覆盖榜内股票，"
-                                 "非全市场；连板高度与炸板数不可得"},
+                         "note": "由同花顺放量天榜（180 只）反推，"
+                                 "只覆盖榜内股票；全市场 7423 只时覆盖率约 2.4%。"
+                                 "连板高度与炸板数不可得"},
         }
 
     @staticmethod
@@ -402,23 +585,6 @@ class ZtPoolSource(_BaseSource):
         if c.startswith(("8", "4")):              # 北交所
             return 29.5
         return 9.8
-
-    @staticmethod
-    def _to_summary(pool: list, qdate: str) -> dict:
-        by_board: dict[str, int] = collections.Counter()
-        max_lb = 0
-        sum_zbc = 0
-        for row in pool:
-            hybk = str(row.get("hybk") or "").strip()
-            lbc = N.int_or_none(row.get("lbc")) or 1
-            zbc = N.int_or_none(row.get("zbc")) or 0
-            if hybk:
-                by_board[hybk] += 1
-            max_lb = max(max_lb, lbc)
-            sum_zbc += zbc
-        return {"qdate": str(qdate), "total": len(pool),
-                "max_lb": max_lb, "sum_zbc": sum_zbc,
-                "by_board": dict(by_board)}
 
 
 class SinaSource(_BaseSource):

@@ -235,18 +235,128 @@ check("空返回 None", A._momentum([]), None)
 
 print()
 print("=" * 74)
-print("8. 涨停池聚合")
+print("8. 涨停池聚合（akshare 重命名后的列名）")
 print("=" * 74)
-pool = [{"hybk": "化学制品", "lbc": 3, "zbc": 1},
-        {"hybk": "化学制品", "lbc": 1, "zbc": 0},
-        {"hybk": "电池", "lbc": 2, "zbc": 2},
-        {"hybk": "", "lbc": 1, "zbc": 0}]
-s = S.ZtPoolSource._to_summary(pool, "20260930")
+# 实测 akshare stock_zt_pool_em 的列：代码/名称/涨跌幅/连板数/炸板次数/所属行业...
+recs = [{"代码": "600xxx", "名称": "A", "涨跌幅": 10.0, "连板数": 3,
+         "炸板次数": 1, "所属行业": "化学制品"},
+        {"代码": "600yyy", "名称": "B", "涨跌幅": 10.0, "连板数": 1,
+         "炸板次数": 0, "所属行业": "化学制品"},
+        {"代码": "300zzz", "名称": "C", "涨跌幅": 20.0, "连板数": 2,
+         "炸板次数": 2, "所属行业": "电池"},
+        {"代码": "600www", "名称": "D", "涨跌幅": 10.0, "连板数": 1,
+         "炸板次数": 0, "所属行业": ""}]
+s = S.ZtPoolSource._records_to_summary(recs, "20260930")
 check("总数", s["total"], 4)
 check("最高连板", s["max_lb"], 3)
 check("炸板合计", s["sum_zbc"], 3)
 check("按板块聚合", s["by_board"], {"化学制品": 2, "电池": 1})
-check("空 hybk 被跳过", "" in s["by_board"], False)
+check("空所属行业被跳过", "" in s["by_board"], False)
+check("档 1 覆盖全市场", s["coverage"]["full_market"], True)
+check("档 1 覆盖股票数=总数", s["coverage"]["stocks_seen"], 4)
+
+print()
+print("=" * 74)
+print("8b. 涨停阈值：分板块 + ST（防把 20% 板误算成 10% 板）")
+print("=" * 74)
+L = S.ZtPoolSource._limit_pct
+check("主板 10%", L("600519", "贵州茅台"), 9.8)
+check("创业板 20%", L("300750", "宁德时代"), 19.5)
+check("301 也是 20%", L("301047", "义翘神州"), 19.5)
+check("科创板 20%", L("688331", "荣昌生物"), 19.5)
+check("北交所 30%", L("830799", "艾融软件"), 29.5)
+check("ST 主板 5%", L("600123", "*ST海航"), 4.8)
+check("ST 创业板也是 5%（优先 ST 判断）", L("300123", "ST某某"), 4.8)
+check("小写 st 也认", L("600123", "*st海航"), 4.8)
+
+print()
+print("=" * 74)
+print("8c. 交易日感知：休市日不能拿今天入库")
+print("=" * 74)
+print("  背景（2026-10-01 国庆实测）：")
+print("    push2ex 的 date 参数被**忽略**，固定返回最新交易日：")
+print("      date=20261001 -> 52 条, qdate=20260930")
+print("      date=20260929 -> 57 条, qdate=20260930  <- 传 0929 却给 0930 的数据")
+print("    所以 qdate 才是唯一可信的真实数据日。")
+
+from datetime import date as _date
+
+# 日历函数本身（离线：注入假日历）
+saved = S._TRADE_DAYS, S._TRADE_DAYS_DAY
+S._TRADE_DAYS = {"2026-09-29", "2026-09-30", "2026-10-09"}
+S._TRADE_DAYS_DAY = _date.today().isoformat()
+check("交易日判 True", S.is_trading_day(_date(2026, 9, 30)), True)
+check("休市日判 False（10-01 国庆）", S.is_trading_day(_date(2026, 10, 1)), False)
+check("休市日前推最近交易日=09-30",
+      S.last_trading_day(_date(2026, 10, 1)).isoformat(), "2026-09-30")
+check("长假末端前推能跨过 09-30/10-01",
+      S.last_trading_day(_date(2026, 10, 8)).isoformat(), "2026-09-30")
+check("交易日当天前推是自己",
+      S.last_trading_day(_date(2026, 10, 9)).isoformat(), "2026-10-09")
+
+# 日历不可用 -> is_trading_day 必须返回 None（不是 False）
+S._TRADE_DAYS, S._TRADE_DAYS_DAY = None, ""
+
+
+def boom():
+    raise RuntimeError("日历接口挂了")
+
+
+real_td = S.trade_days
+S.trade_days = boom
+check("日历挂了 is_trading_day 返回 None 而非 False",
+      S.is_trading_day(_date(2026, 10, 1)) is None)
+check("日历挂了 last_trading_day 返回 None",
+      S.last_trading_day(_date(2026, 10, 1)) is None)
+S.trade_days = real_td
+S._TRADE_DAYS, S._TRADE_DAYS_DAY = saved
+
+# Snapshot 必须带 data_date / is_trading_day
+sn = A.Snapshot()
+check("Snapshot 有 is_trading_day 字段", hasattr(sn, "is_trading_day"))
+check("Snapshot 有 data_date 字段", hasattr(sn, "data_date"))
+d = sn.to_dict()
+check("to_dict 输出 is_trading_day", "is_trading_day" in d)
+check("to_dict 输出 data_date", "data_date" in d)
+
+# 休市日时 data_date 必须 != trade_date（这是入库依据）
+import unittest.mock as _mk
+with _mk.patch.object(S, "is_trading_day", return_value=False), \
+     _mk.patch.object(S, "last_trading_day",
+                      return_value=_date(2026, 9, 30)), \
+     _mk.patch.object(S.THS, "fetch", return_value=[]), \
+     _mk.patch.object(S.KPH, "fetch", return_value=[]), \
+     _mk.patch.object(S.SINA, "fetch", return_value=[]), \
+     _mk.patch.object(S.ZT, "fetch", return_value={}):
+    snap_hol = A.collect()
+check("休市日 is_trading_day=False", snap_hol.is_trading_day, False)
+check("休市日 data_date=最近交易日 09-30",
+      snap_hol.data_date, "2026-09-30",
+      note=f"实得 {snap_hol.data_date}")
+check("休市日 notes 说明了",
+      any("非交易日" in n for n in snap_hol.notes),
+      note=f"notes={snap_hol.notes[:2]}")
+
+# 交易日时 data_date == trade_date
+with _mk.patch.object(S, "is_trading_day", return_value=True), \
+     _mk.patch.object(S.THS, "fetch", return_value=[]), \
+     _mk.patch.object(S.KPH, "fetch", return_value=[]), \
+     _mk.patch.object(S.SINA, "fetch", return_value=[]), \
+     _mk.patch.object(S.ZT, "fetch", return_value={}):
+    snap_tr = A.collect()
+check("交易日 data_date==trade_date",
+      snap_tr.data_date, snap_tr.trade_date)
+
+# 日历不可用时也要照常工作（不能崩）
+with _mk.patch.object(S, "is_trading_day", return_value=None), \
+     _mk.patch.object(S.THS, "fetch", return_value=[]), \
+     _mk.patch.object(S.KPH, "fetch", return_value=[]), \
+     _mk.patch.object(S.SINA, "fetch", return_value=[]), \
+     _mk.patch.object(S.ZT, "fetch", return_value={}):
+    snap_nk = A.collect()
+check("日历不可用时不崩", snap_nk.is_trading_day is None)
+check("日历不可用时 data_date 退回当天",
+      snap_nk.data_date, snap_nk.trade_date)
 
 print()
 print("=" * 74)
