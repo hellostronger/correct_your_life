@@ -376,6 +376,16 @@ cur.execute("... WHERE code = ANY(%s)", (codes,))
 `list_date` 是 `date` 列，比较必须 `list_date::text` 或 `::date`，
 传 ISO 字符串报 `operator does not exist: date = text`。
 
+**字面 `%` 必须写 `%%`**（2026-10-02 实测，`IndexError` 很难联想到是转义问题）：
+
+```python
+cur.execute("... WHERE url LIKE '%~%'", ())     # IndexError: tuple index out of range
+cur.execute("... WHERE url LIKE '%%~%%'", ())   # ✅ 正确
+```
+
+同理还有 `_query` **只做 fetchall、finally 里直接 `conn.close()`，没有 commit** ——
+拿它写 UPDATE 会静默不生效，写库要自建连接并显式 `conn.commit()`。
+
 ### 不要在工具模块里 `from app import get_conn`
 
 它会 import 整个 `app.py`，连带启动所有 daemon（iLink 会话、holiday 日历构建…），
@@ -421,6 +431,32 @@ cur.execute("... WHERE code = ANY(%s)", (codes,))
 已有账号**。核对要用 `bcrypt.checkpw`（容器内 `/app/env_x86_64/bin/python3`，
 系统 `python3` 没装 bcrypt），**别反复试登录**：接口回
 `202 + {"code":40101,"message":"用户名或密码错误，您还有N次机会"}`，会锁号。
+
+### WeRSS SQLite 的列很容易选错（`content` 才是原文）
+
+库在容器内 `/app/data/db.db`（SQLite），表 `articles`。三列长得都像正文：
+
+| 列 | 实际是什么 | id=5236 长度 |
+|---|---|---|
+| **`content`** | **原文完整 HTML** ← 本地要的是这个 | **183,964** |
+| `content_html` | 清洗后的短版（只有原文 1/10） | 18,895 |
+| `description` | 203 字预览 | 203 |
+
+本地 `sa_mp_articles.content_html` ← 远端 `articles.content`，**4 篇实测长度
+逐字节相同**（183964 / 132098 / 100917 / 87183）；`content_text` 由
+`wechat_mp._html_to_text(content)` 派生，远端没有对应列。
+
+**为什么会有 21 篇本地缺正文**：RSS 只推最近 N 篇，旧文早出了 feed 窗口，
+`sync_source` 的 backfill 永远轮不到它们。远端其实 21/21 都有
+（实测 `有正文=21 空=0 库里没有=0`），所以要**直接从 SQLite 导出回填**：
+
+1. 远端脚本 `SELECT title,url,content FROM articles WHERE url=?` → base64 JSON
+2. 本地用 `wechat_mp._html_to_text()` 生成 `content_text`
+3. **单向 UPDATE**：`WHERE url=%s AND COALESCE(content_html,'')=''`
+   （与 `sync_source` 同规则，绝不覆盖已有正文）
+
+回填后 183/183 全部有正文。`wechat_mp` 刻意不 `import app`（见 33 行注释），
+所以工具脚本可以直接 `import wechat_mp` 拿 `_html_to_text`。
 
 ### PowerShell 的 `2>&1 | Where-Object { $_ -is [string] }` 会吃掉异常
 
