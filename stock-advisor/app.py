@@ -1,4 +1,4 @@
-"""Stock Advisor - 本地股票跟踪分析服务
+﻿"""Stock Advisor - 本地股票跟踪分析服务
 
 零成本方案：
 - 行情：腾讯公开行情接口（免费，无需 key）
@@ -43,6 +43,7 @@ from pydantic import BaseModel, Field
 import conf_util
 import config_schema
 import crypto_watch
+import futures_watch
 import holiday_calendar
 import ilink_client
 import ipo_calendar
@@ -6593,6 +6594,42 @@ def _daily_reports_loop():
 
 
 # ---------------- 币圈 24h 趋势参考（crypto_watch.py，gate.io 股票永续） ----------------
+
+# ---------------- 国际期货盯盘（futures_watch.py，akshare 国际商品）----------------
+
+class FuturesWatchIn(BaseModel):
+    symbol: str = Field(min_length=2, max_length=16, description="品种代码，如 XAU / CL")
+    name: str = Field(default="", max_length=64)
+
+
+def _futures_deps() -> dict:
+    return {"get_conn": get_conn, "notify_fn": notifier.notify}
+
+
+@app.get("/api/futures/quotes")
+def futures_quotes():
+    deps = _futures_deps()
+    try:
+        items = futures_watch.quotes_summary(deps)
+    except Exception:
+        futures_watch._ensure_tables(deps)
+        items = futures_watch.quotes_summary(deps)
+    if not items or any(
+        (not i.get("ts")) or (datetime.now(timezone.utc) - datetime.fromisoformat(i["ts"])).total_seconds() >= 300
+        for i in items
+    ):
+        try:
+            futures_watch.run_once(deps)
+            items = futures_watch.quotes_summary(deps)
+        except Exception as exc:
+            print(f"[futures] refresh failed: {exc}", flush=True)
+    return {"source": "akshare国际期货", "updated_at": datetime.now().isoformat(timespec="seconds"), "items": items}
+
+
+@app.post("/api/futures/refresh")
+def futures_refresh():
+    return {"ok": True, **futures_watch.run_once(_futures_deps())}
+
 
 class CryptoWatchIn(BaseModel):
     contract: str = Field(min_length=3, max_length=32, description="合约名，如 TSLA_USDT")

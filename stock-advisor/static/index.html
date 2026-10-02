@@ -526,6 +526,28 @@
   </section>
 
   <!-- 板块轮动 -->
+    <!-- 国际期货盯盘：黄金 / 石油等 -->
+    <div class="card" style="margin-top:14px">
+      <div class="row" style="justify-content:space-between">
+        <b style="font-size:13px">💰 国际期货（akshare）
+          <span class="muted" style="font-weight:normal">黄金/原油等</span></b>
+        <span class="row">
+          <span class="muted" id="futures-meta" style="font-size:12px"></span>
+          <button class="btn ghost" style="font-size:12px" onclick="jsonPost('/api/futures/refresh').then(loadFutures)">强制刷新</button>
+        </span>
+      </div>
+      <div class="empty" id="futures-empty" style="margin-top:8px">加载中...</div>
+      <div style="overflow-x:auto" id="futures-wrap">
+        <table style="margin-top:6px">
+          <thead><tr>
+            <th>品种</th><th>最新价</th><th>涨跌幅</th><th>最高</th><th>最低</th><th>持仓量</th><th>时间</th>
+          </tr></thead>
+          <tbody id="futures-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
   <section id="tab-sector" class="hide">
     <div class="card">
       <div class="row" style="justify-content:space-between">
@@ -2646,7 +2668,7 @@ const TABS = ['market', 'sector', 'holdings', 'strategies', 'plans', 'calendar',
               'bili', 'wb', 'mp', 'x', 'reports', 'paper', 'notify', 'schedule',
               'jq'];
 const TAB_LOADERS = {
-  market:    () => { loadWatch(); loadAlerts(); loadCrypto(); loadDiscover(); },
+  market:    () => { loadWatch(); loadAlerts(); loadCrypto(); loadDiscover(); loadFutures(); },
   sector:    () => { loadSector(); loadIntraday(); startIntradayAuto(); },
   holdings:  () => { loadHoldings(); refreshTradeStrategyOptions(); },
   strategies:() => { loadStrategies(); refreshTradeStrategyOptions(); },
@@ -5148,6 +5170,25 @@ async function genReport(kind) {
 
 // ---- 币圈 24h 趋势参考（gate.io 股票永续）+ 币↔股 关联统计 ----
 let _cryptoLinks = {};   // contract -> {stock_code,label,quote,stats}
+
+async function loadFutures() {
+  try {
+    const d = await api('/api/futures/quotes');
+    const items = d.items || [];
+    $('futures-empty').classList.toggle('hide', items.length > 0);
+    $('futures-body').innerHTML = items.map(i => `<tr>
+      <td><b>${esc(i.name || i.symbol)}</b></td>
+      <td class="muted">${esc(i.symbol)}</td>
+      <td class="num">${i.last != null ? Number(i.last).toFixed(2) : '—'}</td>
+      <td class="${cls(i.change_pct)}">${i.change_pct != null ? (i.change_pct>0?'+':'')+Number(i.change_pct).toFixed(2)+'%' : '—'}</td>
+      <td class="muted num">${i.high != null ? Number(i.high).toFixed(2) : '—'}</td>
+      <td class="muted num">${i.low != null ? Number(i.low).toFixed(2) : '—'}</td>
+      <td class="muted num">${i.vol != null ? Number(i.vol).toFixed(0) : '—'}</td>
+      <td class="muted">${i.ts ? i.ts.replace('T',' ').slice(0,16) : ''}</td>
+    </tr>`).join('');
+    $('futures-meta').textContent = d.updated_at ? '更新于 ' + d.updated_at.replace('T', ' ') : '';
+  } catch (e) { $('futures-meta').textContent = '加载失败: ' + e.message; }
+}
 
 async function loadCrypto(force = false) {
   try {
