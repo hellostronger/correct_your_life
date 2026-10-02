@@ -41,6 +41,22 @@ cd ..
 git add MediaCrawler
 git commit -m "chore: bump MediaCrawler submodule"
 ```
+﻿##TradingAgents-astock submodule
+
+With MediaCrawler, \"TradingAgents-astock/\" is also mounted as a git submodule.
+
+```powershell
+cd TradingAgents-astock
+uv run python main.py --ticker 688017 --date 2026-05-12
+```
+
+Update submodule:
+
+```powershell
+git submodule update --remote --merge -- TradingAgents-astock
+git add TradingAgents-astock
+git commit -m \"chore: bump TradingAgents-astock submodule\"
+```
 
 ## Docker 一键运行
 
