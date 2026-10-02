@@ -49,6 +49,7 @@ import ipo_calendar
 import ipo_llm
 import ipo_market
 import ipo_strategy
+import lot_rate
 import macro_rates
 import notify_events
 import wechat_mp
@@ -2901,14 +2902,28 @@ def macro_rates_sync(days: int = 400):
 
 
 def _ipo_strategy_deps() -> dict:
-    """打新策略需要的实时数据：持仓（算各市场市值）+ 自选股（筛底仓候选）。"""
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT code, name, shares, avg_cost FROM sa_holdings")
-        raw = cur.fetchall()
-    holdings = [{"code": r[0], "name": r[1], "shares": float(r[2] or 0),
-                 "avg_cost": float(r[3] or 0)} for r in raw]
-    # 行情用本模块既有的 fetch_quotes（app.py:752，腾讯 A股 + 新浪港股），
-    # 不要绕去 market_data —— 那是给 K 线用的，字段名不通用
+    """打新策略需要的实时数据：持仓（算各市场市值）+ 自选股（筛底仓候选）。
+
+    ⚠️ 持仓口径必须与持仓页一致，所以**直接复用 `_derive_holdings()`**
+    （按 sa_trades 全流水回放），而不是自己查 `sa_holdings`：
+
+    - `sa_holdings` 只有 6 列（code/name/shares/cost/buy_date/added_at），
+      没有 `avg_cost` —— 早先这里写 `SELECT ... avg_cost` 直接 500。
+    - 更重要的是**净值口径**：`sa_holdings.shares` 是「当前股数」，
+      而 `_derive_holdings()` 的 `net_shares` 扣掉已卖出并算真实摊薄成本。
+      打新市值要的是「实际持有的非限售股数 × 现价」，用错口径会让
+      「我有多少沪市市值」算错，进而给出错误的挪仓建议。
+    """
+    positions = _derive_holdings()
+    holdings = []
+    for p in positions:
+        if p.get("net_shares", 0) <= 0:      # 已清仓不计入市值
+            continue
+        holdings.append({"code": p["code"], "name": p.get("name") or "",
+                         "shares": float(p["net_shares"]),
+                         "avg_cost": float(p.get("avg_cost") or 0),
+                         "realized_pnl": p.get("realized_pnl", 0)})
+    # 行情用本模块既有的 fetch_quotes（app.py:752，腾讯 A股 + 新浪港股）
     quotes = fetch_quotes([h["code"] for h in holdings]) if holdings else {}
     for h in holdings:
         q = quotes.get(h["code"]) or {}
@@ -2916,6 +2931,7 @@ def _ipo_strategy_deps() -> dict:
                       "name": q.get("name") or h.get("name")}
     watchlist = list_watchlist()          # 自带行情，且已有 dividend_yield 字段
     return {"holdings": holdings, "watchlist": watchlist,
+            "holdings_note": "口径与持仓页一致（sa_trades 全流水回放）",
             "samples": ipo_calendar._load().get("items") or []}
 
 
@@ -2933,9 +2949,19 @@ def _holdings_for_ipo() -> list[dict]:
         return []
 
 
+def _bool_arg(v: str) -> bool:
+    """把 query 里的 'false'/'0'/'no' 正确转成 False。
+
+    FastAPI 的 bool 参数会把非空字符串都当 True，所以前端传
+    `use_llm=false` 时若直接用 bool 会得到 True —— 表现为「明明点了关闭
+    LLM，后台还是调了一次 LLM」。这里显式解析。
+    """
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
 @app.get("/api/ipo/strategy")
 def ipo_strategy_view(days: int = 30, target_ratio: float = 1.0,
-                      use_llm: bool = True):
+                      use_llm: str = "false"):
     """打新策略：未来 N 天待申购新股的逐只决策 + 挪仓计划。
 
     三层分工，界面上也分开显示：
@@ -2946,12 +2972,14 @@ def ipo_strategy_view(days: int = 30, target_ratio: float = 1.0,
     只读，不改任何持仓 —— 真正下单仍由你手动决定。
     """
     deps = _ipo_strategy_deps()
+    use_llm_bool = _bool_arg(use_llm)
     with get_conn() as conn:
         plans = ipo_strategy.strategy_for_upcoming(
             holdings=deps["holdings"], watchlist=deps["watchlist"],
             days=days, samples=deps["samples"], target_ratio=target_ratio,
-            conn=conn, use_llm=use_llm)
+            conn=conn, use_llm=use_llm_bool)
         ctx = ipo_market.cached_context(conn, deps["samples"])
+        lrm = lot_rate.load_model(conn)
     cap = ipo_strategy.current_market_cap(deps["holdings"])
     return {"plans": plans, "days": days, "target_ratio": target_ratio,
             "market_context": {
@@ -2967,6 +2995,7 @@ def ipo_strategy_view(days: int = 30, target_ratio: float = 1.0,
             "market_cap": {k: cap[k] for k in ("sh", "sz", "bj")},
             "positions": cap["positions"],
             "excluded": cap["excluded"],
+            "lot_rate_model": lrm,
             "rules": {"lot_value": ipo_strategy.LOT_VALUE,
                       "min_market_cap": ipo_strategy.MIN_MARKET_CAP,
                       "note": "市值按 T-2 日定格；只认本市场市值；"
@@ -3037,6 +3066,17 @@ def ipo_quota_notify(days: int = 45):
                           event="ipo_quota")
     return {"ok": True, "sent": len(alerts),
             "codes": [a["code"] for a in alerts]}
+
+
+@app.get("/api/ipo/lot-rate")
+def ipo_lot_rate_view():
+    """中签率估算模型状态：样本量、总配号数中位/P25/P75、置信度。
+
+    为什么需要它：待申购新股的中签率**发行公告才公布**，akshare 的字段
+    对未上市票是空的 —— 拿不到就只能给「无法评估」。这里用历史已上市新股
+    反推「全市场总配号数」来估算，并如实标出置信度。
+    """
+    return lot_rate.status(get_conn())
 
 
 @app.get("/api/ipo/status")
@@ -5258,6 +5298,19 @@ def _read_conf() -> dict:
     return news_fetcher.load_config()
 
 
+def _yaml_flow(val) -> str:
+    """把 Python 值渲染成 YAML flow 风格（``{enabled: true, url: ''}``）。
+
+    用 yaml.safe_dump 而不是手拼 f-string：searxng 的 url 可能含 ``:``、``#``、
+    中文，手拼必须逐个加引号，漏一个就把配置文件写成非法 YAML，
+    而这个函数的调用方（_write_conf_locked）**不做回读校验** ——
+    写坏了要等到下一次 load_config 才炸，那时已经晚了。
+    """
+    import yaml
+    return yaml.safe_dump(val, allow_unicode=True, default_flow_style=True,
+                          sort_keys=False).strip().rstrip("\n")
+
+
 def _write_conf(conf: dict) -> None:
     """把新闻配置写回 config.yaml（notify / bili 段由各自模块维护）。
 
@@ -5274,18 +5327,27 @@ def _write_conf(conf: dict) -> None:
 def _write_conf_locked(conf: dict) -> None:
     """_write_conf 的实际写盘逻辑（调用方需已持有 conf_util.WRITE_LOCK）。"""
     ch = conf["channels"]
+    # 渠道**通用序列化**，不硬编码渠道名。
+    # 原来这里逐个 f-string 写死 eastmoney/baidu/sina/duckduckgo 四个，
+    # 结果 2026-10-01 新加的 ak_em/bing/searxng 以及健康度参数
+    # 在网页点一次「保存设置」就被静默抹掉 —— 配置文件里的渠道少一个，
+    # 而界面上的复选框还亮着，看起来「保存成功了」。
+    ch_lines = ["  channels:"]
+    for cname, cval in ch.items():
+        ch_lines.append(f"    {cname}: {_yaml_flow(cval)}")
     news_block = "\n".join([
         "# Stock Advisor 新闻抓取配置",
         "# 网页「新闻」标签页也可修改以下配置（保存后下一轮抓取生效）",
+        "# 各渠道实测可用性见 news_fetcher.py 文件头的表格；排查先跑 news_fetcher.py --health",
         "news:",
-        "  channels:",
-        f"    eastmoney: {{enabled: {str(ch['eastmoney']['enabled']).lower()}, min_interval: {ch['eastmoney']['min_interval']}}}",
-        f"    baidu: {{enabled: {str(ch['baidu']['enabled']).lower()}, min_interval: {ch['baidu']['min_interval']}}}",
-        f"    sina: {{enabled: {str(ch['sina']['enabled']).lower()}, min_interval: {ch['sina']['min_interval']}}}",
-        f"    duckduckgo: {{enabled: {str(ch['duckduckgo']['enabled']).lower()}, min_interval: {ch['duckduckgo']['min_interval']}, timeout: {ch['duckduckgo'].get('timeout', 30)}}}",
+        *ch_lines,
         f"  fetch_interval_minutes: {conf['fetch_interval_minutes']}",
         f"  items_per_query: {conf['items_per_query']}",
         f"  keywords_extra: {json.dumps(conf.get('keywords_extra', []), ensure_ascii=False)}",
+        "  # 渠道健康度：连续失败 N 次后跳过整轮 M 分钟。",
+        "  # 「HTTP 200 但 0 条」不算失败（那是正常空结果），只有连接异常/反爬/解析失败才计数。",
+        f"  health_fail_threshold: {conf.get('health_fail_threshold', 3)}",
+        f"  health_cooldown_minutes: {conf.get('health_cooldown_minutes', 30)}",
     ])
     old = CONFIG_FILE.read_text(encoding="utf-8") if CONFIG_FILE.exists() else ""
     lines = old.splitlines()
@@ -5373,6 +5435,7 @@ def trigger_news_fetch():
     if _news_state["fetching"]:
         return {"ok": True, "status": "已在抓取中，请稍后"}
     _news_state["fetching"] = True
+    news_fetcher.reset_progress()
 
     def _run():
         try:
@@ -5389,8 +5452,15 @@ def trigger_news_fetch():
 
 @app.get("/api/news/status")
 def news_status():
+    """抓取状态。progress/health 让「抓取中…」不再是一句没有信息量的话。
+
+    - progress：已抓 N/总数、当前标的、当前渠道、各渠道累计耗时、跳过原因
+    - health  ：各渠道 ok/fail 次数与冷却剩余（排查「为什么这轮没抓到」先看它）
+    """
     return {"fetching": _news_state["fetching"], "last_run": _news_state["last_run"],
-            "last_result": _news_state["last_result"]}
+            "last_result": _news_state["last_result"],
+            "progress": news_fetcher.get_progress(),
+            "health": news_fetcher.health_snapshot()}
 
 
 @app.get("/api/config")
@@ -5406,9 +5476,17 @@ def update_config(body: ConfIn):
     if body.items_per_query is not None:
         conf["items_per_query"] = body.items_per_query
     if body.channels:
-        for name, enabled in body.channels.items():
-            if name in conf["channels"]:
-                conf["channels"][name]["enabled"] = bool(enabled)
+        for name, val in body.channels.items():
+            if name not in conf["channels"]:
+                continue
+            if isinstance(val, dict):
+                # searxng 这类渠道除 enabled 外还有 url / timeout，
+                # 整段覆盖（前端会回传完整对象），只接受已知键以免塞进脏字段
+                conf["channels"][name].update(
+                    {k: v for k, v in val.items()
+                     if k in conf["channels"][name]})
+            else:
+                conf["channels"][name]["enabled"] = bool(val)
     _write_conf(conf)
     return _read_conf()
 
@@ -6842,6 +6920,19 @@ def mp_articles(source_id: int = 0, unread_only: bool = False, limit: int = 50):
     return {"items": wechat_mp.list_articles(_mp_deps(), source_id or None,
                                               unread_only, limit),
             "unread": wechat_mp.unread_count(_mp_deps())}
+
+
+@app.get("/api/mp/articles/{aid}/body")
+def mp_article_body(aid: int, embed_images: bool = True):
+    """单篇正文（HTML 里的图片已转 base64 内嵌）。
+
+    不放进列表接口的原因：60 篇的 content_text 才 38 KB，而 content_html
+    要 784 KB、再把图片内嵌约 18.7 MB。按需取单篇（平均 2 张图 ≈ 324 KB）刚好。
+    """
+    try:
+        return wechat_mp.get_article_body(_mp_deps(), aid, embed_images)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
 
 
 @app.post("/api/mp/read")

@@ -233,6 +233,203 @@ http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ss
 （概念名表就 41 个），200 的预算只够 3 轮。预算耗尽会自动降级到新浪，
 而不是像原实现那样无限打同花顺直到被永久封禁。
 
+### 新闻搜索渠道实测（2026-10-01/02，**别重测**）
+
+| 渠道 | 实测 | 结论 |
+|---|---|---|
+| `eastmoney` | ✅ 可用 | 公告 + 资讯搜索 JSONP，0.2s，主力 |
+| `ak_em`（akshare `stock_news_em`） | ✅ 可用 | **唯一 100% 真实发布时间**的逐股渠道，0.3s |
+| `baidu` | ⚠️ 需 iPhone UA | 桌面 UA 会 302 到 `wappass.baidu.com` 图形验证码 |
+| `sina` | ✅ 可用 | 滚动流按名过滤，3 页 × 2s 间隔，慢但稳 |
+| `bing` | ❌ 噪声 | 中文财经词只认「公司」不认「新闻」，一轮入库 230 条全是官网/行情页 |
+| `searxng` | ✅ 可用 | 101 上自建，实测 14~31 条/查询，出真新闻 |
+| `duckduckgo` | ❌ 已死 | 2026-09-23 起本机与 101 均 TCP 443 超时 |
+
+**关键坑**：
+- 百度**必须用移动端 UA**（iPhone），桌面 UA 会被 WAF 拦。反爬判据不能用
+  `"百度安全验证" in html`（编码乱码恒 False），要用 host 判断。
+- 百度会**分阶段封禁**：36 只票 × 1 次（间隔 5s）后开始跳验证码。
+  被拦后由健康度冷却自动跳过整轮，**不要继续捶源延长封禁**。
+- 必应 `/news/search?format=rss` 返回 **0 条**（HTML 也只有 15KB 空壳）。
+  网页 RSS 有 `pubDate` 但那是**索引时间**不是发稿时间，不写入 `publish_time`。
+- akshare `stock_news_em` 首次 `import akshare` 要 **8~9 秒**，之后 0.15s。
+  在渠道函数里 import 会把一次性开销算进渠道耗时，看起来像渠道慢。
+
+### SearXNG 部署（101，2026-10-02 接入）
+
+- 位置：`/opt/searxng`，容器 `searxng-core` + `searxng-valkey`
+- 绑定：`0.0.0.0:8888`（2026-10-02 从 `127.0.0.1` 改的，安全组已放行）
+- ⚠️ **SearXNG 自身无鉴权**，现在等于在公网开了一个搜索代理。
+  任何人扫到 8888 都能用 101 的出口 IP 搜东西（滥用风险 + 流量成本）。
+  用完建议改回 `127.0.0.1` 绑回环，或加一层带 token 的反代。
+- 实测有效引擎：`sogou` / `yandex` / `360search`（14~31 条/查询）
+- 已禁用引擎（101 上 TCP 443 不通或 0 条）：
+  `duckduckgo` / `brave` / `google` / `mojeek` / `qwant` / `startpage` / `yahoo` /
+  `wikidata` / `wikipedia` / `bing` / `baidu` / `ecosia` / `marginalia`
+- 配置项：`config.yaml` 的 `news.channels.searxng.url`
+  （留空 = 关闭，填 `http://101.43.25.101:8888` 启用）
+- 接入：`news_fetcher.py` 的 `fetch_searxng()`，走 JSON API
+  （`?q=...&format=json&language=zh-CN`）
+
+### 板块资金流只有 3 家（2026-10-01 确认，别再找第四家）
+
+`同花顺`(主) / `开盘红·财联社` / `新浪` —— 就这三家有**板块级资金流**。
+东财的 `push2` 系已全封；akshare 里其余板块资金流函数要么走东财要么走新浪。
+要「板块级净流入绝对额」时只能轮询这三家，**不要再设计第四路**。
+
+---
+
+## 新股/打新「提前发现」渠道实测结论（2026-10-01，**别重查**）
+
+起因：打新额度提醒只依赖 `ipo_calendar` 排期，想问「有没有渠道能在排期公布前发现新股」。
+
+**结论：没有。试过 8 个巨潮关键词 × 4 个时间窗 × 加不加 IPO 辅导层，`fresh` 全程为 0。**
+
+`stock-advisor/ipo_discover.py` 里有一轮完整探测（54 候选 / 8.4s）：
+
+| 分类 | 数量 | 含义 |
+|---|---|---|
+| `listed` | 38 | 已上市（多是「中签率公告」，申购早结束） |
+| `scheduled` | 16 | 已在 `ipo_calendar` 排期里 —— 额度提醒已覆盖 |
+| `indirect` | 12 | 参股/控股**子公司**上市 —— 要打新的不是母公司 |
+| `post` | 38 | 申购后才发的公告，仅归档 |
+| **`fresh`** | **0** | 未上市 + 未排期 + 申购前 + 直接信号 ← 想要的 |
+
+### 三层原因（每层都实测过，不是猜的）
+
+1. **公告时间轴和排期表高度重叠**（结构性）。IPO 从受理到申购，交易所/券商
+   必然先披露排期，所以「公告能看到的时刻」排期表也能看到 → 零增量。
+2. **北交所没有「排期外待打新」的存量**。曾把 `920238 长鹰硬科` 当成
+   「还在排队」（07-13 出招股书 → 推断 10-01 未申购），实际
+   `sa_stock_roster.list_date=2026-07-24` —— **招股书到上市只隔 11 天**
+   （920176 维琪科技 07-27、920079 乔路通 07-22 同理）。
+3. **唯一理论上的早期通道（IPO 辅导）返回 4 年前冻结快照**。
+   `ak.stock_notice_report()` 实测 56 条：日期全是 `2022-05-11`（1604 天前）；
+   未辅导公司的「代码」是**辅导备案号**（`A21479`/`A16087`/`A12031`/`A17225`），
+   不是 A 股 6 位代码。不加过滤时它造出 4 个**假 fresh**（备案号查名册必然
+   落空 → 判成「未上市未排期」）。加 `_is_a_share_code` + `_age_ok` 后归零。
+
+### 巨潮关键词的早期信号密度（选错会让整个模块白做）
+
+| 关键词 | 总命中 | 过噪 | **早期** | 早期占比 | 结论 |
+|---|---|---|---|---|---|
+| 招股说明书 | 7825 | 23 | 23 | 100% | ★主源 |
+| **首次公开发行股票申请** | 1038 | 27 | **17** | 63% | ★★金矿 |
+| 上市委 | 365 | 9 | 9 | 100% | ★ |
+| 受理 | 1101 | 5 | 5 | 100% | ★（要严过滤，见下） |
+| 过会 | 1624 | 12 | 1 | 8% | ✗ 噪声大 |
+| 注册批复 | 2952 | 6 | 1 | 17% | ✗ 29/30 是已上市公司再融资 |
+| 提交注册 | 79 | 0 | 0 | 0% | ✗ |
+| 网上申购/发行公告/提示公告 | ~2000 | ~80 | ~0 | ~0% | 仅 post 校验用 |
+
+**「首次公开发行股票申请」最初漏了** —— 它是申购前 1-2 个月最集中的早期
+信号（受理→问询→过会→注册都在这个短语下）。漏了它 `pre_far` 从 17 掉到 0。
+
+### 「受理」这个关键词要严过滤
+
+它会捞到**药品/医疗器械上市许可受理**（实测海思科「创新药新适应症上市许可
+申请受理通知书」、翰宇药业「司美格鲁肽注射液上市申请获得受理」），
+与 IPO 无关。白名单必须含「首次公开发行/股票发行/公开发行股票/北交所」。
+
+### 巨潮 API 本身
+
+```
+POST https://www.cninfo.com.cn/new/hisAnnouncement/query
+必须 header: Referer(巨潮公告页) + X-Requested-With: XMLHttpRequest
+seDate="" = 只返回最新一批（pageSize 封顶 30，传 50/200 都只给 30）
+seDate 格式 "YYYY-MM-DD~YYYY-MM-DD"，**有效**（实测能拉到 2025-09 的数据）
+column=szse 与 column=sse 返回**完全相同**结果（逐条比对一致）→ 不用查两遍
+```
+
+### 那 `ipo_discover` 保留下来干什么
+
+1. **交叉验证排期表**：16 个 `scheduled` 是公告层**独立**抓到的 → 排期表没漏。
+   反向查漏能找到「排期有但公告层没抓到」的：实测 3 只
+   （`920071` 金钛股份 / `920269` 杰锋动力 / `920289` 华汇智能，都是北交所）。
+2. **`indirect` 对持仓有意义**：参股/控股子公司上市，母公司通常确认一次性
+   投资收益（万润股份、北陆药业、信德新材、汇川技术…）。
+3. **`post` 含新股中签率**，可反推打新收益率。
+
+---
+
+## Python/数据库踩坑（都实测过，别重犯）
+
+### `threading.Lock` 非重入 → 静默死锁
+
+`with _lock:` 里再 `with _lock:` = **进程无输出、无异常、永久挂住**。
+表现为「脚本跑满超时但什么也没打印」。`ipo_discover.discover()` 就这么
+把我骗了半小时 —— 我先后误判成「akshare 上游卡住」「IP 被限流」
+「两个数据源抢出口 IP」，全错，**真因就是锁非重入**。用 `RLock`。
+
+> 以后遇到「无输出、无异常、一直超时」，**第一个怀疑锁**，不是怀疑上游。
+
+### psycopg2 的 `IN (%s)` 传 list 会炸
+
+```python
+cur.execute("... WHERE code IN (%s)", (codes,))
+# IndexError: tuple index out of range   ← psycopg2 索引不了「1 个 list 对多个占位符」
+cur.execute("... WHERE code IN %s", (codes,))
+# SyntaxError: syntax error at or near "ARRAY"  ← 不会帮你展开成 ARRAY
+cur.execute("... WHERE code = ANY(%s)", (codes,))
+# ✅ 正确
+```
+`list_date` 是 `date` 列，比较必须 `list_date::text` 或 `::date`，
+传 ISO 字符串报 `operator does not exist: date = text`。
+
+### 不要在工具模块里 `from app import get_conn`
+
+它会 import 整个 `app.py`，连带启动所有 daemon（iLink 会话、holiday 日历构建…），
+**实测光这一步 46.8 秒**。工具模块用 `ipo_quota._query`（只读 `.env` + psycopg2）。
+
+### 微信 `/s/` 短链的 `~` → `_`：一个字符毁掉 30% 的正文
+
+微信 `mp.weixin.qq.com/s/<token>` 的 token 是 **base64url**（22 字符），字母表里
+**没有 `~`**。抓取链路上某处把 `_` 损坏成了 `~`，后果是：
+
+- `~` 版 URL 恒返回 **HTTP 200 + `参数错误`**（换各种 UA 都一样），
+  看起来像「源活着但今天没数据」—— 和上面那个 push2 假失败同一类陷阱
+- `_` 版才 302 到 `<token>?nwr_flag=1`，能取到标题和正文
+- 64 个字符逐个扫：**只有 `_` 有效**
+- 概率模型吻合：P(22 字符里至少含 1 个 `_`) = 1 − (63/64)^22 ≈ **29.3%**，
+  实测 55/183 ≈ 30%
+
+**修复**：`wechat_mp.py::_normalize_mp_url()`，只对 `https://mp.weixin.qq.com/s/`
+前缀的 `url` **和 `guid`** 做 `~`→`_`。
+
+**踩过的两个坑**：
+
+1. **一开始只改 `url`、刻意保留原始 `guid`**（理由是「guid 是去重键，别动」）——
+   结果远端 WeRSS 的 URL 修好后开始下发 `_` 形式，`ON CONFLICT (source_id, guid)`
+   判成新文章，**同一篇插出两行（34 组重复）**。
+   → `url` 和 `guid` 必须**同口径**，且要迁移库里的历史 guid（先删重复再改，
+   否则 `UNIQUE (source_id, guid)` 直接 23505）。
+2. WeRSS 自带的 `scripts/fix_weread_mp_urls.py` 注释声称做这件事，但它的判断条件
+   `"~" in new_token` **永远不成立** —— 它是个 no-op，别指望它能修。
+
+**结论口径**：判断「某篇抓没抓到正文」必须看 `content_html`/`content_text` 是否非空，
+**不能只看 HTTP 200**。修完后 WeRSS 侧从 117/183 抓回到 **183/183**。
+
+### WeRSS（101:8001）的登录密码与 `/rss` token
+
+| 项 | 在哪 | 备注 |
+|---|---|---|
+| Web UI 登录 | `admin` + `/opt/we-mp-rss/.env.bak` 里的 `WERSS_PASSWORD` | **`.env` 当前那个值登不上** |
+| `/rss` token | stock-advisor `config.yaml` → `mp.auth` | 不带 → `401 RSS requires token` |
+
+`WERSS_PASSWORD` **只在首次初始化时用来建账号**。`.env` 在 09-29 改过一次，但
+`users.password_hash`（bcrypt）匹配的仍是 09-27 的原始密码 —— **改 `.env` 不会同步
+已有账号**。核对要用 `bcrypt.checkpw`（容器内 `/app/env_x86_64/bin/python3`，
+系统 `python3` 没装 bcrypt），**别反复试登录**：接口回
+`202 + {"code":40101,"message":"用户名或密码错误，您还有N次机会"}`，会锁号。
+
+### PowerShell 的 `2>&1 | Where-Object { $_ -is [string] }` 会吃掉异常
+
+stderr 进管道是 `ErrorRecord` 对象，**不是 `[string]`**，全被过滤掉 →
+Python 明明抛了 traceback，我只看到「Exited with code 1」没有输出。
+查 Python 异常时**不要加这个过滤**，直接 `2>&1 | Out-String`。
+
+---
+
 ### 测试环境陷阱
 
 - `notifier._db_exec` 内部 `from app import get_conn`，会**重新执行整个 app.py 并再起一套 daemon**，
@@ -240,6 +437,8 @@ http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ss
 - 看 git 提交内容用 `git cat-file -p` 并显式解码。PowerShell 里
   `git show > file` 再 `-match` 会得到 `System.Object[]`，导致误判。
 - 测试脚本统一放 `%LOCALAPPDATA%\Temp\opencode\`，不要写进仓库。
+- 多行中文脚本**不要用 `python -c "..."`**（PowerShell 会把换行和引号吃掉，
+  表现为无输出 exit 1）。写成 `.py` 文件再跑。
 
 ### 提交范围
 

@@ -325,12 +325,48 @@ def _collect_json(node, out: list) -> None:
             _collect_json(v, out)
 
 
+def _normalize_mp_url(url: str) -> str:
+    """微信 `/s/` 短链里的 `~` → `_`（2026-10-02 实测修复）。
+
+    现象：183 篇文章里 55 篇抓不到正文，按 url 与 WeRSS 对齐后发现 ——
+    **有正文的 128 篇 URL 含 `~` 次数为 0，无正文的 55 篇 100% 含 `~`**。
+    微信 `/s/` 短链是 base64url、恒定 22 字符，字母表里根本没有 `~`。
+
+    实测（3 种 UA × 跟随/不跟随重定向）：
+      - `~` 版 → 恒 200 +「参数错误」页，页面里**没有**文章标题
+      - `_` 版 → 微信 UA 下 302 到 `<同一 _ token>?nwr_flag=1`（只是加风控参数，
+        **不会跳回 `~`**），跟随重定向后 200 + 标题命中
+      - 把 `~` 换成 64 个 base64url 字符逐一试，**只有 `_` 不报参数错误且标题命中**
+
+    概率自洽：22 字符里含至少一个 `_` 的概率 = 1−(63/64)²² ≈ 29.3%，
+    183×29.3% ≈ 53.6 篇，实测失败 55 篇；失败组平均 `_` 数 1.25（理论 1.19）。
+
+    WeRSS 自带的 `scripts/fix_weread_mp_urls.py` 注释声称相反结论
+    （「微信把 `_` 302 回 `~`」），与上面实测矛盾，且它代码里的
+    `"~" in new_token` 条件在当前微信行为下永不成立 —— 注释是陈旧的。
+
+    url 和 guid 都要改 —— guid 就是 `ON CONFLICT (source_id, guid)` 的去重键。
+    （2026-10-02 踩过：当时只改 url、刻意保留原始 guid 想「不动去重键」，结果
+    远端 WeRSS 的 URL 修好之后开始下发 `_` 形式，同一篇文章被判成新文章，
+    **插出 34 组重复行**。所以必须两侧同口径，且库里的历史 guid 也一并规范化。）
+    """
+    if not url or "~" not in url:
+        return url
+    head = "https://mp.weixin.qq.com/s/"
+    if url.startswith(head):
+        # 只换 token 段，query（?nwr_flag=1 等）保持原样
+        token, sep, qs = url[len(head):].partition("?")
+        return head + token.replace("~", "_") + (sep + qs if sep else "")
+    return url
+
+
 def _items_from_json(data) -> list[dict]:
     raw: list[dict] = []
     _collect_json(data, raw)
     out = []
     for it in raw:
-        url = _nested_str(it, _URL_KEYS)
+        url_raw = _nested_str(it, _URL_KEYS)
+        url = _normalize_mp_url(url_raw)
         title = _nested_str(it, _TITLE_KEYS)
         if not url or not title:
             continue
@@ -349,7 +385,8 @@ def _items_from_json(data) -> list[dict]:
             "author": _nested_str(it, ("author", "author_name")) or _mp_name_of(it),
             "mp_name": _mp_name_of(it),
             "published_at": _parse_dt(_first(it, _DATE_KEYS)),
-            "guid": _first(it, ("guid", "id", "mid")) or url,
+            # guid 也要规范化，见 _normalize_mp_url 注释（不同口径会造出重复行）
+            "guid": _normalize_mp_url(_first(it, ("guid", "id", "mid")) or url_raw),
         })
     return out
 
@@ -413,12 +450,13 @@ def _items_from_xml(root) -> list[dict]:
         if not desc and body:
             desc = _norm(title, _html_to_text(body)[:400])[1]
         out.append({
-            "title": title, "url": link, "summary": desc,
+            "title": title, "url": _normalize_mp_url(link), "summary": desc,
             "content_html": body,
             "content_text": _html_to_text(body) if body else "",
             "author": author or mp_name, "mp_name": mp_name,
             "published_at": _parse_dt(date_raw),
-            "guid": guid or link,
+            # guid 也要规范化，见 _normalize_mp_url 注释（不同口径会造出重复行）
+            "guid": _normalize_mp_url(guid or link),
         })
     return out
 
@@ -661,8 +699,14 @@ def list_articles(deps, source_id: int | None = None, unread_only: bool = False,
         params.append(source_id)
     if unread_only:
         where.append("NOT a.is_read")
+    # 2026-10-02 加 content_text：原来列表只给 title + summary，而 summary
+    # 有一个坑 —— **无正文的 66 篇 summary 100% 等于 title**，页面上是标题
+    # 重复两遍、正文区一片空白（库里明明有 117 篇全文却一条都看不见）。
+    # 带上 content_text 后前端既能给真摘要预览，也能不发请求就地展开纯文本。
+    # 体积实测：60 篇 38 KB、200 篇 128 KB（content_html 才是大的，60 篇 784 KB，
+    # 所以正文 HTML 走单独的 /body 接口按需取）。
     sql = ("SELECT a.id, a.source_id, a.title, a.url, a.author, a.mp_name, a.summary, "
-           "a.published_at, a.fetched_at, a.is_read, s.name "
+           "a.published_at, a.fetched_at, a.is_read, s.name, a.content_text "
            "FROM sa_mp_articles a JOIN sa_mp_sources s ON s.id = a.source_id")
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -680,7 +724,134 @@ def list_articles(deps, source_id: int | None = None, unread_only: bool = False,
             "published_at": r[7].isoformat(timespec="minutes") if r[7] else None,
             "fetched_at": r[8].isoformat(timespec="seconds") if r[8] else None,
             "is_read": r[9], "source_name": r[10],
+            "content_text": r[11] or "",
+            # 有没有可展开的正文（决定标题要不要显示展开箭头）
+            "has_body": bool(r[11]),
         })
+    return out
+
+
+# ---------------- 单篇正文（含图片转 base64）----------------
+
+_IMG_TAG = re.compile(
+    r"<img\b[^>]*?\bsrc\s*=\s*([\"'])(https?://[^\"']+)(\1)[^>]*>", re.I)
+_IMG_NOSRC = re.compile(r"<img\b(?![^>]*\bsrc\s*=)[^>]*>", re.I)
+_DATA_SRC = re.compile(r"(\bdata-src\s*=\s*)([\"'])(https?://[^\"']+)(\2)", re.I)
+_MAX_IMG_BYTES = 3_000_000        # 单张上限，防被超大图拖垮
+_INLINE_CACHE_MAX = 40            # 内联结果缓存条数（进程内）
+_inline_cache: dict = {}
+_inline_lock = threading.Lock()
+
+
+def _img_to_data_url(url: str, sess) -> str | None:
+    """下载一张图并转成 data URL；失败返回 None（调用方保留原始外链）。"""
+    try:
+        r = sess.get(url, timeout=(5, 12), stream=True)
+        if r.status_code != 200:
+            return None
+        ctype = (r.headers.get("content-type") or "").split(";")[0].strip().lower()
+        if not ctype.startswith("image/"):
+            return None
+        buf = bytearray()
+        for chunk in r.iter_content(16384):
+            buf.extend(chunk)
+            if len(buf) > _MAX_IMG_BYTES:
+                return None
+        if len(buf) < 200:          # 小于 200 字节的多半是占位/错误页
+            return None
+        import base64
+        return f"data:{ctype};base64," + base64.b64encode(bytes(buf)).decode()
+    except Exception:
+        return None
+
+
+def inline_images(html: str) -> str:
+    """把 HTML 里的远程图片（mmbiz.qpic.cn 等）下载转成 data URL 内嵌。
+
+    为什么要内嵌（2026-10-02 实测）：公众号图床有防盗链且策略会随时变，
+    直接引用外链 = 正文里的图表时好时坏。实测裸连 12/12 通，但**每篇都要
+    现场确认**，所以改成落库后按需内嵌。
+
+    为什么不预生成：230 张图 × 中位 111 KB → base64 后 36.5 MB，
+    塞进列表接口不可接受（列表 60 篇纯文本才 38 KB）。单篇平均 2 张 ≈ 324 KB，
+    按需内嵌刚好。下载失败保留原外链，不因为图挂了就整篇不显示。
+    """
+    if not html:
+        return ""
+    import requests
+
+    urls = [m.group(2) for m in _IMG_TAG.finditer(html)]
+    urls += [m.group(3) for m in _DATA_SRC.finditer(html)]
+    if not urls:
+        return html
+
+    sess = requests.Session()
+    sess.trust_env = False      # 与 _get 同策：绕开本机代理（NO_PROXY=*）
+    sess.headers.update(HEADERS)
+    done: dict = {}
+    for u in dict.fromkeys(urls):        # 去重且保序
+        key = _html_unescape(u)
+        if key not in done:
+            du = _img_to_data_url(key, sess)
+            if du:
+                done[key] = du
+    if not done:
+        return html
+
+    def _sub(m):
+        raw = _html_unescape(m.group(2))
+        return m.group(0).replace(m.group(2), done.get(raw, m.group(2)))
+
+    html = _IMG_TAG.sub(_sub, html)
+
+    # 懒加载图（无 src，只有 data-src）：补上 src 内联后的值
+    def _sub_nosrc(m):
+        tag = m.group(0)
+        dm = _DATA_SRC.search(tag)
+        if not dm:
+            return tag
+        raw = _html_unescape(dm.group(3))
+        du = done.get(raw)
+        if not du:
+            return tag
+        return tag.replace(dm.group(0), f"{dm.group(1)}{dm.group(2)}{raw}{dm.group(2)}"
+                                       f" src={dm.group(2)}{du}{dm.group(2)}")
+    return _IMG_NOSRC.sub(_sub_nosrc, html)
+
+
+def get_article_body(deps, aid: int, embed_images: bool = True) -> dict:
+    """取单篇正文。带图片的 HTML 走这里，纯文本直接用列表里的 content_text。
+
+    返回 {id, title, url, content_html, content_text, has_images}；
+    content_html 里的图片已转 base64 内嵌（embed_images=True 时）。
+    """
+    with deps["get_conn"]() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, title, url, content_html, content_text "
+            "FROM sa_mp_articles WHERE id = %s", (aid,))
+        row = cur.fetchone()
+    if not row:
+        raise ValueError("文章不存在")
+    aid2, title, url, html, txt = row[0], row[1], row[2], row[3] or "", row[4] or ""
+    has_images = bool(_IMG_TAG.search(html) or _DATA_SRC.search(html))
+    if not embed_images or not has_images:
+        return {"id": aid2, "title": title, "url": url,
+                "content_html": html, "content_text": txt,
+                "has_images": False}
+
+    ck = (aid2, len(html))
+    with _inline_lock:
+        hit = _inline_cache.get(ck)
+    if hit is not None:
+        return hit
+
+    out = {"id": aid2, "title": title, "url": url,
+           "content_html": inline_images(html), "content_text": txt,
+           "has_images": True}
+    with _inline_lock:
+        if len(_inline_cache) >= _INLINE_CACHE_MAX:
+            _inline_cache.pop(next(iter(_inline_cache)), None)
+        _inline_cache[ck] = out
     return out
 
 
@@ -734,45 +905,70 @@ def _fetch_source(deps, src: dict, conf: dict,
                             "或地址不是 RSS/Atom/JSON）")
         return result
     now = datetime.now(timezone.utc)
-    with deps["get_conn"]() as conn, conn.cursor() as cur:
-        for it in items:
-            body = it.get("content_html", "") or ""
-            body_txt = it.get("content_text", "") or ""
-            cur.execute(
-                """
-                INSERT INTO sa_mp_articles
-                    (source_id, guid, title, url, author, mp_name, summary,
-                     published_at, content_html, content_text)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (source_id, guid) DO NOTHING
-                """,
-                (src["id"], it["guid"][:512], it["title"], it["url"],
-                 it.get("author", "") or "", it.get("mp_name", "") or src["name"],
-                 it.get("summary", ""), it.get("published_at") or now,
-                 body, body_txt))
-            if cur.rowcount:            # rowcount=1 才是真插入（冲突时为 0）
-                result["new"] += 1
-                result["fresh"].append(it)
-                continue
-            # ---- 冲突：已存在。补正文（2026-09-29 加）----
-            # 实测踩到的坑：文章首次被抓到时 WeRSS 往往只有标题+短摘要，正文
-            # 是空的（「百亿龙头昨天涨停…」库里 HTML=0，而几分钟后 WeRSS 那边
-            # 已经有 24,950 字符的正文）。ON CONFLICT DO NOTHING 让这个状态
-            # 永久化 —— 正文永远不会补上。
-            # 所以这里做一次**单向补齐**：只在「库里为空、这次有」时写。
-            # 绝不用新值覆盖已有值 —— 正文被上游改写（微信排版修正、删图）
-            # 时保留先到的原文更符合「存档」语义。
-            if body:
+    # ⚠️ 这里**必须显式 commit**，不能只靠 `with conn` 的上下文退出。
+    #
+    # 实测踩到的事故（2026-10-01）：这个块以前只有 `with conn, cur:`，
+    # psycopg2 的 with 只在**正常退出**时提交；一旦进程在块内被杀/断连，
+    # 服务器上就留下一条 `idle in transaction` 的连接，**持有
+    # sa_mp_articles 的表锁和行锁**（pg_locks 里 granted=True）。
+    # 后果不是"慢"，是**全服务起不来**：app.py 启动时跑的那些幂等 DDL
+    # （ALTER TABLE ... ADD COLUMN IF NOT EXISTS）全部排在这个锁后面，
+    # 实测 4 个 ALTER 排队等了 20 多分钟，import app 直接卡死、
+    # 8686 端口不监听，而任何一条日志里都没有报错 ——
+    # 看起来像"启动了但没监听"，实际是卡在第一条 ALTER 上。
+    #
+    # 所以：每写完一个源就 commit（这里是一个源一个连接，粒度合适），
+    # 不给任何异常路径留下持锁的窗口。
+    conn = deps["get_conn"]()
+    try:
+        with conn.cursor() as cur:
+            for it in items:
+                body = it.get("content_html", "") or ""
+                body_txt = it.get("content_text", "") or ""
                 cur.execute(
-                    """UPDATE sa_mp_articles
-                       SET content_html = %s,
-                           content_text = COALESCE(NULLIF(content_text,''), %s)
-                       WHERE source_id = %s AND guid = %s
-                         AND COALESCE(content_html,'') = ''""",
-                    (body, body_txt, src["id"], it["guid"][:512]))
-                if cur.rowcount:
-                    result["backfilled"] += 1
-                    result["backfilled_titles"].append(it["title"][:60])
+                    """
+                    INSERT INTO sa_mp_articles
+                        (source_id, guid, title, url, author, mp_name, summary,
+                         published_at, content_html, content_text)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (source_id, guid) DO NOTHING
+                    """,
+                    (src["id"], it["guid"][:512], it["title"], it["url"],
+                     it.get("author", "") or "", it.get("mp_name", "") or src["name"],
+                     it.get("summary", ""), it.get("published_at") or now,
+                     body, body_txt))
+                if cur.rowcount:            # rowcount=1 才是真插入（冲突时为 0）
+                    result["new"] += 1
+                    result["fresh"].append(it)
+                    continue
+                # ---- 冲突：已存在。补正文（2026-09-29 加）----
+                # 实测踩到的坑：文章首次被抓到时 WeRSS 往往只有标题+短摘要，正文
+                # 是空的（「百亿龙头昨天涨停…」库里 HTML=0，而几分钟后 WeRSS 那边
+                # 已经有 24,950 字符的正文）。ON CONFLICT DO NOTHING 让这个状态
+                # 永久化 —— 正文永远不会补上。
+                # 所以这里做一次**单向补齐**：只在「库里为空、这次有」时写。
+                # 绝不用新值覆盖已有值 —— 正文被上游改写（微信排版修正、删图）
+                # 时保留先到的原文更符合「存档」语义。
+                if body:
+                    cur.execute(
+                        """UPDATE sa_mp_articles
+                           SET content_html = %s,
+                               content_text = COALESCE(NULLIF(content_text,''), %s)
+                           WHERE source_id = %s AND guid = %s
+                             AND COALESCE(content_html,'') = ''""",
+                        (body, body_txt, src["id"], it["guid"][:512]))
+                    if cur.rowcount:
+                        result["backfilled"] += 1
+                        result["backfilled_titles"].append(it["title"][:60])
+        conn.commit()          # ← 见上方注释：必须显式提交，不给异常路径留持锁窗口
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
     result["status"] = "ok"
     return result
 

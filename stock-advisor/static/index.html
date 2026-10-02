@@ -246,6 +246,17 @@
   .dyn-author { font-weight: 600; cursor: pointer; }
   .dyn-author:hover { color: var(--accent); }
   .dyn-text { margin: 4px 0 2px; word-break: break-word; white-space: pre-wrap; }
+  /* 公众号正文展开区：微信正文靠内联 style 排版，这里只兜住图片和超宽表格 */
+  .mp-body { margin-top: 8px; padding: 10px 12px; background: var(--bg-2);
+             border-radius: var(--r-sm); font-size: 14px; line-height: 1.75;
+             word-break: break-word; }
+  .mp-body-inner { max-width: 100%; overflow-x: auto; }
+  .mp-body-inner img { max-width: 100%; height: auto; border-radius: 4px;
+                       display: block; margin: 8px auto; }
+  .mp-body-inner p, .mp-body-inner section, .mp-body-inner div {
+    max-width: 100%; overflow-wrap: break-word; }
+  .mp-body-inner table { max-width: 100%; border-collapse: collapse; }
+  .mp-body-inner a { color: var(--accent); }
   .dyn-stats { color: var(--text-2); font-size: 12px; }
   .dyn-cmt { margin-top: 8px; padding: 8px 10px; background: var(--bg-2);
              border-radius: var(--r-sm); font-size: 12px; }
@@ -775,13 +786,57 @@
       </div>
       <div class="muted" style="margin-top:6px">
         规则事件本地推算：每月第 1 个周五<b>非农</b>、第 3 个周五<b>股指期货交割</b>（季月升级<b>四巫日</b>=富时罗素/标普季调生效）、
-        第 4 个周五 ETF 期权到期、每月 20 日 <b>LPR</b>。交易日早 8 点起盘前自动推微信：今明两日事件一条，
-        ⚡重要事件（非农/四巫）另提前 3 天预告一次。
+        第 4 个周五 ETF 期权到期、每月 20 日 <b>LPR</b>；
+        年度政治事件：<b>美国中期选举</b>（偶数年 11 月第一个周一之后的周二）、
+        <b>全国两会开幕</b>（从《政府工作报告》抽取，闭幕日不固定）。
+        交易日早 8 点起盘前自动推微信：今明两日事件一条，
+        ⚡重要事件（非农/四巫/中期选举/两会）另提前 3 天预告一次。
       </div>
     </div>
+
+    <!-- ============ 打新策略（2026-10-01）============ -->
     <div class="card">
       <div class="row" style="justify-content:space-between;margin-bottom:6px">
-        <b style="font-size:13px">未来 3 个月</b>
+        <b style="font-size:13px">🆕 打新策略</b>
+        <div class="row">
+          <label class="muted" style="font-size:12px">目标市值
+            <select id="ipo-target-ratio" onchange="loadIpoStrategy()">
+              <option value="1">顶格</option>
+              <option value="0.5">50%</option>
+              <option value="0.25">25%</option>
+            </select>
+          </label>
+          <button class="btn ghost" id="ipo-llm-btn" data-on="0" onclick="toggleIpoLlm()"
+                  title="要不要为这只票挪市值由 LLM 判断（行业周期位置/资金分流）；收益数字始终由代码实测统计，不会让 LLM 编">带 LLM 判断</button>
+          <button class="btn ghost" onclick="loadIpoContext()">刷新基准</button>
+        </div>
+      </div>
+      <div id="ipo-context" class="muted" style="font-size:12px;margin-bottom:8px"></div>
+      <div id="ipo-strategy-list"></div>
+      <div id="ipo-strategy-empty" class="empty hide">加载中…</div>
+      <details style="margin-top:10px">
+        <summary style="cursor:pointer"><b style="font-size:13px">📐 规则与算法（点击查看口径）</b></summary>
+        <div class="muted" style="font-size:12px;margin:6px 0;line-height:1.75">
+          <b>额度</b>：T-2 日前 20 个交易日<b>日均市值</b> ÷ 5000 元 = 1 个申购单位。
+          <span style="color:#b54708">只认本市场</span>：沪市新股只算沪市非限售A股市值，
+          深市/北交所/基金/债券/现金都不计入。<b>最早 T-2 就要动手</b>，不是 T-1。<br>
+          <b>期望收益</b> = 配号数 × 中签率 × 每签盈利。<br>
+          <b>每签盈利</b>：优先用发行方披露的实测值；没有则用「近期已上市新股首日涨幅中位数
+          × 当期赚钱效应系数」—— <b>全部来自实测统计，代码里没有任何硬编码收益率</b>。<br>
+          <b>划不划算</b>：拿打新期望收益跟「同等市值买底仓吃股息」比，而不是比某个写死金额
+          （股息率取底仓候选池实测中位数）。<br>
+          <b>发行估值溢价是<b style="color:#067647">正向</b>因子</b>：实测相关系数 -0.335（n=20），
+          溢价越高首日涨得越多 —— 因为 A 股新股是稀缺品，定价贵说明需求旺。与直觉相反，样本少需谨慎。<br>
+          <b>LLM 只做定性判断</b>（值不值得为它挪仓、风险点），<b>不产出任何收益率数字</b> ——
+          它没有实时定价数据，编出来的涨幅看着合理但仍是编的。规则与 LLM 冲突时取严并标记人工确认。
+        </div>
+      </details>
+      <div id="ipo-pool-box" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="justify-content:space-between;margin-bottom:6px">
+        <b style="font-size:13px">未来 3 个月（含新股排期）</b>
         <div class="row">
           <button class="btn ghost" onclick="calendarCheck()" title="按当前日期跑一次盘前提醒逻辑">模拟提醒</button>
           <button class="btn ghost" onclick="loadCalendar()">刷新</button>
@@ -810,9 +865,15 @@
         <label class="muted">周期(分钟) <input id="cfg-interval" type="number" min="0" max="1440"
           style="width:70px;padding:5px 7px;border:1px solid var(--border);border-radius:6px"> 0=关闭</label>
         <label class="muted"><input type="checkbox" id="cfg-eastmoney"> 东财</label>
+        <label class="muted"><input type="checkbox" id="cfg-ak_em"> 东财个股新闻</label>
         <label class="muted"><input type="checkbox" id="cfg-baidu"> 百度</label>
         <label class="muted"><input type="checkbox" id="cfg-sina"> 新浪</label>
+        <label class="muted"><input type="checkbox" id="cfg-bing"> 必应</label>
+        <label class="muted"><input type="checkbox" id="cfg-searxng"> SearXNG</label>
         <label class="muted"><input type="checkbox" id="cfg-duckduckgo"> DDG</label>
+        <label class="muted" style="flex:1;min-width:260px">SearXNG 地址
+          <input id="cfg-searxng-url" type="text" placeholder="留空=关闭，如 http://127.0.0.1:8888"
+            style="flex:1;min-width:180px;padding:5px 7px;border:1px solid var(--border);border-radius:6px"></label>
         <button class="btn ghost" onclick="saveConfig()">保存设置</button>
       </div>
     </div>
@@ -2590,7 +2651,7 @@ const TAB_LOADERS = {
   holdings:  () => { loadHoldings(); refreshTradeStrategyOptions(); },
   strategies:() => { loadStrategies(); refreshTradeStrategyOptions(); },
   plans:     () => { loadPlans(); loadLlmConf(); },
-  calendar:  loadCalendar,
+  calendar:  () => { loadCalendar(); loadIpoStrategy(); },
   news:      () => { loadNews(); loadConfig(); },
   bili:      () => { loadBiliCreators(); loadBiliDynamics(); loadBiliStatus(); },
   wb:        () => { loadWbCreators(); loadWbPosts(); loadWbStatus(); },
@@ -3810,6 +3871,221 @@ async function delPlan(id) {
 const CAL_LEVEL = { high: { t: '⚡ 重要', s: 'background:#ffe2e2;color:#b32424' },
                     mid: { t: '关注', s: 'background:#ffe9d6;color:#b25f00' },
                     low: { t: '一般', s: 'background:#e5f3e2;color:#2e7d32' } };
+// ---------------- 打新策略（2026-10-01）----------------
+// 数字（涨幅基准/中签率/期望收益）全部来自后端实测统计；LLM 只做定性判断。
+// 界面上刻意把「代码算的」和「LLM 说的」分开显示 —— 混在一起会让人以为
+// 那句定性结论也是算出来的。
+
+const IPO_VERDICT = {
+  skip:     { t: '不参与',   s: 'background:#f2f4f7;color:#667085' },
+  small:    { t: '收益太薄', s: 'background:#fff4e5;color:#b54708' },
+  evaluate: { t: '需人工确认', s: 'background:#eef2f7;color:#475467' },
+  urgent:   { t: '来不及了', s: 'background:#fee4e2;color:#b42318' },
+  hold:     { t: '底仓已够', s: 'background:#e0f2fe;color:#026aa2' },
+  shift:    { t: '建议挪仓', s: 'background:#d1fadf;color:#067647' },
+  marginal: { t: '可挪可不挪', s: 'background:#fef0c7;color:#b54708' },
+};
+const IPO_RISK = { low: '低风险', medium: '中风险', high: '高风险' };
+
+function ipoWan(v) {
+  if (v == null) return '—';
+  return (v >= 10000 ? (v / 10000).toFixed(0) : v.toFixed(1));
+}
+
+function toggleIpoLlm() {
+  const btn = $('ipo-llm-btn');
+  const on = btn.dataset.on === '1';
+  btn.dataset.on = on ? '0' : '1';
+  btn.textContent = on ? '带 LLM 判断' : '✓ LLM 已开';
+  btn.className = on ? 'btn ghost' : 'btn';
+  loadIpoStrategy();
+}
+
+async function loadIpoContext() {
+  try {
+    const d = await api('/api/ipo/strategy?days=45&use_llm=false');
+    renderIpoContext(d);
+  } catch (e) { /* 上下文拿不到不影响主列表 */ }
+}
+
+function renderIpoContext(d) {
+  const mc = d.market_context || {};
+  const st = mc.sentiment || {};
+  const bits = [];
+  if (mc.sample_n) {
+    bits.push(`<b>新股首日涨幅基准</b>：中位 <b style="color:#067647">${mc.median_gain != null
+      ? (mc.median_gain * 100).toFixed(0) + '%' : '—'}</b>`
+      + `（${mc.sample_n} 只已上市样本）`
+      + (mc.broke_rate != null ? ` · 破发率 ${(mc.broke_rate * 100).toFixed(0)}%` : ''));
+  } else {
+    bits.push('<span style="color:#b54708">新股涨幅基准：无已上市样本</span>');
+  }
+  if (mc.adjusted_note) bits.push(esc(mc.adjusted_note));
+  if (st.band) bits.push(`赚钱效应：${esc(st.band)}${st.multiplier != null
+    ? `（×${st.multiplier}）` : ''}${st.zt_total != null ? ` · 涨停 ${st.zt_total} 家` : ''}`);
+  const cap = d.market_cap || {};
+  bits.push(`我的市值：沪 <b>${ipoWan((cap.sh || 0) / 10000)}</b> 万 / 深 <b>${ipoWan((cap.sz || 0) / 10000)}</b> 万`);
+  if (mc.low_confidence) {
+    bits.push('<span style="color:#b54708">⚠️ 样本或情绪数据不足，基准参考价值有限</span>');
+  }
+  // 中签率模型状态（待申购票的中签率就是用它估的）
+  const lrm = d.lot_rate_model || {};
+  if (lrm.available) {
+    bits.push(`<b>中签率估算</b>：总配号数中位 ${lrm.median_pairs_yi} 亿`
+      + `（P25~P75 ${lrm.p25}~${lrm.p75}，${lrm.n} 只样本，`
+      + `置信度 <b style="color:#b54708">${esc(lrm.confidence)}</b>）`);
+  } else if (lrm.why) {
+    bits.push(`<span style="color:#b54708">中签率无法估算：${esc(lrm.why)}</span>`);
+  }
+  $('ipo-context').innerHTML = bits.join(' ｜ ');
+}
+
+async function loadIpoStrategy() {
+  const ratio = ($('ipo-target-ratio') || {}).value || '1';
+  const useLlm = ($('ipo-llm-btn') || {}).dataset?.on === '1';
+  const list = $('ipo-strategy-list');
+  list.innerHTML = '<div class="muted">加载中…</div>';
+  try {
+    const d = await api(`/api/ipo/strategy?days=45&target_ratio=${ratio}&use_llm=${useLlm}`);
+    renderIpoContext(d);
+    renderIpoPool(d);
+    const plans = d.plans || [];
+    $('ipo-strategy-empty').classList.toggle('hide', plans.length > 0);
+    $('ipo-strategy-empty').textContent = '未来 45 天没有待申购的新 A 股';
+    list.innerHTML = plans.map(ipoPlanCard).join('') || '';
+  } catch (e) {
+    list.innerHTML = `<div class="empty">加载打新策略失败：${esc(e.message)}</div>`;
+  }
+}
+
+function ipoPlanCard(p) {
+  const s = p.stock || {};
+  const v = IPO_VERDICT[p.verdict] || IPO_VERDICT.evaluate;
+  const vc = p.verdict_combined || { final: p.verdict, basis: '', needs_review: false };
+  const vcc = IPO_VERDICT[vc.final] || v;
+  const mc = p.market_context || {};
+  const val = p.valuation_signal || {};
+  const scale = p.issue_scale || {};
+
+  let h = `<div style="border:1px solid var(--border,#eee);border-radius:8px;padding:10px;margin-bottom:10px">`;
+  h += `<div class="row" style="justify-content:space-between;align-items:flex-start">`;
+  h += `<span><b>${esc(s.name || '')}</b> <span class="muted">${esc(s.code || '')}</span>
+    <span class="badge" style="${vcc.s};margin-left:4px">${vcc.t}</span>
+    <span class="muted" style="margin-left:4px">${esc(s.board || '')}</span></span>`;
+  h += `<span class="muted" style="font-size:12px">申购 ${esc(p.sub_date || '—')}
+    ${p.lead_days != null ? `（T-${p.lead_days} 天）` : ''}</span>`;
+  h += `</div>`;
+
+  // 代码算的部分
+  h += `<div class="muted" style="font-size:12px;margin-top:6px;line-height:1.7">`;
+  if (s.price) h += `发行价 ${s.price}　`;
+  if (s.full_cap_wan) h += `顶格需配<b>${s.market_cn}</b>市值 <b>${s.full_cap_wan}</b> 万　`;
+  if (s.lot_rate_pct != null) h += `中签率 ${s.lot_rate_pct}%　`;
+  if (p.current_market_cap != null) {
+    h += `我${esc(p.market_cn || '')}市值 <b>${p.cap_now_wan ?? 0}</b> 万（${p.lots_now || 0} 个号）`;
+  }
+  h += `</div>`;
+
+  // 中签率：真实值 vs 估算值，页面上必须区分（估算的区间可能很宽）
+  const lr = (s || {}).lot_rate_estimate || {};
+  if (s.lot_rate_is_estimate && lr.available) {
+    h += `<div style="font-size:12px;margin-top:3px">中签率 <b style="color:#b54708">约 ${(s.lot_rate_pct || 0).toFixed(2)}%</b>`
+      + ` <span class="badge" style="background:#fef0c7;color:#b54708">估算·置信度${esc(lr.confidence || '?')}</span>`
+      + (lr.low != null ? `<span class="muted"> 区间 ${(lr.low * 100).toFixed(2)}%~${(lr.high * 100).toFixed(2)}%</span>` : '')
+      + `</div>`;
+    if (lr.basis) h += `<div class="muted" style="font-size:11px;margin-top:1px">${esc(lr.basis)}</div>`;
+  } else if (s.lot_rate_pct != null) {
+    h += `<div style="font-size:12px;margin-top:3px">中签率 <b>${s.lot_rate_pct}%</b>`
+      + ` <span class="muted" style="font-size:11px">（发行公告已披露）</span></div>`;
+  } else if (lr.why) {
+    h += `<div class="muted" style="font-size:11px;margin-top:3px;color:#b54708">中签率无法估算：${esc(lr.why)}</div>`;
+  }
+
+  if (p.expected_profit != null) {
+    const rng = p.expected_profit_range;
+    h += `<div style="font-size:12px;margin-top:3px">期望收益 <b style="color:#067647">约 ${Math.round(p.expected_profit).toLocaleString()} 元</b>`;
+    if (rng && rng.low != null) {
+      h += ` <span class="muted">（区间 ${Math.round(rng.low).toLocaleString()} ~ ${Math.round(rng.high).toLocaleString()} 元）</span>`;
+    }
+    h += `</div>`;
+    if (rng && rng.note) h += `<div class="muted" style="font-size:11px">${esc(rng.note)}</div>`;
+  }
+  h += `<div class="muted" style="font-size:12px;margin-top:2px">${esc(p.reason || '')}</div>`;
+
+  // 因子
+  const factors = [];
+  if (val.available) factors.push(`估值溢价 ${val.ratio}x（${val.band}）`);
+  if (scale.available) factors.push(`发行规模 ${scale.yi_shares} 亿股（${scale.band}）`);
+  if (mc.sentiment) factors.push(`情绪 ${mc.sentiment}`);
+  if (factors.length) {
+    h += `<div class="muted" style="font-size:11px;margin-top:3px">${factors.map(esc).join(' ｜ ')}</div>`;
+  }
+
+  // LLM 判断（与代码算的**分开显示**）
+  const llm = p.llm || {};
+  h += `<div style="margin-top:8px;padding-top:7px;border-top:1px dashed var(--border,#eee)">`;
+  if (llm.available) {
+    const shift = llm.worth_shifting;
+    const shiftTxt = { yes: '值得挪', no: '不建议挪', marginal: '可挪可不挪' }[shift] || shift;
+    h += `<div style="font-size:12px"><b>🤖 LLM 判断</b>：
+      <span class="badge" style="background:#eef2f7;color:#475467">${shiftTxt}</span>
+      <span class="muted">风险 ${esc(IPO_RISK[llm.risk_level] || llm.risk_level || '—')}
+      · 收益把握 ${esc(llm.profit_confidence || '—')}</span></div>`;
+    if (llm.shift_advice) {
+      h += `<div style="font-size:12px;margin-top:3px">${esc(llm.shift_advice)}</div>`;
+    }
+    (llm.factors || []).forEach(f => {
+      h += `<div class="muted" style="font-size:11px;margin-top:2px">· 依据：${esc(f)}</div>`;
+    });
+    (llm.caveats || []).forEach(c => {
+      h += `<div class="muted" style="font-size:11px;margin-top:2px;color:#b54708">⚠ ${esc(c)}</div>`;
+    });
+  } else {
+    h += `<div class="muted" style="font-size:11px">未做 LLM 判断：${esc(llm.why || '未知原因')}</div>`;
+  }
+  h += `<div class="muted" style="font-size:11px;margin-top:3px">结论依据：${esc(vc.basis || p.verdict)}`
+    + (vc.needs_review ? '　<b style="color:#b54708">建议人工确认</b>' : '') + `</div>`;
+  h += `</div>`;
+
+  // 挪仓计划
+  if (p.plan && (p.plan.buy || []).length) {
+    h += `<div style="margin-top:8px;padding:8px;background:var(--bg-2,#f7f8fa);border-radius:6px;font-size:12px">`;
+    h += `<b>挪仓计划</b>：缺口 ${p.plan.gap_wan} 万`;
+    if ((p.plan.sell || []).length) {
+      h += `<div class="muted" style="margin-top:3px">建议卖出：${p.plan.sell.map(x =>
+        `${esc(x.code)} ${esc(x.name || '')}（${esc(x.why)}）`).join('、')}</div>`;
+    }
+    h += `<div class="muted" style="margin-top:3px">建议买入底仓：${p.plan.buy.map(x =>
+      `${esc(x.name || x.code)} ${x.amount_wan} 万` +
+      (x.dividend_yield ? `（股息 ${(x.dividend_yield * 100).toFixed(1)}%）` : '')
+      ).join('、')}</div>`;
+    (p.plan.notes || []).forEach(n => {
+      h += `<div class="muted" style="font-size:11px;margin-top:2px">${esc(n)}</div>`;
+    });
+    h += `</div>`;
+  }
+  h += `</div>`;
+  return h;
+}
+
+function renderIpoPool(d) {
+  const box = $('ipo-pool-box');
+  const cap = d.market_cap || {};
+  const pos = (d.positions || []).slice(0, 8);
+  if (!pos.length) { box.innerHTML = ''; return; }
+  box.innerHTML = `<details><summary style="cursor:pointer"><b style="font-size:13px">
+    🧱 我的市值构成（${pos.length} 只）</b></summary>
+    <table style="margin-top:6px"><thead><tr><th>代码</th><th>市场</th><th>市值</th></tr></thead>
+    <tbody>${pos.map(p => `<tr><td>${esc(p.code)}</td>
+      <td>${p.market === 'sh' ? '沪' : p.market === 'sz' ? '深' : '北'}</td>
+      <td>${ipoWan(p.value / 10000)} 万</td></tr>`).join('')}</tbody></table>
+    ${(d.excluded || []).length ? `<div class="muted" style="font-size:11px;margin-top:4px">
+      ${d.excluded.length} 项不计入打新市值（非A股普通股）</div>` : ''}
+    <div class="muted" style="font-size:11px;margin-top:4px">
+      沪市市值只用于打沪市新股，深市市值只用于打深市新股 —— 两者不能互换。</div>
+  </details>`;
+}
+
 async function loadCalendar() {
   try {
     const d = await api('/api/calendar');
@@ -3822,10 +4098,16 @@ async function loadCalendar() {
       const wd = ['日', '一', '二', '三', '四', '五', '六'][new Date(e.date).getDay()];
       const srcBadge = e.source === 'manual'
         ? `<button class="del" style="font-size:12px" onclick="delCalendarEvent(${e.id})" title="删除手动事件">×</button>` : '';
+      // 年份跨度事件（中期选举/两会/新股上市）带 source_url，给个原文链接
+      const link = (e.source_url && e.source_url !== (e.source_url || '') && e.source_url.indexOf('://') > 0)
+        ? `<a href="${esc(e.source_url)}" target="_blank" rel="noopener"
+             style="font-size:11px;margin-left:4px">原文↗</a>` : '';
+      const ipoTag = e.source === 'ipo'
+        ? '<span class="muted" style="font-size:11px"> · 新股</span>' : '';
       return `<div class="row" style="justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--border);${isPast ? 'opacity:.5' : ''}">
         <span><b>${e.date}</b> <span class="muted">周${wd}</span>
           <span class="badge" style="${lv.s}">${lv.t}</span>
-          <span style="margin-left:6px">${esc(e.title)}</span>
+          <span style="margin-left:6px">${esc(e.title)}</span>${link}${ipoTag}
           ${e.time ? `<span class="muted"> · ${esc(e.time)}</span>` : ''}
           ${e.market === 'us' ? '<span class="muted"> · 美</span>' : '<span class="muted"> · A/港</span>'}
           ${e.note ? `<div class="muted" style="margin-top:2px">${esc(e.note)}</div>` : ''}</span>
@@ -4701,7 +4983,8 @@ async function paperReset() {
 }
 
 // ---- 新闻 ----
-const SOURCE_LABEL = { eastmoney: '东财', baidu: '百度', sina: '新浪', duckduckgo: 'DDG' };
+const SOURCE_LABEL = { eastmoney: '东财', ak_em: '个股新闻', baidu: '百度',
+                       sina: '新浪', bing: '必应', searxng: 'SearXNG', duckduckgo: 'DDG' };
 async function loadNews() {
   try {
     const code = $('news-filter').value;
@@ -5185,6 +5468,11 @@ async function loadMpArticles() {
     $('mp-empty').classList.toggle('hide', items.length > 0);
     $('mp-list').innerHTML = items.map(a => {
       const ts = a.published_at || a.fetched_at || '';
+      // summary 的坑（2026-10-02 实测）：**无正文的文章 summary 100% 等于 title**，
+      // 页面上是标题重复两遍、正文区一片空白。这时改用 content_text 开头当预览。
+      let pv = (a.summary || '').trim();
+      if (pv && a.title && pv === a.title.trim()) pv = '';
+      if (!pv) pv = (a.content_text || '').trim();
       return `<div class="dyn-item ${a.is_read ? '' : 'unread'}">
         <div class="dyn-head">
           ${a.is_read ? '' : '<span class="unread-dot" title="未读"></span>'}
@@ -5194,8 +5482,10 @@ async function loadMpArticles() {
           <span class="muted" style="margin-left:auto;font-size:12px">${ts.replace('T', ' ').slice(0, 16)}</span>
         </div>
         <div class="dyn-text" style="font-weight:600;cursor:pointer"
-             onclick="markMpReadOne(${a.id}, this)">${esc(a.title)}</div>
-        ${a.summary ? `<div class="muted" style="margin-top:2px">${esc(a.summary.slice(0, 160))}${a.summary.length > 160 ? '…' : ''}</div>` : ''}
+             onclick="toggleMpBody(${a.id}, this)"
+             title="${a.has_body ? '点击展开全文' : '点击标记已读（这篇没抓到正文）'}">${esc(a.title)}${a.has_body ? ' <span style="font-size:11px;opacity:.55">▾</span>' : ''}</div>
+        ${pv ? `<div class="muted" style="margin-top:2px">${esc(pv.slice(0, 160))}${pv.length > 160 ? '…' : ''}</div>` : ''}
+        <div class="mp-body hide"></div>
       </div>`;
     }).join('');
     const badge = $('mp-tab-badge');
@@ -5206,6 +5496,48 @@ async function loadMpArticles() {
 async function markMpReadOne(id, el) {
   try { await jsonPost('/api/mp/read', { ids: [id] }); el.closest('.dyn-item').classList.remove('unread'); }
   catch (e) { toastErr(e.message); }
+}
+
+// 正文 HTML 来自微信（外部内容）。实测 117 篇：script=0、on*=0、
+// javascript: 伪协议=0、iframe=0，但仍做一次防御性清洗 —— 内联 style 是
+// 微信排版的骨架，保留；只剥可执行部分。
+function sanitizeMpHtml(s) {
+  return String(s)
+    .replace(/<\s*(script|iframe|object|embed|form)\b[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi, '')
+    .replace(/<\s*(script|iframe|object|embed|form)\b[^>]*\/?\s*>/gi, '')
+    .replace(/\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+    .replace(/\b(href|src)\s*=\s*(?:"|')\s*javascript:[^"']*(?:"|')/gi, '$1="#"');
+}
+
+// 点标题：首次点开才请求正文（列表接口故意不带 content_html ——
+// 60 篇 text 才 38 KB，html 要 784 KB，图片内嵌再 ×200）。
+async function toggleMpBody(id, el) {
+  const item = el.closest('.dyn-item');
+  const box = item && item.querySelector('.mp-body');
+  if (!box) { markMpReadOne(id, el); return; }
+  markMpReadOne(id, el);                    // 点开即已读
+  if (box.dataset.loaded === '1') { box.classList.toggle('hide'); return; }
+  box.classList.remove('hide');
+  box.innerHTML = '<div class="muted">⏳ 加载正文…</div>';
+  try {
+    const b = await api(`/api/mp/articles/${id}/body`);
+    box.dataset.loaded = '1';
+    const html = b.content_html ? sanitizeMpHtml(b.content_html) : '';
+    const src = b.url ? `<a href="${esc(b.url)}" target="_blank" rel="noopener">原文 ↗</a>` : '';
+    if (html) {
+      box.innerHTML = `<div class="mp-body-inner">${html}</div>
+        <div class="muted" style="margin-top:8px;font-size:11px">${src}</div>`;
+    } else if (b.content_text) {
+      box.innerHTML = `<div style="white-space:pre-wrap">${esc(b.content_text)}</div>
+        <div class="muted" style="margin-top:8px;font-size:11px">${src}</div>`;
+    } else {
+      box.innerHTML = `<div class="muted">这篇没抓到正文（微信侧未提供）。${src}</div>`;
+    }
+  } catch (e) {
+    box.dataset.loaded = '0';
+    box.classList.add('hide');
+    toastErr('加载正文失败: ' + e.message);
+  }
 }
 async function markAllMpRead() {
   try { const r = await jsonPost('/api/mp/read', { all: true }); toastOk(`已标记 ${r.updated} 条已读`); loadMpArticles(); }
@@ -5523,18 +5855,59 @@ async function triggerFetch() {
     pollStatus();
   } catch (e) { toastErr(e.message); }
 }
+// 抓取进度渲染
+//
+// 为什么需要这个函数：一轮要 36 只票 × (1+关键词轮) × 多个渠道 = 几百次请求，
+// 实测 4~10 分钟。原先界面上只有一句「抓取中…」，看不出是在干活还是卡死 ——
+// DDG 死了一周就是这么被忽略的（每只在白等 30s，但界面上毫无异常）。
+// 现在把后端 progress 里的「已抓 N/总数 / 当前标的 / 当前渠道 / 各渠道累计耗时」
+// 直接显示出来，卡在哪个渠道上一眼可见。
+function renderNewsProgress(st) {
+  const el = $('news-status');
+  if (!st.fetching) {
+    el.textContent = st.last_run ? '上次抓取: ' + st.last_run.replace('T', ' ') : '';
+    el.title = healthTip(st.health);
+    return;
+  }
+  const p = st.progress || {};
+  const seg = [`抓取中 ${p.done || 0}/${p.total || 0}`];
+  if (p.current) seg.push(p.current);
+  if (p.channel) seg.push('@' + p.channel);
+  if (p.elapsed) seg.push(p.elapsed + 's');
+  const skipKeys = Object.keys(p.skipped || {});
+  if (skipKeys.length) seg.push(`跳过 ${skipKeys.length} 项`);
+  el.textContent = seg.join(' · ');
+  el.title = healthTip(st.health);
+}
+
+// 鼠标悬停看各渠道健康度：ok/fail 次数、冷却剩余、上次错误
+// 「为什么这轮没抓到新闻」先看这个 —— 0 条要分清是「没搜到」还是「源坏了」
+function healthTip(health) {
+  if (!health) return '';
+  const L = [];
+  for (const k of Object.keys(health)) {
+    const h = health[k];
+    const state = h.cooling ? `冷却剩 ${Math.ceil(h.cooldown_left_sec / 60)} 分钟`
+      : h.enabled ? '启用' : '停用';
+    L.push(`${k}: ${state}  ok=${h.ok} fail=${h.fail} ${h.last_ms}ms`
+      + (h.last_err ? `\n    错: ${h.last_err}` : ''));
+  }
+  return L.join('\n');
+}
 function pollStatus() {
   const timer = setInterval(async () => {
     try {
       const st = await api('/api/news/status');
-      $('news-status').textContent = st.fetching ? '抓取中…' :
-        (st.last_run ? '上次抓取: ' + st.last_run.replace('T', ' ') : '');
+      renderNewsProgress(st);
       if (!st.fetching) {
         clearInterval(timer);
         $('news-fetch-btn').disabled = false;
         loadNews();
+        const cool = Object.entries(st.health || {})
+          .filter(([, h]) => h.cooling).map(([k]) => k);
         if (st.last_result && st.last_result.total_new !== undefined)
-          toast(`本轮新增 ${st.last_result.total_new} 条新闻`);
+          toast(`本轮新增 ${st.last_result.total_new} 条新闻`
+            + (cool.length ? `（${cool.join('、')} 触发冷却已跳过）` : ''));
       }
     } catch { clearInterval(timer); $('news-fetch-btn').disabled = false; }
   }, 2000);
@@ -5548,22 +5921,35 @@ async function loadConfig() {
       const el = $('cfg-' + k);
       if (el) el.checked = !!(conf.channels[k] && conf.channels[k].enabled);
     });
+    if ($('cfg-searxng-url'))
+      $('cfg-searxng-url').value = (conf.channels.searxng && conf.channels.searxng.url) || '';
     const st = await api('/api/news/status');
-    $('news-status').textContent = st.fetching ? '抓取中…' :
-      (st.last_run ? '上次抓取: ' + st.last_run.replace('T', ' ') : '');
+    renderNewsProgress(st);
     if (st.fetching) { $('news-fetch-btn').disabled = true; pollStatus(); }
   } catch (e) { /* 配置加载失败不阻塞页面 */ }
 }
 async function saveConfig() {
   try {
+    // SearXNG 的 enabled 与 url 必须一起提交：只勾不填地址等于白勾
+    // （fetch_searxng 拿不到 url 就直接返回 []，界面上却显示「已启用」）。
+    // 所以勾上地址为空时给出明确提示，而不是默默存一个空转的配置。
+    const sxEnabled = $('cfg-searxng').checked;
+    const sxUrl = ($('cfg-searxng-url') ? $('cfg-searxng-url').value : '').trim();
+    if (sxEnabled && !sxUrl) {
+      toastErr('勾选了 SearXNG 但没填地址。请填如 http://127.0.0.1:8888，或取消勾选。');
+      return;
+    }
     await api('/api/config', { method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         fetch_interval_minutes: +$('cfg-interval').value,
         channels: {
           eastmoney: $('cfg-eastmoney').checked,
+          ak_em: $('cfg-ak_em').checked,
           baidu: $('cfg-baidu').checked,
           sina: $('cfg-sina').checked,
+          bing: $('cfg-bing').checked,
+          searxng: { enabled: sxEnabled, url: sxUrl },
           duckduckgo: $('cfg-duckduckgo').checked,
         }})});
     toast('设置已保存，下一轮抓取生效');

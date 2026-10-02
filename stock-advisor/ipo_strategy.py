@@ -519,9 +519,23 @@ def gain_model(samples: list[dict], *, board: str = "") -> dict:
 
     实测校准逻辑（破发率/分位数/分板块/情绪折算）现在都在 `ipo_market` 里，
     因为它需要 DB 连接读 `sa_sector_daily`（市场宽度/涨停数）。
+
+    **兼容层必须补回旧字段**：`per_lot_profit_estimate()` 与既有测试读的是
+    `median_gain_board` / `median_gain_all` / `samples`，而 `gain_stats` 的新
+    结构给的是 `primary.median` / `primary.n`。只写一句
+    `return gain_stats(...)` 的话，上面那句「避免旧调用点断掉」就是空话 ——
+    `.get()` 拿到 None 不报错，却会静默退化成「无法给出每签期望收益」。
+    字段口径对齐旧实现：`samples = len(g_b) or len(g_all)`，
+    且 `board` 为空时 `g_b == pool`（即取全市场）。
     """
     import ipo_market
-    return ipo_market.gain_stats(samples, board=board)
+    out = ipo_market.gain_stats(samples, board=board)
+    alls = out.get("all") or {}
+    bs = out.get("board_stats") or {}
+    out["median_gain_all"] = alls.get("median")
+    out["median_gain_board"] = bs.get("median") if board else alls.get("median")
+    out["samples"] = (bs.get("n") or 0) or (alls.get("n") or 0)
+    return out
 
 
 def _dead_legacy_gain_model(samples: list[dict], *, board: str = "") -> dict:

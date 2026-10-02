@@ -34,6 +34,8 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
+import holiday_calendar
+
 from psycopg2.extras import execute_values
 
 DC_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
@@ -244,6 +246,6 @@ def listed_days(cur, code: str, today: str | None = None) -> int | None:
     days, d = 0, d0
     while d < end:
         d = d.fromordinal(d.toordinal() + 1)
-        if d.weekday() < 5:
+        if holiday_calendar.is_trading(d):
             days += 1
     return days

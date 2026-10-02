@@ -130,10 +130,22 @@ def gain_stats(samples: list[dict], *, board: str = "",
         out["primary_source"] = f"{board} {primary['n']} 只"
     else:
         out["primary"] = out["all"]
-        out["primary_source"] = (f"全市场 {out['all']['n']} 只"
-                                 + (f"（{board} 样本仅 "
-                                    f"{(out.get('board_stats') or {}).get('n', 0)} 只，已退化）"
-                                    if board else ""))
+        alln = (out["all"] or {}).get("n", 0)
+        if not alln:
+            # 一个已上市样本都没有（samples 为空 / 全缺 price、first_day_close）。
+            # 原来这里直接 `out['all']['n']` 对 None 取下标 → TypeError 把整个
+            # 调用链崩掉；下游 market_context / digest_for_llm 本来就写了
+            # `g.get("primary") or {}`，说明「primary 为 None」是**预期状态**，
+            # 只有这一行没跟上。改成如实报 insufficient，而不是抛异常。
+            out["primary_source"] = "无样本"
+            out["insufficient"] = True
+            out["why"] = ("没有可用的已上市新股样本（缺 price/first_day_close 或列表为空），"
+                          "给不出历史涨幅基准与破发率")
+        else:
+            out["primary_source"] = (f"全市场 {alln} 只"
+                                     + (f"（{board} 样本仅 "
+                                        f"{(out.get('board_stats') or {}).get('n', 0)} 只，已退化）"
+                                        if board else ""))
     out["low_confidence"] = (out["primary"] or {}).get("n", 0) < 10
     return out
 
