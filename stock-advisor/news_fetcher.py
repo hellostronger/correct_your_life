@@ -984,6 +984,57 @@ _KEYWORD_SKIP_CHANNELS = {"duckduckgo", "bing", "searxng"}
 
 # ---------------- 聚合入口 ----------------
 
+
+def _llm_filter_news_items(code: str, name: str, items: list[dict]) -> list[dict]:
+    """用 LLM 过滤最近抓取的新闻：只保留**2 天内**且与当前股票真正相关的项。
+
+    本函数对 *所有* 渠道返回的 items 生效（东财 AK_EM/百度/新浪/SearXNG/...）。
+    若 LLM 不可用或返回格式异常，静默回退为原 items。
+    """
+    if not items:
+        return items
+    try:
+        import llm_advisor as llm
+    except Exception:
+        return items
+    conf = llm.load_llm_conf()
+    if not conf.get("enabled") or not conf.get("api_key"):
+        return items
+    # 构造清晰的 Prompt：一条 item 一行，字段都给出，便于模型判断时效性和相关性。
+    lines = []
+    for i, it in enumerate(items):
+        title = (it.get("title") or "").replace("\n", " ").strip()
+        media = it.get("media") or ""
+        pub = it.get("publish_time") or ""
+        url = it.get("url") or ""
+        lines.append(f"{i}. title={title} | media={media} | publish_time={pub} | url={url}")
+    system = (
+        "你是一个金融新闻过滤器。请根据提供的股票代码与名称，判断哪些新闻：\n"
+        f"1) **发布时间是 2 天内**（日期距今 <= 2 天），2) **真的与当前股票有关**（标题、媒体、URL 中明确提及该股票名称、代码、公司其主营业务或重要业务动态）。\n"
+        "不相关的、纯行情数据的、首页链接、广告页等全部剔除。\n"
+        "只输出一个 JSON 数组，索引对应输入行号，不要包含任何额外说明、markdown 或代码块。"
+    )
+    user = f"股票代码: {code}\n股票名称: {name}\n\n新闻列表:\n" + "\n".join(lines)
+    try:
+        raw = llm.ask(system, user, conf=conf, max_tokens=4096, thinking=False)
+    except Exception:
+        return items
+    try:
+        import re as _r
+        m = _r.search(r"\[.*?\]", raw, _r.S)
+        if not m:
+            return items
+        keep_indices = json.loads(m.group(0))
+        if not isinstance(keep_indices, list):
+            return items
+        keep_set = set()
+        for idx in keep_indices:
+            if isinstance(idx, int) and 0 <= idx < len(items):
+                keep_set.add(idx)
+        return [items[i] for i in range(len(items)) if i in keep_set]
+    except Exception:
+        return items
+
 def fetch_for_stock(code: str, name: str, conf: dict | None = None,
                     keywords: list[str] | None = None,
                     keywords_pos: list[str] | None = None,
@@ -1043,6 +1094,8 @@ def fetch_for_stock(code: str, name: str, conf: dict | None = None,
         else:
             seen[url] = item
             uniq.append(item)
+    uniq = _llm_filter_news_items(code, name, uniq)
+    uniq = _llm_filter_news_items(code, name, uniq)
     return {"code": code, "name": name, "results": uniq, "errors": errors}
 
 
