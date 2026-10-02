@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import sector
 
-URL = "http://127.0.0.1:8901"
+URL = "http://101.43.25.101:8080"
 from data_service.tests.asserts import FAIL, PASS, check, report
 
 

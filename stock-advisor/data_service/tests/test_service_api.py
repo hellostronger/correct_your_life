@@ -13,7 +13,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 from data_service.tests.asserts import FAIL, PASS, check, report
 
-BASE = "http://127.0.0.1:8901"
+BASE = "http://101.43.25.101:8080"
 
 
 def call(path, method="GET", timeout=180):
