@@ -105,13 +105,33 @@ def fetch_quotes(symbols: list[str]) -> dict:
         if not isinstance(df, pd.DataFrame) or df.empty:
             continue
         row = df.iloc[0]
+        try:
+            last = float(row.get("最新价")) if row.get("最新价") is not None else None
+        except Exception:
+            last = None
+        try:
+            change_pct = float(row.get("涨跌幅")) if row.get("涨跌幅") is not None else None
+        except Exception:
+            change_pct = None
+        try:
+            high = float(row.get("最高价")) if row.get("最高价") is not None else None
+        except Exception:
+            high = None
+        try:
+            low = float(row.get("最低价")) if row.get("最低价") is not None else None
+        except Exception:
+            low = None
+        try:
+            vol = float(row.get("持仓量")) if row.get("持仓量") is not None else None
+        except Exception:
+            vol = None
         found[sym] = {
             "symbol": sym,
-            "last": row.get("最新价"),
-            "change_pct": row.get("涨跌幅"),
-            "high": row.get("最高价"),
-            "low": row.get("最低价"),
-            "vol": row.get("持仓量"),
+            "last": last,
+            "change_pct": change_pct,
+            "high": high,
+            "low": low,
+            "vol": vol,
             "ts": datetime.now(timezone.utc).isoformat(),
         }
     return found
@@ -149,4 +169,13 @@ def quotes_summary(deps: dict) -> list[dict]:
             tuple(syms),
         )
         cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        for row in rows:
+            if row.get("ts") is not None:
+                row["ts"] = row["ts"].isoformat()
+            for k in ("last", "change_pct", "high", "low", "vol"):
+                if isinstance(row.get(k), (int, float)):
+                    pass
+                elif row.get(k) is not None:
+                    row[k] = float(row[k])
+        return rows
