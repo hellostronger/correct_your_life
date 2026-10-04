@@ -342,7 +342,9 @@ Debate History:
 {_compact_history(history)}
 
 Output format (strict):
-Rating: [Buy|Overweight|Hold|Underweight|Sell]
+你的**第一行**必须是 `Rating: X`（X 是上面五个之一），然后空一行，再写 Reasoning。
+**不要**在 Rating 行之前输出任何内容 —— 不要写 "Let me analyze"、不要复述本 prompt、
+不要以 "The user wants" 或 "As the Research Manager" 开头。
 Reasoning: [2-4 sentences summarizing the strongest arguments from both sides and your conclusion]
 
 Output in Chinese."""
@@ -361,6 +363,39 @@ Output in Chinese."""
     }
 
 
+def _strip_prompt_leakage(text: str) -> str:
+    """剥离 Judge 输出开头的 prompt 泄漏。
+
+    nemotron 模型有时把 prompt 指令当输出开头（2026-10-04 实测：
+    600406/603718 的 judge_decision 以 "The user wants me to act as a
+    Research Manager..." 开头，3447 字符里没有 `Rating:` 行）。
+    泄漏会污染兜底匹配（前 400 字符里全是 prompt 指令），必须先剥掉。
+    """
+    # 泄漏的常见开头（prompt 的前几句被复述）
+    leak_markers = (
+        "the user wants me to",
+        "as the research manager",
+        "let me analyze",
+        "i need to provide",
+        "i'll evaluate",
+        "i will evaluate",
+    )
+    low = text.lower()
+    for marker in leak_markers:
+        if low.startswith(marker):
+            # 找到泄漏结束的位置：第一个换行后的正文，或 Rating: 行
+            # 策略：从 "Rating:" 行开始截取；没有则取第一个空行之后
+            m = re.search(r"Rating\s*[:：]", text, re.I)
+            if m:
+                return text[m.start():]
+            # 没有 Rating: 行 —— 取前 3 个换行之后的内容（跳过泄漏段）
+            parts = text.split("\n\n", 3)
+            if len(parts) >= 3:
+                return parts[-1]
+            return text
+    return text
+
+
 def parse_judge_rating(judge_decision: str) -> str:
     """从 Research Manager 的输出中提取评级。
 
@@ -369,16 +404,21 @@ def parse_judge_rating(judge_decision: str) -> str:
     `Underweight` 之外，英文正文里出现 "buy"（如 "buy the dip"）、
     "sell"（如 "sell-off"）都会误判 —— 这是**在自由文本里做子串匹配**，
     判据必须是 `Rating:` 那一行的精确值。
+
+    2026-10-04 加：先剥离 prompt 泄漏（`_strip_prompt_leakage`），
+    否则泄漏的 prompt 指令会污染前 400 字符的兜底匹配。
     """
+    text = _strip_prompt_leakage(judge_decision)
     # 1) 优先取 `Rating: X` 这一行（prompt 明确要求输出这一行）
     m = re.search(r"Rating\s*[:：]\s*\**\s*"
-                  r"(Overweight|Underweight|Buy|Sell|Hold)", judge_decision, re.I)
+                  r"(Overweight|Underweight|Buy|Sell|Hold)", text, re.I)
     if m:
         raw = m.group(1).lower()
         return {"overweight": "Overweight", "underweight": "Underweight",
                 "buy": "Buy", "sell": "Sell", "hold": "Hold"}[raw]
     # 2) 退而求其次：独立成词的长词优先（用词边界，避免 sell-off 误命中）
-    head = judge_decision[:400].lower()
+    #    只在剥离泄漏后的正文里找，且要求出现在前 200 字符（正文开头）
+    head = text[:200].lower()
     for word, rating in (("underweight", "Underweight"), ("overweight", "Overweight")):
         if re.search(rf"\b{word}\b", head):
             return rating

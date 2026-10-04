@@ -534,6 +534,26 @@ TradingAgents 原版把这块放在 `risk_mgmt/conservative_debator.py`
 ② 兜底用**词边界** `\bsell\b` 而非子串；③ **长词优先**
 （先 `Underweight`/`Overweight` 再 `Buy`/`Sell`）。
 
+### Judge prompt 泄漏 + 缺 `Rating:` 行（2026-10-04 修）
+
+**症状**：600406/603718 的 `judge_decision` 以 "The user wants me to act
+as a Research Manager..." 开头（3447 字符），**没有 `Rating:` 行** ——
+`parse_judge_rating` 靠兜底猜，不可靠。
+
+**真因**：nemotron 模型把 prompt 指令当输出开头（同「LLM 不遵守
+只输出 JSON」那节的行为抖动）。
+
+**修法**：
+1. **prompt 加强**：明确要求「第一行必须是 `Rating: X`」，禁止以
+   "The user wants"/"As the Research Manager"/"Let me analyze" 开头
+2. **`_strip_prompt_leakage()`**：解析前剥离 prompt 泄漏（检测常见泄漏
+   开头标记，从 `Rating:` 行或空行后截取），否则泄漏的 prompt 指令会
+   污染前 200 字符的兜底匹配
+3. 兜底匹配范围从 400→200 字符（剥离泄漏后正文更短）
+
+测试：`%LOCALAPPDATA%\Temp\opencode\test_leak.py`（600406/603718 真实
+泄漏样本 + 正常输出 + 中文冒号）。
+
 ### 已知局限
 
 - **Bull 和 Bear 用同一个模型**。TradingAgents 的 `role_llms` 支持给多空辩手配
