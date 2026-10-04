@@ -2124,7 +2124,11 @@ def _strategy_loop():
     while True:
         try:
             now = datetime.now()
-            is_weekday = holiday_calendar.is_trading(now.date())
+            # 三态闸门（2026-10-04 改）：日历源不可用（None）时**不扫**。
+            # 原来用 is_trading() 把 None 折叠成周一~周五，日历源间歇性失败时
+            # 会在真实假日用 stale 价标记 strategy_triggered_at（真实资金信号）。
+            # 未知=不安全：跳过本轮，日历恢复后下一轮（60s/5min 内）自然补上。
+            is_weekday = holiday_calendar.is_trading_day(now.date()) is True
             in_session = is_weekday and (
                 now.hour > 9 or (now.hour == 9 and now.minute >= 15)
             ) and (now.hour < 15 or (now.hour == 15 and now.minute <= 5))
@@ -2132,8 +2136,10 @@ def _strategy_loop():
                 check_strategies_once()
                 check_position_strategies_once()
                 time.sleep(60)
-            else:
+            elif is_weekday:
                 check_position_strategies_once()  # 非交易时段也扫（time_stop/补触发）
+                time.sleep(300)
+            else:
                 time.sleep(300)
         except Exception as exc:
             print(f"[strategy] loop error: {exc}", flush=True)
@@ -3790,6 +3796,13 @@ def paper_run(force_slot: bool = False):
     now = datetime.now()
     st = paper_trading.market_session_state("", now)
     lh, lm = _hhmm(conf.get("latest_trade_time"), 15, 5)
+    # 日历闸门（2026-10-04 加）：手动触发也不绕过交易日判定。
+    # 日历未知（None）时拒绝 —— 未知=不安全，绝不在日历状态不明时下单。
+    _td = holiday_calendar.is_trading_day(now.date())
+    if _td is not True:
+        _reason = ("非交易日" if _td is False
+                   else "交易日历暂不可用（不成交，稍后重试）")
+        return {"ok": False, "status": f"{_reason}，不成交。", "trading": st}
     if not (st["open"] and now.hour * 60 + now.minute <= lh * 60 + lm):
         return {"ok": False, "status": f"已收市（{st['reason']}，现在 {now:%H:%M}），"
                                        f"不成交。需要复盘请用「立即结算复盘」。",
@@ -5094,7 +5107,12 @@ def _paper_loop():
         try:
             now = datetime.now()
             conf = _conf_section("paper")
-            if conf.get("enabled") and holiday_calendar.is_trading(now.date()):
+            # 三态闸门（2026-10-04 改）：日历源不可用（None）时**交易轮次跳过**，
+            # 结算/快照照常。原来用 is_trading() 把 None 折叠成周一~周五，
+            # 导致 09-25（中秋）4 笔真实买入成交、10-01（国庆）跑了一轮 catchup。
+            # 交易要求明确的 True；结算幂等、只读为主，True/None 都跑。
+            _td = holiday_calendar.is_trading_day(now.date())
+            if conf.get("enabled") and paper_trading.calendar_gate(_td, allow_when_unknown=True):
                 dh, dm = _sched_time("paper", "decide_time")
                 sh, sm = _sched_time("paper", "settle_time")
                 iv = max(1, int(conf.get("interval_minutes", 30) or 30))
@@ -5115,14 +5133,16 @@ def _paper_loop():
                 # 1) 盘中轮次：到点就跑（>= 而非 ==，迟一点起也能补上）
                 due = (sm_h * 60 + sm_m) <= cur_min <= (em_h * 60 + em_m)
                 on_mark = cur_min % iv == 0
-                if can_trade and due and on_mark and last_slot != slot:
+                if (paper_trading.calendar_gate(_td, allow_when_unknown=False)
+                        and can_trade and due and on_mark and last_slot != slot):
                     last_slot = slot
                     last_decision_day = now.date()
                     _paper_run_cycle(conf, slot, kind="intraday", trigger="interval")
 
                 # 2) 兜底补跑：过了 decide_time 且当天还没跑过任何一轮。
                 #    同样受 can_trade 约束 —— 收市后不再成交（结算不受影响）。
-                elif (can_trade and (now.hour, now.minute) >= (dh, dm)
+                elif (paper_trading.calendar_gate(_td, allow_when_unknown=False)
+                      and can_trade and (now.hour, now.minute) >= (dh, dm)
                       and last_decision_day != now.date()
                       and last_slot != slot):
                     last_slot = slot

@@ -130,6 +130,34 @@ TRADING_SESSIONS = {
 }
 
 
+def calendar_gate(td, allow_when_unknown: bool) -> bool:
+    """_paper_loop 的三态日历闸门（2026-10-04 加）。
+
+    td = is_trading_day(now)：True=交易日 / False=休市 / **None=日历源不可用**。
+
+    - 交易轮次（allow_when_unknown=False）：**仅 True 放行**。
+      未知 = 不安全，绝不在日历状态不明时下单。
+    - 结算/快照（allow_when_unknown=True）：True 或 None 都放行。
+      结算幂等、只读为主，日历未知时跑没有副作用。
+
+    ## 为什么需要它（实测驱动的补丁）
+
+    `is_trading()` 把 None 折叠成「周一~周五」（设计意图：采集路径宁可跑
+    不可静默跳过）。但交易路径的后果严重得多：`_paper_loop` 的假日闸门
+    只有 is_trading() 这一层，`market_session_state()` 只判时段不判假日。
+    2026-10-04 定位发现：**09-25（中秋）4 笔真实买入成交**
+    （003035/513980/600121/600406，trade_date=09-25，而 is_trading_day(09-25)
+    =False，5 个独立进程复核一致），10-01（国庆）还跑了一轮 catchup。
+    日历源（gov.cn 公告抓取）间歇性失败时，折叠把假日变成交易日。
+
+    采集路径（data_service 等）维持原有「宁可跑」行为不变 —— 那里最多
+    用到陈旧数据，状态字段会标出来；交易路径不能容忍陈旧价成交。
+    """
+    if td is None:
+        return allow_when_unknown
+    return bool(td)
+
+
 def market_session_state(code: str = "", now=None) -> dict:
     """该品种此刻能不能成交。返回 {open, market, reason, hhmm}。
 

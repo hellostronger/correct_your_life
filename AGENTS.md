@@ -255,6 +255,49 @@ NoneType.__format__`，成果**全部丢失**。真因是 `f"{r.get('price'):.2f
    **日历不可用时 `is_trading_day` 返回 `None` 而非 `False`** ——
    分不清「休市」和「日历挂了」时绝不能当休市，否则交易时段会跳过采集。
 
+### ✅ 日历源不可用时会真实成交 —— 已修（2026-10-04）
+
+`is_trading()` 把 `None` 折叠成「周一~周五」（设计意图：采集路径宁可跑
+不可静默跳过，见上）。但**对交易路径的后果比采集严重**：`_paper_loop`
+的假日闸门只有 `is_trading()` 这一层，`market_session_state()` 只判时段
+不判假日。日历源（gov.cn 公告抓取）间歇性失败时，折叠把假日变成交易日
+→ **真实成交**。
+
+**实证**：`sa_paper_trades` 里 4 笔买入的 `trade_date = 2026-09-25`（中秋，
+`is_trading_day(09-25)=False`，5 个独立进程复核一致）——
+003035/513980/600121/600406 在假日以（可能 stale 的）价格成交。
+`sa_paper_cycles` 还有 `2026-10-01 15:35 catchup`（国庆）一轮，
+`planned=18, acted=0`（`can_trade` 的行情闸门挡住了成交，但轮次照跑）。
+
+**修法**：`paper_trading.calendar_gate(td, allow_when_unknown)` 三态闸门 ——
+交易轮次**仅 True 放行**（未知=不安全，绝不下单）；结算/快照 **True/None
+都放行**（幂等、只读为主）。`_paper_loop` 外层闸门用 `is_trading_day()`
+三态 + `calendar_gate(..., True)`，两个交易轮次各加
+`calendar_gate(..., False)`。采集路径（data_service 等）的 `is_trading()`
+折叠行为**不变** —— 那里最多用到陈旧数据，状态字段会标出来。
+
+**同源修复（全部交易/信号路径）**：
+- `_paper_loop`（app.py:5097）—— 盘中轮次 + 兜底补跑，真实成交
+- `_strategy_loop`（app.py:2127）—— 真实策略止盈监控，标记
+  `strategy_triggered_at` + 发通知（不执行成交，但假日 stale 价触发信号
+  会误导后续真实卖出）
+- `/api/paper/run` 手动触发（app.py:3799）—— 用户手动一轮决策
+
+三处统一改法：交易/信号路径要求 `is_trading_day() is True`（明确交易日），
+`None`（日历未知）时跳过本轮 —— 守护线程 60s/5min 内自然补上，
+手动触发直接拒绝并说明原因。
+
+**未改（设计意图覆盖）**：
+- `_paper_strategy_loop`（影子卖出扫描）—— docstring 明确「策略探索不该
+  依赖交易时段」，且 `_record` 只写 `sa_paper_strategy_exits`，不碰
+  `sa_paper_trades`、不动持仓、不改现金
+- 通知/采集类循环（提款、财经日历、公告、报告、宏观）—— 维持
+  「宁可跑不可静默跳过」，stale 数据会标状态字段
+- `in_trading_session`（app.py:1100）—— 无调用者的死代码，不动
+
+测试：`%LOCALAPPDATA%\Temp\opencode\test_cal_gate.py`（17 项，含
+「None 时交易停、结算继续」「is_trading 折叠逻辑未改」回归）。
+
 ### 新浪板块资金流（2026-10-01 采纳为第三数据源）
 
 > ⚠️ 我之前在本文件写过「新浪板块只有 49 行业，无资金流」——**那是错的**，
