@@ -4,6 +4,78 @@
 
 ---
 
+## 0. 发现 bug 自行修复，无需逐个确认（2026-10-04 用户授权）
+
+**默认动作是「修」，不是「问」。** 发现明确的 bug 后直接修，不必先征求确认。
+
+但「自行修复」有边界，越界的改动仍然要先问。判断标准是**可逆性 × 影响面**：
+
+### 可以直接修，不用问
+
+| 类别 | 例子 |
+|---|---|
+| **明确的逻辑错误** | 拼错符号、off-by-one、错误的变量名、null 未处理、异常吞掉 |
+| **明确的资源泄漏 / 死锁** | 锁未释放、连接未关、线程未停 |
+| **已验证的假失败** | 源其实活着但参数名/日期写错（见第 2 条各类「200 + data:null」） |
+| **配置指向已失效的东西** | 模型 EOL、endpoint 404、证书过期（**改动要记进本文件**） |
+| **测试/工具脚本的 bug** | 只影响临时脚本，不影响生产路径 |
+
+### 必须先问
+
+| 类别 | 为什么不能自己决定 |
+|---|---|
+| **删文件 / 删表 / 删数据** | 不可逆 |
+| **改数据库 schema** | 影响面超出单次会话，且可能有其他消费者 |
+| **改交易/钱的逻辑** | `paper_trading._execute_decision`、`paper_goal`、真实持仓口径 |
+| **改风控阈值默认值** | 如 `stop_loss_max_pct`、`atr_stop_k`、`max_chase_pct20` |
+| **大规模重构 / 删模块** | 超出「修 bug」范畴 |
+| **碰用户 WIP** | `jq_sandbox.py`、`sandbox_runner.py`、`valuation_data.py`、`scripts/*.py`、`_dirty_backup_*.json`、`clade` |
+| **加新依赖** | 影响 `requirements.txt` 和构建 |
+| **推送 / 提交到远端** | 见下方「推送」一节 |
+
+### 修完必须做的三件事
+
+1. **验证**：写离线断言（可重复跑、不依赖网络/LLM），再跑一次端到端真请求。
+   「改完看着对」不算修完 —— 参见第 2 条。
+2. **记录**：把「症状 → 真因 → 修法」写进本文件对应章节。**没记录的修复等于没修**，
+   下次会重新踩一遍。
+3. **报告**：明确告诉用户改了什么、验证结果、以及**顺带发现的其它问题**
+   （后者即使不在本次授权范围内，也要报出来让用户决定）。
+
+### 推送
+
+- **不自动 push。** 修完先在本地汇报，等用户明确说「提交 / 推送」再执行。
+- 提交范围遵守既有约定：只提交本次相关的文件，不碰用户 WIP。
+- `config.yaml` 含明文密钥且已 gitignore，**永远不要提交**；
+  涉及配置变更时只提交 `config.example.yaml`。
+
+### 长任务：每步落盘，格式化不许能弄丢数据（2026-10-04 血的教训）
+
+**症状**：15 只持仓的决策（约 90 分钟、90+ 次 LLM 调用）**全部跑完**，
+在最后写报告那一步崩了 —— `TypeError: unsupported format string passed to
+NoneType.__format__`，成果**全部丢失**。真因是 `f"{r.get('price'):.2f"}`
+而 `price` 是 `None`（算完价忘了塞进结果 dict）。
+
+**两条规则**：
+
+1. **超过 ~10 分钟或含外部调用的任务，每完成一个单元就落盘**
+   （JSON checkpoint），并支持 `--resume` 复用已完成的部分。
+   判据：「重跑一遍要花多少时间 / 多少钱」—— 90 分钟和 90 次 LLM 调用
+   就必须能续跑。
+2. **展示层（格式化/渲染）绝不该有能力弄丢数据**：
+   - 所有数值格式化走一个 `num(v, spec, dash)` 兜底函数，`None`/非数值 → 破折号
+   - 取值一律 `.get()` + 默认值，**不要 `d["key"]`**
+   - 每条记录的渲染独立 `try/except`，一只票渲染失败只影响它自己
+
+**离线验证渲染层**（不烧 LLM，可重复跑）：直接构造残缺数据喂给渲染函数 ——
+「price 缺失 / 几乎全空 / final 缺 action / debate 缺字段 / cost 是 str」。
+`%LOCALAPPDATA%\Temp\opencode\test_render.py`（11 项）。
+
+> 这与第 2 条「区分 HTTP 200 和有数据」同源：**都要在「看起来成功」的地方
+> 再确认一次**。那次是「源返回 200 但 data 为空」，这次是「LLM 全跑完但报告没写成」。
+
+---
+
 ## 1. 优先用 GitHub 开源方案，不要自己造轮子
 
 **这是硬性要求。** 动手写实现之前，先搜 GitHub 有没有现成方案。
@@ -273,11 +345,161 @@ http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ss
 - 接入：`news_fetcher.py` 的 `fetch_searxng()`，走 JSON API
   （`?q=...&format=json&language=zh-CN`）
 
+### WeRSS 多账号配额 failover + 前端多次扫码（2026-10-04，已部署 101）
+
+**配额是账号级（`wr_vid`）不是 IP 级** —— 已实测：同一个 cookie 从
+`101.43.25.101` 和本机 `59.34.155.130` 分别请求，**都是 `499 -2014`**，
+一字不差。换 IP 无法绕过，**「把刷新/采集挪到本机」这条路从根上不成立**。
+
+**改的是自己的 fork** `hellostronger/we-mp-rss`（本地 `D:\correct_your_life\we-mp-rss`）：
+
+| 提交 | 内容 |
+|---|---|
+| `0d498c5` | 多账号 failover：`_weread_accounts` / `_switch_weread_account()` / `_weread_http_get()` |
+| `93ceb59` | QR 登录写 `accounts[]` 数组（按 `vid` 去重追加，旧格式自动迁移） |
+| `e706e98` | header 构造收敛到基类 `_weread_headers()`，`_request_headers` 留作别名 |
+
+**关键设计点**：
+
+- `wx.lic` 的 `weread_data.accounts: [{cookie, vid, name}, ...]`
+  —— **旧单账号 `weread_data.cookie` 格式自动包装成 1 元素数组**，不迁移也不报错
+- failover 触发条件：`499` / `-2014` / `-2041` / `-2012` 四个码**都**会切号
+  （它们是配额耗尽时的三种伪装，见上文「三码齐出」那条）
+- **每个账号最多试一次**，全耗尽抛 `WereadMPAPIError(retriable=False)`，不死循环
+- 切号时 `cookie/ticket/vid/name` 四个字段**一起换**（漏一个就会出现
+  「用 A 的 cookie 配 B 的 ticket」这种混合态）
+- 请求头**只有一处来源** `MpsWeread._weread_headers()`。
+  ⚠️ 改造中间态踩过：三个调用点改走基类后，`_request_headers` 变成**死代码**
+  （grep 只剩定义），而基类里我又复制了一份 dict —— 以后谁改子类那份都不会生效，
+  **且没有任何报错**。这类「副本漂移」改完必须 grep 确认。
+
+**前端多次扫码（用户要的）零前端改动**：`web_ui/src/api/weread.ts` 已有
+`/wx/weread/qr/code|status|over`，扫码成功走 `_save_cookies_to_lic` 追加账号。
+所以「扫码一次 = 加一个账号」，扫 N 次就有 N 个配额池。
+
+- `jobs/mps.py:74-75` **每次任务都 `MpsWereadMP()` + `_load_weread_auth()`**
+  → **扫完码下一轮任务即生效，不需要重启容器**
+- `/api/v1/wx/auth/wechat/unbind` 只删公众号 token，**不碰 `weread_data`**，
+  不会误清 `accounts[]`
+
+**离线断言**（可重复跑，不烧配额）—— 用 `importlib.util.spec_from_file_location`
+按路径加载模块，因为 `core/wx/__init__.py` 会连**真实 DB**（`core.db` 模块级
+`create_engine(cfg.get("db"))`），直接 import 会抛
+`Could not parse SQLAlchemy URL from string ''`。要 stub 掉
+`core.db` / `core.config` / `core.print` / `core.log` / `core.wx.base`：
+
+- `%LOCALAPPDATA%\Temp\opencode\test_multi_account.py` —— **34 项**（failover/切号/终止/header）
+- `%LOCALAPPDATA%\Temp\opencode\test_qr_multi_account.py` —— **22 项**（QR 追加/去重/迁移）
+
+### 101 容器运维的三个坑（2026-10-04 都踩了）
+
+1. **`docker exec` 的解释器不是 venv 那个**：系统 `python3` 连
+   `yaml` / `requests` 都没有 → `ModuleNotFoundError`，
+   必须 `/app/env_x86_64/bin/python3`（AGENTS.md 早先只提过 bcrypt，同样原因）
+2. **`git fetch` 会静默失败**，脚本用 `2>&1 | tail -2` 一吞就只剩「后面步骤超时」。
+   **判据必须查 `FETCH_HEAD` 的实际 sha，不能看返回码**。
+   症状：build 成功、镜像 digest 与上一次**完全相同**（`b699c265`）、
+   `git log` 还停在旧 commit → 源码根本没更新，却看起来「部署成功了」。
+   同理本机 `git fetch` 也要重试（github 抽风：`early EOF` / `Connection was reset`），
+   且**必须设 `NO_PROXY=*`**，否则走代理直接 reset
+3. **`sed` 替换 compose 镜像标签要写通配**：我按上一版标签
+   （`126993c`）写死 `sed 's|...fork-scratch-126993c|...|'`，但 compose 早被改成
+   `0d498c5` → **sed 空操作、静默无效**，容器还在跑旧镜像。
+   用 `s|image: we-mp-rss:fork-scratch-.*|image: <新>|` 再 `grep` 复核
+
+**磁盘**：删镜像标签**几乎不释放空间**（分层共享），真正的大头是
+**build cache**（当时 2.97GB）。`docker builder prune -f` 之后
+96% → 89%（40G 用 34G，剩 4.4G）。镜像内 `/app` 自己就 2.4GB。
+
 ### 板块资金流只有 3 家（2026-10-01 确认，别再找第四家）
 
 `同花顺`(主) / `开盘红·财联社` / `新浪` —— 就这三家有**板块级资金流**。
 东财的 `push2` 系已全封；akshare 里其余板块资金流函数要么走东财要么走新浪。
 要「板块级净流入绝对额」时只能轮询这三家，**不要再设计第四路**。
+
+### Bull/Bear 多空辩论（2026-10-04 接入，TradingAgents-astock 的对抗机制）
+
+`TradingAgents-astock/` 是**参考实现，不是运行时依赖**。主项目只借鉴了它的
+「多空辩论」思路，自建了 `stock-advisor/debate.py`（约 260 行），
+**没有引入 langgraph、没有 import 它的任何模块**。
+
+| 组件 | 位置 | 说明 |
+|---|---|---|
+| 辩论模块 | `stock-advisor/debate.py` | `run_debate()` 跑 RiskCritic→Bull→Bear→Judge |
+| 接入点 | `paper_trading._decide_one()` | 交易员**第一轮之后**插入辩论，再**复判**一次 |
+| 配置 | `config.yaml` 的 `paper.paper_debate` | 默认 `enabled: false` |
+| 提示词来源 | TradingAgents 的 `bull_researcher.py` / `bear_researcher.py` / `conservative_debator.py` | A股特色论据（政策市/T+1/涨跌停/游资/解禁/北向）已内建 |
+
+**决策链**（辩论关闭时 = 原行为，成本不变）：
+
+```
+分析师 → 交易员① → [触发? no→结束 / yes→ RiskCritic?(按需) →Bull→Bear→Judge → 交易员② → [enforce_rating? → 否决]
+```
+
+- 每轮辩论 **3 次 LLM 调用**（+1 次仅高风险票）；触发辩论的票整轮 **6~7 次**
+- 触发条件：`action ∈ {buy,sell}`（hold 不辩）且 `confidence >= min_confidence`
+- 辩论失败**不阻断**决策：捕获异常后沿用第一轮结果，记 `debate_error`
+
+### Risk Critic：补上被漏掉的风险层（2026-10-04）
+
+**起因是实测反常**：`603718 *ST海利` 跑完 Bull/Bear 辩论后，**Judge 给了 Buy**。
+一个带 `*ST`（退市风险警示）的亏损股被判看多 —— 说明 Bull/Bear 的框架里
+**没有专门讲 A 股结构性风险**，辩手把它当普通亏损股讨论。
+
+TradingAgents 原版把这块放在 `risk_mgmt/conservative_debator.py`
+（T+1 锁定、涨跌停无法出场、ST/退市、质押爆仓），我最初移植时
+**只带了 researchers/ 里的 Bull/Bear，漏了这一层**。
+
+**修法**：`run_risk_critic()` 专查 7 类结构性风险（ST/退市、T+1、
+跌停出场、股权质押、基本面恶化、流动性、估值陷阱），**只输出风险清单、
+不给方向判断**。三处接入：
+
+1. **默认只对高风险票跑**（名称含 ST/*ST/退市，或代码 4/8 开头=北交所），
+   普通票不额外花钱（`risk_critic_always: false`）
+2. **风险清单注入 Bull/Bear/Judge 三方**，且对 Bull 明确要求
+   「不得回避，必须正面回应命中的风险」
+3. **Judge 加了「结构性风险 = 否决项，不是扣分项」**：清单里命中
+   ST/退市/质押/跌停 任一条就**不得**给 Buy/Overweight。
+   同时把原来的 `Commit to a clear stance…` 软化 ——
+   原措辞在**推着 Judge 远离 Hold**，是 *ST 股被判 Buy 的帮凶之一
+
+### `enforce_rating`：让辩论有约束力（2026-10-04，默认关）
+
+**实测问题**：600406 / 000858 / 002457 三只 Judge 判 Sell / Underweight / Sell，
+**但交易员复判后动作全是 hold** —— 辩论沦为「参考意见」。
+
+`apply_rating_veto()` 的三条设计约束（都不是随意选的）：
+
+1. **只拦与评级方向相反的动作**：Judge 判 Sell 而交易员想 buy → 降级 hold。
+   Judge 判 Sell 而交易员想 **hold → 不拦**（hold 已是不加仓，
+   `_execute_decision` 的资金/T+1/持仓数约束会兜底）
+2. **只对 BEARISH 评级否决**（Sell/Underweight → 拦 buy）。
+   看多评级**不产生否决** —— 否则 Judge 喊 Buy 就能逼着加仓，
+   那不是风控是放大风险。加仓该由 `max_position_pct` 管
+3. **必须写在代码里、且在成交之前**。延续 `stop_loss_max_pct` 那条：
+   「不要追高」写在提示词里 LLM 可以自己论证「但前景光明」压过去。
+
+**默认 `enforce_rating: false`** —— 先观察辩论质量是否稳定，再决定是否上闸门。
+
+### `parse_judge_rating` 曾在自由文本里做子串匹配（2026-10-04 修）
+
+原实现兜底是 `if "buy" in text` / `if "sell" in text`，而 Judge 的输出是
+**英文推理正文**，里面出现 "sell-off"、"buy the dip" 就会误判；
+且 `Buy` 分支在前，`Underweight` 有可能被含 "buy" 的句子抢走。
+
+**修法**：① 优先精确取 `Rating:` 那一行（prompt 强制要求输出）；
+② 兜底用**词边界** `\bsell\b` 而非子串；③ **长词优先**
+（先 `Underweight`/`Overweight` 再 `Buy`/`Sell`）。
+
+### 已知局限
+
+- **Bull 和 Bear 用同一个模型**。TradingAgents 的 `role_llms` 支持给多空辩手配
+  不同厂商模型来避免「同源模型互相不反驳」，**本项目没实现**。当前两方同源，
+  辩论的独立性打了折扣。真要强化，需要在 `debate.py` 里加 per-role 模型配置。
+- **Judge 的推理可能输出英文**（Bull/Bear/RiskCritic 是中文）。评级行 `Rating:`
+  能被正确提取，但正文语言不稳定。
+- 测试：`%LOCALAPPDATA%\Temp\opencode\test_rc_veto.py`（45 项，
+  含「正文含 buy/sell 但评级相反」「ETF 不误判为 ST」「否决只拦相反方向」）。
 
 ---
 
@@ -355,6 +577,131 @@ column=szse 与 column=sse 返回**完全相同**结果（逐条比对一致）�
 ---
 
 ## Python/数据库踩坑（都实测过，别重犯）
+
+### 港股 K 线静默全挂：`market_data.tx_symbol` 把港股拼成深市代码（2026-10-04 修）
+
+**症状**：`market_data.fetch_kline` 对港股（00136/09696/01024）抛
+`两个源都失败 ... tx: 腾讯 K 线失败: 响应里没有 qfqday/day 数组（code=0）`。
+看起来像「腾讯源挂了」或「港股没数据」，**实际是符号拼错**。
+
+**真因**（`market_data.py:69` 修复前）：
+
+```python
+def tx_symbol(code):
+    if code.startswith(("60","68","51","58","11","50","56")): return "sh"+code
+    return "sz"+code        # ← 港股 00136 落到这里，变成 sz00136
+```
+
+`sz00136` 是一个**不存在的深市代码**。腾讯对它的响应是
+`code=0`（HTTP 200、JSON 合法）但 `data` 里没有该 key → `bars` 为空 →
+抛「没有 qfqday/day 数组」。**又是「200 但没数据」那一类**，极易误判成源挂了。
+
+**修法**：港股走 `hk` + 5 位。识别口径与 `paper_trading.market_of` /
+`app._market_of` 对齐（5 位纯数字，或已带 `hk` 前缀）。
+
+**关键澄清**：`app.py:734` 的 `_tx_symbol` **一直是对的**
+（`re.fullmatch(r"\d{5}", code)` → `hk`），所以**线上实时行情路径没受影响**。
+坏的只有 `market_data.py` 这份副本，影响的是 `sa_market_kline` 的港股日K落库
+—— 即港股历史数据一直在静默缺失。两个同名函数、不同实现，是这次的坑根。
+
+**验证**：`hk00136/hk09696/hk01024/hk00700` + A股/ETF 11 只，实测 15/15 取到
+91 行，港股末根 `2026-10-02`、A股末根 `2026-09-30`。
+港股**不需要特殊 param**，用 A 股那套 `,day,,,{n},qfq` 就能拿满（实测 120 根）。
+
+> 教训：改这类「符号/参数拼接」函数前，先 grep 全部调用方。
+> 同名函数有多份副本时，**逐个比对实现**，别以为改了 A 就是改了 A。
+
+### LLM 模型 EOL：`/v1/models` 列表不能当可用性判据（2026-10-04 修）
+
+**症状**：所有 LLM 功能（提款建议、模拟交易决策、辩论）集体失败：
+
+```
+HTTP 410  The model 'nvidia/nemotron-3-super-120b-a12b' has reached its end of
+life on 2026-10-03T09:00:00Z and is no longer available.
+```
+
+**真因**：网关（`101.43.25.101:3000`）把模型的 EOL 生效了，而 `config.yaml`
+的 `llm.model` 还指着它。**所有走 `llm_advisor.ask()` 的功能同时挂掉** ——
+这也是判断「一个模型名会影响多少功能」的依据：ask() 是统一出口。
+
+**三个必须知道的点**：
+
+1. **`GET /v1/models` 仍会列出已 EOL 的模型**（实测 92 个里大量已死）。
+   拿到列表**不等于**能用。判据只能是**真发一次推理请求**。
+2. **失败模式因模型而异，不能一概而论**：
+   | 返回 | 含义 |
+   |---|---|
+   | `410 ... end of life` | 模型 EOL，确定不可用 |
+   | `404 Function '<uuid>': Not found for account '<uuid>'` | NIM deployment 被删；**uuid 每次都不同** → 网关后端是多个 NIM 实例，部分已清理 |
+   | `503 Service temporarily overloaded` / `ResourceExhausted: Worker local total request limit reached (16/16)` | 临时过载，**重试可能成功** |
+   | `Timeout` | 可能是**冷启动**（550B 级模型实测 129~224s），不是不可用 |
+
+   → **超时和 503 必须重试才能区分**，一次探测下结论会误杀可用模型。
+3. 本机出口 IP 与是否代理**不影响**这些判定，别往 IP 限流上想。
+
+**实测可用（2026-10-04，网关 `101.43.25.101:3000`）**：
+
+| 模型 | 首字节 | 备注 |
+|---|---|---|
+| **`nvidia/nemotron-3-ultra-550b-a55b`** | **~1s** | **已配为默认**；550B 但响应最快 |
+| `openai/gpt-oss-20b` | ~1s | 可用 |
+| `deepseek-ai/deepseek-v4.1-flash` | 224s | 可用但冷启动极慢 |
+| `moonshotai/kimi-k3` | 187s | 同上 |
+| `z-ai/glm-5.3-flash` | 129s | 同上 |
+
+已死（勿再试）：`nemotron-3-super-120b-a12b`(410)、`deepseek-v4-pro/flash-0731`(410)、
+`minimax-m2.7/m3`(410)、`gpt-oss-120b`(410)、`kimi-k2.6`(404-fn)、
+`nemotron-4-340b`(404-fn)、`mistral-large-2`(404-fn)、`glm-5.3`(3×240s 超时)。
+
+**顺带修掉的隐患**：`llm_advisor.DEFAULT_LLM_CONF["model"]` 原本硬编码
+`"claude-opus-5"`。本机 `base_url` 指向自建网关，一旦 `config.yaml` 的
+`llm.model` 被清空（网页「LLM 设置」保存时容易发生），就会拿
+`claude-opus-5` 去打网关 → 必然 404，而报错完全指不到真因。已改为**留空**
+并在 `ask()` 里显式拦截，报错直指「`llm.model` 为空 + 当前是网关模式」。
+
+### LLM 不遵守「只输出 JSON」+ 静默降级成 hold（2026-10-04）
+
+**症状**：15 只持仓决策里 **5 只**交易员 JSON 解析失败，全部**静默**降级成
+`hold`（信心 1）。不报错、不告警，模拟盘看起来只是「今天比较谨慎」。
+
+**真因不是 `max_tokens` 太小** —— 这是我一开始的假设，被实测推翻：
+
+| max_tokens | 输出字符 | 可解析 |
+|---|---|---|
+| 1500 | 230 | ✅ |
+| 3000 | 278 | ✅ |
+| 6000 | 234 | ✅ |
+| 12000 | 249 | ✅ |
+
+同一个 prompt、同一个 `max_tokens=1500`，**有时直出 230 字符 JSON，
+有时先写 4000+ 字符英文思维链**、写到 `Final JSON` 就撞上限被截断
+（JSON 一个字都没输出）。**是模型行为抖动，不是配置问题** ——
+所以调大 `max_tokens` 解决不了，只能在**解析侧**兜底。
+
+两种截断形态（都要能救）：
+
+- **短截断**（123~293 字符）：JSON 写到 `reasoning` 中途断掉，字段基本完好
+- **长截断**（4000+ 字符）：全是思维链，**没有任何字段可救** → 必须返回 None
+
+**修法**：`paper_trading._extract_json()` 加第 4 级容错
+`_extract_truncated_json()` —— 用正则逐个捞标量字段。**两条纪律**：
+
+1. **只取标量**（`action`/`confidence`/`target_value_pct`/`stop_loss_pct`）。
+   `reasoning` 是自由文本、几乎总是被截断的那部分，捞不到就置空。
+   宁可少一个字段，也不要因为最后一条 reasoning 没写完就丢掉整个
+   `action=buy/sell`。
+2. **必须拿到合法枚举的 `action` 才算成功**，否则返回 None。
+   这里踩过一个自己写的 bug：`[^",}]+` 会匹配到**空串**，于是 `{}` 造出
+   一个「有 action 的假 dict」。修法是加 `and m.group(1).strip()`。
+
+**实测**：真实失败样本抢救回 2 只（`603366`、`01024`，都正确恢复
+`confidence: 8`），另外 3 只本就没有可救内容、正确返回 None。
+原有 7 类输入（围栏/裸 JSON/带前言/单引号/非 JSON/空串/双 JSON）**零回归**。
+测试：`%LOCALAPPDATA%\Temp\opencode\test_trunc.py`（含「拒绝样本不得瞎猜」）。
+
+> **静默降级比报错危险**：503 会报错你看得见，「解析失败 → hold」看不见。
+> 任何 `_validate_decision(...) or {"action":"hold"}` 的兜底都要计数上报，
+> 否则「模型没按格式输出」会伪装成「模型很谨慎」。
 
 ### `threading.Lock` 非重入 → 静默死锁
 

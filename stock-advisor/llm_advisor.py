@@ -19,12 +19,20 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "config.yaml"
 
-# 默认模型用 Claude Opus 5（Anthropic 最新主力，1M 上下文）。
+# 默认模型。**留空 = 不覆盖**，强制由 config.yaml 的 llm.model 决定。
+#
+# 2026-10-04 修正：原来这里硬编码 "claude-opus-5"。本机 base_url 指向自建网关
+# （101:3000），网关的模型名与 Anthropic 官方完全不同 —— 一旦 config.yaml 的
+# llm.model 被清空（网页「LLM 设置」保存时容易发生），就会拿 claude-opus-5
+# 去打网关，必然 404，且报错信息完全指不到真因（看着像「模型名写错」，
+# 实际是「配置被清空后回退到了不该用的默认值」）。
+# 留空让 load_llm_conf 保留配置里的值；配置里也没有时报错要求显式指定，
+# 这比静默用一个必然失败的模型名好。
 DEFAULT_LLM_CONF = {
     "enabled": False,
     "api_key": "",
     "base_url": "",        # 留空 = Anthropic 官方端点；代理/网关在此填
-    "model": "claude-opus-5",
+    "model": "",           # 留空 = 沿用 config.yaml；两处都没有则调用时报错
     "auto_advice": False,  # 盘后里程碑推送后自动补一条 AI 建议（每日至多一次）
 }
 
@@ -92,7 +100,10 @@ def _render_llm_block(conf: dict) -> str:
         f"  enabled: {str(bool(conf.get('enabled'))).lower()}",
         f"  api_key: {q(conf.get('api_key', ''))}",
         f"  base_url: {q(conf.get('base_url', ''))}",
-        f"  model: {q(conf.get('model') or DEFAULT_LLM_CONF['model'])}",
+        # 不用 `or DEFAULT_LLM_CONF['model']` 兜底：DEFAULT 已是空串，
+        # 兜底只会把「配置缺失」伪装成「模型名是某个具体值」，报错时看不出真因。
+        # 空就写空，下次调用会在 client 构造前明确报错。
+        f"  model: {q(conf.get('model', ''))}",
         f"  auto_advice: {str(bool(conf.get('auto_advice'))).lower()}",
     ])
 
@@ -140,6 +151,14 @@ def ask(system: str, user: str, conf: dict | None = None,
     if not conf["api_key"]:
         raise RuntimeError("未配置 Anthropic API key（config.yaml llm.api_key "
                            "或环境变量 ANTHROPIC_API_KEY）")
+    if not (conf.get("model") or "").strip():
+        # 空模型名会在 SDK 里变成一个必然 404/400 的请求，而错误信息只说
+        # 「模型不存在」，完全指不到「配置里模型名是空的」这个真因。这里提前拦。
+        raise RuntimeError(
+            "未配置模型名（config.yaml llm.model）。"
+            + ("当前 base_url 指向自建网关，模型名必须是网关支持的名字，"
+               "不是 Anthropic 官方模型名。" if conf.get("base_url")
+               else "留空会走到 Anthropic 官方端点，请填官方模型名。"))
     client_kwargs = {"api_key": conf["api_key"], "timeout": 120.0, "max_retries": 2}
     if conf.get("base_url"):
         client_kwargs["base_url"] = conf["base_url"]

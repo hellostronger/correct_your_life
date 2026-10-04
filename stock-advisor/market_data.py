@@ -67,7 +67,28 @@ def em_symbol(code: str) -> str:
 
 
 def tx_symbol(code: str) -> str:
-    code = str(code).strip()
+    """代码 -> 腾讯符号。
+
+    港股必须走 `hk` + 5 位数字，不能落到 sz 分支（2026-10-04 实测）：
+    港股 00136 被拼成 `sz00136`（一个不存在的深市代码），腾讯返回
+    `code=0` 但 `data` 里没有该 key → `bars` 为空 → 抛
+    「响应里没有 qfqday/day 数组」，看起来像源挂了，实际是符号拼错。
+    同样的 `hk00136` + `,day,,,120,qfq` 实测能拿满 120 根，最后一根
+    2026-10-02。所以港股不需要特殊 param，只是**符号前缀**要对。
+
+    识别口径与 paper_trading.market_of / benchmark_symbol 一致：
+    5 位且首位为 0（00136/09696/01024），或已带 hk 前缀。
+    """
+    code = str(code).strip().lower()
+    if code.startswith("hk"):
+        return "hk" + code[2:].zfill(5)
+    if len(code) == 5 and code.isdigit():
+        return "hk" + code.zfill(5)
+    if code.startswith(("sh", "sz", "bj")):
+        bare = code[2:]
+        if bare[:1] == "0" and len(bare) == 5:
+            return "hk" + bare
+        code = bare
     if code.startswith(("60", "68", "51", "58", "11", "50", "56")):
         return "sh" + code
     return "sz" + code

@@ -53,11 +53,19 @@ withdrawal:
 # LLM 提款建议（Anthropic Claude API；api_key 留空则读环境变量 ANTHROPIC_API_KEY）
 # enabled=允许网页手动生成；auto_advice=盘后里程碑提醒后自动补一条建议（每日每计划至多一次）
 # base_url 留空 = Anthropic 官方端点；使用代理/网关在此填
+#
+# ⚠️ model 必须与 base_url 指向的端点**匹配**：
+#   - base_url 空（Anthropic 官方）→ 填官方模型名，如 'claude-opus-5'
+#   - base_url 非空（自建网关）  → 填**网关**支持的模型名，不是官方名
+# 2026-10-04 踩过：配置里模型被清空后回退到 'claude-opus-5'，打自建网关必然 404，
+# 而报错完全指不到真因。现在 llm.model 留空会在调用前明确报错。
 llm:
   enabled: true
   api_key: ''
   base_url: ''
-  model: 'claude-opus-5'
+  # 本机 base_url 指向 101 网关，用这个（2026-10-04 实测 ~1s 响应）。
+  # 用 Anthropic 官方端点时请改成 'claude-opus-5'。
+  model: 'nvidia/nemotron-3-ultra-550b-a55b'
   auto_advice: true
 
 # 财经日历盘前提醒（econ_calendar.py + app.py _calendar_loop）
@@ -87,6 +95,29 @@ paper:
   holding_days: 5           # 持有几个交易日后自动平仓结算
   max_position_pct: 25      # 单票市值上限（% of 总资产）
   sleep_seconds: 3          # 逐股决策间 sleep，防 LLM 网关限流
+
+  # Bull/Bear 多空辩论（debate.py；TradingAgents-astock 对抗机制的本地移植）
+  # 决策链：分析师 → 交易员① → [触发] → Bull→Bear→Judge → 交易员②
+  # 每轮辩论 +3 次 LLM 调用；关闭时成本与原来完全一样。
+  paper_debate:
+    enabled: false          # 总开关
+    max_rounds: 1           # 辩论轮次（1 = Bull→Bear→Judge）
+    trigger_codes: ''       # 逗号分隔的代码白名单；留空 = 对所有票
+    trigger_on_buy: true
+    trigger_on_sell: true
+    # 交易员信心 >= 此值才触发。hold 不辩（没决策可辩）。
+    # 调高可省 LLM 调用：35 只自选股 × 每轮 30 分钟，触发率直接决定成本。
+    min_confidence: 5
+    # 风险辩手：专盯 ST/退市/质押/跌停等结构性风险，不参与多空方向判断。
+    # 默认只对名称含 ST/*ST/退市 或代码 4/8 开头（北交所）的票触发。
+    # 加它的原因：2026-10-04 实测 *ST 海利在只有 Bull/Bear 时被 Judge 判了 Buy。
+    risk_critic: true
+    risk_critic_always: false    # true = 每只票都跑（每次辩论 +1 次 LLM 调用）
+    # 让 Judge 的强信号评级成为**硬约束**：判 Sell/Underweight 时否决加仓
+    # （buy → hold）。默认关闭，先观察辩论质量是否稳定。
+    # 为什么需要它：实测三只 Judge 判 Sell/Underweight 的票，复判后动作全是 hold
+    # —— 辩论当时只是「参考意见」，没有任何约束力。
+    enforce_rating: false
 
 # 通知配置（微信走腾讯官方 iLink Bot，凭据存云库；邮件走 SMTP）
 # 网页「通知」标签页可改；auth_code 是邮箱授权码，注意保管

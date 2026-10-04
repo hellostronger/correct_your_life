@@ -71,6 +71,17 @@ DEFAULTS = {
     "tplus1_extra": "",           # 逗号分隔的代码/关键词，强制当 T+1
     "fees": {},                   # 交易费率覆盖（见 DEFAULT_FEES），完整键在 config.yaml
     "judge_holdings_only": False, # True=每轮只判已持仓（最省）；False=全自选股都判
+    # —— Bull/Bear 多空辩论（TradingAgents-astock 对抗机制移植）——
+    # 在分析师报告之后、交易员决策之前插入 Bull→Bear→Research Manager 辩论。
+    # 每轮 3 次 LLM 调用（Bull + Bear + Manager），默认关闭。
+    "paper_debate": {
+        "enabled": False,          # 总开关
+        "max_rounds": 1,           # 辩论轮次（1 = Bull→Bear→Manager）
+        "trigger_codes": "",       # 逗号分隔的代码白名单；空 = 对所有票启用
+        "trigger_on_buy": True,    # 对 buy 决策启用辩论
+        "trigger_on_sell": True,   # 对 sell 决策启用辩论
+        "min_confidence": 5,       # 交易员 confidence >= 此值时才触发（0=不限）
+    },
 }
 
 EM_FIELDS_OHLCV = "f51,f52,f53,f54,f55,f56,f57"   # 日期,开,收,高,低,量,额
@@ -701,14 +712,32 @@ def _llm_call(system_prompt: str, user_text: str, max_tokens: int = 1500,
 
 
 def _extract_json(text: str) -> dict | None:
-    """三级容错解析交易员 JSON：剥 ```json 围栏 → 首尾大括号截取 → 放弃。"""
+    """四级容错解析交易员 JSON。
+
+    1. 剥 ```json 围栏
+    2. 首尾大括号截取
+    3. 单引号修复
+    4. **截断修复 + 逐字段提取**（2026-10-04 加）
+
+    第 4 级的必要性：`nvidia/nemotron-3-ultra-550b-a55b` 对「只输出 JSON」的
+    指令**服从性抖动** —— 实测同一个 prompt、同一个 max_tokens=1500，
+    有时直出 230 字符 JSON（解析成功），有时先写 4000+ 字符英文思维链，
+    写到 `Final JSON` 就撞上 max_tokens 被截断（JSON 一个字都没有）。
+    实测 15 只票里有 5 只这样，全部静默降级成 hold（信心 1）——
+    **比报错更危险，因为看不出发生过**。
+
+    注意：这**不是** max_tokens 太小。四档实测（1500/3000/6000/12000）
+    都能正常直出 JSON，输出仅 230~278 字符。问题是模型行为不稳定，
+    所以只能在**解析侧**兜底，不能靠调大 max_tokens 解决。
+    """
     m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
     if not m:
         s, e = text.find("{"), text.rfind("}")
         if s >= 0 and e > s:
             m = type("M", (), {"group": staticmethod(lambda g, _s=s, _e=e: text[_s:_e + 1])})()
         else:
-            return None
+            # 没有配对的 } —— 很可能是被 max_tokens 截断，尝试修复
+            return _extract_truncated_json(text)
     try:
         d = json.loads(m.group(1))
         return d if isinstance(d, dict) else None
@@ -718,7 +747,39 @@ def _extract_json(text: str) -> dict | None:
             d = json.loads(fixed)
             return d if isinstance(d, dict) else None
         except json.JSONDecodeError:
-            return None
+            return _extract_truncated_json(text)
+
+
+def _extract_truncated_json(text: str) -> dict | None:
+    """从**被截断**的输出里抢救交易员 JSON 的可用字段。
+
+    只取**标量字段**（action/confidence/target_value_pct/stop_loss_pct）。
+    reasoning 是自由文本、几乎总是被截断的那部分 —— 抢救不到就置空，
+    由 _validate_decision 填「（未给出理由）」。宁可少一个字段，
+    也不要因为最后一条 reasoning 没写完就丢掉整个 action=buy/sell。
+
+    判据：必须**四个字段里至少拿到 action**，否则返回 None
+    （宁可降级 hold，也不要凭空猜一个方向）。
+    """
+    out: dict = {}
+    for key in ("action", "confidence", "target_value_pct", "stop_loss_pct"):
+        # 匹配 "key": value 或 "key":{...}（只取标量，忽略复杂值）。
+        # 值必须**非空**：`[^",}]+` 会匹配到空串，于是 "{}" 里的 "action" 之后
+        # 什么也没取到却仍被记进 out，造出一个「有 action 的假 dict」。
+        m = re.search(rf'"{key}"\s*:\s*"?([^",}}]+)"?', text)
+        if m and m.group(1).strip():
+            out[key] = m.group(1).strip()
+    # reasoning 单独找：截断时可能只抓到开头一句
+    m = re.search(r'"reasoning"\s*:\s*"([^"]+)', text)
+    if m:
+        r = m.group(1).strip()
+        if r:
+            out["reasoning"] = r[:1500] + ("…（原文被 max_tokens 截断）" if len(r) > 1500 else "")
+    # 只有 action 是**有效枚举值**才算抢救成功 —— 否则宁可不猜
+    if str(out.get("action", "")).lower() not in ("buy", "sell", "hold"):
+        return None
+    out["_recovered_from_truncation"] = True
+    return out
 
 
 def _clip(v, lo, hi, default):
@@ -1098,7 +1159,7 @@ def _decide_one(deps, conf, stock, today, results, slot: str = ""):
                          account, positions, past, conf, social)
     # 3. LLM 调用 1：分析师
     report = _llm_call(ANALYST_PROMPT, ctx + f"\n\n数据时点 {today}。请给出分析报告。")
-    # 4. LLM 调用 2：交易员（结构化）
+    # 4. LLM 调用 2：交易员（结构化）— 第一轮（无辩论）
     # 把交易规则也告诉它，否则它会规划出真实市场做不到的事（比如让 A 股当天买当天卖）
     with get_conn() as conn:
         c2 = conn.cursor()
@@ -1131,6 +1192,74 @@ def _decide_one(deps, conf, stock, today, results, slot: str = ""):
         decision["_parse_failed"] = True
     decision["report"] = report
     decision["raw"] = raw_trader
+    # 4.5 Bull/Bear 多空辩论（可选增强）
+    # 先拿到第一轮交易员决策，如果满足触发条件（action + confidence + code），
+    # 再跑 Bull→Bear→Research Manager 辩论，把辩论结果注入后重新跑交易员。
+    # 不触发的票成本不变（2 次 LLM），触发的票 5 次 LLM（2 交易员 + 3 辩论）。
+    import debate as debate_mod
+    debate_conf = debate_mod.load_debate_conf(conf)
+    debate_result = None
+    if debate_mod.should_debate(debate_conf, code, decision["action"],
+                                decision["confidence"]):
+        try:
+            # Risk Critic 只对高风险票跑（ST/*ST/退市/北交所），普通票不额外花钱。
+            # 动机见 debate.py 顶部：*ST 海利在只有 Bull/Bear 时被 Judge 判了 Buy。
+            _want_rc = debate_mod.needs_risk_critic(debate_conf, code, name)
+            debate_result = debate_mod.run_debate(
+                report, ctx, code, name,
+                max_rounds=int(debate_conf.get("max_rounds", 1)),
+                risk_critic_check=_want_rc)
+            _rating = debate_mod.parse_judge_rating(debate_result["judge_decision"])
+            # 把辩论结果注入交易员 prompt，重新决策
+            debate_block = debate_mod.format_debate_for_trader(debate_result)
+            raw_trader_2 = _llm_call(
+                TRADER_PROMPT,
+                f"【分析报告】\n{report}\n\n【账户现状】\n可用现金 {account['cash']:,.0f} 元，"
+                f"总资产 {account['total_value']:,.0f} 元，"
+                f"已持有该股 {positions[code]['shares']} 股（成本 {positions[code]['cost']:g}，"
+                f"今日可卖 {_free} 股）"
+                if code in positions else
+                f"【分析报告】\n{report}\n\n【账户现状】\n可用现金 {account['cash']:,.0f} 元，"
+                f"总资产 {account['total_value']:,.0f} 元，该股无持仓",
+                extra=rules + _vol_hint + debate_block)
+            decision_2 = _validate_decision(_extract_json(raw_trader_2) or {})
+            if decision_2 is not None:
+                decision_2["report"] = report
+                decision_2["raw"] = raw_trader_2
+                decision_2["debate"] = {
+                    "rounds": debate_result["rounds"],
+                    "llm_calls": debate_result["llm_calls"],
+                    "rating": _rating,
+                    "risk_critic": bool(debate_result.get("risk_report")),
+                    "risk_report": debate_result.get("risk_report", "")[:3000],
+                    "bull_history": debate_result["bull_history"],
+                    "bear_history": debate_result["bear_history"],
+                    "judge_decision": debate_result["judge_decision"],
+                }
+                decision = decision_2
+            else:
+                # 第二轮解析失败，保留第一轮决策，但记录辩论结果
+                decision["debate"] = {
+                    "rounds": debate_result["rounds"],
+                    "llm_calls": debate_result["llm_calls"],
+                    "rating": _rating,
+                    "risk_critic": bool(debate_result.get("risk_report")),
+                    "parse_failed_round2": True,
+                }
+            # enforce_rating：把强信号评级变成硬约束（默认关闭）。
+            # 放在最后、且**在成交之前** —— 这是「风控必须在 LLM 之外」的延续，
+            # 见 AGENTS.md 里 stop_loss_max_pct 那条：写在提示词里 LLM 能自己论证掉。
+            _veto_act, _veto_note = debate_mod.apply_rating_veto(
+                debate_conf, _rating, decision["action"],
+                has_position=(code in positions))
+            if _veto_act != decision["action"]:
+                print(f"[paper] {code} 辩论否决：{decision['action']} -> {_veto_act}"
+                      f"（Judge={_rating}，{_veto_note}）", flush=True)
+                decision["action"] = _veto_act
+                decision["rating_veto"] = _veto_note
+        except Exception as exc:
+            print(f"[paper] {code} 辩论失败（保留原决策）: {exc}", flush=True)
+            decision["debate_error"] = str(exc)
     # 5. 成交执行（资金硬约束代码强制）
     executed, note = _execute_decision(deps, conf, stock, today, decision, quote,
                                        slot, bars=bars)
