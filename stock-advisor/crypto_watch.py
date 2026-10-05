@@ -529,8 +529,8 @@ EM_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 # 腾讯日K 的两个可用镜像。**不要用 web.ifzq.gtimg.cn** —— 那个域名被 WAF 拦成
 # 501（app.py 量能模块的注释里已记录），去掉 `web.` 前缀的 ifzq.gtimg.cn 和
 # proxy.finance.qq.com/ifzqgtimg 都正常（2026-09-26 实测 A股/港股/美股全通）。
-TX_KLINE_HOSTS = ("https://ifzq.gtimg.cn/appstock/app/fqkline/get",
-                  "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get")
+TX_KLINE_HOSTS = ("https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get",
+                  "https://ifzq.gtimg.cn/appstock/app/fqkline/get")
 SINA_CN_KLINE = ("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
                 "CN_MarketData.getKLineData")
 SINA_US_KLINE = ("https://stock.finance.sina.com.cn/usstock/api/jsonp.php/"
@@ -540,7 +540,9 @@ SOHU_KLINE = "https://q.stock.sohu.com/hisHq"
 # 逐个源尝试的顺序。2026-09-26 在本机逐个实测过可达性，结论写在这里，
 # 免得下次再从头试一遍：
 #   腾讯 ifzq   —— 首选。一条符号打通 A/港/美（美股须带交易所后缀，见
-#                    _resolve_us_suffix 的警告），两个镜像都可用
+#                    _resolve_us_suffix 的警告）。**2026-10-05 实测 ifzq.gtimg.cn
+#                    也被 WAF 拦成 501 了**（和 web. 前缀那个一样），所以镜像
+#                    顺序调成 proxy.finance.qq.com 优先，且两个镜像各自 try/except
 #   东财 push2his —— 一条 secid 打通 A/港/美，字段最干净；但本机 *.eastmoney.com
 #                    整域连不上（RemoteDisconnected，sector.py 也有同样记录）
 #   新浪 CN/US  —— 实测可用：A股 json_v2、美股 US_MinKService（返回全量历史，
@@ -570,7 +572,15 @@ def _kline_tencent(sym: dict, days: int) -> list[dict]:
     if not tx:
         return []
     for host in TX_KLINE_HOSTS:
-        data = _get_json(host, params={"param": f"{tx},day,,,{days},qfq"}, timeout=15)
+        # ⚠️ 每个镜像必须各自 try/except：_get_json 里 raise_for_status() 会抛，
+        # 而 ifzq.gtimg.cn 已被 WAF 拦成 501（2026-10-05 实测），原来没兜住，
+        # 第一个镜像一抛就把整个腾讯源判死，**第二个能用的镜像根本没试**，
+        # 于是明明有可用源却记成「tencent:HTTPError + 兜底全无数据」。
+        # 与 paper_trading._tencent_closes 的写法保持一致。
+        try:
+            data = _get_json(host, params={"param": f"{tx},day,,,{days},qfq"}, timeout=15)
+        except Exception:
+            continue
         bars = (data or {}).get("data", {}).get(tx, {})
         bars = bars.get("qfqday") or bars.get("day") or []
         out = [{"date": str(b[0]), "close": _f(b[2])}
