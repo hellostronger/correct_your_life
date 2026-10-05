@@ -16,6 +16,7 @@ deps = {"get_conn", "em_kline_fn", "tx_symbol_fn", "quote_fn", "conf",
 """
 
 import json
+import os
 import re
 import time
 import traceback
@@ -437,12 +438,16 @@ TRADER_PROMPT = """\
 只输出一个 JSON 代码块，不要其他文字：
 ```json
 {"action":"buy|sell|hold","confidence":1-10,"target_value_pct":1-20,
- "stop_loss_pct":2-15,"reasoning":"2-4句操作理由"}
+ "stop_loss_pct":2-15,"expected_up_pct":1-40,"reasoning":"2-4句操作理由"}
 ```
 字段含义：
 - action：buy=买入（用现金按建议仓位），sell=清仓该股已有持仓，hold=观望不动
 - target_value_pct：本次买入动用资金占总资产百分比（1-20）
 - stop_loss_pct：止损线距买入价的百分比（2-15）
+- expected_up_pct：预期涨幅，到目标位的价格百分比（1-40）。**买的时候必填**，
+  hold/sell 可留空。系统会用它和 confidence、stop_loss_pct 合成一个风险收益
+  比，在现金不够分给所有买入机会时**按这个比值从高到低决定先买哪只**——
+  所以这不是修饰词，它直接决定你能不能被选中。
 - reasoning：必须引用报告和账户数据的具体数字说明为什么是这笔交易而不是相反
 
 硬性纪律：现金不足时 action 必须是 hold；没有已有持仓时不能 sell；
@@ -781,7 +786,8 @@ def _extract_json(text: str) -> dict | None:
 def _extract_truncated_json(text: str) -> dict | None:
     """从**被截断**的输出里抢救交易员 JSON 的可用字段。
 
-    只取**标量字段**（action/confidence/target_value_pct/stop_loss_pct）。
+    只取**标量字段**（action/confidence/target_value_pct/stop_loss_pct/
+    expected_up_pct）。
     reasoning 是自由文本、几乎总是被截断的那部分 —— 抢救不到就置空，
     由 _validate_decision 填「（未给出理由）」。宁可少一个字段，
     也不要因为最后一条 reasoning 没写完就丢掉整个 action=buy/sell。
@@ -790,7 +796,8 @@ def _extract_truncated_json(text: str) -> dict | None:
     （宁可降级 hold，也不要凭空猜一个方向）。
     """
     out: dict = {}
-    for key in ("action", "confidence", "target_value_pct", "stop_loss_pct"):
+    for key in ("action", "confidence", "target_value_pct", "stop_loss_pct",
+                "expected_up_pct"):
         # 匹配 "key": value 或 "key":{...}（只取标量，忽略复杂值）。
         # 值必须**非空**：`[^",}]+` 会匹配到空串，于是 "{}" 里的 "action" 之后
         # 什么也没取到却仍被记进 out，造出一个「有 action 的假 dict」。
@@ -818,17 +825,50 @@ def _clip(v, lo, hi, default):
 
 
 def _validate_decision(d: dict) -> dict | None:
-    """交易员 JSON 二次校验：enum/数值范围 clip，不合格返回 None（降级 hold）。"""
+    """交易员 JSON 二次校验：enum/数值范围 clip，不合格返回 None（降级 hold）。
+
+    expected_up_pct 允许缺省（hold/sell 本就不需要）。缺了不报错，交给 roi_score
+    走 confidence 兜底 —— 截断输出和旧格式决策都必须能继续参与排序，不能因为
+    少一个字段整笔买单被丢掉。
+    """
     action = str(d.get("action", "")).lower().strip()
     if action not in ("buy", "sell", "hold"):
         return None
+    up = d.get("expected_up_pct")
+    try:
+        up = None if up in (None, "") else _clip(up, 1, 40, None)
+    except (TypeError, ValueError):
+        up = None
     return {
         "action": action,
         "confidence": int(_clip(d.get("confidence"), 1, 10, 5)),
         "target_value_pct": _clip(d.get("target_value_pct"), 1, 20, 5),
         "stop_loss_pct": _clip(d.get("stop_loss_pct"), 2, 15, 8),
+        "expected_up_pct": up,
         "reasoning": str(d.get("reasoning") or "")[:2000] or "（未给出理由）",
     }
+
+
+def roi_score(decision: dict) -> float:
+    """风险收益率比 —— 现金稀缺时决定「先买哪只」的唯一排序键。纯函数。
+
+        ROI = (confidence/10) × (expected_up_pct / stop_loss_pct)
+              胜率代理        赔率                    = 每单位风险的理论期望值
+
+    为什么是这三项相乘而不是只看赔率：赔率高但只有三成把握的机会，期望值低于
+    赔率平平但有八成把握的。把胜率乘进去才是「风险收益率」而不是「odds」。
+
+    ⚠️ confidence 是「把握度」而非真实胜率，这里拿它当胜率代理是有意的简化，
+    已在 Prompt 里要求交易员对每笔单独给出把握度。expected_up_pct 缺失时
+    （截断/旧格式）**回退成 confidence** —— 此时退化为「把握度/止损幅度」，
+    仍是合理的单调排序，不会因为缺字段把买单扔掉。
+    """
+    conf = _clip(decision.get("confidence"), 1, 10, 5) / 10.0
+    stop = _clip(decision.get("stop_loss_pct"), 2, 15, 8)
+    up = decision.get("expected_up_pct")
+    if not isinstance(up, (int, float)) or up <= 0:
+        up = conf * 10          # ≈ 0.1~1.0 的比率，与有值时同量纲
+    return conf * (float(up) / float(stop))
 
 
 # ---------------- 账户与持仓（流水推导，不建持仓表） ----------------
@@ -1013,12 +1053,18 @@ def position_limit_status(cur, conf: dict) -> dict:
 def run_decisions(deps: dict, slot: str = "", only: set | None = None) -> dict:
     """为每只自选股生成买卖决策并按当前价成交（盘中每 30 分钟一轮）。
 
+    两阶段（2026-10-05 改）：**先收集齐全部决策，再决定谁拿到现金**。
+    以前是逐只「决策完立刻成交」，循环顺序来自 sa_watchlist 的 ORDER BY code，
+    于是同轮多个 buy 候选时实际是「谁代码字典序靠前谁先拿到钱」。现在买入候选
+    按 `roi_score`（胜率代理 × 赔率）降序执行，卖单先于买单释放现金，
+    见 `_execute_plans`。
+
     slot：决策轮次标签（'HH:MM'）。同一 slot 内同股只决策一次（幂等），
     不同 slot 各自独立决策 —— 这是「每半小时判断一次」的落点。
     only：只判这些 code（None = 全部自选股）。盘中已持仓的票可只判持仓，
     省下 LLM 调用。
     逐股 try/except 隔离，一股失败不影响其余（仿新闻抓取循环）。
-    返回 {date, slot, decided: [...]}。
+    返回 {date, slot, decided: [...], position_limit, skipped_by_limit}。
     """
     get_conn = deps["get_conn"]
     conf = {**DEFAULTS, **(deps.get("conf") or {})}
@@ -1044,7 +1090,6 @@ def run_decisions(deps: dict, slot: str = "", only: set | None = None) -> dict:
                   f"当前 {_gnote['return_pct']:+.2f}%，剩 {_gnote['days_left']} 天）",
                   flush=True)
     today = datetime.now().strftime("%Y-%m-%d")
-    results = []
     with get_conn() as conn:
         cur = conn.cursor(cursor_factory=_real_dict_cursor(deps))
         cur.execute("SELECT code, name FROM sa_watchlist ORDER BY code")
@@ -1078,13 +1123,23 @@ def run_decisions(deps: dict, slot: str = "", only: set | None = None) -> dict:
         done = {r["code"] for r in cur.fetchall()}
     if only is not None:
         stocks = [s for s in stocks if s["code"] in only]
+    # ---- 阶段一：逐只决策，**不成交** ----
+    # 决策与成交必须分开，因为「先买哪只」需要看到同轮**所有** buy 候选才能排。
+    # 以前是决策完立刻成交，循环按 sa_watchlist 的 ORDER BY code 走，等于
+    # 「谁代码字典序靠前谁先拿到现金」——与这只票值不值得买毫无关系。
+    plans = []
     for stock in stocks:
         code = stock["code"]
         if code in done:
             continue
         try:
-            _decide_one(deps, conf, stock, today, results, slot)
+            plan = _decide_one(deps, conf, stock, today, slot)
             done.add(code)   # 股间也不重入（并发手动触发/线程双写防护）
+            if plan:
+                plans.append(plan)
+                # 立刻落 sidecar：阶段二（排序成交）之前崩了/被 kill，
+                # DB 里一条都没有，但 LLM 的钱和时间已经花掉了。
+                append_decision_sidecar(stock, plan["decision"], slot)
         except Exception as exc:
             # UniqueViolation = 本 slot 已有决策行（线程与手动触发并发），静默跳过
             if "sa_paper_trades_trade_date_slot_code_side_key" in str(exc):
@@ -1093,8 +1148,65 @@ def run_decisions(deps: dict, slot: str = "", only: set | None = None) -> dict:
                 traceback.print_exc()
                 print(f"[paper] decide {code} failed: {exc}", flush=True)
         time.sleep(float(conf.get("sleep_seconds", 3)))
+    # ---- 阶段二：先卖后买，买入按 ROI 从高到低分配现金 ----
+    results = _execute_plans(deps, conf, plans, today, slot)
     return {"date": today, "slot": slot, "decided": results,
             "position_limit": limit, "skipped_by_limit": sorted(blocked_by_limit)}
+
+
+def _execute_plans(deps, conf, plans: list, today: str, slot: str) -> list[dict]:
+    """按「先卖后买、买入按风险收益率比降序」逐笔成交。返回结果列表（成交顺序）。
+
+    为什么卖要先执行：卖出释放的现金本轮就该能用于买入，先买后卖会让好机会
+    白白排不上队（卖出反而可能被当成「现金不足」拒掉）。
+
+    为什么排序能生效而不用自己维护资金账本：`_execute_decision` 在自己的事务里
+    重新 `_account_row` 读现金，逐笔扣减（`UPDATE sa_paper_account SET cash =
+    cash - ...`）。所以按顺序调用即可，现金约束天然是串行且准确的 —— 排在后面
+    的买入看到的是前面扣完之后的真实现金，不够就自己拒单。
+
+    ⚠️ 一个有意的行为变化：以前后面的票能看到前面扣完的现金，Prompt 里
+    「现金不足时 action 必须是 hold」靠这个生效。现在同一轮所有决策看到的是
+    **同一份轮次开头的现金快照**，谁都不会因为「前面买完了」而自动转向 hold，
+    稀缺性统一由这里的 ROI 排序在代码层裁决。风控仍在代码层（这是 AGENTS.md
+    里「风控必须在 LLM 之外」的要求），Prompt 那句退化为软提示。
+    """
+    sells = [p for p in plans if p["decision"]["action"] == "sell"]
+    buys = [p for p in plans if p["decision"]["action"] == "buy"]
+    # 同分时按 confidence 再按 code 兜底：纯 Python 的 sort 是稳定排序，
+    # 补上确定性 key 才保证同样输入永远得到同样的成交顺序（否则无法复现对账）。
+    buys.sort(key=lambda p: (-p["roi"], -float(p["decision"]["confidence"]),
+                            p["stock"]["code"]))
+    if len(buys) > 1:
+        print(f"[paper] 本轮 {len(buys)} 个买入候选，按风险收益率比排序："
+              + " > ".join(f"{p['stock']['name']}({p['roi']:.2f})" for p in buys),
+              flush=True)
+    results = []
+    buy_rank = 0
+    for p in sells + buys:
+        stock, decision = p["stock"], p["decision"]
+        if decision["action"] == "buy":
+            buy_rank += 1
+        try:
+            executed, note = _execute_decision(deps, conf, stock, today, decision,
+                                               p["quote"], slot, bars=p["bars"])
+        except Exception as exc:
+            traceback.print_exc()
+            executed, note = False, f"成交异常（已隔离，不影响其余）: {exc}"
+        results.append({
+            "code": stock["code"], "name": stock["name"],
+            "action": decision["action"], "executed": executed,
+            "reasoning": decision["reasoning"], "note": note,
+            # 资金分配的可观测性：哪几只是因为 ROI 高才抢到现金的
+            "roi": round(p["roi"], 4),
+            "expected_up_pct": decision.get("expected_up_pct"),
+            "stop_loss_pct": decision.get("stop_loss_pct"),
+            "target_value_pct": decision.get("target_value_pct"),
+            # 名次只在买入内部计 —— 卖出不占号，否则前端会显示「第一笔买入
+            # 排第 2」，读起来像有笔买入没排上。
+            "funding_rank": buy_rank if decision["action"] == "buy" else None,
+        })
+    return results
 
 
 def _real_dict_cursor(deps):
@@ -1142,7 +1254,87 @@ def _rule_brief(code: str, name: str, held: bool, free_shares: int = 0,
             f"- 卖出{ sell.lstrip('；') if sell else '无持仓'}{extra}")
 
 
-def _decide_one(deps, conf, stock, today, results, slot: str = ""):
+DEBATE_TEXT_CAP = 8000
+"""落库时每段辩论文本的截断上限（字符）。
+
+为什么要截断：judge_decision 实测有过 3447 字符，Bull/Bear 历史随轮次增长，
+而 decision_raw 已有 max=8503 字节。不设上限的话一次多轮辩论能把单行推到
+几十万字节（JSONB + 每轮 INSERT 都走 WAL）。
+"""
+
+
+def _cap(text, cap: int = DEBATE_TEXT_CAP) -> str:
+    """文本截断，附带标记，让看结论的人知道被截过（否则会当成完整原文）。"""
+    text = str(text or "")
+    if len(text) <= cap:
+        return text
+    return text[:cap] + f"...[截断，全文 {len(text)} 字符，见 sidecar]"
+
+
+def _pack_debate(debate_result: dict, rating: str, round2_failed: bool = False) -> dict:
+    """把 run_debate() 的产物打成一个 dict，**原样进 decision_raw**。
+
+    三个分支（正常 / 第二轮解析失败 / 抛异常）都必须走这里，
+    否则最贵的部分（Bull/Bear 发言、Judge 结论）会在异常分支里丢掉 ——
+    那正是「花 6 次 LLM 调用、最后只留一句错误信息」的老问题。
+    """
+    if not debate_result:
+        return {}
+    return {
+        "rounds": debate_result.get("rounds", 0),
+        "llm_calls": debate_result.get("llm_calls", 0),
+        "rating": rating,
+        "risk_critic": bool(debate_result.get("risk_report")),
+        "risk_report": _cap(debate_result.get("risk_report", "")),
+        "bull_history": _cap(debate_result.get("bull_history", "")),
+        "bear_history": _cap(debate_result.get("bear_history", "")),
+        "history": _cap(debate_result.get("history", "")),
+        "judge_decision": _cap(debate_result.get("judge_decision", "")),
+        # 标记位：Judge 有输出但交易员第二轮解析失败 —— 有结论但没被采纳
+        "trader_round2_parse_failed": bool(round2_failed),
+    }
+
+
+def append_decision_sidecar(stock: dict, decision: dict, slot: str = "") -> str:
+    """把单只股票的决策**立即**追加到 data/paper_decisions_YYYYMMDD.jsonl。
+
+    为什么要有这个 sidecar（AGENTS.md「长任务每步落盘」）：
+    - 决策与成交是**两阶段**的（`run_decisions` 先全部决策，再排序成交），
+      中间任何崩溃 / 被 kill / 数据库写失败，DB 里一条记录都不会有，
+      但 LLM 调用已经花掉了（15 只 × 6 次 ≈ 90 分钟）。
+    - JSONL 逐行追加、崩溃安全、不依赖事务，可直接 `json.loads` 复盘。
+    - 返回文件路径；写失败只打印，不影响主流程（决策本身仍会进 DB）。
+    """
+    try:
+        code = (stock or {}).get("code", "")
+        if not code:
+            return ""
+        data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+        os.makedirs(data_dir, exist_ok=True)
+        d = os.path.join(data_dir, f"paper_decisions_{datetime.now():%Y%m%d}.jsonl")
+        rec = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "slot": slot,
+            "code": code,
+            "name": (stock or {}).get("name", ""),
+            "decision": decision,
+        }
+        with open(d, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        return d
+    except Exception as exc:
+        print(f"[paper] sidecar 写入失败（不影响主流程）: {exc}", flush=True)
+        return ""
+
+
+def _decide_one(deps, conf, stock, today, slot: str = ""):
+    """只做决策，**不成交**。返回 None（跳过）或可交给 _execute_decision 的执行包。
+
+    2026-10-05 改为两阶段：以前这里是「决策完立刻按代码字典序成交」，导致同轮
+    多个 buy 候选时谁代码靠前谁先拿到现金（见 run_decisions 的排序说明）。
+    现在本函数只产出决策，成交统一由 run_decisions 在收集齐全部候选后按 ROI
+    排序执行 —— 这样「现金优先给最值得的那只」才成立。
+    """
     get_conn, em_kline_fn = deps["get_conn"], deps["em_kline_fn"]
     quote_fn, tx_symbol_fn = deps["quote_fn"], deps["tx_symbol_fn"]
     news_fn, events_fn = deps.get("news_fn"), deps.get("events_fn")
@@ -1226,6 +1418,8 @@ def _decide_one(deps, conf, stock, today, results, slot: str = ""):
     # 不触发的票成本不变（2 次 LLM），触发的票 5 次 LLM（2 交易员 + 3 辩论）。
     import debate as debate_mod
     debate_conf = debate_mod.load_debate_conf(conf)
+    # 先置空再进 try：异常分支要靠它判断「已经拿到多少辩论产物」，
+    # 否则 run_debate 成功后���面的步骤抛错时，那几次 LLM 调用白花。
     debate_result = None
     if debate_mod.should_debate(debate_conf, code, decision["action"],
                                 decision["confidence"]):
@@ -1254,26 +1448,13 @@ def _decide_one(deps, conf, stock, today, results, slot: str = ""):
             if decision_2 is not None:
                 decision_2["report"] = report
                 decision_2["raw"] = raw_trader_2
-                decision_2["debate"] = {
-                    "rounds": debate_result["rounds"],
-                    "llm_calls": debate_result["llm_calls"],
-                    "rating": _rating,
-                    "risk_critic": bool(debate_result.get("risk_report")),
-                    "risk_report": debate_result.get("risk_report", "")[:3000],
-                    "bull_history": debate_result["bull_history"],
-                    "bear_history": debate_result["bear_history"],
-                    "judge_decision": debate_result["judge_decision"],
-                }
+                decision_2["debate"] = _pack_debate(debate_result, _rating)
                 decision = decision_2
             else:
-                # 第二轮解析失败，保留第一轮决策，但记录辩论结果
-                decision["debate"] = {
-                    "rounds": debate_result["rounds"],
-                    "llm_calls": debate_result["llm_calls"],
-                    "rating": _rating,
-                    "risk_critic": bool(debate_result.get("risk_report")),
-                    "parse_failed_round2": True,
-                }
+                # 第二轮解析失败：保留第一轮决策，但**辩论全文照存**
+                # （以前这里只留 rounds/llm_calls/rating，把最贵的正文丢了）
+                decision["debate"] = _pack_debate(debate_result, _rating,
+                                                  round2_failed=True)
             # enforce_rating：把强信号评级变成硬约束（默认关闭）。
             # 放在最后、且**在成交之前** —— 这是「风控必须在 LLM 之外」的延续，
             # 见 AGENTS.md 里 stop_loss_max_pct 那条：写在提示词里 LLM 能自己论证掉。
@@ -1288,12 +1469,20 @@ def _decide_one(deps, conf, stock, today, results, slot: str = ""):
         except Exception as exc:
             print(f"[paper] {code} 辩论失败（保留原决策）: {exc}", flush=True)
             decision["debate_error"] = str(exc)
-    # 5. 成交执行（资金硬约束代码强制）
-    executed, note = _execute_decision(deps, conf, stock, today, decision, quote,
-                                       slot, bars=bars)
-    results.append({"code": code, "name": name, "action": decision["action"],
-                     "executed": executed, "reasoning": decision["reasoning"],
-                     "note": note})
+            # run_debate 已经返回、后面某步抛错时，产物照样落库。
+            # 否则「3~4 次 LLM 调用跑完、格式化时炸了」= 全丢。
+            if debate_result:
+                try:
+                    decision["debate"] = _pack_debate(
+                        debate_result,
+                        debate_mod.parse_judge_rating(
+                            debate_result.get("judge_decision", "")),
+                        round2_failed=True)
+                except Exception:
+                    pass
+    # 5. 只交回执行包，不在这里成交（排序权归 run_decisions）
+    return {"stock": stock, "quote": quote, "bars": bars, "decision": decision,
+            "roi": roi_score(decision)}
 
 
 def _execute_decision(deps, conf, stock, today, decision, quote,
