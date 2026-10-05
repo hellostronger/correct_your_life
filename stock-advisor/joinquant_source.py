@@ -320,8 +320,17 @@ def syntax_verdict(code: str) -> dict:
     import ast
     if not (code or "").strip():
         return {"state": "empty", "ok": False, "detail": "没有源码"}
+    # ⚠️ 必须 compile 而不是 ast.parse（2026-10-05 修）。
+    # ast.parse 只做语法分析，**不做作用域检查**：`if dd>=0.2:\n  return`
+    # 这种模块层的裸 return，ast.parse 放行、compile 报
+    # SyntaxError: 'return' outside function。而沙箱那边
+    # （sandbox_runner.exec(compile(src,...))）走的正是 compile ——
+    # 于是体检说「可以跑」，真跑就炸在 runner 异常，白花 400 秒切数据。
+    # 实测《多因子LightGBM》就中了这个：5 个代码块机械拼接，第 4 块是
+    # 一个只有 `if dd >= 0.20: ... return` 的函数片段。
+    # 判据要和真正的执行器一致，否则这个字段就是在骗人。
     try:
-        ast.parse(code)
+        compile(code, "<strategy>", "exec")
         return {"state": "ok", "ok": True, "detail": ""}
     except SyntaxError as exc:
         msg = "%s (行%s)" % (exc.msg, exc.lineno)

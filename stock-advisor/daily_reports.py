@@ -348,6 +348,18 @@ def _build_context(deps, kind: str) -> str:
         if decisions:
             lines.append("【当日模拟交易决策】")
             lines.extend(decisions)
+        # 聚宽策略库沙箱验证的结论。放盘后而不是盘前：这是「回头复盘」的
+        # 材料（这批策略跑出来到底能不能用），不是盘前的情绪输入。
+        # 判据在 strategy_gate.judge()，这里只负责把结论摆进上下文。
+        gate_fn = deps.get("strategy_gate_fn")
+        if gate_fn:
+            try:
+                gated = gate_fn()
+            except Exception:
+                gated = []
+            if gated:
+                lines.append("【聚宽策略库沙箱验证（跑通≠可信，见每条⚠）】")
+                lines.extend(gated)
     return "\n".join(lines)
 
 

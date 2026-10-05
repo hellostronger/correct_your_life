@@ -449,8 +449,14 @@ def main() -> int:
         }
         _emit(payload)
         return 0
-    except Exception:                          # noqa: BLE001
-        payload = {"ok": False, "error": "runner 异常",
+    except Exception as exc:                  # noqa: BLE001
+        # ⚠️ error 必须是**异常自己的话**，不能是固定串（2026-10-05 修）。
+        # 原来写死 "runner 异常"，于是「源码没有 initialize」「没装 lightgbm」
+        # 「KeyError: df」在结果里长得一模一样，每次都得人去翻 traceback
+        # 的最后一行才知道死在哪 —— 而这次验证 4 个候选挂了 3 个，全是这句
+        # 废话。traceback 只在 payload 里，前端和日报都不读它。
+        payload = {"ok": False,
+                   "error": "%s: %s" % (type(exc).__name__, exc),
                    "traceback": traceback.format_exc()[-4000:],
                    "elapsed": round(time.time() - t0, 2)}
         _emit(payload)

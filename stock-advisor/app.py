@@ -630,6 +630,16 @@ def init_db():
                     cur.execute(stmt)
                 ok = True
                 break
+            except psycopg2.errors.DuplicateObject:
+                # 并发启动时才会出现：server 进程和一个临时脚本同时 init_db()，
+                # 而 `DROP CONSTRAINT IF EXISTS` 与 `ADD CONSTRAINT` 分属两个事务，
+                # 交叉执行就是 A 加完、B 再加一次 → DuplicateObject。
+                # （2026-10-05 实测撞过：DuplicateObject 是 ProgrammingError，
+                #  不在下面那个 except 里，会一路冒泡把 import app 打挂。）
+                # 这里整段 ddl 的语义就是幂等建表 —— CREATE/DROP 都带 IF NOT/IF
+                #  EXISTS，「约束已存在」正是想要的结果，直接算成功。
+                ok = True
+                break
             except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
                 last_exc = exc
                 print(f"[init_db] stmt failed (attempt {attempt + 1}): "
@@ -3582,6 +3592,7 @@ import joinquant_source
 import strategy_crawler
 import strategy_extract as SX
 import jq_sandbox as JS
+import strategy_gate as SG
 import stock_discovery
 import stock_roster
 import paper_memory
@@ -4036,6 +4047,68 @@ def paper_strategy_compare(code: str = ""):
     return paper_strategy.compare(_paper_strategy_deps(), code=code)
 
 
+@app.get("/api/paper/adopted-strategies")
+def paper_adopted_strategies(include_rejected: bool = False):
+    """模拟盘这边「已采纳的外部策略」。
+
+    为什么这一栏是空的也要有：paper_strategy 那一套（sa_strategies /
+    sa_paper_strategy_bindings）只支持 6 种**卖出**策略（移动止盈、回撤止盈、
+    固定止盈、分批、止损、时间止盈）。聚宽社区策略是**选股**逻辑 ——
+    决定买哪只、什么时候买 —— 两者不在一个维度上，硬塞进 sa_strategies 会
+    得到一个语义错误的绑定（把「选股」当成「卖出条件」）。
+
+    所以采纳走另一条路：沙箱验证通过 → 写 sa_strategy_def
+    （portable_score 打分、enabled=TRUE 表示采纳）→ 这里列出来。
+    enabled=TRUE 只代表「验证结论可信、值得作为选股参考」，**不代表它已经在
+    替你下单**。真要让它参与模拟盘选股，需要另外把它编译成 sa_strategies
+    能表达的规则形态（runnable='rules'），那是另一件事。
+
+    include_rejected=true 时把被否决的也列出来，附否决原因 —— 「为什么不
+    用它」和「为什么用它」一样需要留痕。
+    """
+    sql = """SELECT s.id, s.name, s.article_id, s.runnable, s.portable_score,
+                    s.enabled, s.note, s.created_at,
+                    (SELECT max(r.created_at) FROM sa_backtest_run r
+                      WHERE r.strategy_id = s.id) AS last_run,
+                    (SELECT br.total_return FROM sa_backtest_run br
+                      WHERE br.strategy_id = s.id
+                      ORDER BY br.id DESC LIMIT 1) AS total_return,
+                    (SELECT br.annual_return FROM sa_backtest_run br
+                      WHERE br.strategy_id = s.id
+                      ORDER BY br.id DESC LIMIT 1) AS annual_return,
+                    (SELECT br.max_drawdown FROM sa_backtest_run br
+                      WHERE br.strategy_id = s.id
+                      ORDER BY br.id DESC LIMIT 1) AS max_drawdown,
+                    (SELECT br.sharpe FROM sa_backtest_run br
+                      WHERE br.strategy_id = s.id
+                      ORDER BY br.id DESC LIMIT 1) AS sharpe
+             FROM sa_strategy_def s
+             WHERE (%s = '' OR %s)
+             ORDER BY s.enabled DESC, s.portable_score DESC, s.id DESC
+             LIMIT 50"""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SET statement_timeout='20s'")
+        cur.execute(sql, ("TRUE" if include_rejected else "FALSE",
+                          "TRUE" if include_rejected else "s.enabled"))
+        rows = cur.fetchall()
+    items = []
+    for r in rows:
+        (sid, name, aid, runnable, score, enabled, note, created, last_run,
+         tr, ar, mdd, sh) = r
+        items.append({
+            "id": sid, "name": name, "article_id": aid,
+            "runnable": runnable, "portable_score": score,
+            "enabled": bool(enabled), "note": note,
+            "created_at": str(created or ""), "last_run": str(last_run or ""),
+            "total_return": _pct_or_none(tr), "annual_return": _pct_or_none(ar),
+            "max_drawdown": _pct_or_none(mdd), "sharpe": sh,
+            "drives_paper": False,      # 见 docstring：它不参与实际下单
+        })
+    return {"n": len(items), "items": items,
+            "adopted": sum(1 for i in items if i["enabled"]),
+            "hint": "已采纳=验证通过、可作选股参考；不等于已在替你下单。"}
+
+
 # ---------- 策略库采集（聚宽社区，防重复爬取）----------
 
 def _slib_deps() -> dict:
@@ -4386,6 +4459,16 @@ def _precheck_verdict(m: dict, scan: dict, all_mkt: bool,
         return "不能跑：拼接后源码语法错误，需要改写。"
     if not m["syntax_ok"]:
         return "不能跑：syntax_state=%s" % (m["syntax_state"] or "未知")
+    # 没有 initialize 就是空跑，而空跑**不报错**：沙箱逐日驱动完，回测正常
+    # 收尾，净值是一条直线。sandbox_runner 里也拦了一道，但那时候 400 只
+    # 数据已经切完、传完了，白花 250 秒。这里提前拦。
+    if not scan.get("has_initialize"):
+        if scan.get("n_funcs"):
+            return ("不能跑：源码有 %d 个函数但没有 initialize —— 聚宽靠它注册"
+                    "回调，缺了就是空跑，净值是一条直线。"
+                    % scan["n_funcs"])
+        return ("不能跑：抽出来的源码里一个函数都没有（作者贴的是 g.xxx = ... "
+                "这类参数片段，不是可运行策略）。")
     if m["redacted"]:
         return ("能跑但结果不可信：作者用省略号把核心逻辑藏了（脱敏），"
                 "跑出来的净值不代表真实策略。")
@@ -4449,7 +4532,14 @@ def sandbox_precheck(body: SandboxPrecheckIn):
         print("[sandbox] jq_sandbox.estimate_universe 不可用，"
               "precheck 跳过内存估算", flush=True)
     return {"post_id": m["post_id"], "title": m["title"],
-            "can_run": m["syntax_ok"], "syntax_state": m["syntax_state"],
+            # can_run = 语法过 **且** 有 initialize。缺 initialize 的源码编译
+            # 是过的（sandbox_runner 会另外抛 RuntimeError），但它不是策略 ——
+            # 只判 syntax_ok 会让「作者贴的参数片段」显示成可跑，而实测要等
+            # 切完 400 只数据传上容器才炸，白花 250 秒（2026-10-05 修）。
+            "can_run": bool(m["syntax_ok"]) and bool(scan["has_initialize"]),
+            "syntax_ok": m["syntax_ok"],
+            "syntax_state": m["syntax_state"],
+            "has_initialize": scan["has_initialize"],
             "redacted": m["redacted"], "n_blocks": m["n_blocks"],
             "n_lines": scan["n_lines"], "n_funcs": scan["n_funcs"],
             "funcs": scan["funcs"], "risks": scan["risks"],
@@ -4567,6 +4657,72 @@ def sandbox_run(body: SandboxRunIn):
                 "result": r}
     finally:
         shutil.rmtree(tdir, ignore_errors=True)
+
+
+@app.post("/api/sandbox/judge")
+def sandbox_judge(body: SandboxRunIn, submit: bool = True):
+    """判「这次沙箱结果能不能用」，并把结论写回 sa_strategy_def。
+
+    为什么和 /sandbox/run 分开：run 只回答「代码跑完了吗」（ok 字段），
+    而实测 4 个候选 ok 的比例不低，但**没有一个的收益数字能直接用** ——
+    ok=True 只说明代码没崩。所以「跑通」和「可信」必须是两个字段，
+    否则前端那个绿色对勾就是在骗人。
+
+    这里不重跑：直接读最近一次 sa_sandbox_run（body.post_id 为空则取
+    limit 天内全部）。判定逻辑全在 strategy_gate.judge()，纯函数、可单测。
+    """
+    rows = _latest_sandbox_runs(body.post_id, limit=8)
+    out = []
+    for d in rows:
+        j = SG.judge_row(d)
+        item = {"post_id": d["post_id"], "title": d["title"],
+                "verdict": j["verdict"], "score": j["score"],
+                "usable": SG.usable(j), "flags": j["flags"],
+                "blockers": j["blockers"], "penalties": j["penalties"],
+                "line": SG.one_line(d["title"], j),
+                "metrics": j["metrics"], "created_at": str(d["created_at"] or "")}
+        if submit:
+            try:
+                item["strategy_id"] = SG.submit(get_conn, d["post_id"],
+                                                d["title"], j)
+            except Exception as exc:                    # noqa: BLE001
+                item["submit_error"] = str(exc)[:200]
+        out.append(item)
+    return {"n": len(out), "items": out}
+
+
+def _latest_sandbox_runs(post_id: str = "", limit: int = 8) -> list[dict]:
+    """最近一次沙箱运行（每个 post_id 只留最新那条）。
+
+    返回的 dict 形状与 SG.judge_row 的入参一致 —— 判定逻辑只有
+    strategy_gate 一份，这里**不重复实现**。曾经两边各判一次，
+    结论能不一致（report_lines 只读列、这里只读 result）。
+    """
+    sql = """SELECT DISTINCT ON (r.post_id)
+                    r.post_id, a.title, r.ok, r.error, r.total_return,
+                    r.annual_return, r.max_drawdown, r.sharpe, r.win_rate,
+                    r.n_trades, r.n_rejected, r.warnings, r.host,
+                    r.created_at, s.redacted, s.syntax_state, s.syntax_ok,
+                    s.code, r.limits, r.result
+             FROM sa_sandbox_run r
+             JOIN sa_strategy_article a ON a.post_id = r.post_id
+             LEFT JOIN sa_strategy_source s ON s.post_id = r.post_id
+             WHERE (%s = '' OR r.post_id = %s)
+             ORDER BY r.post_id, r.created_at DESC
+             LIMIT %s"""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SET statement_timeout='20s'")
+        cur.execute(sql, (post_id or "", post_id or "", int(limit)))
+        rows = cur.fetchall()
+    # 前 18 列与 SG._ROW_COLS 同序；后两列（limits/result）不在判定入参里，
+    # 但 metrics_from_row / trade_stats_from_row 要用，所以一并塞进 dict。
+    out = []
+    for row in rows:
+        d = dict(zip(SG._ROW_COLS, row[:len(SG._ROW_COLS)]))
+        d["limits"] = row[len(SG._ROW_COLS)]
+        d["result"] = row[len(SG._ROW_COLS) + 1]
+        out.append(d)
+    return out
 
 
 @app.post("/api/sandbox/batch")
@@ -6544,6 +6700,7 @@ def _report_deps() -> dict:
         "paper_decisions_fn": _report_paper_decisions,
         "crypto_fn": lambda: crypto_watch.crypto_lines(_crypto_deps()),
         "crypto_link_fn": lambda: crypto_watch.link_lines(_crypto_deps()),
+        "strategy_gate_fn": lambda: SG.report_lines(get_conn, days=14, limit=6),
         "mp_fn": lambda: wechat_mp.digest_lines(_mp_deps(), hours=36),
         "x_fn": lambda: x_monitor.digest_lines(_x_deps(), hours=24),
         "notify_fn": notifier.notify,
