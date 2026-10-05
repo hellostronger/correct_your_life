@@ -947,7 +947,7 @@ def recent_links(deps) -> list[dict]:
             SELECT DISTINCT ON (contract) stat_date, contract, stock_code, market,
                    currency, overlap_days, n_obs, corr, beta, alpha_daily,
                    vol_crypto, vol_stock, ratio, ratio_ma, ratio_dev_pct,
-                   crypto_close, stock_close, status, error, computed_at
+                   crypto_close, stock_close, status, error, computed_at, series
             FROM sa_crypto_link_stats
             WHERE overlap_days > 0
             ORDER BY contract, stat_date DESC""")
@@ -963,6 +963,13 @@ def recent_links(deps) -> list[dict]:
         # n_obs, corr, beta, alpha_daily, vol_crypto, vol_stock, ratio, ratio_ma,
         # ratio_dev_pct, crypto_close, stock_close, status, error, computed_at
         st, err, latest_date = latest.get(r[1], (r[17], r[18], r[0]))
+        # JSONB 列 psycopg2 直接给 dict；自定义游标/文本传输下才是 str。两种都认。
+        _ser = r[20] or {}
+        if not isinstance(_ser, dict):
+            try:
+                _ser = json.loads(_ser)
+            except (TypeError, ValueError):
+                _ser = {}
         item = {
             "contract": r[1], "stock_code": r[2], "market": r[3], "currency": r[4],
             "stat_date": r[0].isoformat() if r[0] else None,
@@ -973,6 +980,11 @@ def recent_links(deps) -> list[dict]:
             "crypto_close": _f(r[15]), "stock_close": _f(r[16]),
             "status": st, "error": err,
             "computed_at": r[19].isoformat(timespec="seconds") if r[19] else None,
+            # 已对齐日K 序列：表格行内迷你双线图用，随列表一起下发免得每行再发一次请求。
+            # 白名单通常 2~8 只 × 约 33 个点，JSON 体积几 KB，可接受。
+            "series": {"dates": _ser.get("dates") or [],
+                       "crypto": _ser.get("crypto") or [],
+                       "stock": _ser.get("stock") or []},
         }
         # 最新一次重算失败但上面给的是更早的正常值 -> 明确标出来，别让人当成新鲜数据
         if st != "ok":

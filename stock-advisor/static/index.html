@@ -335,6 +335,9 @@
   .lg { display: inline-block; width: 14px; height: 3px; border-radius: 2px;
         vertical-align: 3px; margin-right: 4px; }
   .lg-a { background: var(--accent); } .lg-b { background: var(--up); }
+  /* 行内迷你双线图。flex:none 是必须的 —— 放在 flex 行里不给固定宽高会被压扁 */
+  .spark { flex: none; display: block; vertical-align: middle;
+           overflow: visible; }
 
   @media (max-width: 640px) {
     .wrap { padding: 0 10px 60px; }
@@ -5222,7 +5225,56 @@ async function loadCrypto(force = false) {
   } catch (e) { $('crypto-meta').textContent = '加载失败: ' + e.message; }
 }
 
-// 关联列：已配且算出来了 → 可点的「相关度」徽标；配了没数据 → 警示；
+// 行内迷你双线图（SVG，不用 canvas：行内图不需要 dpr 处理，也不会引发布局抖动）。
+// 归一化方式**必须**与弹窗大图 drawLinkChart 一致（各自首日 = 100）：两处形状
+// 对不上，用户点开一看发现不一样，就不知道该信哪个。
+function sparkDual(ser, w = 88, h = 24) {
+  const dts = (ser && ser.dates) || [];
+  if (!dts || dts.length < 2) return '';
+  const num = v => (typeof v === 'number' && isFinite(v) ? v : null);
+  const idx100 = arr => {
+    const a = (arr || []).map(num);
+    const base = a.find(v => v != null && v > 0);
+    return base ? a.map(v => (v == null ? null : (v / base) * 100)) : a.map(() => null);
+  };
+  const A = idx100(ser.crypto), B = idx100(ser.stock);
+  const all = A.concat(B).filter(v => v != null);
+  if (all.length < 2) return '';
+  let lo = Math.min(...all), hi = Math.max(...all);
+  const m = (hi - lo) * 0.08 || 1;
+  lo -= m; hi += m;
+  const n = dts.length;
+  const X = i => 1 + (i / (n - 1)) * (w - 2);
+  const Y = v => h - 1 - ((v - lo) / (hi - lo)) * (h - 2);
+  // 停牌缺口用 M 断开、不连过去 —— 连过去等于凭空造出一段走势。
+  const path = arr => {
+    let s = '', pen = false;
+    for (let i = 0; i < n; i++) {
+      const v = arr[i];
+      if (v == null) { pen = false; continue; }
+      s += (pen ? 'L' : 'M') + X(i).toFixed(1) + ' ' + Y(v).toFixed(1) + ' ';
+      pen = true;
+    }
+    return s.trim();
+  };
+  const pa = path(A), pb = path(B);
+  if (!pa || !pb) return '';
+  const tip = `两线各自以首日=100 归一化后叠加；点击看大图与全部指标`;
+  // 100 基准线只在落进可视范围时才画，否则会画到画布外留一条无意义的边。
+  const y0 = Y(100);
+  const base = (y0 >= 0 && y0 <= h)
+    ? `<line x1="1" y1="${y0.toFixed(1)}" x2="${w - 1}" y2="${y0.toFixed(1)}"
+             stroke="var(--border)" stroke-width="1" stroke-dasharray="2 2"/>` : '';
+  return `<svg class="spark" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"
+             role="img" aria-label="合约与关联股票的归一化走势对比"><title>${esc(tip)}</title>
+    ${base}
+    <path d="${pb}" fill="none" stroke="var(--up)" stroke-width="1.1"
+          stroke-dasharray="3 2" stroke-linejoin="round"/>
+    <path d="${pa}" fill="none" stroke="var(--accent)" stroke-width="1.4"
+          stroke-linejoin="round"/></svg>`;
+}
+
+// 关联列：已配且算出来了 → 迷你双线图 + 可点的「相关度」徽标；配了没数据 → 警示；
 // 没配 → 「设关联」按钮
 function linkCell(contract) {
   const l = _cryptoLinks[contract];
@@ -5231,21 +5283,37 @@ function linkCell(contract) {
   }
   const s = l.stats, q = l.quote || {};
   const name = q.name ? `<span class="muted">${esc(q.name)}</span> ` : '';
-  if (!s || s.status !== 'ok') {
+  // 「有没有可画的数据」和「最新一次重算有没有成功」是两件事，必须分开判断。
+  // 后端 latest 重算失败时会回退到最近一条 ok 行把 corr/series 照常下发（标 stale），
+  // 数据源一抖就整格变「无数据」等于把有效统计白扔；所以先看有没有数据，再决定怎么标。
+  const nPts = (s && s.series && s.series.dates) ? s.series.dates.length : 0;
+  if (!s || (s.corr == null && !nPts)) {
     const why = (s && s.error) ? esc(s.error).slice(0, 60) : '尚未重算';
     return `<span class="badge b-warn" title="${why}"
               onclick="showCryptoLink('${esc(contract)}')">${esc(l.stock_code)} 无数据</span>`;
   }
+  const stale = s.status !== 'ok';
   const dev = s.ratio_dev_pct;
   const devTxt = (dev == null ? '' :
     ` 比价偏离 <b class="${Math.abs(dev) >= 5 ? 'up' : ''}">${signed(dev)}%</b>`);
-  return `<span class="row tight" style="flex-wrap:nowrap">
-    <span class="badge b-info" style="cursor:pointer"
+  const spark = sparkDual(s.series);
+  const corrTxt = s.corr == null ? '相关 —' : `相关 ${s.corr.toFixed(2)}`;
+  const tip = `合约日涨跌 ${s.vol_crypto ?? '—'}% / 股票 ${s.vol_stock ?? '—'}%；`
+    + `β=${s.beta?.toFixed(2) ?? '—'}；样本 ${s.n_obs ?? '—'} 个重叠交易日`
+    + `（截至 ${s.stat_date || '—'}）。`
+    + (stale
+        ? `\n⚠ 最新一次重算（${s.latest_attempt || '—'}）失败，下面是 ${s.data_stat_date || s.stat_date || '—'} 的旧值：`
+          + (s.error || '')
+        : '')
+    + `\n点击看大图。`;
+  return `<span class="row tight" style="flex-wrap:nowrap;align-items:center;${stale ? 'opacity:.75' : ''}">
+    ${spark}
+    <span class="badge ${stale ? 'b-warn' : 'b-info'}" style="cursor:pointer"
           onclick="showCryptoLink('${esc(contract)}')"
-          title="点击看「合约 vs 股票」双线图与指标">相关 ${s.corr?.toFixed(2)}</span>
+          title="${esc(tip)}">${stale ? '旧 ' : ''}${corrTxt}</span>
     ${name}<span class="muted">${esc(l.stock_code)}</span>
     ${q.change_pct != null ? `<span class="${cls(q.change_pct)}">${signed(q.change_pct)}%</span>` : ''}
-    <span class="faint">${devTxt}</span></span>`;
+    <span class="faint">${stale ? `<span title="${esc(s.error || '')}">陈旧·${esc(s.data_stat_date || s.stat_date || '?')}</span> ` : ''}${devTxt}</span></span>`;
 }
 
 async function editCryptoLink(contract) {
