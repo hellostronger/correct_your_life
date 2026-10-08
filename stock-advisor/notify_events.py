@@ -247,6 +247,17 @@ EVENTS: dict[str, dict[str, Any]] = {
                 "触发频繁，**默认只推微信**。",
         "source": "app._paper_strategy_scan()",
     },
+    "paper_stoploss_failed": {
+        "label": "🔴 模拟盘止损失败",
+        "group": "模拟盘",
+        # 微信 + 邮件都开：这是**风控静默失效**，属于「必须看到」的一类。
+        # 2026-10-08 加 —— 那天 3 只持仓跌破止损线却没卖（异常回滚了成交），
+        # 系统只是「看起来今天没止损」，没人第一时间发现。
+        "default": {"wx": True, "email": True},
+        "help": "持仓**已跌破止损线**但因异常未能卖出（成交被回滚，"
+                "风险敞口仍在）。同一只票同一原因当天只推一次。",
+        "source": "paper_trading.check_stop_loss()",
+    },
 }
 
 # 渠道名（与 notify.<渠道> 段一一对应）

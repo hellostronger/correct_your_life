@@ -107,6 +107,19 @@ def collect(include_aux: bool = True, include_concept: bool = True,
     try:
         ths_rows = THS.fetch(include_concept=include_concept)
         snap.sources_used.append("ths")
+        # **部分**被预算挡掉也算降级（2026-10-08 加）。
+        # 原来只在 sources.py 里 print 一行，于是 ths 概念整轮消失时：
+        # degraded=False、healthy=True、consec_fail=0、notes 里也看不到 ——
+        # 板块数从 971 悄悄掉到 697，没有任何字段能说明少了什么。
+        # 这里不能只记 note：note 是「说明」，degraded 是「判断」，
+        # 调用方（sector.py）只认 degraded。
+        if getattr(THS, "last_budget_skipped", None):
+            _parts = "、".join(THS.last_budget_skipped)
+            snap.degraded = True
+            snap.notes.append(
+                f"同花顺源部分降级：{_parts}因每日请求预算用尽被跳过"
+                f"（板块数偏少，ths healthy 仍为 true —— 那是源本身健康，"
+                f"但这部分数据这一轮真没拿到）")
     except SourceError as exc:
         snap.sources_failed.append({"source": "ths", "error": str(exc)})
         snap.degraded = True

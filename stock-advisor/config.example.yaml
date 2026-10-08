@@ -10,7 +10,12 @@ news:
     eastmoney: {enabled: true, min_interval: 1.0}
     baidu: {enabled: true, min_interval: 3.0}
     sina: {enabled: true, min_interval: 2.0}
-    duckduckgo: {enabled: true, min_interval: 5.0, timeout: 30}
+    # 2026-10-08 关掉 bing / duckduckgo：实测二者带发布时间 0 条、
+    # 近 30 天入库 0 条，而 baidu 75% / searxng 17% 缺失仍有可用产出、
+    # eastmoney / sina / ak_em / wx_channels 是 0% 缺失。
+    # 详情与实测数据见 AGENTS.md「新闻时效」一节。
+    bing: {enabled: false, min_interval: 3.0}
+    duckduckgo: {enabled: false, min_interval: 5.0, timeout: 30}
   fetch_interval_minutes: 30
   items_per_query: 10
   keywords_extra: []
@@ -205,3 +210,77 @@ x:
   keep_days: 90
   include_retweets: false
   wait_timeout: 25
+
+channels:
+  enabled: false            # 默认关：依赖本机 PC 微信 + 管理员权限注入。
+                            #   守护线程每 300s 重读本段，所以改这里免重启
+                            #   生效（最长 5 分钟）。开启前置条件：
+                            #   1) wx_channel 以管理员身份运行（否则注入
+                            #      WeChatAppEx.exe 失败，报 administrator
+                            #      permission may be required）
+                            #   2) 微信里点开视频号页面（status 的 clients > 0）
+                            #   3) 用 /api/channels/contact/search?keyword=<昵称>
+                            #      拿 v2_ 开头的 username 填进 subscriptions
+  api_base: 'http://127.0.0.1:2026'
+  api_token: ''              # wx_channel 若设了 X-Local-Auth 才需要
+  interval_minutes: 30      # 轮询间隔（分钟），交易时段内
+  comments: true            # 是否抓评论（**要求微信页面停在那个视频上**，
+                            #   页面 DOM/Store 采集，拿不到会报「客户端未就绪」
+                            #   而不是谎报「0 条评论」）
+  comment_pages: 1
+  max_new_per_sub: 5        # 单个博主单轮最多处理几条新视频
+  # 订阅博主：username 是 v2_ 开头的加密 ID，不是昵称。
+  # 用 wx_channel 的 /api/channels/contact/search?keyword=<昵称> 查。
+  subscriptions: []
+  #  - username: 'v2_xxxxxxxxxxxxxxxx'
+  #    name: '博主名'
+  #    codes: ['600519']      # 关联股票，写进 sa_news_related
+  # L2：语音转写（ASR）。**需要先下载 mp4**，当前未接下载器，故默认关。
+  # 三种 provider（get_asr 按名字路由）：
+  #   xfyun  —— 讯飞语音转写 lfasr。**免费额度最大**（体验包 5 小时/30天，
+  #             新用户礼包最高 50 小时/年），中文最准，支持金融垂域 pd=finance。
+  #             异步任务制：prepare→upload→merge→轮询→getResult，
+  #             task_id 按音频内容 sha1 落盘，重跑不会重复烧额度。
+  #             拿凭证：xfyun.cn 注册 → 创建应用 → 添加「语音转写」服务
+  #             → 控制台取 app_id + APISecret（32 位）→ 领免费体验包。
+  #             APISecret 也可走环境变量 XFYUN_API_SECRET。
+  #   auto + Qwen3-Omni-*  —— 硅基多模态，走 /v1/chat/completions，13 tokens/秒
+  #   auto + 其它语音模型   —— 硅基 /v1/audio/transcriptions
+  asr:
+    enabled: false           # 三个 provider 都还没配好凭证，见下面各段
+    provider: auto
+    # ---- 讯飞（推荐：免费 + 中文最准）----
+    app_id: ''                 # 讯飞应用 ID
+    api_secret: ''             # 讯飞 APISecret；留空则读环境变量 XFYUN_API_SECRET
+    xfyun_base_url: ''        # 留空用官方 https://raasr.xfyun.cn/api
+    pd: finance               # 垂域：finance=金融（对财报口播准确率提升明显）
+    hot_words: []             # 热词，单个≤16字、最多200个，用 | 分隔
+    poll_seconds: 15          # 轮询间隔；官方建议长音频 10 分钟一轮
+    max_wait: 900             # 单次同步等待上限；超时后 task_id 已落盘，
+                              #   下次调用接着等，不会重复提交
+    target_rate: 16000        # 讯飞只收 8k/16k
+    # ---- 硅基流动（备用）----
+    model: 'Qwen/Qwen3-Omni-30B-A3B-Instruct'
+    api_key: ''    # 留空则读环境变量 SILICONFLOW_API_KEY；实测 402 余额不足
+    base_url: 'https://api.siliconflow.cn/v1'
+    timeout: 300
+    # 音频抽取：优先 PyAV(av，已装 14.1.0，自带 FFmpeg 库)，
+    # 没有 av 才找 ffmpeg 可执行文件，两者都没有会明确报 asr_no_decoder
+
+# 分析技法学习：从已抓取的公众号文章里萃取「别人用了什么指标、怎么判读」，
+# 落 sa_analysis_techniques，注入盘前/盘后报告 prompt。
+# 关键设计：人工审核与 AI 自进化是**同一个 status 字段的两端**，不是两套代码。
+#   抽取 -> 一律写 pending；ai 模式下 score>=activate_score 的直接转 active，
+#          其余留 pending；manual 模式下**全部**留 pending 等人改 status。
+#   审核 -> POST /api/analysis/techniques/review {"id":N,"status":"active|rejected"}
+# 所以「AI 学歪了」时人一条请求就能止损，不必改代码、不必重启。
+analysis_learn:
+  enabled: true
+  mode: ai                    # ai = AI 自进化（默认）| manual = 人工审核
+  activate_score: 7.0         # ai 模式下 >= 这个分直接 active，其余留 pending
+  limit: 12                   # 单次注入最多几条（prompt 膨胀会稀释注意力）
+  max_chars: 2600             # 注入块总字符上限
+  min_chars: 1500             # 正文短于此视为快讯，不花 LLM 调用
+  auto_loop: true             # 守护线程定期从新文章萃取
+  loop_interval_minutes: 720  # 默认 12h 一轮，每轮最多 3 篇
+

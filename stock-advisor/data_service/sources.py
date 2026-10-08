@@ -196,7 +196,14 @@ class ThsSource(_BaseSource):
         self._code_ind: dict[str, str] = {}
         self._code_con: dict[str, str] = {}
         self._code_ts: float = 0.0
-        # 行业 code 相对稳定，缓存 12 小时足够
+        # 本轮**因预算不足被跳过**的部分（"行业" / "概念"）。
+        # 2026-10-08 加：原来只在 stdout print 一行，/health 的 healthy 与
+        # 快照的 degraded 全都是 False/True 之外的「没事」状态 ——
+        # 实测 data.10jqka 预算打满(198/200)后，**每一轮都静默丢掉 387 个
+        # 同花顺概念板块**，而 degraded=False、ths healthy=true、consec_fail=0。
+        # 板块数从 971 掉到 697 就是这么来的，没有任何字段能看出少了东西。
+        # 现在由 aggregate.collect() 读走，转成 note + degraded。
+        self.last_budget_skipped: list[str] = []
         self._CODE_TTL = 12 * 3600
 
     def _ak(self):
@@ -283,6 +290,8 @@ class ThsSource(_BaseSource):
         self._refresh_codes()          # 内部自行记账（预算 meter，不是健康度）
         out: list[dict] = []
         budget_blocked = False
+        # 每轮重置：只报「本轮」被预算挡掉的部分，不累积成永久降级
+        self.last_budget_skipped = []
 
         # 行业：8 字段最全
         if METER.allow("q.10jqka.com.cn", 3):
@@ -292,6 +301,7 @@ class ThsSource(_BaseSource):
                                                self._code_ind.get(nm)))
         else:
             budget_blocked = True
+            self.last_budget_skipped.append("行业")
             print("[data_service] q.10jqka 预算不足，跳过行业", flush=True)
 
         # 概念：只有涨跌幅/资金流/领涨股
@@ -303,6 +313,7 @@ class ThsSource(_BaseSource):
                                                   self._code_con.get(nm)))
             else:
                 budget_blocked = True
+                self.last_budget_skipped.append("概念")
                 print("[data_service] data.10jqka 预算不足，跳过概念",
                       flush=True)
 

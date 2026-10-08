@@ -1773,6 +1773,14 @@ def _alpha_for_round(cur, code: str, me: dict | None, sell_price: float,
         return None, ""
 
 
+# _settle_buy_rows 的 SELECT 列顺序。普通游标返回 tuple，靠它还原成 dict。
+# 改这条 SELECT 时必须同步改这里，否则字段会**静默错位**（不报错、算出
+# 错的份额和收益）。断言见 %LOCALAPPDATA%\Temp\opencode\test_settle_cursor.py
+_SETTLE_BUY_COLS = ("id", "trade_date", "slot", "shares", "price", "confidence",
+                    "stop_loss_pct", "reasoning", "report", "decision_raw",
+                    "fee_total")
+
+
 def _settle_buy_rows(cur, code: str, sell_shares: int, sell_price: float,
                      today: str, report: str = "", alpha: float | None = None,
                      benchmark: str = "") -> int:
@@ -1795,9 +1803,8 @@ def _settle_buy_rows(cur, code: str, sell_shares: int, sell_price: float,
     left = int(sell_shares or 0)
     if left < 1 or sell_price <= 0:
         return 0
-    cur.execute("""SELECT id, trade_date, slot, shares, price, confidence,
-                          stop_loss_pct, reasoning, report, decision_raw, fee_total
-                   FROM sa_paper_trades
+    cur.execute("SELECT " + ", ".join(_SETTLE_BUY_COLS) +
+                """ FROM sa_paper_trades
                    WHERE code=%s AND side='buy' AND status='open'
                    ORDER BY id""", (code,))
     rows = cur.fetchall()
@@ -1805,6 +1812,13 @@ def _settle_buy_rows(cur, code: str, sell_shares: int, sell_price: float,
     for r in rows:
         if left <= 0:
             break
+        # 调用方 _execute_decision 用的是普通游标（行是 tuple），而本函数按
+        # dict 取字段 —— 2026-10-08 实测崩在这行（TypeError: tuple indices
+        # must be integers or slices, not str），只要该股有未平仓的买入行，
+        # 卖出结算必抛异常 → 事务回滚 → 卖单不落库。
+        # 与本文件 _account_row / _derive_paper_positions 同样的兼容写法。
+        if not isinstance(r, dict):
+            r = dict(zip(_SETTLE_BUY_COLS, r))
         bought = int(r["shares"] or 0)
         if bought < 1:
             continue
@@ -1852,6 +1866,12 @@ def _settle_buy_rows(cur, code: str, sell_shares: int, sell_price: float,
 
 
 # ---------------- 盘中轮次：免 LLM 止损 + 周期台账 ----------------
+
+# 止损失败告警去重集合：{(交易日, code, 原因)}。
+# 盘中每 N 分钟一轮，同一故障会反复失败；不去重等于一天发几十条同一条
+# 告警，**报警变成噪音就等于没报警**。键里带交易日，所以隔天能重新报。
+_STOPLOSS_ALERTED: set = set()
+
 
 def check_stop_loss(deps: dict, slot: str = "", max_pct: float | None = None) -> dict:
     """盘中免 LLM 的止损扫描：持仓现价跌破各自 stop_loss_pct 立即市价卖出。
@@ -1942,15 +1962,57 @@ def check_stop_loss(deps: dict, slot: str = "", max_pct: float | None = None) ->
                  "stop_loss_pct": sl, "note": note})
         except Exception as exc:
             traceback.print_exc()
-            skipped.append({"code": code, "reason": f"异常: {exc}"})
+            skipped.append({"code": code, "reason": f"异常: {exc}",
+                            "FAILED": True})
     if sold:
         print(f"[paper] 盘中止损 {len(sold)} 只: "
               f"{[s['code'] for s in sold]}", flush=True)
     if off_session:
         print(f"[paper] {len(off_session)} 只持仓已收市，止损待下一交易时段处理: "
               f"{off_session}", flush=True)
+
+    # 止损失败必须**喊人**（2026-10-08 加）。
+    # 为什么：`_execute_decision` 用 `with get_conn()`，里面抛异常会
+    # **回滚整个事务** —— 刚插的卖单一起没了，于是「已触发但没卖」。
+    # 2026-10-08 实测就是这样丢了 3 只（588000 / 513980 / 01024），
+    # 而现象只是「今天没止损」，日志里躺着 traceback 但没人第一时间看见。
+    # → 与 AGENTS.md「静默降级比报错危险」同源：风控静默失效最糟。
+    #
+    # 只报 `failed=True`（执行期异常），**不报** T+1 锁定/行情不可得这类
+    # 正常跳过 —— 那不是失效，天天发生，报警会变成噪音而被忽略。
+    failed = [s for s in skipped if s.get("FAILED")]
+    # 去重：`check_stop_loss` 交易时段每 N 分钟跑一轮，同一个故障会一直失败。
+    # 不去重的话一天能发几十条同一条告警，**报警变成噪音就等于没报警**。
+    # 同一 (code, reason) 当天只报一次；换股票或错误内容变了会重新报。
+    global _STOPLOSS_ALERTED
+    today_key = today
+    fresh = []
+    for s in failed:
+        key = (today_key, s.get("code"), str(s.get("reason"))[:80])
+        if key in _STOPLOSS_ALERTED:
+            continue
+        _STOPLOSS_ALERTED.add(key)
+        fresh.append(s)
+    if fresh:
+        lines = "\n".join(
+            "· %s %s：%s" % (s.get("code"), s.get("name", ""),
+                            str(s.get("reason"))[:120]) for s in fresh)
+        print(f"[paper] 🔴 止损失败 {len(fresh)} 只（已触发但未成交）:\n{lines}",
+              flush=True)
+        _notify = deps.get("notify_fn")
+        if _notify:
+            try:
+                _notify("🔴 模拟盘止损失败",
+                        "以下持仓**已跌破止损线**但本轮未能卖出"
+                        "（异常导致成交回滚，风险敞口仍在）：\n" + lines,
+                        event="paper_stoploss_failed")
+            except Exception as n_exc:            # noqa: BLE001
+                # 通知本身失败绝不能反过来打断止损循环
+                print(f"[paper] 止损失败通知发送失败（不影响止损）: {n_exc}",
+                      flush=True)
     return {"date": today, "slot": slot, "checked": len(tradable), "sold": sold,
-            "skipped": skipped, "off_session": off_session}
+            "skipped": skipped, "off_session": off_session,
+            "failed": [s.get("code") for s in fresh]}
 
 
 def record_cycle(deps: dict, cycle_date: str, slot: str, kind: str = "intraday",
@@ -2370,7 +2432,7 @@ def rounds(deps: dict, code: str = "", only_closed: bool = False,
     sql = ("SELECT id, code, name, trade_date, slot, side, shares, price, value, "
            "fee_total, confidence, stop_loss_pct, reasoning, report, decision_raw, "
            "status, auto_closed, settle_date, settle_price, raw_return, "
-           "alpha_return, benchmark "
+           "alpha_return, benchmark, created_at "
            "FROM sa_paper_trades WHERE side IN ('buy','sell') "
            "AND status <> 'skipped'")
     params: list = []
@@ -2431,7 +2493,14 @@ def _fifo_rounds(rows: list[dict]) -> list[dict]:
                 "code": r["code"], "name": r["name"] or lot["name"],
                 "entry": {
                     "id": lot["id"], "date": str(lot["trade_date"])[:10],
-                    "slot": lot["slot"] or "", "price": float(lot["price"] or 0),
+                    "slot": lot["slot"] or "",
+                    # decided_at = 这一条决策**实际产出**的时刻（2026-10-08 加）。
+                    # 不能拿 slot 当决策时间：slot 是轮次开始时刻，而行是决策跑完
+                    # 才写的，实测 created_at - slot = p50 11.9 / max 32.6 分钟
+                    # （400 行采样，从不为负）。
+                    "decided_at": (lot["created_at"].isoformat()
+                                   if lot.get("created_at") else ""),
+                    "price": float(lot["price"] or 0),
                     "shares": take, "fee": round(e_in, 2),
                     "net_in": round(net_in, 2),
                     "confidence": lot["confidence"],
@@ -2442,7 +2511,10 @@ def _fifo_rounds(rows: list[dict]) -> list[dict]:
                 },
                 "exit": {
                     "id": r["id"], "date": str(r["trade_date"])[:10],
-                    "slot": r["slot"] or "", "price": float(r["price"] or 0),
+                    "slot": r["slot"] or "",
+                    "decided_at": (r["created_at"].isoformat()
+                                   if r.get("created_at") else ""),
+                    "price": float(r["price"] or 0),
                     "shares": take, "fee": round(s_out, 2),
                     "net_out": round(net_out, 2),
                     "confidence": r["confidence"],
@@ -2476,7 +2548,10 @@ def _fifo_rounds(rows: list[dict]) -> list[dict]:
             "code": lot["code"], "name": lot["name"],
             "entry": {
                 "id": lot["id"], "date": str(lot["trade_date"])[:10],
-                "slot": lot["slot"] or "", "price": float(lot["price"] or 0),
+                "slot": lot["slot"] or "",
+                "decided_at": (lot["created_at"].isoformat()
+                               if lot.get("created_at") else ""),
+                "price": float(lot["price"] or 0),
                 "shares": sh, "fee": round(fee, 2),
                 "net_in": round(sh * float(lot["price"] or 0) + fee, 2),
                 "confidence": lot["confidence"],

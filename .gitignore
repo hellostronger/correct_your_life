@@ -1,8 +1,11 @@
-# 环境变量 / 密钥
+﻿# 环境变量 / 密钥
 .env
 
 # Stock Advisor 真实配置（含密钥，不入库；模板见 config.example.yaml）
 stock-advisor/config.yaml
+# 2026-10-08 加：根目录 config.yaml（wx_channel 用，含 cloud_secret）也没被忽略，
+# 一次 git add -A 就会把密钥推上去。gitignore 只认路径，这行必须单列。
+config.yaml
 # 改配置前留的备份 —— 内容与 config.yaml 相同，同样含 mp.auth / auth_code /
 # LLM api_key。2026-09-29 发现 config.yaml 被 .gitignore 覆盖了，但 config.yaml.bak-*
 # 没有，备份差点被提交（git status 里是 ?? 未跟踪）。

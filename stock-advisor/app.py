@@ -42,6 +42,7 @@ from pydantic import BaseModel, Field
 
 import conf_util
 import config_schema
+import cost_estimate
 import crypto_watch
 import futures_watch
 import holiday_calendar
@@ -666,7 +667,31 @@ def init_db():
             print(f"[init_db] 预置策略失败（非致命）: {exc}", flush=True)
     except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
         print(f"[init_db] post-DDL step failed (non-fatal): {exc}", flush=True)
+    _init_analysis_learn_tables()
     return
+
+
+def _init_analysis_learn_tables() -> None:
+    """建 `sa_analysis_techniques`。失败**绝不阻断启动**。
+
+    这张表是「学习」的唯一持久化载体，但它是可选增强：建不出来只该功能缺失，
+    不能让整个服务起不来（与上面其它 post-DDL step 同规格）。
+
+    独立一轮而不是塞进主 ddl 字符串：主 ddl 是整块 `split(';')` 逐条执行的，
+    这里要额外处理 CREATE INDEX 与「整体失败就整体放弃」的语义。
+    """
+    for stmt in [s.strip() for s in analysis_learn.DDL.split(";") if s.strip()]:
+        stmt = "\n".join(l for l in stmt.splitlines()
+                         if not l.strip().startswith("--")).strip()
+        if not stmt:
+            continue
+        try:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute(stmt)
+            conn.commit()
+        except Exception as exc:
+            print(f"[init_db] 分析技法表 DDL 失败（跳过）: {exc}", flush=True)
+            return
 
 
 def _drop_legacy_strategies() -> None:
@@ -1014,10 +1039,48 @@ def fetch_kline_volumes(symbol: str, days: int = VOL_MA_DAYS + 2) -> list[float]
     return [v for v in (_to_float(k.split(",")[1]) for k in ks if len(k.split(",")) > 1) if v]
 
 
-def fetch_kline_amounts(symbol: str, days: int = VOL_MA_DAYS + 2) -> list[float]:
-    """近 N 个交易日成交额（元，升序）。东财 f57 为绝对元；A股指数/个股通用。"""
-    ks = _em_kline_fields(symbol, days, "f51,f57")
-    return [v for v in (_to_float(k.split(",")[1]) for k in ks if len(k.split(",")) > 1) if v]
+def fetch_spot_turnover(symbols: list[str]) -> dict[str, dict]:
+    """腾讯实时行情里取**成交额（元）**等字段。
+
+    为什么必须用行情而不是日K（2026-10-07 实测）：
+    - 腾讯日K只有 6 个字段 `[日期,开,收,高,低,成交量]`，**没有成交额**；
+    - 原 `fetch_kline_amounts()` 只走东财 `push2his` 的 f57，而 **push2 系全封**
+      （实测 4/4 RemoteDisconnected），所以它是个「已定义、零调用、永远返回空」
+      的函数 —— 那种不报错但永远没数据的坑。
+
+    成交额在行情的 `f[35]`，格式是 `收盘价/成交量/成交额`（实测与 `f[37]*1e4`
+    一致到 0.000%，f37 单位是万元）。
+
+    ⚠️ **`成交量` 字段跨市场单位不一致**，别拿来直接显示：
+    A股指数是「手」，恒生是「股」（实测同为万级数值但差 100 倍量级）。
+    所以这里只取成交额（单位统一是元），成交量仍走日K只用于算量比。
+    """
+    if not symbols:
+        return {}
+    out: dict[str, dict] = {}
+    try:
+        resp = requests.get(TENCENT_QUOTE_URL + ",".join(symbols),
+                            headers=HEADERS, timeout=15)
+        text = resp.content.decode("gbk", "ignore")
+        for sym in symbols:
+            m = re.search(rf'{sym}="([^"]*)"', text)
+            if not m:
+                continue
+            f = m.group(1).split("~")
+            amount = None
+            if len(f) > 35 and f[35] and "/" in f[35]:
+                parts = f[35].split("/")
+                if len(parts) >= 3:
+                    amount = _to_float(parts[2])      # 已是绝对元
+            if amount is None and len(f) > 37:
+                amount = _quote_amount(f[37], "a")   # 兜底：万元 → 元
+            close = _to_float(f[3]) if len(f) > 3 else None
+            prev = _to_float(f[4]) if len(f) > 4 else None
+            out[sym] = {"amount": amount, "close": close, "prev_close": prev,
+                        "pct": _to_float(f[32]) if len(f) > 32 else None}
+    except Exception as exc:
+        print(f"[mktvol] fetch_spot_turnover failed: {exc}", flush=True)
+    return out
 
 
 def _vol_label(ratio) -> str:
@@ -1058,20 +1121,36 @@ def analyze_volume(symbol: str) -> dict:
 
 
 def market_volume_status() -> dict:
-    """大盘量能：上证/深成/创业板/恒指 各自 均量比 + 放量缩量标签。"""
+    """大盘量能：上证/深成/创业板/恒指 各自 均量比 + **成交额绝对值**。
+
+    为什么加成交额（2026-10-07 用户要求）：原来只有 `缩量 0.89x` 这种比值，
+    看不出「到底缩了多少量」—— 0.89x 可能是 8000 亿→7100 亿（缩量）也可能是
+    400 亿→356 亿（同样 0.89x，但完全不同的量级）。**量级决定这是正常缩量
+    还是流动性枯竭**，所以必须给绝对数字。
+    """
+    spot = fetch_spot_turnover([s for s, _ in INDEX_POOL])
     items = []
     for sym, name in INDEX_POOL:
         vols = fetch_kline_volumes(sym)
         stat = _latest_vs_ma(vols)
+        sp = spot.get(sym) or {}
         items.append({"symbol": sym, "name": name,
                       "today_volume": vols[-1] if vols else None,
+                      "amount": sp.get("amount"),          # 成交额（元）
+                      "close": sp.get("close"),
+                      "pct": sp.get("pct"),
                       **stat})
     # 大盘整体倾向：取有数据的主流 A 股指数均量比的均值（恒指不参与定性）
     ratios = [i["ratio"] for i in items if i["ratio"] is not None and "HSI" not in i["symbol"]]
     overall_ratio = round(sum(ratios) / len(ratios), 2) if ratios else None
+    # 两市合计成交额：沪(上证) + 深(成指)。**创业板指是深市子集，不能重复加**。
+    total_amount = sum(i["amount"] for i in items
+                       if i["amount"] and i["symbol"] in ("sh000001", "sz399001"))
     return {"items": items, "overall_ratio": overall_ratio,
             "overall_label": _vol_label(overall_ratio),
             "overall_color": _vol_color(overall_ratio),
+            "total_amount": total_amount or None,
+            "total_amount_yi": round(total_amount / 1e8, 1) if total_amount else None,
             "checked_at": datetime.now().isoformat(timespec="seconds")}
 
 
@@ -1659,6 +1738,209 @@ def remove_holding(code: str):
         if cur.rowcount == 0:
             raise HTTPException(404, f"{normalized} 无交易流水")
     return {"ok": True, "removed": normalized, "trades_deleted": cur.rowcount}
+
+
+# ---------------- 加仓摊薄成本预估（买入前试算，不写库） ----------------
+# 为什么要单独做而不是让前端自己算：
+#   1) **费用规则只在一处**。佣金最低 5 元、印花税仅卖出、港股印花税双向、
+#      基金免印花税 —— 前端算一遍、后端记账算一遍，两份实现必然漂移，
+#      而漂移的方向是「前端显示的回本价比真实低」。已有
+#      `paper_trading.trade_fees` 是模拟盘那侧的，cost_estimate 是本工具的，
+#      判据测试里断言了两者默认费率一致。
+#   2) 页面要能传「分批加仓」和「预算档位」，那是多笔模拟，纯前端写易错。
+#
+# 口径提示（前端展示时要说明，否则用户会困惑）：
+#   avg_cost_gross 账面摊薄成本 = 持仓页那个「摊薄成本」（不含任何费用）
+#   avg_cost_net   真实回本价 = 含买入费用的现金 / 总股数
+# 两者不一样，差额就是累计已付的佣金+过户费。
+
+def _fee_conf_from_config() -> dict:
+    """交易费用从 `fees` 配置段读（`_conf_section` 是项目里唯一的配置入口）。
+
+    键名与 config_schema 的 `fees.*` 一致；缺段/缺键/坏值一律回落到
+    `cost_estimate.FeeConf` 的默认值 —— 宁可用市场通行费率，也不要 0
+    （费率 0 会让「回本价」凭空低一个数量级）。
+    """
+    fees = _conf_section("fees") or {}
+    d = cost_estimate.FeeConf()
+    mapping = {
+        "commission_rate": ("a_commission_rate", d.commission_rate),
+        "commission_min": ("a_commission_min", d.commission_min),
+        "stamp_duty_sell": ("a_stamp_duty", d.stamp_duty_sell),
+        "transfer_fee": ("transfer_fee", d.transfer_fee),
+    }
+    out: dict = {}
+    for field_name, (key, default) in mapping.items():
+        raw = fees.get(key, default)
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            val = default
+        out[field_name] = val if val >= 0 else default
+    return out
+
+
+def _current_cash_paid(conn, code: str, pos: dict) -> float:
+    """持仓的**累计已付现金**（含历史所有买入费用）。
+
+    `pos` 只有不含费的 `avg_cost`（`calc_position` 的口径），用它反推费用
+    会得到 0，于是 `estimate()` 算出的 `total_fees_paid` 永远只有本次那一笔 ——
+    多次加仓时历史费用被"忘掉"，分 10 笔的净成本会收敛到 10.005 而不是
+    10.0501。所以这里直接回放流水求 Σ(price×shares + 买入费用)。
+    """
+    if pos.get("net_shares", 0) <= 0:
+        return 0.0
+    cur = conn.cursor()
+    cur.execute("SELECT price, shares FROM sa_trades "
+                "WHERE code = %s AND side = 'buy' ORDER BY trade_date, id", (code,))
+    buys = cur.fetchall()
+    cur.close()
+    if not buys:
+        return 0.0
+    fee = cost_estimate.FeeConf(**_fee_conf_from_config())
+    total = 0.0
+    for price, shares in buys:
+        value = float(price) * int(shares)
+        total += value + cost_estimate.buy_fees(value, fee)["total"]
+    return total
+
+
+class CostEstimateIn(BaseModel):
+    """单笔加仓试算。持仓（shares/avg_cost）不传就从账本取。"""
+    code: str = ""
+    price: float = Field(gt=0, description="拟买入价")
+    shares: int = Field(gt=0, description="拟买入股数")
+    old_shares: int | None = Field(default=None, ge=0,
+                                   description="现有持股；不传则按 code 取")
+    old_avg_cost: float | None = Field(default=None, ge=0,
+                                       description="现有账面成本；不传则取账本")
+    current_price: float = Field(default=0.0, ge=0,
+                                 description="现价；不传则自动取实时行情")
+    is_fund: bool = Field(default=False, description="场内基金（免印花税）")
+
+
+class CostPlanIn(BaseModel):
+    """分批加仓计划：按预算档位算，或按给定笔序列逐步模拟。
+
+    `price` 只在 budgets 模式需要（legs 模式每笔自带价格）。
+    第一版把它设成必填，结果只传 legs 的请求直接 422 ——
+    「换个调用方式就报参数缺失」是最容易误导人的一种错。
+    """
+    code: str = ""
+    price: float | None = Field(default=None, gt=0,
+                                description="budgets 模式必填；legs 模式不需要")
+    budgets: list[float] = Field(default_factory=list, description="预算档位（元）")
+    legs: list[dict] | None = Field(default=None,
+                                   description='分批明细 [{"price":15,"shares":500}]')
+    old_shares: int | None = Field(default=None, ge=0)
+    old_avg_cost: float | None = Field(default=None, ge=0)
+    current_price: float = Field(default=0.0, ge=0)
+    is_fund: bool = False
+
+
+def _resolve_position(code: str, old_shares, old_avg_cost) -> tuple[str, int, float, float]:
+    """归一化 code、决定用传入的持仓还是账本的，返回 (code, shares, avg, 现价)。
+
+    现价取不到就返回 0 —— 上层据此不算「回本涨幅」，
+    而不是拿成本价当现价给出一个假的 0%。
+    """
+    normalized = _normalize_code(code) if code else ""
+    pos = {"net_shares": 0, "avg_cost": 0.0}
+    if normalized:
+        for p in _derive_holdings():
+            if p.get("code") == normalized:
+                pos = p
+                break
+    shares = int(old_shares if old_shares is not None else pos["net_shares"])
+    avg = float(old_avg_cost if old_avg_cost is not None else pos["avg_cost"])
+    price = 0.0
+    if normalized:
+        try:
+            q = fetch_quotes([normalized]).get(normalized) or {}
+            p = q.get("price")
+            price = float(p) if isinstance(p, (int, float)) and p > 0 else 0.0
+        except Exception as exc:
+            print(f"[cost-estimate] 取现价失败 {normalized}: {exc}", flush=True)
+    return normalized, shares, avg, price
+
+
+@app.post("/api/cost-estimate")
+def cost_estimate_api(req: CostEstimateIn):
+    """预估「按 price 买 shares 股」之后的摊薄成本。只读，不写库。
+
+    返回里同时给账面成本（与持仓页同口径）与真实回本价（含买入费用）。
+    """
+    code, shares, avg, cur_price = _resolve_position(
+        req.code, req.old_shares, req.old_avg_cost)
+    current = req.current_price or cur_price
+    market = "HK" if _market_of(code) == "hk" else "A"
+    fee = cost_estimate.FeeConf(**_fee_conf_from_config(), is_fund=req.is_fund)
+    est = cost_estimate.estimate(shares, avg, req.price, req.shares,
+                                  current_price=current, market=market, fee=fee)
+    # 账本里该票的历史已付现金（含费用）—— 传进去才不会丢掉历史费用
+    cash_paid = 0.0
+    if code and shares > 0:
+        try:
+            with get_conn() as conn:
+                cash_paid = _current_cash_paid(conn, code, {"net_shares": shares})
+        except Exception as exc:
+            print(f"[cost-estimate] 回放流水失败 {code}: {exc}", flush=True)
+    if cash_paid > 0:
+        est = cost_estimate.estimate(
+            shares, avg, req.price, req.shares, current_price=current,
+            market=market, fee=fee, old_cash_paid=cash_paid)
+    d = est.to_dict()
+    d["code"] = code
+    d["current_price"] = round(current, 4) if current else None
+    d["price_source"] = "provided" if req.current_price else (
+        "quote" if current else "unavailable")
+    d["lines"] = cost_estimate.render_lines(est)
+    d["caveats"] = [
+        "avg_cost_gross 不含费用，与持仓页「摊薄成本」同口径；"
+        "avg_cost_net 含买入费用，是真正的回本价。",
+        "卖出印花税只在卖出时收，已单独列在 exit_cost，不摊进 avg_cost_net。",
+        "不含分红送转 —— 要算含分红得按交易流水回放（app.calc_position）。",
+    ]
+    return d
+
+
+@app.post("/api/cost-plan")
+def cost_plan_api(req: CostPlanIn):
+    """分批加仓计划：预算档位 → 每档买多少股、摊薄到多少。
+
+    与单笔预估的差别：**账面成本与笔数无关，真实成本与笔数有关**。
+    同样 1000 股，1 笔佣金 5 元，分 10 笔就是 50 元 —— 最低佣金按笔收。
+    所以分批计划必须逐步模拟，不能只算加权平均价。
+    """
+    code, shares, avg, cur_price = _resolve_position(
+        req.code, req.old_shares, req.old_avg_cost)
+    market = "HK" if _market_of(code) == "hk" else "A"
+    fee = cost_estimate.FeeConf(**_fee_conf_from_config(), is_fund=req.is_fund)
+    cash_paid = 0.0
+    if code and shares > 0:
+        try:
+            with get_conn() as conn:
+                cash_paid = _current_cash_paid(conn, code, {"net_shares": shares})
+        except Exception:
+            pass
+
+    if req.legs:
+        legs = [cost_estimate.Leg(float(l.get("price") or 0),
+                                  int(l.get("shares") or 0))
+                for l in req.legs]
+        legs = [l for l in legs if l.price > 0 and l.shares > 0]
+        steps = cost_estimate.simulate(
+            legs, start_shares=shares, start_avg_cost=avg,
+            start_cash_paid=cash_paid or None, market=market, fee=fee)
+        return {"code": code, "mode": "legs",
+                "steps": [s.to_dict() for s in steps],
+                "final": steps[-1].to_dict() if steps else None}
+
+    rows = cost_estimate.ladder(
+        shares, avg, req.price, req.budgets, market=market, fee=fee,
+        old_cash_paid=cash_paid or None)
+    return {"code": code, "mode": "budgets", "rows": rows,
+            "current_price": round(cur_price, 4) if cur_price else None}
 
 
 # ---------------- 止盈策略（与股票无关的模板，供「记一笔」引用；触发即通知） ----------------
@@ -2662,11 +2944,15 @@ def _plan_recent_news_titles(held: list[dict]) -> list[str]:
     try:
         with get_conn() as conn, conn.cursor() as cur:
             cur.execute(
-                "SELECT DISTINCT ON (n.url) n.title FROM sa_news n "
-                "LEFT JOIN sa_news_related r ON r.url = n.url "
-                "WHERE (n.code = ANY(%s) OR r.code = ANY(%s)) "
-                "AND COALESCE(n.publish_time, n.fetched_at) > now() - interval '3 days' "
-                "ORDER BY n.url, COALESCE(n.publish_time, n.fetched_at) DESC LIMIT 12",
+                "SELECT title FROM ("
+                "  SELECT DISTINCT ON (n.url) n.title, n.publish_time"
+                "    FROM sa_news n "
+                "    LEFT JOIN sa_news_related r ON r.url = n.url "
+                "   WHERE (n.code = ANY(%s) OR r.code = ANY(%s)) "
+                "     AND n.publish_time IS NOT NULL "
+                "     AND n.publish_time > now() - interval '3 days' "
+                "   ORDER BY n.url, n.publish_time DESC"
+                ") t ORDER BY publish_time DESC LIMIT 12",
                 (codes, codes))
             return [r[0] for r in cur.fetchall()]
     except Exception:
@@ -3582,6 +3868,661 @@ def _alerts_loop():
             time.sleep(600)
 
 
+# ---------------- 全市场供给冲击 + 海外市场（解禁/增发/减持 + 美日韩资金抽离） ----------------
+# 与上面的 alerts.py 是**两个维度**，不是替代关系：
+#   alerts.py        = 自选股（逐代码查，只覆盖你盯的票）
+#   supply_events.py = 全市场（解禁/增发/减持按日聚合 + 历史分位数判「潮」）
+#   global_markets.py= 美日韩 + 港股相对强弱（港资可买美日韩 → 资金抽离视角）
+import supply_events
+import global_markets
+import channels_watch
+import analysis_learn
+
+
+def _analysis_learn_conf() -> dict:
+    """分析技法学习配置（config.yaml 的 analysis_learn 段）。
+
+    `mode` 是**同一字段的两端**，不是两套代码（见 analysis_learn 模块 docstring）：
+      - `ai`（默认）AI 自进化：抽取后 score>=activate_score 直接 active，
+        低于阈值的落 pending（可以人工捞回来）
+      - `manual`  人工审核：一律 pending，人改 status 才生效
+    随时改这个值即可切换，**已生效的技法不受影响**（审核粒度是单条）。
+    """
+    c = _conf_section("analysis_learn") or {}
+    c.setdefault("enabled", True)
+    c.setdefault("mode", "ai")
+    c.setdefault("activate_score", 7.0)
+    c.setdefault("limit", 12)
+    c.setdefault("max_chars", 2600)
+    c.setdefault("min_chars", analysis_learn.MIN_CHARS)
+    c.setdefault("auto_loop", True)
+    c.setdefault("loop_interval_minutes", 720)
+    return c
+
+
+def _anal_tech_block(cur, c: dict | None = None, as_of=None,
+                     bump_hits: bool = True) -> str:
+    """注入用技法文本；配置关闭或查询失败都返回空串（调用方直接跳过该区块）。
+
+    这里**吞掉所有异常**：技法注入是「锦上添花」，绝不能因为它让报告/决策失败。
+    `bump_hits=False` 给预览端点用 —— 看一眼不该让「被注入次数」计数虚增。
+    """
+    c = c if c is not None else _analysis_learn_conf()
+    if not c.get("enabled", True):
+        return ""
+    try:
+        return analysis_learn.build_injection_block(
+            cur, limit=int(c.get("limit", 12)),
+            as_of=as_of, max_chars=int(c.get("max_chars", 2600)),
+            bump_hits=bump_hits)
+    except Exception as exc:
+        print(f"[anal_tech] 注入失败（跳过，不影响主流程）: {exc}", flush=True)
+        return ""
+
+
+def _anal_tech_block_with_conn() -> str:
+    """自开连接的注入入口（给 deps 这种「无游标可用」的调用方用）。
+
+    hits 计数是**观测用途**，不值得为它多开一次提交 —— 但要 commit，
+    否则游标随连接关闭回滚，hits 永远是 0（这正是「打印了但没生效」那类坑）。
+    """
+    try:
+        with get_conn() as conn, conn.cursor(
+                cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            block = _anal_tech_block(cur)
+        conn.commit()          # hits 计数要落库
+        return block
+    except Exception as exc:
+        print(f"[anal_tech] 注入失败（跳过，不影响主流程）: {exc}", flush=True)
+        return ""
+
+
+def _channels_conf() -> dict:
+    """视频号监控配置（config.yaml 的 channels 段，单一源走 `_conf_section`）。
+
+    `api_base` 默认 127.0.0.1:2026 —— wx_channel 只监听本机，且**必须**跑在
+    装了 PC 微信并已登录的机器上（还要管理员权限注入 WeChatAppEx.exe）。
+    """
+    conf = _conf_section("channels")
+    conf.setdefault("enabled", False)          # 默认关：依赖本机 PC 微信
+    conf.setdefault("api_base", channels_watch.DEFAULT_API)
+    conf.setdefault("comments", True)
+    conf.setdefault("comment_pages", 1)
+    conf.setdefault("max_new_per_sub", 5)
+    conf.setdefault("interval_minutes", 30)
+    return conf
+
+
+def _channels_subs() -> list:
+    """订阅列表：优先读 config.yaml，其次读 data/channels_subs.json。"""
+    c = _channels_conf()
+    subs = c.get("subscriptions")
+    if isinstance(subs, list) and subs:
+        return [s for s in subs if isinstance(s, dict) and s.get("username")]
+    return channels_watch.load_subs()
+
+
+def _run_channels_once() -> dict:
+    """采集一轮视频号内容。**任何异常都不许中断调用方**（守护线程会 log 后继续）。"""
+    c = _channels_conf()
+    if not c.get("enabled", False):
+        return {"skipped": True, "reason": "channels.enabled=false"}
+    api = c.get("api_base") or channels_watch.DEFAULT_API
+    asr_conf = {
+        "enabled": bool(c.get("asr", {}).get("enabled", False)),
+        "provider": c.get("asr", {}).get("provider", "siliconflow"),
+        # api_key 走环境变量优先：config.yaml 是明文密钥文件（已 gitignore），
+        # 但能从环境注入更安全，也不怕误提交
+        "api_key": os.environ.get("SILICONFLOW_API_KEY", "")
+                   or c.get("asr", {}).get("api_key", ""),
+        "model": c.get("asr", {}).get("model", ""),
+        "base_url": c.get("asr", {}).get("base_url",
+                                          "https://api.siliconflow.cn/v1"),
+        "timeout": int(c.get("asr", {}).get("timeout", 300)),
+        "api_token": c.get("api_token", ""),
+    }
+    subs = _channels_subs()
+    if not subs:
+        return {"skipped": True, "reason": "没有订阅博主（channels.subscriptions 或 "
+                                           "data/channels_subs.json）"}
+    client = channels_watch.WxChannelClient(base_url=api,
+                                            token=asr_conf["api_token"])
+    asr = channels_watch.get_asr(asr_conf)
+    data_dir = os.path.join(BASE_DIR, "data")
+    state = channels_watch.load_state(data_dir)
+    result = channels_watch.poll_once(
+        client, subs, asr=asr, state=state, data_dir=data_dir,
+        with_comments=bool(c.get("comments", True)),
+        comment_pages=int(c.get("comment_pages", 1)),
+        max_new_per_sub=int(c.get("max_new_per_sub", 5)),
+        downloader=None)          # ASR 前置下载需要视频文件，先不接
+    if result.get("items"):
+        channels_watch.append_items(result, data_dir)
+        channels_watch.save_state(state, data_dir)
+        # 2026-10-07 补：原来只 append_items 落 jsonl，**从没调 save_to_sa_news**
+        # → sa_news 里 source='wx_channels' 恒为 0 行，前端「内容监控」看不到
+        # 视频号内容，关联股票也写不进去。save_to_sa_news 已支持 commit=False，
+        # 这里自己控制提交（get_conn 不带事务托管）。
+        try:
+            with get_conn() as conn:
+                inserted = channels_watch.save_to_sa_news(conn, result["items"],
+                                                          with_relations=True,
+                                                          commit=False)
+                conn.commit()
+            result["sa_news_inserted"] = inserted
+            if inserted:
+                print(f"[channels] sa_news 新增 {inserted} 行", flush=True)
+        except Exception as exc:
+            # 写库失败不许丢已采到的内容（jsonl 已落盘、state 已存 → 下轮不重复）
+            result["sa_news_error"] = str(exc)
+            print(f"[channels] sa_news 写入失败（内容已落 jsonl）: {exc}", flush=True)
+    result["asr_provider"] = asr.name
+    return result
+
+
+@app.get("/api/channels/subscriptions")
+def channels_subscriptions():
+    """列出/登记视频号订阅（订阅也可以直接写 config.yaml 或 json 文件）。"""
+    subs = _channels_subs()
+    return {"ok": True, "count": len(subs), "subscriptions": subs,
+            "hint": "username 用 v2_ 开头的加密 ID，"
+                    "可用 wx_channel 的 /api/channels/contact/search?keyword= 查"}
+
+
+@app.post("/api/channels/subscriptions")
+def channels_add_subscription(req: dict):
+    """新增订阅博主。body: {"username": "v2_xxx", "name": "博主名", "codes": ["600xxx"]}"""
+    user = str(req.get("username") or "").strip()
+    if not user:
+        return {"ok": False, "error": "缺少 username"}
+    subs = channels_watch.load_subs()
+    if any(s.get("username") == user for s in subs):
+        return {"ok": True, "added": False, "reason": "已存在",
+                "subscriptions": subs}
+    subs.append({"username": user, "name": req.get("name") or user,
+                 "enabled": True, "codes": req.get("codes") or []})
+    channels_watch.save_subs(subs)
+    return {"ok": True, "added": True, "subscriptions": subs}
+
+
+@app.get("/api/channels/check")
+def channels_check(days: int = 0):
+    """立刻跑一轮视频号采集（不落库，只返回结果与文本）。"""
+    try:
+        r = _run_channels_once()
+        if r.get("skipped"):
+            return r
+        return {"ok": True, **r, "text": channels_watch.render(r)}
+    except channels_watch.WxChannelError as exc:
+        return {"ok": False, "error": str(exc),
+                "hint": "wx_channel 必须在装有 PC 微信的机器上以管理员权限运行，"
+                        "且微信需打开视频号页面"}
+    except Exception as exc:
+        traceback.print_exc()
+        return {"ok": False, "error": str(exc)}
+
+
+def _channels_loop():
+    """视频号监控守护线程：按 `interval_minutes` 轮询订阅博主。
+
+    与 `_alerts_loop` 同一时刻启动（工作日 8:30 后首轮），之后按间隔跑。
+    只推**有新内容**的轮次；接口不可用时降低频率并打印原因，不刷屏。
+    """
+    last_day = None
+    last_poll = 0.0
+    while True:
+        try:
+            now = datetime.now()
+            c = _channels_conf()
+            if c.get("enabled", False):
+                interval = max(5, int(c.get("interval_minutes", 30))) * 60
+                ah, am = _sched_time("alerts", "check_time")
+                in_window = ((now.hour, now.minute) >= (ah, am)) and now.hour < 21
+                if in_window and (time.time() - last_poll) >= interval:
+                    last_poll = time.time()
+                    r = _run_channels_once()
+                    if r.get("skipped"):
+                        print(f"[channels] 跳过: {r.get('reason')}", flush=True)
+                    else:
+                        n = len(r.get("items") or [])
+                        if n:
+                            last_day = now.date()
+                            _notifier_notify_safe(
+                                f"📺 视频号更新（{n} 条）",
+                                channels_watch.render(r), event="wx_channels")
+                            print(f"[channels] {n} 条新内容已推送", flush=True)
+                        elif r.get("errors"):
+                            print(f"[channels] 本轮无新增但有异常: "
+                                  f"{r['errors'][:2]}", flush=True)
+            time.sleep(300)
+        except Exception as exc:
+            print(f"[channels] loop error: {exc}", flush=True)
+            time.sleep(300)
+
+
+# ---------------- 分析技法学习（analysis_learn） ----------------
+
+def _run_analysis_learn_once(limit_articles: int = 3, force: bool = False,
+                             dry_run: bool = False) -> dict:
+    """从 sa_mp_articles 挑文章 → LLM 萃取技法 → 落库。返回统计。
+
+    为什么要 `force` / `dry_run`：
+    - `force=True` 允许重抽已抽过的文章（抽取会重试、也会因换 prompt 需要重来）
+    - `dry_run=True` **只打印会抽哪几篇，不调 LLM、不写库**。LTM 调用花钱，
+      先看一眼筛选结果比先烧钱合理（AGENTS.md 第 0 条「先确认再动」）。
+
+    长任务纪律（AGENTS.md）：每篇抽完立刻 commit，不攒到最后 —— 一篇失败
+    不该让前几篇的 LLM 费用白花。
+    """
+    c = _analysis_learn_conf()
+    if not c.get("enabled", True):
+        return {"skipped": True, "reason": "analysis_learn.enabled=false"}
+    min_chars = int(c.get("min_chars", analysis_learn.MIN_CHARS))
+    mode = c.get("mode", "ai")
+    if mode not in ("ai", "manual"):
+        return {"skipped": True, "reason": f"未知 mode={mode}（只支持 ai|manual）"}
+
+    # ---- 选候选文章：已抽过的排除（除非 force） ----
+    with get_conn() as conn, conn.cursor(
+            cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        if not force:
+            # 已经抽过技法的文章 id（**抽过的**，不是没抽过的）。
+            # 写反的话：技法表为空时该集合 = 全部文章 id，
+            # 于是「跳过已抽过的」会把每一篇都跳过 —— 实测 660 篇候选全被拦掉，
+            # picked 恒为 0，而筛选本身其实有 42 篇合格（见 diag_funnel.py）。
+            cur.execute(
+                "SELECT DISTINCT source_article_id AS id "
+                "FROM sa_analysis_techniques")
+        else:
+            cur.execute("SELECT NULL::bigint AS id WHERE false")
+        done_ids = {r["id"] for r in cur.fetchall()}
+        cur.execute(
+            "SELECT id, title, url, mp_name, published_at, content_text "
+            "FROM sa_mp_articles WHERE coalesce(content_text,'') <> '' "
+            "ORDER BY published_at DESC NULLS LAST LIMIT 800")
+        cands = cur.fetchall()
+
+    picked = []
+    for a in cands:
+        if not force and a["id"] in done_ids:
+            continue
+        text = analysis_learn._flatten(a["content_text"])
+        if len(text) < min_chars:
+            continue
+        if not analysis_learn.looks_like_analysis(a["title"] or "", text):
+            continue
+        picked.append(a)
+        if len(picked) >= max(1, int(limit_articles)):
+            break
+
+    result = {"mode": mode, "candidates": len(cands),
+              "picked": [{"id": a["id"], "title": (a["title"] or "")[:60],
+                          "chars": len(a["content_text"] or "")} for a in picked],
+              "extracted": 0, "active": 0, "pending": 0, "errors": []}
+    if not picked:
+        result["reason"] = "没有符合筛选条件的新文章"
+        return result
+    if dry_run:
+        result["dry_run"] = True
+        return result
+
+    conf = llm_advisor.load_llm_conf()
+    activate = float(c.get("activate_score", 7.0))
+    for a in picked:
+        text = analysis_learn._flatten(a["content_text"])
+        body = text[:analysis_learn.MAX_CHARS]
+        user = analysis_learn.EXTRACT_USER.format(
+            title=a["title"] or "(无标题)", mp_name=a["mp_name"] or "",
+            published_at=str(a["published_at"] or ""), body=body)
+        try:
+            raw = llm_advisor.ask(analysis_learn.EXTRACT_SYSTEM, user, conf=conf,
+                                  max_tokens=8000, thinking=True)
+        except Exception as exc:
+            result["errors"].append(f"id={a['id']} LLM 失败: {exc}")
+            continue
+        techs = analysis_learn.parse_techniques(raw)
+        if not techs:
+            result["errors"].append(
+                f"id={a['id']} 抽取到 0 条（可能全是无依据的，已按纪律丢弃）")
+            continue
+        # 每篇一个事务：立刻 commit，崩了也不丢前面的
+        try:
+            with get_conn() as conn, conn.cursor() as cur:
+                n = analysis_learn.upsert_techniques(
+                    cur, int(a["id"]), a["url"] or "", a["title"] or "",
+                    techs, mode=mode, auto_activate_score=activate)
+                conn.commit()
+            result["extracted"] += n
+            n_act = sum(1 for t in techs
+                        if mode == "ai" and t["score"] >= activate)
+            result["active"] += n_act
+            result["pending"] += n - n_act
+            print(f"[anal_tech] id={a['id']} 抽 {n} 条"
+                  f"（active {n_act} / pending {n - n_act}）", flush=True)
+        except Exception as exc:
+            result["errors"].append(f"id={a['id']} 写库失败: {exc}")
+    return result
+
+
+@app.get("/api/analysis/techniques")
+def analysis_techniques(status: str = "", limit: int = 200):
+    """列出学到的技法（人工审核界面用的数据源）。
+
+    `status` 空 = 全部。每条都带 `evidence`（原文依据）与来源文章标题 ——
+    审核时必须能一眼看出「这条是文章说的，还是模型编的」。
+    """
+    sql = ("SELECT id, source_article_id, source_title, source_url, name, "
+           "       category, rule, indicators, evidence, status, score, "
+           "       mode, hits, learned_at, reviewed_at, review_note, "
+           "       COALESCE(NULLIF(applicable,''),'[]') AS applicable "
+           "FROM sa_analysis_techniques")
+    args: tuple = ()
+    if status:
+        sql += " WHERE status = %s"
+        args = (status,)
+    sql += " ORDER BY score DESC, learned_at DESC LIMIT %s"
+    args = args + (max(1, min(500, int(limit))),)
+    with get_conn() as conn, conn.cursor(
+            cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(sql, args)
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.execute("SELECT status, count(*) AS n FROM sa_analysis_techniques "
+                    "GROUP BY status")
+        stats = {r["status"]: r["n"] for r in cur.fetchall()}
+    return {"ok": True, "count": len(rows), "stats": stats, "techniques": rows}
+
+
+@app.post("/api/analysis/techniques/review")
+def analysis_technique_review(payload: dict = None):
+    """人工审核：改单条 status（active/pending/rejected）+ 备注。
+
+    这就是「人工审核」与「AI 自进化」的**唯一分界点**：
+    两种模式的抽取产物都落同一张表，审核动作也只有一个 —— 改 status。
+    所以 AI 学歪时人一条请求就能止损，不需要改代码、不需要重启。
+    """
+    payload = payload or {}
+    tid = payload.get("id")
+    status = (payload.get("status") or "").strip()
+    note = str(payload.get("note") or "")[:500]
+    if not tid:
+        return {"ok": False, "error": "缺少 id"}
+    if status not in ("active", "pending", "rejected"):
+        return {"ok": False, "error": "status 只支持 active/pending/rejected"}
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE sa_analysis_techniques "
+            "SET status = %s, review_note = %s, reviewed_at = now(), "
+            "    mode = CASE WHEN %s = '' THEN mode ELSE 'manual' END "
+            "WHERE id = %s RETURNING id, name, status",
+            (status, note, payload.get("mode") or "", tid))
+        row = cur.fetchone()
+        conn.commit()
+    if not row:
+        return {"ok": False, "error": f"id={tid} 不存在"}
+    return {"ok": True, "id": row[0], "name": row[1], "status": row[2]}
+
+
+@app.post("/api/analysis/learn")
+def analysis_learn_run(payload: dict = None):
+    """手动触发一轮萃取。默认 `dry_run=true` —— 只看会抽哪几篇，不花钱。
+
+    真要花钱必须显式传 `{"dry_run": false, "articles": N}`。
+    这个默认值是刻意的：LLM 调用花钱，而「先看看筛选对不对」不需要花。
+    """
+    payload = payload or {}
+    dry = payload.get("dry_run", True)
+    try:
+        return _run_analysis_learn_once(
+            limit_articles=int(payload.get("articles") or 3),
+            force=bool(payload.get("force")),
+            dry_run=bool(dry))
+    except Exception as exc:
+        traceback.print_exc()
+        return {"ok": False, "error": str(exc)}
+
+
+@app.get("/api/analysis/config")
+def analysis_conf_get():
+    """返回当前模式（供前端显示开关状态）。改配置走 /api/config 系列。"""
+    c = _analysis_learn_conf()
+    return {"ok": True, "enabled": c.get("enabled", True), "mode": c.get("mode", "ai"),
+            "activate_score": c.get("activate_score", 7.0),
+            "limit": c.get("limit", 12), "max_chars": c.get("max_chars", 2600)}
+
+
+@app.post("/api/analysis/config")
+def analysis_conf_set(payload: dict = None):
+    """切换模式（ai 自进化 / manual 人工审核）。
+
+    只改这个字段，**不动已生效的技法** —— 审核粒度是单条，
+    切到 manual 不该把已经 active 的全部打回 pending（那是破坏性动作）。
+    """
+    payload = payload or {}
+    mode = (payload.get("mode") or "").strip()
+    if mode not in ("ai", "manual"):
+        return {"ok": False, "error": "mode 只支持 ai|manual"}
+    enabled = payload.get("enabled")
+    path = CONFIG_FILE
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        sec = data.get("analysis_learn") or {}
+        sec["mode"] = mode
+        if enabled is not None:
+            sec["enabled"] = bool(enabled)
+        data["analysis_learn"] = sec
+        path.write_text(
+            yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
+            encoding="utf-8")
+    except Exception as exc:
+        return {"ok": False, "error": f"写配置失败: {exc}"}
+    return {"ok": True, "mode": mode,
+            "enabled": (enabled if enabled is not None else _analysis_learn_conf().get("enabled", True))}
+
+
+@app.get("/api/analysis/injection")
+def analysis_injection_preview():
+    """预览当前会注入到 prompt 的技法原文（调试/核对用）。"""
+    c = _analysis_learn_conf()
+    with get_conn() as conn, conn.cursor(
+            cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        block = _anal_tech_block(cur, c, bump_hits=False)
+        cur.execute("SELECT count(*) AS n FROM sa_analysis_techniques "
+                    "WHERE status='active'")
+        active = cur.fetchone()["n"]
+    return {"ok": True, "active_count": active, "chars": len(block),
+            "block": block}
+
+
+@app.get("/api/analysis/judge/config")
+def analysis_judge_config():
+    """当前技法裁判用的是**哪一套判据**（可观测，别猜）。
+
+    判据 prompt 是可插拔的：改 `config.yaml` 的 `analysis_learn.judge_prompt_file`、
+    设环境变量 `SA_JUDGE_PROMPT_FILE`，或往
+    `stock-advisor/skills/technique_judge/{JUDGE,SKILL}.md` 丢一个文件即可，
+    **不用改代码**。这个端点就是为了让「换没换成功」一眼可见。
+    """
+    import technique_judge as TJ
+    c = _analysis_learn_conf() or {}
+    prompt, source = TJ.load_judge_prompt(
+        explicit_path=str(c.get("judge_prompt_file") or ""))
+    return {"ok": True, "prompt_source": source,
+            "prompt_chars": len(prompt),
+            "is_builtin": prompt == TJ.DEFAULT_JUDGE_PROMPT,
+            "skill_candidates": [str(TJ.BASE_DIR / r) for r in TJ.SKILL_CANDIDATES],
+            "verdicts": list(TJ.VERDICTS),
+            "verdict_label": TJ.VERDICT_LABEL}
+
+
+@app.get("/api/analysis/judge/duplicates")
+def analysis_judge_duplicates(limit: int = 200):
+    """**不烧 LLM** 的跨篇重复检测（difflib 比 rule 归一化后的字面相似度）。
+
+    补 `UNIQUE (source_article_id, name)` 防不住的洞：同一篇里的重名挡住了，
+    **跨篇文章抽出的同一套技法**挡不住。
+    """
+    import technique_judge as TJ
+    with get_conn() as conn, conn.cursor(
+            cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        rows = TJ.fetch_for_judge(cur, limit=limit)
+        dups = TJ.find_duplicates(cur)
+    return {"ok": True, "scanned": len(rows), "count": len(dups),
+            "duplicates": dups}
+
+
+@app.post("/api/analysis/judge")
+def analysis_judge_run(payload: dict = None):
+    """跑一轮技法质量审计（判断「抽出来的技法到底有没有用」）。
+
+    `dry_run` 默认 **true** —— 判据要花钱调 LLM，与 `/api/analysis/learn`
+    同一个默认值纪律。要真写进 `review_note` 必须显式 `dry_run=false`。
+
+    **本端点绝不改 `status`**：判定只落 `review_note`（前缀 `judge:`），
+    生效与否仍然由人在「分析技法」页点。这条人工兜底纪律不破。
+    """
+    import technique_judge as TJ
+    payload = payload or {}
+    dry_run = bool(payload.get("dry_run", True))
+    statuses = payload.get("statuses") or ["active", "pending"]
+    batch = int(payload.get("batch", TJ.DEFAULT_BATCH))
+    max_items = int(payload.get("max_items", TJ.DEFAULT_MAX_ITEMS))
+    c = _analysis_learn_conf() or {}
+    if not c.get("enabled", True):
+        return {"ok": True, "skipped": True, "reason": "analysis_learn.enabled=false"}
+
+    # ⚠️ 判据路径与 LLM 配置是两个键。混在一起会让 ask() 抛
+    #    KeyError: 'api_key'（2026-10-08 踩过，只在真调 LLM 时才暴露）。
+    deps = {"get_conn": get_conn,
+            "conf": llm_advisor.load_llm_conf(),
+            "judge_prompt_file": c.get("judge_prompt_file")}
+    res = TJ.run_judge(deps, statuses=tuple(statuses), batch=batch,
+                       max_items=max_items, dry_run=dry_run)
+    res["suggest_reject"] = TJ.suggest_rejections(res.get("items") or [])
+    return res
+
+
+def _analysis_learn_loop():
+    """守护线程：定期从新文章里萃取技法。
+
+    频率由 `loop_interval_minutes` 控制（默认 12h）。**不推送通知** ——
+    技法学习的产出是「悄悄变好的分析质量」，不是事件；推通知只会变成噪音。
+    审核/生效的结果在网页「分析技法」页看。
+    """
+    while True:
+        try:
+            time.sleep(120)          # 等启动期（init_db + 其它守护线程）过去
+            c = _analysis_learn_conf()
+            if not c.get("enabled", True) or not c.get("auto_loop", True):
+                time.sleep(600)
+                continue
+            interval = max(60, int(c.get("loop_interval_minutes", 720))) * 60
+            while True:
+                try:
+                    r = _run_analysis_learn_once(limit_articles=3)
+                    if r.get("picked"):
+                        print(f"[anal_tech] 守护轮次: 抽 {r.get('extracted', 0)} 条 "
+                              f"(active {r.get('active', 0)})", flush=True)
+                except Exception as exc:
+                    print(f"[anal_tech] loop run error: {exc}", flush=True)
+                time.sleep(interval)
+        except Exception as exc:
+            print(f"[anal_tech] loop error: {exc}", flush=True)
+            time.sleep(600)
+
+
+@app.get("/api/supply-events/calendar")
+def supply_events_calendar(days: int = 30):
+    """全市场供给冲击日历：未来 N 天的解禁/增发 + 近 N 天减持回顾 + 潮度评级。
+
+    潮度用**历史分位数**判定，不是绝对值：
+    - 单日评级 vs 历史每日解禁市值分布
+    - 窗口合计评级 vs 历史同长度滚动窗口分布
+    （拿 30 天合计去比单日 p90 会永远判「强潮」= 永远报警，已修）
+    """
+    try:
+        snap = supply_events.collect(days=max(1, min(days, 120)))
+        supply_events.append_snapshot(snap)
+        return {"ok": True, "snapshot": snap, "text": supply_events.render(snap)}
+    except Exception as exc:
+        traceback.print_exc()
+        return {"ok": False, "error": str(exc)}
+
+
+@app.get("/api/global-markets/snapshot")
+def global_markets_snapshot(days: int = 30):
+    """美日韩 + 港股 + A股 相对强弱，含「港资抽离」信号。
+
+    KOSPI **取不到**（push2 被封 / 新浪 int_* 全空 / akshare 历史 KeyError，
+    2026-10-06 三条路径实测），返回体里如实标注，不用其它指标冒充。
+    美股/日经只有**当日**涨跌（无历史源），A股/港股有 5 日/20 日。
+    """
+    try:
+        r = global_markets.check_once(days=max(5, min(days, 60)))
+        global_markets.append_snapshot(r)
+        return {"ok": True, "snapshot": r,
+                "text": global_markets.render(r["spot"], r["hist"])}
+    except Exception as exc:
+        traceback.print_exc()
+        return {"ok": False, "error": str(exc)}
+
+
+def _supply_market_loop():
+    """每日推送：全市场供给冲击日历 + 海外市场资金抽离视角。
+
+    为什么要推送而不是只在页面看：解禁潮和海外资金流向都是**开盘前就该知道**的
+    信息 —— 10-28 有 990 亿解禁这种事，等到盘中看页面已经晚了。
+
+    触发：工作日 alerts.check_time 之后跑一次（与自选股告警同一时刻，便于对齐理解）。
+    只推**有信号**的日子（潮度达中潮以上，或抽离信号触发），否则不打扰。
+    """
+    last_day = None
+    while True:
+        try:
+            now = datetime.now()
+            if now.hour >= 21:
+                time.sleep(1800)
+                continue
+            conf = _alerts_conf()
+            ah, am = _sched_time("alerts", "check_time")
+            if (holiday_calendar.is_trading(now.date())
+                    and (now.hour, now.minute) >= (ah, am)
+                    and last_day != now.date()):
+                last_day = now.date()
+                days = int(conf.get("days", 14))
+                # —— 全市场供给冲击 ——
+                try:
+                    snap = supply_events.collect(days=30)
+                    supply_events.append_snapshot(snap)
+                    lift = (snap.get("kinds") or {}).get("lift") or {}
+                    lv = lift.get("level", "normal")
+                    if lv in ("tide", "surge"):
+                        _notifier_notify_safe(
+                            f"🔓 全市场解禁潮（{lv}）未来 30 天",
+                            supply_events.render(snap), event="supply_calendar")
+                    else:
+                        print(f"[supply] 解禁潮度 {lv}，未达推送阈值", flush=True)
+                except Exception as exc:
+                    print(f"[supply] 日历采集失败: {exc}", flush=True)
+                # —— 海外市场 ——
+                try:
+                    gm = global_markets.check_once(days=30)
+                    global_markets.append_snapshot(gm)
+                    if gm.get("signals"):
+                        _notifier_notify_safe(
+                            "🌏 海外市场：资金抽离信号",
+                            global_markets.render(gm["spot"], gm["hist"]),
+                            event="global_markets")
+                    else:
+                        print("[global] 无资金抽离信号", flush=True)
+                except Exception as exc:
+                    print(f"[global] 海外市场采集失败: {exc}", flush=True)
+            time.sleep(900)
+        except Exception as exc:
+            print(f"[supply/global] loop error: {exc}", flush=True)
+            time.sleep(900)
+
+
 # ---------------- 模拟交易（LLM 决策 + 结算反思沉淀，见 paper_trading.py） ----------------
 
 import paper_trading
@@ -3650,20 +4591,31 @@ def _paper_deps(conf: dict | None = None) -> dict:
 
 
 def _paper_news_rows(code: str, limit: int = 10) -> list[dict]:
-    """该股近 7 天新闻（带 sentiment），供决策上下文。"""
+    """该股近 7 天新闻（带 sentiment），供决策上下文。
+
+    ⚠️ 两条硬约束（2026-10-08，用户定的规矩，教训见AGENTS.md）：
+    1) **必须有 publish_time**，且**不许回退到 fetched_at**。fetched_at 是
+       「我们什么时候抓到的」，一篇 6 月的旧闻就是这样被当成「近 7 日新闻」
+       喂给交易员的（莲花控股阶跃星辰那篇）。
+    2) 去重和排序要分开：DISTINCT ON 要求 ORDER BY 以 url 打头，于是
+       `LIMIT` 实际取的是**url 序最靠前的 N 条**，不是最新的 N 条 ——
+       实测 6 条全被丢掉。DISTINCT 放子查询里，外层再按时间排。
+    """
     try:
         with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                "SELECT DISTINCT ON (n.url) n.title, n.media, n.source, n.sentiment, "
-                "n.publish_time, n.fetched_at FROM sa_news n "
-                "LEFT JOIN sa_news_related r ON r.url = n.url "
-                "WHERE (n.code = %s OR r.code = %s) "
-                "AND COALESCE(n.publish_time, n.fetched_at) > now() - interval '7 days' "
-                "ORDER BY n.url, COALESCE(n.publish_time, n.fetched_at) DESC LIMIT %s",
+                "SELECT title, media, source, sentiment, publish_time FROM ("
+                "  SELECT DISTINCT ON (n.url) n.title, n.media, n.source, n.sentiment,"
+                "         n.publish_time"
+                "    FROM sa_news n "
+                "    LEFT JOIN sa_news_related r ON r.url = n.url "
+                "   WHERE (n.code = %s OR r.code = %s) "
+                "     AND n.publish_time IS NOT NULL "
+                "     AND n.publish_time > now() - interval '7 days' "
+                "   ORDER BY n.url, n.publish_time DESC"
+                ") t ORDER BY publish_time DESC LIMIT %s",
                 (code, code, limit))
-            rows = [dict(r) for r in cur.fetchall()]
-            rows.sort(key=lambda r: r["publish_time"] or r["fetched_at"], reverse=True)
-            return rows
+            return [dict(r) for r in cur.fetchall()]
     except Exception:
         return []
 
@@ -3727,10 +4679,16 @@ def paper_overview():
 
 @app.get("/api/paper/trades")
 def paper_trades(code: str = "", limit: int = 100):
-    """交易记录（含 reasoning/report 全文），新→旧。"""
+    """交易记录（含 reasoning/report 全文），新→旧。
+
+    `slot` 是**决策轮次标签 = 真实决策时刻**（app.py:6250
+    `slot = now.strftime("%H:%M")`）。之前这个接口没取它，前端只能显示到
+    日期（MM-DD），于是「决策理由」看不出是什么时候做的、是否已经过期
+    （2026-10-08 加）。
+    """
     limit = max(1, min(limit, 500))
-    sql = ("SELECT id, code, name, trade_date, side, shares, price, value, confidence, "
-           "stop_loss_pct, reasoning, status, auto_closed, settle_date, settle_price, "
+    sql = ("SELECT id, code, name, trade_date, slot, side, shares, price, value, "
+           "confidence, stop_loss_pct, reasoning, status, auto_closed, settle_date, settle_price, "
            "raw_return, alpha_return, benchmark, created_at FROM sa_paper_trades ")
     params: list = []
     if re.fullmatch(r"\d{4,6}", code or ""):
@@ -4081,20 +5039,42 @@ def paper_adopted_strategies(include_rejected: bool = False):
                       ORDER BY br.id DESC LIMIT 1) AS max_drawdown,
                     (SELECT br.sharpe FROM sa_backtest_run br
                       WHERE br.strategy_id = s.id
-                      ORDER BY br.id DESC LIMIT 1) AS sharpe
+                      ORDER BY br.id DESC LIMIT 1) AS sharpe,
+                    s.universe
              FROM sa_strategy_def s
-             WHERE (%s = '' OR %s)
+             WHERE (%s OR s.enabled)
              ORDER BY s.enabled DESC, s.portable_score DESC, s.id DESC
              LIMIT 50"""
+    # ⚠️ 这里踩了**两个**叠加的坑，都靠「真发一次查询 + 断言行数」逮到：
+    #
+    # ① 列名被塞进参数位。原写法 `WHERE (%s = '' OR %s)` 传
+    #    ("FALSE", "s.enabled") —— 第二个 %s 是列名却被参数化，psycopg2 渲染成
+    #    带引号的字面量 `'s.enabled'`，Postgres 当 boolean 解析 →
+    #    `invalid input syntax for type boolean` → 500。而且**两个分支都坏**：
+    #    include_rejected=True 时渲染成 `('TRUE' = '' OR 'TRUE')`，同样把 'TRUE'
+    #    当字符串字面量。也就是说这个端点从来没成功返回过一次。
+    #    教训：**列名永远不能走参数位**，参数位只放值。
+    #
+    # ② 修完①还写反过一次布尔：一度传 `not include_rejected`，于是
+    #    include_rejected=True 渲染成 `WHERE (FALSE OR s.enabled)` = 只留已采纳的
+    #    —— 不抛异常、返回 200，但**恒 0 行**（库里一条都没采纳过）。这种
+    #    「不炸但空」比 500 难发现得多，只有断言 `True 分支必须有行` 才逮得到。
+    #    而当时我写的测试断言**也是同一个错误预期**，照常 PASS ——
+    #    测试和代码一起错，是「看着通过」最阴的形态。
+    #
+    #    语义钉死（别再靠猜）：include_rejected=True → 全都要（TRUE OR ...）；
+    #    False → 只要已采纳（FALSE OR s.enabled → 即 s.enabled）。
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("SET statement_timeout='20s'")
-        cur.execute(sql, ("TRUE" if include_rejected else "FALSE",
-                          "TRUE" if include_rejected else "s.enabled"))
+        cur.execute(sql, (include_rejected,))
         rows = cur.fetchall()
     items = []
     for r in rows:
         (sid, name, aid, runnable, score, enabled, note, created, last_run,
-         tr, ar, mdd, sh) = r
+         tr, ar, mdd, sh, universe) = r
+        # universe 可能是 NULL（老行）或 JSON 数组；一律给前端 list，
+        # 免得前端拿到 null 还要写两套判空。
+        pool = universe if isinstance(universe, list) else []
         items.append({
             "id": sid, "name": name, "article_id": aid,
             "runnable": runnable, "portable_score": score,
@@ -4102,11 +5082,93 @@ def paper_adopted_strategies(include_rejected: bool = False):
             "created_at": str(created or ""), "last_run": str(last_run or ""),
             "total_return": _pct_or_none(tr), "annual_return": _pct_or_none(ar),
             "max_drawdown": _pct_or_none(mdd), "sharpe": sh,
+            "universe": pool, "universe_n": len(pool),
             "drives_paper": False,      # 见 docstring：它不参与实际下单
         })
     return {"n": len(items), "items": items,
             "adopted": sum(1 for i in items if i["enabled"]),
             "hint": "已采纳=验证通过、可作选股参考；不等于已在替你下单。"}
+
+
+@app.post("/api/paper/adopted-strategies/{sid}/to-watchlist")
+def adopted_strategy_to_watchlist(sid: int):
+    """把某条已登记策略的**股票池**（universe）批量加进自选。
+
+    为什么这条路能通（前提已实测，不是猜的）：模拟盘 `run_decisions` 的候选池
+    就是 `sa_watchlist` —— `paper_trading.py:1095`
+    `SELECT code, name FROM sa_watchlist ORDER BY code`。所以「让策略参与模拟盘」
+    当前最短的路径是把它的 universe 写进自选：**不改 schema、不改交易逻辑**。
+
+    ⚠️ 但必须说清楚它**不等于策略在替你决策**：写进去的只是策略**自己声明的
+    股票池**，买不买、何时买、何时卖仍由 run_decisions 的 LLM 决策 + 那 6 种
+    卖出规则决定。聚宽策略是「选股」逻辑、sa_strategies 只支持「卖出」kind，
+    两者不在一个维度（见 paper_adopted_strategies 的 docstring）。
+
+    三个实现要点：
+    1. **必须后端批量**：`fetch_quotes` 是批量接口（一次请求带全部 A股代码，
+       app.py:791）。前端逐个调 `POST /api/watchlist` 会变成 N 次行情请求。
+    2. **单个代码不许中断整批**：universe 里混一个格式非法/行情取不到的代码，
+       不能导致整批加不进去 —— 分开报 added / already / invalid / no_quote。
+    3. **`ON CONFLICT DO NOTHING` 而非 DO UPDATE**：POST /api/watchlist 那个
+       是「编辑单只」语义，会覆盖 note/keywords；批量引用绝不能把用户已有的
+       备注和关键词洗掉。
+    """
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT name, universe, enabled FROM sa_strategy_def WHERE id=%s",
+                    (sid,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, f"没有 id={sid} 的策略")
+    name, universe, enabled = row
+    if not isinstance(universe, list) or not universe:
+        raise HTTPException(400, f"策略「{name}」没声明股票池（universe 为空），无从加入")
+
+    # ① 规范化：非法格式逐个记账，不让一个坏码中断整批
+    codes, invalid = [], []
+    for raw in universe:
+        s = str(raw or "").strip()
+        try:
+            codes.append(_normalize_code(s))
+        except HTTPException:
+            invalid.append(s or "(空)")
+    codes = list(dict.fromkeys(codes))          # 去重、保持原顺序
+    if not codes:
+        raise HTTPException(400, f"universe 里没有可识别的 A股/港股代码：{universe}")
+
+    # ② 一次行情请求验活（顺便拿到 name，入库要写）
+    quotes = fetch_quotes(codes)
+    alive, no_quote = {}, []
+    for c in codes:
+        q = quotes.get(c) or {}
+        if q.get("error") or not q.get("name"):
+            no_quote.append({"code": c, "reason": q.get("error") or "行情未返回"})
+        else:
+            alive[c] = q["name"]
+
+    # ③ 插入：先看哪些已在自选里，避免把用户已有条目当「新增」报数
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT code FROM sa_watchlist WHERE code = ANY(%s)",
+                    (list(alive),))
+        existing = {r[0] for r in cur.fetchall()}
+        fresh = [c for c in alive if c not in existing]
+        if fresh:
+            note = f"来自策略「{name}」股票池"
+            cur.executemany(
+                "INSERT INTO sa_watchlist (code, name, note, keywords, "
+                "keywords_pos, keywords_neg) VALUES (%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (code) DO NOTHING",
+                [(c, alive[c], note, "", "", "") for c in fresh])
+        conn.commit()
+
+    return {
+        "strategy_id": sid, "name": name, "enabled": bool(enabled),
+        "pool": len(universe),
+        "added": len(fresh), "already": len(existing),
+        "invalid": invalid, "no_quote": no_quote,
+        "added_codes": fresh,
+        "hint": "已加进自选 = 模拟盘候选池；买不买仍由 run_decisions 决策，"
+                "不等于该策略在替你下单。",
+    }
 
 
 # ---------- 策略库采集（聚宽社区，防重复爬取）----------
@@ -5570,24 +6632,32 @@ def list_news(code: str = "", limit: int = 30):
     """读已抓取的新闻（可按股票过滤），新→旧。每条附 related：关联的全部自选股代码。
 
     code 过滤时同时匹配主 code 与关联表（sa_news_related），保证按股筛选不漏关联新闻。
+
+    ⚠️ 只列**有发布时间**的新闻，且不回退 fetched_at（用户 2026-10-08 定）：
+    没有发布时间的条目时效未知，列出来会让人当成新消息看。
     """
     limit = max(1, min(limit, 200))
     params: list = []
-    # DISTINCT ON (url) 按 URL 去重（同一新闻只显示一次，关联股票在 related 里给出）
-    sql = ("SELECT DISTINCT ON (n.url) n.code, n.title, n.url, n.source, n.media, "
-           "n.publish_time, n.fetched_at, n.sentiment FROM sa_news n ")
+    conds = ["n.publish_time IS NOT NULL"]
+    join = ""
     if re.fullmatch(r"\d{5,6}", code or ""):
         target = code if len(code) == 6 else code.zfill(5)
-        sql += ("LEFT JOIN sa_news_related r ON r.url = n.url "
-                "WHERE (n.code = %s OR r.code = %s) ")
+        join = "LEFT JOIN sa_news_related r ON r.url = n.url "
+        conds.insert(0, "(n.code = %s OR r.code = %s)")
         params += [target, target]
-    sql += "ORDER BY n.url, COALESCE(n.publish_time, n.fetched_at) DESC LIMIT %s"
+    # DISTINCT ON 要求 ORDER BY 以 url 打头，所以去重必须放子查询里；
+    # 否则外层 LIMIT 取的是 url 序最靠前的 N 条而不是最新的 N 条。
+    sql = ("SELECT code, title, url, source, media, publish_time, fetched_at, sentiment FROM ("
+           "  SELECT DISTINCT ON (n.url) n.code, n.title, n.url, n.source, n.media, "
+           "         n.publish_time, n.fetched_at, n.sentiment FROM sa_news n "
+           + join +
+           "  WHERE " + " AND ".join(conds) +
+           "  ORDER BY n.url, n.publish_time DESC"
+           ") t ORDER BY publish_time DESC LIMIT %s")
     params.append(limit)
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(sql, params)
         rows = [dict(r) for r in cur.fetchall()]
-        # DISTINCT ON 的排序含 url，这里重排为时间序
-        rows.sort(key=lambda r: r["publish_time"] or r["fetched_at"], reverse=True)
         # 批量取这批 URL 的全部关联（含主 code）
         if rows:
             urls = [r["url"] for r in rows]
@@ -6701,6 +7771,8 @@ def _report_deps() -> dict:
         "crypto_fn": lambda: crypto_watch.crypto_lines(_crypto_deps()),
         "crypto_link_fn": lambda: crypto_watch.link_lines(_crypto_deps()),
         "strategy_gate_fn": lambda: SG.report_lines(get_conn, days=14, limit=6),
+        # 分析技法注入：单独建连接（不能复用其它 deps 的游标，那会串事务）
+        "anal_tech_fn": lambda: _anal_tech_block_with_conn(),
         "mp_fn": lambda: wechat_mp.digest_lines(_mp_deps(), hours=36),
         "x_fn": lambda: x_monitor.digest_lines(_x_deps(), hours=24),
         "notify_fn": notifier.notify,
@@ -7665,6 +8737,16 @@ _start_daemon(_macro_loop, "sa_macro")
 
 # 自选股事件告警线程（工作日 8:30 后每日一轮：解禁/增发上市新事件推微信）
 _start_daemon(_alerts_loop, "sa_alerts")
+
+# 全市场供给冲击 + 海外市场线程（工作日 8:30 后每日一轮：解禁潮达中潮以上、或
+# 出现港资抽离信号时才推；两者都是开盘前必须知道的信息，见 _supply_market_loop）
+_start_daemon(_supply_market_loop, "sa_supply_market")
+
+# 视频号监控线程（channels.enabled=true 才真正轮询；依赖本机 PC 微信 + wx_channel）
+_start_daemon(_channels_loop, "sa_channels")
+
+# 分析技法学习线程（从公众号文章萃取判读规则；默认 12h 一轮，不推通知）
+_start_daemon(_analysis_learn_loop, "sa_analysis_learn")
 
 # 盘中大盘量能监控线程（交易时段每 5 分钟采量比，放量/缩量翻转推微信；volume 段可配）
 _start_daemon(_market_volume_loop, "sa_market_volume")

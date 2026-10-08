@@ -434,14 +434,26 @@ _REL_PATTERNS = [
     (re.compile(r"^(\d+)\s*小时前$"), lambda m, now: now - timedelta(hours=int(m.group(1)))),
     (re.compile(r"^(\d+)\s*天前$"), lambda m, now: now - timedelta(days=int(m.group(1)))),
     (re.compile(r"^(\d+)\s*分钟前"), lambda m, now: now - timedelta(minutes=int(m.group(1)))),
+    # 周/月/年 —— 2026-10-08 补。原来只认到「天」，于是「4个月前」返回 None，
+    # publish_time 存 NULL，下游回退到 fetched_at（今天），一篇 6 月的旧闻
+    # 就被当成「近 7 日新闻」喂给决策。
+    (re.compile(r"^(\d+)\s*周前$"), lambda m, now: now - timedelta(weeks=int(m.group(1)))),
+    (re.compile(r"^(\d+)\s*个?月前$"), lambda m, now: now - timedelta(days=30 * int(m.group(1)))),
+    (re.compile(r"^(\d+)\s*年前$"), lambda m, now: now - timedelta(days=365 * int(m.group(1)))),
+    # 「半小时前」「N个半小时前」偶尔出现
+    (re.compile(r"^(\d+)\s*个?半?小时前$"), lambda m, now: now - timedelta(minutes=30 * int(m.group(1)))),
 ]
 
 
 def _cn_relative_to_iso(text: str, now: datetime | None = None) -> str | None:
     """中文/相对时间表述 → ISO 字符串；认不出来返回 None。
 
-    支持：`刚刚`、`6小时前`、`8天前`、`今天HH:MM`、`昨天HH:MM`、`前天HH:MM`、
-    `HH:MM`（今天）、`YYYY年M月D日`、`YYYY年M月D日HH:MM`、`YYYY-MM-DD HH:MM[:SS]`。
+    支持：`刚刚`、`6小时前`、`8天前`、`2周前`、`4个月前`、`1年前`、`今天HH:MM`、
+    `昨天HH:MM`、`前天HH:MM`、`HH:MM`（今天）、`YYYY年M月D日`、
+    `YYYY年M月D日HH:MM`、`YYYY-MM-DD HH:MM[:SS]`。
+
+    月/年按固定天数折算（30/365），不按日历月 —— 只会把边界差几天，
+    而这里要解决的是「旧闻被当成新消息」，误差方向安全。
     """
     if not text:
         return None
@@ -491,6 +503,314 @@ def _cn_relative_to_iso(text: str, now: datetime | None = None) -> str | None:
         return now.replace(hour=int(m.group(1)), minute=int(m.group(2)),
                            second=0, microsecond=0).isoformat(timespec="seconds")
     return None
+
+
+# ---------------- 从新闻页面里抽发布时间（2026-10-08）----------------
+#
+# 为什么必须抽、而不是拿抓取时间顶替：
+#   fetched_at 是「**我们**什么时候抓到的」，不是「新闻什么时候发的」。
+#   两者混用等于凭空给旧闻造出新鲜度 —— 实测一篇 6 月的每经/证券时报旧闻
+#   （百度百家号页），搜索结果里没带发布时间 → publish_time=NULL →
+#   下游 `COALESCE(publish_time, fetched_at)` 回退到 10-01 的抓取时间 →
+#   被当成「近 7 日新闻」写进了 10-08 的决策，LLM 据此给「基本面造假嫌疑」。
+#
+# 顺序按可信度：结构化元数据（JSON-LD / meta / JS 变量）> 正文里的时间文本。
+# **抽不出完整日期（年+月+日）就返回 None** —— 宁可这条新闻因缺时间被丢掉，
+# 也不能给一个猜的时间。宁可少，也不要错的。
+
+_PUB_RE = [
+    # JSON-LD / 常见结构化字段
+    re.compile(r'"datePublished"\s*:\s*"([^"]{8,40})"'),
+    re.compile(r'"datePublished"\s*:\s*(\d{13})'),
+    re.compile(r'"pubDate"\s*:\s*"([^"]{8,40})"'),          # RSS 里的字段名
+    re.compile(r'"publishTime"\s*:\s*"([^"]{8,40})"'),      # 东财等 JS 变量
+    re.compile(r'publishTime\s*=\s*"([^"]{8,40})"'),
+    re.compile(r'"rt_time"\s*:\s*"?(\d{13})"?'),            # 腾讯系
+    # meta 标签
+    re.compile(r'<meta[^>]+(?:name|property)=["\'](?:article:published_time|og:published_time'
+               r'|publishdate|publishtime|apub:time|PubDate|weibo:article:create_at)["\']'
+               r'[^>]+content=["\']([^"\']{8,40})["\']', re.I),
+    re.compile(r'<meta[^>]+content=["\']([^"\']{8,40})["\'][^>]+(?:name|property)=["\']'
+               r'(?:article:published_time|og:published_time|publishdate|apub:time)["\']', re.I),
+    # <time datetime="...">
+    re.compile(r'<time[^>]+datetime=["\']([^"\']{8,40})["\']', re.I),
+]
+
+# 正文里裸奔的时间文本（兜底，可信度最低）
+# 「年月日」中文式足够特异，可以不锚定；`2026/06/14` `2026-06-14` 这种
+# 在 HTML 里太常见（注释、版权、别的文章的日期），**必须**前面有时间标签，
+# 否则会把页面上任意一个日期当成发布时间 —— 错的时间比没有时间更糟。
+_PUB_TEXT_RE = re.compile(
+    r'(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日(?:\s*[ T]?\s*(\d{1,2}):(\d{2}))?')
+_PUB_TEXT_LABELED_RE = re.compile(
+    r'(?:发布(?:时间|于|日期)?|发表于|时间|来源|更新于|日期)\s*[:：]?\s*'
+    r'(20\d{2})[-/](\d{1,2})[-/](\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?')
+
+
+def _normalize_pub_dt(raw: str) -> str | None:
+    """把抽到的原始时间串规整成 ISO；不含完整年月日一律 None。"""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    # 13 位毫秒时间戳（weibo create_at 之类）
+    if s.isdigit() and len(s) == 13:
+        try:
+            return datetime.fromtimestamp(int(s) / 1000.0).isoformat(timespec="seconds")
+        except (ValueError, OSError, OverflowError):
+            return None
+    # ISO / 常见分隔
+    m = re.match(r'^(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})日?'
+                 r'(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?', s)
+    if m:
+        try:
+            dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                          int(m.group(4) or 0), int(m.group(5) or 0), int(m.group(6) or 0))
+        except ValueError:
+            return None
+        return dt.isoformat(timespec="seconds")
+    # 相对表述（「6小时前」/「发布于：4个月前」）交给已有的中文解析器
+    return _cn_relative_to_iso(s)
+
+
+def extract_publish_time(html: str, *, now: datetime | None = None) -> str | None:
+    """从新闻页面 HTML 里抽发布时间。抽不出返回 None（调用方应丢弃该条）。
+
+    拒绝「未来时间」：服务器时钟错、站点预发布时间都会给出未来的日期，
+    那种时间会让新闻永远留在「近 7 日」窗口里 —— 比没有时间更坏。
+    """
+    if not html:
+        return None
+    now = now or datetime.now()
+    for pat in _PUB_RE:
+        m = pat.search(html)
+        if not m:
+            continue
+        iso = _normalize_pub_dt(m.group(1))
+        if iso:
+            try:
+                dt = datetime.fromisoformat(iso)
+                if dt.replace(tzinfo=None) > now + timedelta(days=1):
+                    continue          # 未来时间，丢弃这个候选，继续找下一个
+            except ValueError:
+                continue
+            return iso
+    m = _PUB_TEXT_RE.search(html)
+    if m:
+        return _normalize_pub_dt(m.group(0))
+    m = _PUB_TEXT_LABELED_RE.search(html)
+    if m:
+        # 从**日期本身**开始截，不能传 group(0) —— 那个含「发布时间：」前缀，
+        # 而 _normalize_pub_dt 用的是 re.match（锚定开头），带前缀会解析失败。
+        return _normalize_pub_dt(m.group(0)[m.start(1) - m.start(0):])
+    return None
+
+
+def _html_to_text(html: str, limit: int = 4000) -> str:
+    """粗剥 HTML 成可读文本（给 LLM 读 / 做检索关键词）。"""
+    if not html:
+        return ""
+    s = re.sub(r'(?is)<(script|style|noscript)[^>]*>.*?</\1>', ' ', html)
+    s = re.sub(r'(?s)<!--.*?-->', ' ', s)
+    s = re.sub(r'<[^>]+>', ' ', s)
+    s = unquote(s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s[:limit]
+
+
+_PUBDATE_SYSTEM = (
+    "你从新闻正文中找出这篇报道的**发布时间**（不是抓取时间、不是更新时间）。"
+    "只依据正文里明确写出的日期时间。找不到就输出 NONE，绝不猜测、绝不用当前日期。"
+)
+_PUBDATE_USER = (
+    "标题：{title}\n\n正文：\n{body}\n\n"
+    "若正文中有明确的发布时间（年月日），输出 YYYY-MM-DD。"
+    "只有年月日没有时分秒也照样输出 YYYY-MM-DD。"
+    "没有明确发布时间就只输出 NONE。\n只输出这一行。"
+)
+
+
+def llm_extract_publish_time(title: str, body: str, conf: dict | None = None) -> str | None:
+    """第 2 级：让 LLM 从正文里读发布时间。
+
+    为什么不直接信 LLM 的日期输出：模型爱在没找到时给一个「今天」。
+    所以只在**正文里确实出现**该日期字符串时才认（交叉验证）。
+    """
+    if not body:
+        return None
+    try:
+        import llm_advisor
+        raw = (llm_advisor.ask(_PUBDATE_SYSTEM,
+                              _PUBDATE_USER.format(title=title, body=body[:3000]),
+                              conf) or "").strip()
+    except Exception:                                     # noqa: BLE001
+        return None
+    m = re.search(r'(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})', raw)
+    if not m:
+        return None
+    try:
+        dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+    iso = dt.isoformat(timespec="seconds")
+    # 交叉验证：正文里必须真的出现过这个日期，否则是模型编的
+    probe = "%d-%02d-%02d" % (dt.year, dt.month, dt.day)
+    alt = "%d年%d月%d日" % (dt.year, dt.month, dt.day)
+    if probe not in body and alt not in body:
+        return None
+    if dt > datetime.now() + timedelta(days=1):
+        return None
+    return iso
+
+
+def _search_candidate_urls(query: str, limit: int = 5) -> list[str]:
+    """找关联报道的 URL。**只用 URL，不用搜索引擎给的 pubDate** ——
+    那是索引时间（AGENTS.md 记过 searxng/bing 的坑），必须自己去正文抽。"""
+    urls: list[str] = []
+    try:
+        cfg = load_config() or {}
+        ch = ((cfg.get("channels") or {}).get("searxng")
+              or (cfg.get("searxng") or {}))
+        sx = (ch.get("url") or "").strip()
+        if sx:
+            r = requests.get(sx.rstrip("/") + "/search",
+                             params={"q": query, "format": "json", "language": "zh-CN"},
+                             headers=UA, timeout=15)
+            if r.status_code == 200:
+                for it in (r.json() or {}).get("results", [])[:limit]:
+                    if it.get("url"):
+                        urls.append(it["url"])
+    except Exception:                                     # noqa: BLE001
+        pass
+    if not urls:
+        try:
+            r = requests.get("https://cn.bing.com/search",
+                             params={"q": query, "format": "rss"},
+                             headers=UA, timeout=15)
+            if r.status_code == 200:
+                for i, m in enumerate(re.finditer(r'<link>(https?://[^<]+)</link>', r.text)):
+                    if i >= limit:
+                        break
+                    urls.append(m.group(1))
+        except Exception:                                 # noqa: BLE001
+            pass
+    return urls
+
+
+def search_publish_time(title: str, summary: str, *, rounds: int = 3,
+                        span_days: int = 90) -> str | None:
+    """第 3 级：用正文摘要去搜**关联报道**，读它们的发布时间。
+
+    迭代最多 `rounds` 轮，每轮用上轮学到的词细化检索词。
+
+    取关联报道里**最早**的那个时间当估计值 —— 方向偏保守（宁可当成旧的、
+    被 7 天窗口丢掉，也不要当成新的喂给决策），这与用户「宁可少」的要求一致。
+    自保：关联报道的时间跨度超过 `span_days` 说明这是个常青话题、
+    根本没法据此断代，直接放弃。
+    """
+    base = (title or "").strip()
+    if not base:
+        return None
+    query = base[:60]
+    found: list[datetime] = []
+    for i in range(max(1, rounds)):
+        q = query if i == 0 else "%s %s" % (base[:40], (summary or "")[:60])
+        for u in _search_candidate_urls(q, limit=4):
+            if not u.startswith("http"):
+                continue
+            try:
+                r = requests.get(u, headers=UA, timeout=12)
+                if r.status_code != 200:
+                    continue
+                r.encoding = r.apparent_encoding or r.encoding
+                iso = extract_publish_time(r.text)
+                if iso:
+                    found.append(datetime.fromisoformat(iso).replace(tzinfo=None))
+            except Exception:                             # noqa: BLE001
+                continue
+        if found:
+            break
+        if not summary:
+            break
+    if not found:
+        return None
+    found.sort()
+    if (found[-1] - found[0]).days > span_days:
+        return None                # 跨度太大，无法据此断代
+    return found[0].isoformat(timespec="seconds")
+
+
+def resolve_publish_time(url: str, title: str, conf: dict | None = None,
+                         *, search_rounds: int = 3) -> tuple[str | None, str]:
+    """三级降级抽发布时间。返回 (ISO | None, 命中方式)。
+
+    1) 页面正则（meta / JSON-LD / 正文时间文本）
+    2) LLM 读正文（且必须能在正文里交叉验证到同一个日期）
+    3) 用正文摘要搜关联报道，读它们的发布时间（最多迭代 search_rounds 轮）
+    全都不行 -> 返回 (None, 'none')，调用方**丢弃这条新闻**
+    """
+    body = ""
+    try:
+        r = requests.get(url, headers=UA, timeout=15)
+        if r.status_code == 200:
+            r.encoding = r.apparent_encoding or r.encoding
+            html = r.text
+            iso = extract_publish_time(html)
+            if iso:
+                return iso, "pattern"
+            body = _html_to_text(html)
+        else:
+            return None, "http_%s" % r.status_code
+    except Exception:                                     # noqa: BLE001
+        return None, "fetch_error"
+
+    iso = llm_extract_publish_time(title, body, conf)
+    if iso:
+        return iso, "llm"
+
+    summary = body[:300] if body else ""
+    iso = search_publish_time(title, summary, rounds=search_rounds)
+    if iso:
+        return iso, "related"
+    return None, "none"
+
+
+def backfill_publish_times(items: list[dict], conf: dict | None = None,
+                           *, max_fetch: int = 8) -> dict:
+    """给缺 publish_time 的条目走三级降级抽时间。抽不到就丢弃（不猜）。"""
+    conf = conf or {}
+    st = {"missing": 0, "fetched": 0, "pattern": 0, "llm": 0, "related": 0,
+          "still_none": 0, "errors": 0}
+    if not items:
+        return st
+    st["missing"] = sum(1 for it in items if not it.get("publish_time"))
+    if not st["missing"]:
+        return st
+    rounds = int(conf.get("pubtime_search_rounds", 3) or 3)
+    for it in items:
+        if st["fetched"] >= max_fetch:
+            break
+        if it.get("publish_time"):
+            continue
+        url = it.get("url") or ""
+        if not url.startswith("http"):
+            continue
+        st["fetched"] += 1
+        iso, how = resolve_publish_time(url, it.get("title") or "", conf,
+                                        search_rounds=rounds)
+        if iso:
+            it["publish_time"] = iso
+            it["_pubtime_src"] = how
+            if how in ("pattern", "llm", "related"):
+                st[how] += 1
+            else:
+                st["still_none"] += 1
+        else:
+            st["still_none"] += 1
+            if how == "fetch_error":
+                st["errors"] += 1
+    return st
 
 
 def _looks_like_news(url: str, title: str) -> bool:
@@ -1009,10 +1329,19 @@ def _llm_filter_news_items(code: str, name: str, items: list[dict]) -> list[dict
         url = it.get("url") or ""
         lines.append(f"{i}. title={title} | media={media} | publish_time={pub} | url={url}")
     system = (
-        "你是一个金融新闻过滤器。请根据提供的股票代码与名称，判断哪些新闻：\n"
-        f"1) **发布时间是 2 天内**（日期距今 <= 2 天），2) **真的与当前股票有关**（标题、媒体、URL 中明确提及该股票名称、代码、公司其主营业务或重要业务动态）。\n"
-        "不相关的、纯行情数据的、首页链接、广告页等全部剔除。\n"
-        "只输出一个 JSON 数组，索引对应输入行号，不要包含任何额外说明、markdown 或代码块。"
+        "你是财经资讯编辑。下面是按股票名搜到的候选条目，逐条判断它**是不是一篇"
+        "真正的新闻报道**，只保留同时满足以下三条的条目：\n"
+        "  (1) 内容类型是**新闻/公告/解读**：报道了一件事、有叙事主体。\n"
+        "      行情页、报价页、分时图页、数据统计表页（如股东户数、融资融券明细、"
+        "ROE 排名、行情快照）、公司简介/百科词条、栏目目录页、专题聚合页 —— "
+        "这些**不是新闻**，一律剔除。**不要用具体词去匹配，按内容类型判断**，"
+        "因为你不可能穷举下一次的关键词。\n"
+        "  (2) 有明确的发布时间且在该股票近期窗口内；publish_time 为空的"
+        "条目一律剔除（时效未知，不能当作新消息）。\n"
+        "  (3) 与该股票或其行业直接相关（公司自身、行业、上下游、竞争对手的重要动态）。\n"
+        "同一件事的多家转载只留一条。\n"
+        "只输出满足条件的编号 JSON 数组，例如 [0,3,5]。不要包含任何额外说明、"
+        "markdown 或代码块。"
     )
     user = f"股票代码: {code}\n股票名称: {name}\n\n新闻列表:\n" + "\n".join(lines)
     try:
@@ -1094,7 +1423,6 @@ def fetch_for_stock(code: str, name: str, conf: dict | None = None,
         else:
             seen[url] = item
             uniq.append(item)
-    uniq = _llm_filter_news_items(code, name, uniq)
     uniq = _llm_filter_news_items(code, name, uniq)
     return {"code": code, "name": name, "results": uniq, "errors": errors}
 
@@ -1182,25 +1510,38 @@ def save_to_db(items: list[dict], related_map: dict[str, list[str]] | None = Non
         return 0
     senti_words = senti_words or {}
     inserted = 0
+    skipped_no_time = 0
+    skipped_bad_time = 0
+    skipped_too_old = 0
     now = datetime.now()
     max_age_days = 7  # 只保留最近 7 天的新闻，旧新闻对决策没有价值
+    # 先试着从正文抽发布时间；抽不到的在下面被丢弃。
+    # 「抓取时间不等于发布时间」—— 用户 2026-10-08 定的规矩。
+    _bf = backfill_publish_times(items)
     with _db() as conn, conn.cursor() as cur:
         for it in items:
-            # 过滤旧新闻：publish_time 存在且超过 max_age_days 天的跳过。
-            # publish_time 为 None 的（如 SearXNG/bing）不过滤 —— 它们没有时间信息，
-            # 无法判断新旧，宁可保留（下游可以按 fetched_at 过滤）。
+            # 时效闸门（2026-10-08 用户定的规矩）：**没有发布时间就不用**。
+            # 原来这里是「publish_time 为 None 不过滤，宁可保留（下游按 fetched_at
+            # 过滤）」—— 那正是 6 月旧闻被当成今天新闻的根因：fetched_at 是
+            # 「我们什么时候抓到的」，不是「新闻什么时候发的」，拿它当时效
+            # 等于凭空造出新鲜度。宁可少，也不要错的。
             pub = it.get("publish_time")
-            if pub:
-                try:
-                    if isinstance(pub, str):
-                        pub_dt = datetime.fromisoformat(pub.replace("Z", "+00:00"))
-                    else:
-                        pub_dt = pub
-                    age_days = (now - pub_dt.replace(tzinfo=None)).days
-                    if age_days > max_age_days:
-                        continue
-                except (ValueError, TypeError):
-                    pass  # 时间解析失败不过滤，宁可保留
+            if not pub:
+                skipped_no_time += 1
+                continue
+            # 解析不出来的时间同样不能用 —— 原来这里是 `except: pass`
+            # 「时间解析失败不过滤，宁可保留」，那等于放进来一条时效未知
+            # 的新闻，和上面那条 NULL 是一个洞。
+            try:
+                pub_dt = (datetime.fromisoformat(pub.replace("Z", "+00:00"))
+                          if isinstance(pub, str) else pub)
+                pub_dt = pub_dt.replace(tzinfo=None)
+            except (ValueError, TypeError):
+                skipped_bad_time += 1
+                continue
+            if (now - pub_dt).days > max_age_days:
+                skipped_too_old += 1
+                continue
             sw = senti_words.get(it.get("code")) or {}
             senti = classify_sentiment(it.get("title") or "",
                                        sw.get("pos"), sw.get("neg"))
@@ -1217,6 +1558,13 @@ def save_to_db(items: list[dict], related_map: dict[str, list[str]] | None = Non
                     "UPDATE sa_news SET sentiment = 'neg' "
                     "WHERE url = %s AND sentiment <> 'neg'", (it["url"],))
     _save_relations(related_map or {})
+    # 丢弃必须**可见**：静默丢一半新闻会让人以为「今天没新闻」，
+    # 而实际是「抽不到发布时间的被丢了」—— 这正是原来查不出来的原因。
+    if (skipped_no_time or skipped_bad_time or skipped_too_old) and items:
+        print("[news] 入库过滤：新增 %d，丢弃 无时间 %d / 时间不可解析 %d / 超过%d天 %d"
+              "（backfill 抽取 %d）"
+              % (inserted, skipped_no_time, skipped_bad_time, max_age_days,
+                 skipped_too_old, _bf.get("extracted", 0)), flush=True)
     return inserted
 
 

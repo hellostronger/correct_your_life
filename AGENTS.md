@@ -298,6 +298,344 @@ NoneType.__format__`，成果**全部丢失**。真因是 `f"{r.get('price'):.2f
 测试：`%LOCALAPPDATA%\Temp\opencode\test_cal_gate.py`（17 项，含
 「None 时交易停、结算继续」「is_trading 折叠逻辑未改」回归）。
 
+### 卖出结算必崩：`_settle_buy_rows` 拿 tuple 当 dict 用（2026-10-08 修）
+
+**症状**：`sa_paper_trades` 的**卖出成交永远不落库**。日志反复：
+
+```
+File "paper_trading.py", line 1671, in _execute_decision
+    _settle_buy_rows(cur, code, shares, price, today, ...)
+File "paper_trading.py", line 1808, in _settle_buy_rows
+    bought = int(r["shares"] or 0)
+TypeError: tuple indices must be integers or slices, not str
+```
+
+路径是 `check_stop_loss` → `_execute_decision` → `_settle_buy_rows`。
+
+**真因：游标类型和取字段的方式对不上。**
+
+| 位置 | 写法 | 行是什么 |
+|---|---|---|
+| `_execute_decision:1500` | `cur = conn.cursor()` | **tuple** |
+| `_settle_buy_rows:1808` | `r["shares"]` | 当 dict 用 → **TypeError** |
+
+同一文件里 `_account_row` / `_derive_paper_positions` 都写了
+`isinstance(row, dict)` 分支来兼容两种游标，**唯独 `_settle_buy_rows` 漏了**。
+
+**影响面**：只要该股存在 `status='open'` 的买入行，`rows` 非空就进循环、
+必抛异常 → 事务回滚 → **止损卖单、决策卖单全部落不了库**。
+（`rows` 为空时循环不进反而不炸，所以「有时能卖出」纯属运气。）
+
+**修法**：加 `_SETTLE_BUY_COLS` 模块常量 + 循环开头一行归一化，
+照抄本文件已有的兼容写法：
+
+```python
+if not isinstance(r, dict):
+    r = dict(zip(_SETTLE_BUY_COLS, r))
+```
+
+**并把 SELECT 改成由 `_SETTLE_BUY_COLS` 生成**：
+`"SELECT " + ", ".join(_SETTLE_BUY_COLS) + " FROM ..."`。
+这样**列名和列顺序不可能再漂移** —— 漂移的后果是**静默算错份额和收益率**
+（tuple 按位置取，不报错），比崩溃危险得多。
+
+**未改 `_execute_decision` 的游标**（另一个方案是把它换成 `RealDictCursor`）：
+`position_limit_status` / `sellable_shares` / `_alpha_for_round` 三个 helper
+还没审过，风险面更大。改动只在读行，不碰任何金额/份额/手续费口径。
+
+**验证**：`%LOCALAPPDATA%\Temp\opencode\test_settle_cursor.py`（**14 项**，全
+FakeCursor、**不碰生产库**），最强的一条是**parity**：
+tuple 模式与 dict 模式必须产出**逐字节相同的 SQL 与参数**，
+否则「修好了」也可能悄悄改了金额。
+回归：`test_debate_persist` 54 / `test_trunc` / `test_cal_gate` / `test_rc_veto`
+**全部通过，零回归**。
+
+> 写断言时我错了两次，都是**断言写错不是代码有洞**：
+> ① 以为部分平仓 `closed` 返回 0 —— 实际 line 1849 两个分支都 `closed += 1`，
+>    它统计的是**被结算的行数**不是「整笔核销数」；
+> ② 参数下标取错，`shares` 是 `[5]`、`value` 才是 `[6]`，我拿 `[6]` 断言 shares
+>    得到 4000.0，差点以为代码算错了。
+> → 断言的预期必须**独立于被测代码**推导，别照抄实现（下标就是照抄的）。
+
+### ⚠️ 部分平仓永远不可能成功：remainder 行撞唯一索引（2026-10-08 查明，未修）
+
+**上一条的姊妹 bug，修好 TypeError 之后才暴露出来。**
+
+`sa_paper_trades` 上有唯一索引：
+
+```
+sa_paper_trades_trade_date_slot_code_side_key
+  UNIQUE (trade_date, slot, code, side)
+```
+
+`_settle_buy_rows` 的**部分平仓**分支把 `trade_date`/`slot` **原样复制**：
+
+```sql
+INSERT INTO sa_paper_trades (code, name, trade_date, slot, side, shares, ...)
+SELECT code, name, trade_date, slot, 'buy', %s, price, %s, ...
+  FROM sa_paper_trades WHERE id=%s
+```
+
+→ remainder 行与被拆的那行 **(trade_date, slot, code, side) 完全相同**，
+且 INSERT 发生在把原行改成 `resolved` 的 UPDATE **之前**（line 1832 vs 1841），
+所以**必然** `UniqueViolation`。实测：
+
+```
+psycopg2.errors.UniqueViolation: duplicate key value violates unique constraint
+  "sa_paper_trades_trade_date_slot_code_side_key"
+DETAIL: Key (trade_date, slot, code, side)=(2026-09-25, , 600406, buy) already exists.
+```
+
+**与游标 bug 的关系**：修之前部分平仓报 TypeError，修之后报 UniqueViolation ——
+**两个都得修才能走通**。整笔平仓只 UPDATE 不 INSERT，**不受影响**（已实测通过）。
+
+**为什么不能自己修**：要让 remainder 行不撞索引，就得改 `slot`（或置 NULL ——
+Postgres 唯一索引里 NULL 之间不冲突，而**空串 `''` 会冲突**，库里 buy 行有
+**9 行 `slot=''`、0 行 NULL**，600406 的 id=118 就是 `slot=''`）。
+但 `slot` 同时是 `_execute_decision` 的**幂等守卫**字段：
+
+```sql
+WHERE trade_date=%s AND slot=%s AND code=%s AND status<>'skipped'
+```
+
+改动会影响「本轮是否已决策过」的判定和按轮次分组的报表口径
+（`sa_paper_cycles` / rounds）。**这属于交易口径，必须先问用户**，没动。
+
+**验证脚本**：`test_settle_realdb.py`（6 项，真连生产库、**自己 rollback
+并回查计数**）。它先试 1 股 → 撞 UniqueViolation；改成卖出**恰好等于最老
+未平仓行**的股数（整笔平仓）→ 通过，且 `18→18 行 / 600→600 股 / 3→3 open`
+证明回滚真的生效（AGENTS.md：回滚了不等于没写进去）。
+
+### 启动本地服务：只有一种起法能活下来（2026-10-08 实测）
+
+用户自己的 `run_local.py`（`%LOCALAPPDATA%\Temp\opencode\run_local.py`，
+UTF-8 重定向日志 + `NO_PROXY=*` + 固定 cwd + 剔掉会遮蔽真 `click` 包的
+`sys.path[0]`）是对的，**别改**。但「怎么把它启动起来」有坑：
+
+| 方式 | 结果 |
+|---|---|
+| harness `background:true` + `python -m uvicorn` | 跑 43 分钟后 `Exited with code 1`，**harness 只报 exit code，进程已死** |
+| `Start-Process -WindowStyle Hidden` | 瞬死，**连 `=== launcher start ===` 都没写出来** |
+| `Invoke-CimMethod Win32_Process Create`（WMI） | 同上，瞬死 |
+| `schtasks /Create` + `/Run` | 同上，瞬死（任务本身创建成功，但进程一样没起来） |
+| **`Start-Process -RedirectStandardOutput/-Error -NoNewWindow` + 同一条命令里轮询端口** | ✅ **活着，端口在听** |
+
+**判据仍然是 AGENTS.md 那条**：光看「8686 在监听」不够，要核对
+**监听 PID 的 CreationDate 晚于被改文件的 mtime**。
+
+⚠️ 我因此犯了个错：为了上修复**先 kill 了用户 15:02:48 起的进程**，
+结果四种起法全失败、**服务停了 20 分钟**才找到能活的那一种。
+**正确顺序是先把能存活的起法验证通过，再动旧进程。**
+
+### 🔴 新闻时效：抓取时间 ≠ 发布时间（2026-10-08 用户定规矩，已修）
+
+**症状**：10-08 的每日总结里，**莲花控股 600186** 写着
+「每经/证券时报揭露投资标的阶跃星辰大额亏损 | -4 基本面造假嫌疑 | 观望80%」，
+用户指出**那是 6 月的新闻**。
+
+**真因（三层，缺一不可）**：
+
+**① 下游拿 `fetched_at` 顶替缺失的 `publish_time`。**
+`app.py` 三处查询都是 `COALESCE(n.publish_time, n.fetched_at) > now() - interval 'N days'`。
+`fetched_at` 是「**我们**什么时候抓到的」，不是「新闻什么时候发的」。
+百度会持续把 6 月的旧百家号页返在搜索结果里 → 10-01 抓到 →
+**10-08 的报告里就成了「近 7 日新闻」**。这是最关键的一条。
+
+**② 入库层主动放行无时间的条目。** `save_to_db` 原来写着
+「publish_time 为 None 的（如 SearXNG/bing）不过滤 —— 宁可保留
+（**下游可以按 fetched_at 过滤**）」。那句注释就是根因的说明书。
+同一段还有个洞：`except (ValueError, TypeError): pass  # 时间解析失败不过滤`。
+
+**③ 时间解析器只认到「天」。** `_cn_relative_to_iso` 支持
+`分钟前/小时前/天前`，**不认 `周前/月前/年前`**。一篇 6 月的旧闻，
+百度标「4个月前」→ 解析返回 `None` → 落成 NULL → 走 ①。
+实测该缺口 6 种表述全部返回 None（`test_time_parse.py` 修前 `GAP_CONFIRMED`）。
+
+**顺带查出两个独立的真 bug（都是「安静地错」类型）**：
+
+| bug | 后果 |
+|---|---|
+| `ORDER BY n.url, COALESCE(...) DESC LIMIT 6` + `DISTINCT ON (n.url)` | `DISTINCT ON` 强制 ORDER BY 以 url 打头，于是 **LIMIT 取的是 url 序最靠前的 N 条，不是最新的 N 条**。实测莲花控股**最新的 6 条全被丢弃**，报告展示的是最旧的一批 |
+| 时效过滤用 `COALESCE` | 见 ① |
+
+**修法**：
+
+1. **查询层**：三处（`_paper_news_rows` / `_plan_recent_news_titles` / `/api/news`）
+   改成 `n.publish_time IS NOT NULL AND n.publish_time > now() - interval ...`，
+   **彻底删掉 `COALESCE(..., fetched_at)`**。
+   去重下沉到子查询（`DISTINCT ON` 留在内层、外层 `ORDER BY publish_time DESC LIMIT`），
+   顺便修掉排序 bug。
+2. **入库层**：无 `publish_time` 直接丢弃；`时间解析失败` 也丢弃。
+   丢弃**必须打印**（`[news] 入库过滤：新增 N，丢弃 无时间/不可解析/超期`）——
+   静默丢一半会让人误以为「今天没新闻」。
+3. **解析器**：补 `周前/月(个)前/年(个)前/半?小时前`（月按 30 天、年按 365 天折算，
+   误差方向安全）。修后 `test_time_parse.py` → `NO_GAP`。
+4. **三级降级抽时间**（用户要求：先试 LLM，再搜关联报道，迭代 3 次，仍不行就放弃）：
+   `news_fetcher.resolve_publish_time()`
+   - **tier1 `pattern`**：`extract_publish_time(html)` — JSON-LD `datePublished`、
+     meta(`article:published_time`/`og:published_time`/`publishdate`/`apub:time`)、
+     `<time datetime>`、东财 `publishTime` JS 变量、13 位毫秒、正文「年月日」。
+     **拒绝未来时间**（时钟错/预发布会让新闻永远留在近 7 日窗口，比没时间更坏）。
+   - **tier2 `llm`**：让 LLM 读正文给日期，**但必须在正文里交叉验证到同一日期字符串**
+     才认 —— 模型爱在没找到时答「今天」。
+   - **tier3 `related`**：摘正文 300 字去搜关联报道，读**它们**的时间，最多迭代 3 轮。
+     取**最早**那个（方向保守：宁可当旧的丢掉）。关联报道时间跨度 > 90 天
+     说明是常青话题、无法断代 → 放弃。
+     ⚠️ 搜索只取 URL，**绝不用搜索引擎给的 `pubDate`**（那是索引时间，见 SearXNG 那节）。
+   - 全失败 → 丢弃。
+
+**验证**：
+
+| 脚本 | 项 | 结果 |
+|---|---|---|
+| `test_pub_extract.py` | 26 | 全过（1 级 8 种页面形态 + 未来/裸年份/无标签日期拒绝）|
+| `test_news_time_gate.py` | 9 | 全过（3 条 SQL 真跑、零 NULL、按时间倒序）|
+| `test_pubtime_chain.py` | 真网络 | **那 3 篇骗人的文章实测：2 篇 tier3 解析出 `2026-05-27`（133 天前）→ 被 7 天窗口正确丢弃；1 篇放弃丢弃** |
+| `test_news_api_live.py` | 6 | 全过（`/api/news` 零缺时间、倒序、**阶跃星辰已不出现**）|
+
+回归：`test_debate_persist` 54 / `test_trunc` / `test_cal_gate` / `test_settle_cursor` 14
+**全过**。`test_time_parse` 修前 6 缺口 → 修后 `NO_GAP`。
+
+**代价（明说，别让人以为是数据丢了）**：`sa_news` 15602 行里
+**6761 行（43%）没有发布时间**，现在全部不再参与决策；
+可用（近 7 天且有真实发布时间）**1549 行**，另有 **7292 行有时间但已超期**（本就超期）。
+按来源看 NULL 率：`baidu 75%`、`bing 100%`、`duckduckgo 100%`、`searxng 17%`，
+而 **`eastmoney` / `sina` / `ak_em` / `wx_channels` 全是 0%**（可信渠道）。
+
+### 关掉 bing 与 duckduckgo（2026-10-08，用户「没用的就关掉吧」）
+
+**先实测再关**（AGENTS.md 第 2 条），不是照着聚合数字下结论：
+
+| 渠道 | 实测（600186 莲花控股） | 库里 total / 无时间 / 近30天 |
+|---|---|---|
+| **bing** | 返回 5 条、**带发布时间 0 条**、0.5s。标题是「公司简介-浙江大学…」「悟空洁身露增长51%」「2026中秋佳品礼盒」—— **跟莲花控股毫无关系** | 422 / 422 / **0** |
+| **duckduckgo** | 返回 **0 条**、白等 **16.1s** | 668 / 668 / **0** |
+| eastmoney | 20 条、20 条带时间、1.2s | 5699 / 0 / 4862 |
+| searxng | 7 条、7 条带时间、1.7s | 1079 / 181 / 898 |
+| baidu | 1 条带时间（稀疏但有效） | 7273 / 5490 / 1783 |
+| sina | 本轮 0 条（偶发），但库里有 289 条近 30 天 → **保留** | 304 / 0 / 289 |
+
+→ 只关 `bing` + `duckduckgo`，**`sina` 保留**（单轮为空是偶发，不能凭一次就判死）。
+剩下的 `eastmoney / ak_em / baidu / sina / searxng` 一条没动。
+实测关掉后仍能取到 **40/40 条带发布时间**的条目 —— 不是「全关了就没新闻了」。
+
+**为什么不需要重启**：`load_config()` 每轮都重读 `config.yaml`
+（`fetch_watchlist` / `fetch_topics` 都是 `conf = conf or load_config()`），
+下一轮抓取自动生效。开关判断是
+`if not ch_conf.get("enabled", False): continue` —— **缺 key 时默认关**（fail-safe），
+而 `load_config` 是**逐个渠道 merge** 到 `DEFAULT_CONF` 之上，
+所以 config.yaml 里的 `false` 不会被默认值覆盖。
+
+⚠️ **`config.yaml` 含明文密钥且已 gitignore，不要提交**；
+本次只同步改了 `config.example.yaml`（可提交那份）。
+
+> 写测试时我又错了两次，都是**断言写错不是代码有洞**：
+> ① 月份按 30 天折算，我却按日历月写期望（4 个月前应得 06-10 而非 06-08）；
+> ② weibo 那条 fixture 我漏写了 `name=`，属性选择器匹配不到。
+> 另外真正的代码 bug 是测试抓出来的：`_normalize_pub_dt(m.group(0))`
+> 传了**含「发布时间：」前缀**的整串，而它内部用 `re.match` 锚定开头 → 永远解析失败。
+> 第三处：探针里我把渠道配置读成 `conf["news"]["channels"]`，
+> 而 `news_fetcher` 的 conf 里 channels 在**顶层** → 一开始打印 `[]`，
+> 差点误判成「配置没生效」。
+
+### 「这是不是新闻」不能靠关键词黑名单（2026-10-08 用户指出，已改成通用方案）
+
+**用户的原话**：「不是写代码写死吧，下次不是这个关键字怎么办，应该是通用的呀」。
+
+**背景**：莲花控股那 7 天窗口里混着 `分时-莲花控股`、`千股千问ROE数据`、
+`股东户数(33户)`、`融资融券明细,2025年三季度`、`东方财富网_莲花控股_公司`。
+我第一反应是「再加几个词到 `_NOT_NEWS_HOSTS` / `_NOT_NEWS_TITLE`」——
+**那是错的**，那个黑名单已经有洞了（这些全是从正常新闻站 host 出来的），
+再加词只是把洞挪个位置，下次换个词又漏。
+
+**改法**：判断「这是不是一篇新闻」是**语义问题**，交给已有的
+`_llm_filter_news_items()`，把 prompt 从「按关键词/按 2 天内」改成
+**按内容类型**判断，并明确写了「不要用具体词去匹配，因为你不可能穷举下一次的关键词」。
+代码只负责提供**结构化事实**（标题、来源、发布时间、URL），判断交给 LLM。
+
+prompt 的三条判据（都不是关键词）：
+1. **内容类型**：新闻/公告/解读 = 有一件事、有叙事主体；行情页、报价页、
+   分时图页、数据统计表页、百科词条、目录页、聚合页 = 不是新闻
+2. **有明确发布时间且在窗口内**；`publish_time` 为空一律剔除（与新规一致）
+3. 与该股或其行业直接相关；同一件事的转载只留一条
+
+**实测（真调 LLM，喂 600186 真实 14 条）**：
+- **漏网的行情/资料页 = 0**
+- 被剔除的包含**任何关键词表都不会列的**东西：YouTube 的 ASMR 视频、
+  `EBOD-633 太阳望远镜选购`（百科词条）、`百科的进一步说明:225-236`、
+  `商品ASMR混剪`、`龙虎榜:涨幅偏离值达9%`、两条融资融券明细
+  → **证明它是语义判断，不是词表**
+- 保留的 2 条都是真新闻（持有浙大智能制造创新中心股权、商誉减值约 7.20 亿元）
+
+**顺带修掉一个真 bug**：`fetch_for_stock` 里
+`uniq = _llm_filter_news_items(code, name, uniq)` **写了两遍** ——
+同一个列表跑两次 LLM，既浪费又可能二次过滤。
+
+**时间抽取那部分本来就是通用的**（顺带自证）：新增代码里唯一的中文字面量
+只有**日期格式标记**（`年/月/日`、`发布时间/发表于/时间/来源/更新于/日期`）
+和 LLM prompt，**没有任何股票名、公司名、题材关键词**。
+1 级靠的是标准属性名（`article:published_time` / `datePublished` /
+`<time datetime>`）+ 日期正则；2 级靠 LLM；3 级靠搜索关联报道。
+
+> 编辑工具在这个文件上反复失配（**行尾混合**：242 个裸 LF + 部分 CRLF）。
+> 最后用**按行号定位**的脚本改（`patch_llm_prompt.py`）才成功 ——
+> AGENTS.md 早先记过这个坑，这里再确认一次。
+
+### 🔴 止损失败会静默回滚 —— 3 只持仓跌破止损线却没卖（2026-10-08 修）
+
+**症状**：用户问「科创50ETF华夏为什么没按计划严格止损」。查下来不是判据问题，
+是**止损触发了但成交被回滚**：
+
+| 代码 | 名称 | 成本 | 止损 | 止损价 | 10-08 最低 | 卖出记录 |
+|---|---|---|---|---|---|---|
+| 588000 | 科创50ETF华夏 | 1.6440 | -4% | 1.5782 | **1.5270** | **0** |
+| 513980 | 港股科技ETF景顺 | 0.5840 | -5% | 0.5548 | **0.5510** | **0** |
+| 01024 | 快手-W | 30.62 | -5% | 29.089 | **28.52** | **0** |
+
+**真因**：`_execute_decision` 用 `with get_conn() as conn:`，
+`_settle_buy_rows` 里抛的 TypeError（见上一条，游标 tuple/dict 不匹配）
+会让**整个事务回滚** —— 刚 INSERT 的卖单一起没了。
+
+**为什么没人发现**：`check_stop_loss` 把异常 `except` 掉，只
+`traceback.print_exc()` + 塞进返回值的 `skipped`，**既不发通知也不计数上报**。
+于是现象只是「今天没止损」，日志里躺着 traceback 但没人第一时间看见。
+→ 与 AGENTS.md「静默降级比报错危险」同源：**风控静默失效最糟**。
+
+**修法**（`check_stop_loss`）：
+1. 异常分支给 skipped 项打 `FAILED: True`
+2. 扫出 `failed` 列表 → 打印 `[paper] 🔴 止损失败 N 只` + `notify_fn(...)`
+3. **只报 `FAILED`，不报 T+1 锁定 / 行情不可得**这类正常跳过 ——
+   那是天天发生的，报了就是噪音，**噪音等于没报警**
+4. 去重：`_STOPLOSS_ALERTED` 记 `(交易日, code, 原因)`，同一故障当天只报一次
+   （盘中每 N 分钟一轮，不去重一天能发几十条同样的告警）
+5. 通知本身包 try/except —— 通知挂了绝不能反过来打断止损循环
+6. 新事件 `paper_stoploss_failed` 登记进 `notify_events.EVENTS`
+   （`default: wx+email`，属于「必须看到」的一类）
+
+⚠️ `event_default()` 对**未登记**事件是**全开**（fail-open，故意如此，
+好让 `POST /api/notify/send` 手工发的消息不被静默丢掉）——
+所以漏登记不会丢告警，但会没有 UI 标签、也没法单独配渠道。
+
+**修复时机的尴尬**：`settle_buy_rows` 修好是 **15:54**，A 股 **15:00 已收盘**，
+所以修复后没有任何交易时段可用。**下一个交易时段（10-09）才会真正成交。**
+
+**仍未解决、需用户定口径**：止损判据是「**现价**跌破」，
+所以 10-09 若反弹回止损线上方就**不会**卖 —— 今天那次破位不会被记住。
+要不要改成「盘中触及即锁死」，属策略口径变更，没动。
+
+**验证**：`test_stoploss_alert.py`（**18 项**，全 Fake deps，不碰库不联网）——
+失败必发通知且带事件名/代码、去重生效（第二轮不重发但仍记 `failed`）、
+T+1 跳过**不发**通知、通知炸了止损循环照常返回。
+回归 `test_settle_cursor` 14 / `test_settle_realdb` 6 / `test_cal_gate` /
+`test_trunc` / `test_debate_persist` 54 **全过**。
+实机：`/api/notify/events` 里 `paper_stoploss_failed` 的
+`effective = {wx: true, email: true}`。
+
+> 写断言时我错了一次：以为「未登记事件会被静默丢掉」，
+> 实测 `event_default` 是 **fail-open 全开**。断言写错不是代码有洞。
+> 另外 `_execute_decision` 里的异常路径必须**整段包 try/except** ——
+> 它是风控的最后一道闸门，闸门自己报错时不能连带把止损循环带走。
+
 ### 新浪板块资金流（2026-10-01 采纳为第三数据源）
 
 > ⚠️ 我之前在本文件写过「新浪板块只有 49 行业，无资金流」——**那是错的**，
@@ -616,6 +954,554 @@ compose 改标签**必须用通配**并 `grep` 复核（写死版本号会静默
 **build cache**（当时 2.97GB）。`docker builder prune -f` 之后
 96% → 89%（40G 用 34G，剩 4.4G）。镜像内 `/app` 自己就 2.4GB。
 
+### 全市场供给冲击 + 海外市场：解禁潮 / 增发 / 减持 / 美日韩资金抽离（2026-10-06）
+
+新增 `stock-advisor/supply_events.py` + `global_markets.py`，端点
+`/api/supply-events/calendar`、`/api/global-markets/snapshot`，守护线程
+`sa_supply_market`（工作日 8:30 后一轮，**只在有信号时才推**）。
+
+**与 `alerts.py` 是两个维度不是替代**：`alerts.py` 逐代码查 → 只覆盖自选股；
+新模块去掉 `SECURITY_CODE in (...)` 过滤 → **全市场**，按日聚合判「潮」。
+
+### 解禁数据源实测（东财 datacenter-web 可用，别再怀疑）
+
+| 事实 | 值 |
+|---|---|
+| 解禁 `RPT_LIFT_STAGE` | 全表 **31,617 行**；未来 60 天 293 行 |
+| 增发 `RPT_SEO_DETAIL` | 全表 5,900 行；未来 180 天仅 **3 条**（天然稀疏，**不能用分位数判潮**）|
+| 减持 `RPT_SHARE_HOLDER_INCREASE` | 全表 **146,773 行**，`DIRECTION` 取中文字符串 |
+| 延迟 | 0.1~0.3 秒/请求；`pageSize=300` 可一次拿完 293 行 |
+
+**坑（都是实测）**：
+
+1. `LIFT_MARKET_CAP` 单位是**万元**（不是元），/1e4 才是亿元；
+   `CURRENT_FREE_SHARES` 是**万股**。写错差 1e4 倍。
+2. **`DIRECTION="减持"` 的中文枚举值必须用双引号**。单引号
+   `(DIRECTION='减持')` 实测**静默返回空** —— 看起来像「最近没人减持」。
+3. 聚类字段（`COUNT`/`SUM_MARKET_CAP`）**不存在**，报
+   `9501 COUNT返回字段不存在` → 按日聚合必须在客户端做。
+4. **「空」有两种原因，必须区分**：`success=true` + `result=null` = 真的 0 行；
+   `success=false` + `code=9501` = **参数写错**。HTTP 都是 200。
+   实测踩过：`PREDICT_DATE` 列不存在时报 `9501`，差点误判成「未来无增发」。
+   `_dc_query` 因此返回 `meta`（success/code/message/count）。
+5. `LIFT_MARKET_CAP=0` 占 0.9%（都是定向增发机构配售），求和不失真但要单独计数。
+
+### 减持做不出「前瞻日历」——源的结构性限制
+
+`RPT_SHARE_HOLDER_INCREASE` 的 `NOTICE_DATE` / `START_DATE` / `END_DATE` /
+`TRADE_DATE` **四个字段在未来窗口全部 0 行**（2026-10-06 实测）——
+这张表**只收录已过公告日**的减持。所以：
+
+- `supply_events.py` 里减持是 **`MODE="backward"` 回顾模式**，不做假前瞻
+- 真要前瞻只能走逐代码公告检索（`alerts.py` 的 `f_node=7`），那是自选股维度
+- 渲染里明写这个限制，不假装有
+
+### 「潮」判定：两套基线，绝不能混用
+
+| 判定 | 对照基线 | 代码 |
+|---|---|---|
+| **单日**潮度 | 历史「每日」解禁市值分布 | `classify()` |
+| **窗口合计**潮度 | 历史「同长度滚动窗口合计」分布 | `classify_window()` |
+
+⚠️ **踩过的方法论错误**：初版拿「30 天合计 3213 亿」去比「单日 p90 = 328 亿」，
+结果**永远判「强潮」= 永远报警 = 等于没有报警**。必须用滚动窗口分布
+（实测历史同 30 天窗口 p50=1629 / p90=2997 亿 → 3213 亿判强潮才是真结论）。
+
+- 分位数用 **nearest-rank**（`int(n*p)`，不插值）：只用于分级，行为要可复算
+- 基线**只用有事件的日历天** —— 那天没解禁不是「压力小」而是「那天没这回事」
+- 基线样本 < 10 天 → **不给评级**（不硬编「安全」结论）
+- 每类事件**各自**的请求预算（`BUDGET_PER_KIND`）：共用一个池子会被先执行的
+  解禁吃光，减持直接采不到，且表现为「最近没人减持」
+
+### 2026-10 真实核实：「10 月解禁上千亿」成立，但低估 3 倍
+
+| 指标 | 值 |
+|---|---|
+| 解禁市值 | **3,105 亿元**（139 只，124.87 亿股）|
+| 12 个月排位 | **第 2**（仅低于 2025-12 的 3,290 亿）|
+| 12 个月均值 | 2,305 亿 → 10 月是 **1.3 倍**|
+| 最猛两天 | **10-28 990 亿（9 家）/ 10-21 749 亿（5 家）**，合计占全月 56%|
+
+**「解禁市值」≠「新增抛压」**，按类型拆开后：
+
+| 类型 | 市值 | 占比 |
+|---|---|---|
+| 追加承诺限售股份上市流通 | 1,398 亿 | 45.0% |
+| 首发原股东/战略配售 | 1,019 亿 | 32.8% |
+| **定向增发机构配售** | **483 亿** | **15.6%** |
+| 股权激励（64 条） | 18 亿 | 0.6% |
+
+真正「成本低、减持倾向强」的是**机构配售那 483 亿（15.6%）**。
+「追加承诺限售」占 45%、1,398 亿 —— 从字面看是对已解禁股份的自愿延长锁定，
+到期多为形式到期；**这条是解读不是核实过的事实**，所以不算进「真压力」。
+
+数据源**单一**（akshare 1.18.88 里 `stock_restricted_release_summary/detail/batch`
+三个名字**不存在**，`stock_restricted_release_queue_em` 只返回 4 行近期批次，
+无法交叉验证）。
+
+### 美日韩：KOSPI 真的取不到（试过 4 条路径，2026-10-06）
+
+| 源 | 结果 |
+|---|---|
+| `akshare.index_global_spot_em()` | **push2 系全封**；10-05 偶然返回 56 行，10-06 就 `RemoteDisconnected` → 再次印证「一次成功不代表源可用」|
+| `hq.sinajs.cn/list=int_kospi` 等 10 个符号穷举 | 全空 |
+| `index_global_name_table()` 有「首尔综合指数/KOSPI」 | 但 `index_global_hist_sina(symbol="KOSPI")` 抛 `KeyError` —— **名字表有代码 ≠ 历史接口支持** |
+| 新浪 K 线接口 | `Service not valid` |
+
+→ 模块里**明确把 KOSPI 标为不可用**并写进报告，**不用任何代理指标冒充**。
+
+可用的源（全部实测）：
+
+| 市场 | 源 | 符号 |
+|---|---|---|
+| 纳指/标普/道指 | 腾讯 `qt.gtimg.cn` | `usIXIC,usINX,usDJI` |
+| 恒生/恒生科技/国企 | 腾讯 | `s_hkHSI,s_hkHSTECH,s_hkHSCEI` |
+| 上证/沪深300/中证500 | 腾讯 | `s_sh000001,s_sh000300,s_sh000905` |
+| 日经225 | 新浪 `hq.sinajs.cn` | `int_nikkei`（**仅现货**）|
+
+**坑**：
+
+1. **腾讯没有日韩符号**：`s_jpNI225`/`s_krKOSPI`/`jpNI225` 等全部
+   `v_pv_none_match="1";`
+2. **腾讯字段布局按市场前缀不同**（写错不报错、静默给错数）：
+   - `us*`：`[3]`现价 `[4]`昨收 `[5]`今开 **`[32]`涨跌幅**
+   - `s_*`（港/A）：`[3]`现价 `[4]`涨跌额 **`[5]`涨跌幅**
+   把港股的「涨跌额 68.05」当涨跌幅 → 数值离谱但不报错
+3. **日K 要去掉 `s_` 前缀**：`s_hkHSI` 返回 0 根，`hkHSI` 返回 30 根
+4. **美股/日经无历史源** → 只能算**当日**涨跌，算不了 5日/20日；
+   渲染里用 `SPOT_ONLY` 标注「（仅当日）」，不假装有
+5. 现货**2 次请求**拿全（腾讯批量 + 新浪批量，逗号分隔）
+
+「资金抽离」信号定义（阈值写死、不预测）：港股当日跑输纳指 ≥1.0pp /
+跑输日经 ≥0.8pp / 上证跑输恒生 ≥0.8pp。数据缺失时**不产生信号**
+（实测「全 None 不出信号」）。
+
+### 辩论结论落库保全（2026-10-05 修）
+
+**问题**：`paper_trading._decide_one` 的三个分支各自手拼 `decision["debate"]`：
+
+| 分支 | 修复前 | 修复后 |
+|---|---|---|
+| 正常 | 存全文 | 不变 |
+| 交易员第二轮解析失败 | 只存 `rounds`/`llm_calls`/`rating` —— **Bull/Bear/Judge 正文全丢** | 加标记 `trader_round2_parse_failed`，正文照存 |
+| 抛异常（`format_debate_for_trader` 或第二轮 LLM 炸）| 只存 `str(exc)` —— **辩论已跑完的钱全白花** | `debate_result` 提到 try 外，异常时照样打包落库 |
+
+- 新增 `_pack_debate()` 统一打包（含 `history` 字段，之前根本没用上）
+- `risk_report` 原来硬编码 `[:3000]` 截断且**不带标记**（看的人会当完整原文），
+  现在统一 `_cap()`，超长附 `[截断，全文 N 字符]`；每段 8000 字符上限
+- **新增 sidecar** `data/paper_decisions_YYYYMMDD.jsonl`：决策与成交是**两阶段**
+  （`run_decisions` 先全部决策再排序成交），中间崩溃/被 kill 时 DB 里一条都没有，
+  但 LLM 的钱已经花掉了。每只票决策完**立刻**逐行追加（崩溃安全、不依赖事务）
+
+⚠️ sidecar 按 `__file__` 定位 `data/`：**测试必须重定向** `os.path.dirname`，
+否则测试数据会写进真实仓库（第一版测试就在 `stock-advisor/data/` 留下过垃圾，
+已清理；`data/` 在 .gitignore 里没进版本库）。
+
+测试：`%LOCALAPPDATA%\Temp\opencode\test_debate_persist.py`（54 项）、
+`test_supply_global.py`（65 项）、`test_supply_e2e.py`（端到端真发 HTTP）。
+
+### 微信视频号监控（2026-10-06，闭环已跑通，卡在 PC 微信那一端）
+
+新增 `stock-advisor/channels_watch.py`。**视频号没有公开 API**，网页端也拿不到
+内容（`wx_channel` 文档原文：「微信视频号内容来自独立客户端，浏览器不能直接访问
+内容」），所以必须 MITM 代理 + PC 版微信 —— 这条链路 101（无桌面 Linux）**跑不了**。
+
+开源方案调研（全部 `api.github.com` 核实，别只信搜索摘要）：
+
+| 仓库 | star | License | 最近提交 | 结论 |
+|---|---|---|---|---|
+| `nobiyou/wx_channel` | 2699 | **MIT** | **2026-10-05** | ✅ **用这个**（v5.7.10，有 API + radar 监控变体）|
+| `ltaoo/wx_channels_download` | 9626 | NOASSERTION(Commons Clause) | 2026-09-30 | 上游鼻祖，License 非 OSI |
+| `qiye45/wechatVideoDownload` | 5857 | **NONE** | 2026-10-05 | 无 License = 保留所有权利 |
+| `will-17173/electron-...downloader` | 66 | MIT | 2025-07-21 | 停滞 1 年 |
+| `KingsleyYau/WeChatChannelsDownloader` | 60 | NONE | 2020-09-27 | 6 年前 |
+| `crossthere/sph_caiji_wenan`（搜索里的「视频转文字」）| — | — | — | ❌ **404，仓库不存在** |
+
+用到的接口（`wx_channel` API 端口 2026）：`/api/channels/contact/feed/list?username=`
+（监控核心）、`/feed/profile`（描述文案）、`/feed/comment/list`（**评论区有**）、
+`/contact/search`。参数名是 `object_id`/`nonce_id`（不是 objectId）。
+
+**闭环**（已端到端验证，见下）：
+```
+订阅 → 轮询 feed/list → 按 object_id 判重 → feed/profile 取描述
+  → （可选）下载 mp4 + ASR → 情绪判定 → ① data/channels_items_*.jsonl
+  → ② sa_news（url 唯一去重，code=''）→ sa_news_related（多对多关联股票）
+```
+**不新建表**：`sa_news` 以 `url` 唯一、`code=''` 表示非股票源，正好容得下，
+关联股票走 `sa_news_related`。完整正文（描述+ASR）不塞进 `sa_news`
+（title 语义是标题），落 jsonl 用 url 关联。
+
+### ⚠️ `save_to_sa_news` 内部 commit → 测试 rollback 变空操作（污染了生产，已清理）
+
+端到端测试第一版把 3 行测试数据写进了**生产 `sa_news`**（14998 行），
+而测试结尾那句 `conn.rollback()` 什么都没回滚 —— 因为 `save_to_sa_news`
+内部无条件 `conn.commit()`。
+
+**教训（比 bug 本身更重要）**：
+
+1. **凡是需要能被调用方放进事务的写入函数，就不要自己 commit**。
+   加 `commit: bool = True` 参数，`commit=False` 时不提交。
+2. **测试里「回滚了」不等于「没写进去」** —— 必须**回滚后再查一次计数**，
+   拿数字说话。现在 E2E 末尾就是这么断言的：
+   `assert left == 0, "回滚没生效！生产表里还有 N 行测试数据"`。
+3. 清理脚本先 SELECT 看清要删什么、先删子表再删主表、删完再复查
+   （`clean_test_pollution.py`）。清理后 14998 → 14995、关联 6 行清零。
+
+### 视频号 ASR（L2）：两种端点 + 网关是 NVIDIA NIM 而非 SiliconFlow（2026-10-06）
+
+**先纠正本文件早前两处错**：
+
+1. 「`XingChenAGI/XingChenASR-V3.2-Ultra` 不是硅基模型名」——**错**，见下方「我判错的两处」
+2. 「在 101 网关加一个 SiliconFlow 渠道就能通」——**不完整**：网关跟 SiliconFlow
+   **毫无关系**（见下），加渠道的前提是有一个**充值过的** SiliconFlow key
+
+#### ASR 有两个不同端点，选错必然失败
+
+| 端点 | 适用模型 | 请求体 |
+|---|---|---|
+| `POST /v1/audio/transcriptions` | SenseVoiceSmall / TeleSpeechASR / **XingChenASR-\*** / Qwen3-ASR-1.7B | multipart，`files={file:...}`，**≤1h / ≤50MB** |
+| `POST /v1/chat/completions` | **Qwen3-Omni-30B-A3B-\***（用户最终指定） | JSON，音频是 content part：`{"type":"audio_url","audio_url":{"url":"data:audio/wav;base64,..."}}` |
+
+- **计费：omni 音频 13 tokens/秒**（官方原文：22.5s = 292 tokens）
+- 官方文档页的 `enum` **不完整** —— 判据是 `/v1/models` 的真实返回
+- `channels_watch.py` 里两个 provider：`SiliconFlowAsr`（transcriptions）
+  和 `QwenOmniAsr`（chat），`get_asr()` **按模型名路由端点**，不只看 provider
+- 分片下限 `MIN_CHUNK_SECONDS=30`：低于 30 秒会把一次转写拆成几十次请求，
+  每次都付音频费 + 冷启动，反而更贵
+- 非 WAV（视频号下载是 mp4）需要 ffmpeg 抽音轨，**没有就明确报 `asr_no_ffmpeg`**，
+  不静默降级
+
+#### ⚠️ 101 网关是 NVIDIA NIM，不是 SiliconFlow 代理
+
+读 `one-api.db` 的 `channels` 表（**别 SELECT `key` 列**）：
+
+| id | name | base_url | 模型数 | status |
+|---|---|---|---|---|
+| 2/3/4/5/6/7/9 | 杭威/文启/12/小红书/军强193/军强/海瑞 | `https://integrate.api.nvidia.com` | 14~572 | 1（3 是 2=停用）|
+| 10 | gitee | `https://ai.gitee.com` | 5 | 1 |
+
+→ 这解释了之前那些 `404 Function '<uuid>': Not found for account '<uuid>'`
+（NIM 的 deployment id），以及为什么模型名长得像 SiliconFlow（NVIDIA 也托管
+`nvidia/*`、`z-ai/*`、`moonshotai/*`、`deepseek-ai/*`）。
+
+**8 个渠道没有一个含 `Qwen3-Omni`**，含 `Qwen3-Omni` 的判断是逐条 LIKE 出来的
+`no`。渠道 3（文启，停用）的模型列表里**有** `FunAudioLLM/SenseVoiceSmall`，
+但那是一份 572 个模型的通用聚合清单、`base_url` 仍指向 NVIDIA。
+
+#### 网关的 nemotron-3-nano-omni **不能**做中文 ASR（采样率全档实测）
+
+`nvidia/nemotron-3-nano-omni-30b-a3b-reasoning` 是网关上唯一名字带 omni/audio
+的模型，它**确实吃音频**（不是 model_not_found），但转写质量不可用：
+
+| 采样率 | 字符覆盖 | 备注 |
+|---|---|---|
+| 22050（原始） | 0% | 全 `<unk>`，5200+ tokens 全是未知 token |
+| 16000 | **54%** | 真实转写但系统性音近错 |
+| 8000 | 39% | |
+| 24000 | 43% | 最快（6s） |
+| 44100 | 21% | |
+| 16000/32000/48000 | — | 两次都撞 `503 ResourceExhausted`，重试仍 503 |
+
+判读门槛 85%（财报错字不可接受）—— **无一档达标**。音近错形态：
+`市场→石场`、`信号→新好`、`明显→明天方`、`解禁→基金归`。
+
+**两种故障要分开认**（同一条链路、不同根因）：
+- 全 `<unk>` = 音频解成词表外 token（解码失败）
+- 有汉字但音近错 = 音频真被听了，但**听错了**（模型/编码器能力问题）
+
+`503 ResourceExhausted: Worker local total request limit reached (16/16)` 在这个
+模型上是**常见态**（7 档里 5 档首撞），必须退避重试才能拿到真实结果 ——
+一次探测下结论会误杀。
+
+#### 自己踩的坑：`audioop.ratecv` 返回裸 PCM，不是 WAV
+
+采样率扫描第一版整轮作废：`to_rate()` 直接 return `ratecv()` 的返回值
+（**只有帧数据**），base64 开头是 `AAAAAAA`（0x00）而不是 `RIFF`。
+服务端回 `HTTP 500 Failed to load audio from data:audio/wav;base64,AAAAA...`
+—— 这个报错本身是**正确的**。断言 `blob[:4] == b"RIFF"` 现在写进脚本。
+
+判别「模型不支持音频」和「我传的音频是垃圾」：看错误里回显的 base64 **开头**。
+
+#### 现状与唯一阻塞
+
+用户最终指定 `Qwen/Qwen3-Omni-30B-A3B-Instruct`，`config.yaml` /
+`config.example.yaml` 已切好（`provider: auto`）。唯一阻塞：
+**硅基余额不足** `402 {"code":30001,"message":"Sorry, your account balance is
+insufficient"}`。key 有效、端点通、模型有权限（402 而不是 404/401）。
+
+解法只有两条：① 充值个人账户；② 充值后把 key 建成网关的 SiliconFlow 渠道
+（这样 ASR 走网关不占个人额度）。离线断言 104 项全过
+（`%LOCALAPPDATA%\Temp\opencode\test_channels.py`）。
+
+### 视频号：wx_channel 本机跑起来的实测 + 我判错的两处（2026-10-06 01:20）
+
+**部署**：`nobiyou/wx_channel` v5.7.10 的 `wx_channel_radar.zip`（16.9MB 便携版，
+免安装）→ `%LOCALAPPDATA%\Temp\opencode\wx_channel\app\`。
+`config.yaml` 从 `config.yaml.example` 拷，把 `radar_enabled` 改 `true`。
+启动后 **2025（代理）/ 2026（API）端口在听**，证书流程自动装好了 SunnyNet。
+
+**本机前置条件（都满足）**：
+
+- PC 微信已装：`Weixin.exe`（4.x，6 进程）+ 旧版 `WeChat.exe` 3.9.12.51
+- **视频号宿主 `WeChatAppEx.exe` 13 个进程在跑**（工具就是注入它）
+- 系统证书里有 `CN=SunnyNet`（工具第二次启动时 `certificate.installed=True`）
+
+**卡住的唯一门槛：注入要管理员权限**
+
+```
+connected=false  clients=0  ready_clients=0
+injection: {target_process: "WeChatAppEx.exe", started: false,
+            last_error: "StartProcess returned false; administrator permission
+                          may be required"}
+搜索接口 → 503 "No ready WeChat page is available for search"
+```
+
+用 `-Verb RunAs` 提权被 UAC 拒绝（「此操作已被取消」），**我无法自行跨过**。
+需要用户：① 以管理员身份运行 exe ② 在微信里打开视频号页面。
+另外雷达文档明写「如果博主列表为空，**请先在视频号添加博主**」——
+所以要监控某博主，得先在微信视频号里关注/添加它。
+
+**「只开系统代理」实测无效（已回滚）**：我怀疑 `ProxyEnable=0` 是直接原因，
+于是把系统代理临时指到 `127.0.0.1:2025`（原值 `ProxyEnable=0` /
+`ProxyServer=127.0.0.1:6478` 已记录并加了 `127.*;<local>` 旁路），等 25 秒后
+`clients` 仍是 0。工具日志给出答案：**「可能需要【管理员权限】才能开启系统代理」**
+—— 非提权时它自己都设不了系统代理；且微信大概只在启动时读一次代理。
+**已回滚到原值**（别把用户的代理留在指向一个抓不到流量的工具上）。
+
+### ⚠️ `channels_watch.py` 解析层路径全错 —— 这模块**从没跑通过**（2026-10-06 修）
+
+**症状**：E2E 实测博主「多空看财报」，`search_contact` 恒返回 `[]`、
+`contact_feed_list` 恒空 → 看起来像「搜不到 / 该博主没视频」，
+但**同一时刻直接 curl 同一个 URL 返回 15 条真实数据**。
+
+**真因：当初照 `web/docs/API.md` 的示例写，而 v5.7.10 的真实响应是三层 `data`。**
+
+| 方法 | 代码原来找的 | **真实路径**（2026-10-06 实测）|
+|---|---|---|
+| `search_contact` | `data.list` | **`data.data.infoList[]`**，账号包在 `.contact` 里 |
+| `feed/list` 的 items | `data.list` / `data.feed_list` | **`data.data.object[]`** |
+| `feed/list` 分页 | `data.next_marker` | **`data.data.lastBuffer`** |
+| `feed_profile` | `data` | **`data.data.object`**（`data` 是 `{data,errCode,errMsg,payload}` 空壳，拿它当 profile 只会得到没有正文的壳）|
+
+字段名同样对不上（`_first` 靠候选名取，一个都命不中）：
+
+| 代码找的 | **真实字段** |
+|---|---|
+| `desc` / `description` | **`objectDesc.description`** —— `objectDesc` 是**对象不是字符串** |
+| `title` / `shortTitle` | **`objectDesc.shortTitle` = `[{'shortTitle': '...'}]`（`list[dict]`！）** |
+| `create_time` / `createTime` | **`createtime`**（**小写 t**，`dict.get` 区分大小写）|
+| `nonce_id` / `nonceId` | **`objectNonceId`** |
+| `object_id` | `id`（这条本来就靠 `id` 兜住了，没暴露）|
+
+**最阴的是 `shortTitle`**：它是 `list[dict]`，`str()` 出来是 Python repr，标题会
+原样显示成 `[{'shortTitle': '老腾讯赚钱新腾讯烧钱'}]` —— **数据一直在，
+是渲染层把它变成了垃圾**。这与「200 + data:null」「渲染丢数据」是同一类陷阱：
+**必须在「看起来有值」的地方再确认一次值的类型**。
+
+**修法**：4 处路径改真实结构（每处都保留旧路径做兜底，见各方法 docstring）+
+新增 `_flat_text()` 摊平类型不稳的值（str/dict/list/嵌套全兜，dict 未知键递归一层）
++ `extract_text` 改走 `_desc_text()` 从 `objectDesc` 取。
+
+**验证（三层，都可重复）**：
+
+| 层 | 脚本 | 结果 |
+|---|---|---|
+| 离线 | `%LOCALAPPDATA%\Temp\opencode\test_channels_offline.py` | **70 项全过**，fixture 是真实响应快照 `%TEMP%\opencode\wx_fixture\*.json`，patch `_get` **不联网** |
+| 回归 | `%LOCALAPPDATA%\Temp\opencode\test_channels.py` | **104 项，改完仍 exit=0** |
+| E2E | `%LOCALAPPDATA%\Temp\opencode\test_channels_e2e.py` | 真跑通：**15 条视频 + 评论**（`comment_meta ready=True total=6 collected=6`），三轮幂等 10→5→0 |
+
+> 测试里我三次把自己的断言写错（首轮受 `max_new_per_sub=10` 限制只取 10/15、
+> 期望 `poll_once` 自己持久化、把另一次请求的 `objectNonceId` uuid 硬编进断言）
+> —— **失败的不一定是要修的代码**。判据是「真实结构到底是什么」，
+> 不是「断言说什么」。
+
+### 🔑 流量重定向**必须提权**（2026-10-06 03:15 实测，非提权是死路）
+
+判据是 `netstat`，不是猜：
+
+```
+非提权实例（能绑 2025/2026、cert.installed=True、lifecycle 正常）：
+  微信活动连接 8 个 → 183.61.x / 121.12.x / 101.91.x / 117.89.x **全部直连 :443**
+  连到 127.0.0.1:2025 的微信连接数 = 0
+  全系统连 2025 的进程数 = 0（连我自己发的探测请求都不算）
+  → 一个连接都没被 SunnyFilter2.sys 重定向
+```
+
+所以三条链路条件缺一不可，**缺的都是提权那一条**：
+
+| 条件 | 非提权 | 提权 |
+|---|---|---|
+| 端口 2025/2026 | ✅ 能绑（>1024 不需要管理员）| ✅ |
+| 证书 `CN=SunnyNet` | ✅ 装在 `LocalMachine\Root`，**跨实例有效，不用重装** | ✅ |
+| `injection.started` | ❌ `StartProcess returned false; administrator permission may be required` | ✅ |
+| **微信流量走 2025** | ❌ **0 连接** | ✅（实测通了，见下）|
+
+> **提权成功过一次**（本节上方 01:20 那段写「被 UAC 拒绝、我无法自行跨过」，
+> 在**当次会话后来成功了**：`Start-Process -Verb RunAs -PassThru` 通了 →
+> `injection started=True` → 点视频号入口后
+> **`connected=True ready=1 search_ready=1 lifecycle=healthy`**，
+> 搜索立刻返回真实数据）。UAC 是否放行取决于用户当时点没点，
+> **别把一次被取消当成永久不可行**，也别把一次成功当成不用再验证。
+
+**运维三个坑（都会表现成「工具莫名其妙不可用」）**：
+
+1. **非交互 shell 里 `Start-Process` 起的进程会被回收** —— 表现为
+   「起来了、端口在听、还服务过一次 200，几十秒后突然 `无法连接到远程服务器`」。
+   必须用 harness 的 **`background: true`** 常驻跑（`sh_...`），
+   不能用 `Start-Process` + `Start-Sleep` 就当它活着。
+2. **僵尸实例会占掉「正常实例」的预期位**：提权实例死掉后，剩一个
+   `拒绝访问`（= 它是提权的）却**零监听端口**的残留进程 —— 杀不掉、也没用。
+   判据用 `netstat -ano | findstr <PID>`，**不要用 `Get-Process` 还在就以为它在服务**。
+3. **`Get-NetTCPConnection -OwningProcess` 可能因为权限静默返回空**，
+   与「真的没监听」不可区分 —— 用 `netstat -ano -p tcp` 交叉验证。
+
+**当前数据状态（实测留下的）**：
+`data/channels_subs.json` 有 1 条订阅（多空看财报，`v2_06...f2b7@finder`）、
+`channels_state.json` 已删（所以下一次真实轮询会把 15 条全当新的、重新写 jsonl）。
+
+### 视频号 ASR：改用讯飞 lfasr（2026-10-06，免费额度最大）
+
+**为什么换**：SiliconFlow 402 余额不足；网关的 `nemotron-3-nano-omni`
+采样率全档实测中文覆盖只有 21~54%（音近错，见上）。讯飞是**唯一免费额度
+够用**的选项。
+
+**三个讯飞产品要选对，别默认用「语音听写」**：
+
+| 产品 | 时长 | 免费额度 | 适配视频号？ |
+|---|---|---|---|
+| 语音听写（流式）`iat-api.xfyun.cn/v2/iat` | **≤60 秒** | 创建应用后**默认每日 500 次** | ✗ 视频常超 60s |
+| 语音听写大模型 V2 `wss://iat.cn-huabei-1.xf-yun.com/v1` | ≤60s | 按产品页 | ✗ 同上 |
+| **语音转写 lfasr** `raasr.xfyun.cn/api/*` | **≤5 小时** | 体验包 **5 小时/30 天**（每账户限 1 次）+ 新用户礼包**最高 50 小时/年** | ✅ **本项目用这个** |
+
+lfasr 支持 `wav/flac/opus/m4a/mp3`、8k/16k、单&多声道、≤500M，
+并且有 **`pd=finance` 金融垂域** 和 `hotWord` 热词（≤200 个、单个≤16 字）——
+对财报口播是实打实的准确率提升。官方还劝「尽量转 5 分钟以上的音频」，
+短音频反而容易排队。
+
+**它是异步任务制**（与 SiliconFlow/Qwen 的同步一次调用完全不同）：
+
+```
+POST /api/prepare      form  -> data = task_id
+POST /api/upload       multipart(10MB 分片) -> 每片一个 slice_id
+POST /api/merge
+POST /api/getProgress  -> data 是 JSON 字符串，status=9 才算完成
+POST /api/getResult    -> data 是 **双层 JSON 字符串**
+```
+
+**签名**（文档给了测试向量，可离线验证、不需要账号）：
+
+```
+signa = base64(HmacSHA1(MD5(app_id + ts), api_secret))
+```
+
+文档向量：`appid=595f23df ts=1512041814 secret=d9f4aa7e…fd5234`
+→ `IrrzsJeOFk1NGfJHW6SkHUoN9CU=`（`test_xfyun_signa.py` 逐字验证 ✅）。
+四个易踩变体都算错、已写进断言防回归：MD5 漏 secret、漏 MD5、
+key/msg 反了、用 SHA256。
+
+**额度按秒扣 → task_id 必须落盘**。`channels_asr_tasks.json` 以**音频内容
+sha1** 为键存 `task_id`/`text`。重跑时：已有 `text` 直接复用（**一个请求都不发**）；
+有 `task_id` 没结果就**接着轮询**（不重新提交）；只有 `err_no=26602`
+（任务不存在）才重新 prepare。
+
+**双层 JSON**：`getResult` 的 `data` 是「被 JSON 字符串包了一层的数组」，
+**必须 parse 两次**，少一次就会当成 dict、拿到空结果（HTTP 200 但没数据那一类）。
+
+**没有开源实现**（AGENTS.md 第 1 条已查）：`api.github.com` 搜
+`xfyun lfasr python` → total=0；`讯飞 语音转写 python` 只有 4 个仓库，
+最好的 `sonicrhino-client`（1★）是**讯飞听见**不是开放平台，
+`lfasr_new_python` 0★ 无 License 且停在 2024。官方只有 Java SDK，
+文档明说「开发语言任意」+ 附 Python demo → 自己实现（已说明理由）。
+
+#### 🎉 mp4 抽音轨不需要 ffmpeg —— PyAV 已装
+
+`shutil.which('ffmpeg')` 是 None，但 **`av` (PyAV) 14.1.0 已装**，
+自带 FFmpeg 库，能编也能解 → **零新依赖**解决了「视频号下载是 mp4」
+这个卡点（`asr_no_decoder` 只在既没 av 又没 ffmpeg 时才报）。
+
+> ⚠️ **PyAV 的坑**：`bytes(frame.planes[0])` 取的是**带 SIMD 对齐填充**的
+> 整块 plane，会让时长**虚长约 30%**（实测 3.0s → 3.89s，多 28012 字节）。
+> 必须 `[: frame.samples * 2]` 截断，或用 `to_ndarray().tobytes()`。
+> 解码完还要 `resample(None)` **flush**，否则末尾丢一截。
+
+#### 自己踩的坑（都靠测试逮到，不是靠「看着对」）
+
+1. **`json.dump` 崩掉整个转写**：checkpoint 里存了 `_now()`（返回
+   `datetime`）→ `TypeError: Object of type datetime is not JSON serializable`。
+   修法：`json.dump(..., default=str)`，且 `except` 要同时接
+   `(OSError, TypeError, ValueError)` —— checkpoint 写不了**不该**让转写失败，
+   但**写盘时崩溃必须防住**。
+2. **测试用例互相污染**：checkpoint 按音频 sha1 索引，同一个 wav 第二个用例
+   直接命中缓存、**连请求都不发**，于是 6 个错误码用例全部「没抛异常」。
+   修法：每个用例造**内容不同**的音频。**失败的不一定是要修的代码**。
+3. **`git checkout --` 连带毁掉未提交的新配置段**：想撤销一次坏补丁，
+   却把整个 `channels:` 段还原没了（git HEAD 里只有 `news.channels`）。
+   重新写脚本从 `config.yaml` 取模板、清空密钥重建。
+4. **同一招失败两次就换手段**：`edit` 工具在这个文件上失配（**行尾混合**：
+   242 个裸 LF + 部分 CRLF）→ 改用脚本；脚本又失配 →
+   改成**按行定位**而不是多行 anchor。
+
+测试：`%LOCALAPPDATA%\Temp\opencode\test_xfyun_asr.py`（**43 项**，全 patch
+`requests.post`，不联网不烧额度）+ `test_xfyun_signa.py`（签名向量）+
+`probe_av_padding.py`（PyAV padding 定位）+ 回归 `test_channels.py` 104 /
+`test_channels_offline.py` 69，**共 216 项全过**。
+
+**当前阻塞**：需要用户去 xfyun.cn 注册 → 创建应用 → 添加「语音转写」服务
+→ 控制台取 `app_id` + `APISecret`（32 位）→ 领免费体验包。配置项已留好
+（`channels.asr.app_id` / `api_secret`，也支持环境变量 `XFYUN_API_SECRET`）。
+
+### ⚠️ 我判错的两处（都被真实请求打脸）
+
+**① `XingChenAGI/XingChenASR-V3.2-Ultra` 是真实存在的模型，我说不存在是错的。**
+
+我当时的依据是 SiliconFlow **官方文档页** `/audio/transcriptions` 的 `enum`
+（只列 `FunAudioLLM/SenseVoiceSmall` 和 `TeleAI/TeleSpeechASR`）。用真 key 打
+`GET /v1/models` 返回 **97 个模型，其中语音类 9 个**：
+
+```
+XingChenAGI/XingChenASR-V3.2-Ultra      ← 用户指定的，真实存在
+XingChenAGI/XingChenASR-V3.2
+XingChenAGI/XingChenASR-Diarize-V3.0
+Qwen/Qwen3-ASR-1.7B
+FunAudioLLM/SenseVoiceSmall              （有免费额度）
+TeleAI/TeleSpeechASR
+Qwen/Qwen3-Omni-30B-A3B-Instruct / -Thinking / -Captioner
+```
+
+> **判据**：模型是否存在以 `/v1/models` 的真实返回为准，**文档页的 enum 不完整**。
+> 这与「`/v1/models` 列表里有 ≠ 能用」（EOL 模型也在列表里）不矛盾 ——
+> **存在性**看列表，**可用性**必须真发一次请求。两个问题要分开验。
+
+**② 评论接口的响应结构我全猜错了**，照 GitHub 文档写的 `data.list[]` /
+`next_marker` / `create_time` 实际是（读**工具自带的** `web/docs/API.md`
+和 `COMMENT_CAPTURE.md` 才发现）：
+
+| 我原来写的 | 实际 |
+|---|---|
+| `data.list[]` | **`data.data.commentInfo[]`**（两层 `data`）|
+| `next_marker` | **`lastBuffer`** |
+| `create_time` | **`createtime`**（秒级）|
+| — | `nonce_id`（一级评论必需）、`commentId`、`replyCommentId`、|
+| — | `likeCount`、`expandCommentCount`（回复数）、**`levelTwoComment[]`（二级回复）**、|
+| — | `data.data.countInfo.commentCount` |
+
+> **教训**：优先读**工具包内自带的文档**（`web/docs/*.md`），不是 GitHub 页面上的
+> 二手示例 —— 前者是该版本的真实契约。
+
+**更关键的结构性约束**：评论**走页面 DOM/Store 采集**，链路是
+`HTTP API → WebSocket Hub → 注入脚本 → 页面内 finderGetCommentList`。
+**微信页面必须停在那个视频上**才返回数据。所以 `comment_meta.ready=False`
+必须报「客户端未就绪」，**不能报「该视频 0 条评论」** —— 两者混在一起会让监控
+看起来在工作、其实什么都没抓到。
+
+### 雷达 API 前缀不同（容易踩）
+
+- 视频数据：`/api/channels/...`（如 `feed/comment/list`、`contact/feed/list`）
+- 雷达目标：`/api/v1/radar/targets`（POST 增、DELETE 删、`{id}/logs`、`{id}/status`）
+- 本地浏览记录搜索：`/__wx_channels_api/search?q=`（与 `/api/channels/contact/search` 是两回事）
+
+雷达开关 `radar_enabled` **只认 `config.yaml`，控制台是只读展示**，改完要重启。
+
 ### 板块资金流只有 3 家（2026-10-01 确认，别再找第四家）
 
 `同花顺`(主) / `开盘红·财联社` / `新浪` —— 就这三家有**板块级资金流**。
@@ -728,6 +1614,157 @@ as a Research Manager..." 开头（3447 字符），**没有 `Rating:` 行** —
 
 ---
 
+### 模拟盘「决策理由」必须带决策时刻（2026-10-08 加）
+
+**症状**：决策流水只显示 `trade_date.slice(5)` = `10-08`，**同一天几轮决策完全
+分不清**，也没法判断理由是不是已经过期（行情早变了）。`/api/paper/trades`
+连 `slot` 都没取。
+
+**关键判断：不能拿 `slot` 当决策时间。** `slot` 是 `_paper_loop` 决定跑这一轮的
+时刻（`app.py:6250` `slot = now.strftime("%H:%M")`），而行是**决策跑完才 INSERT**。
+实测（400 行采样，`created_at AT TIME ZONE 'Asia/Shanghai'` 减 `trade_date+slot`）：
+
+```
+min=+0.3min   p50=+11.9min   p90=+22.5min   max=+32.6min   （从不为负）
+```
+
+所以 slot 系统性偏早最多半小时。真正该显示的是 `created_at`（决策实际产出时刻）。
+另有 **74/674 行（11%）slot 为空** → 必须有兜底，不能只靠 slot。
+
+**优先级**：`decided_at`（rounds 的 entry/exit，本轮给 `rounds()` 新增）
+> `created_at`（trades 接口早有）> `slot`（轮次标签，仅兜底）> 都没有则显示破折号。
+
+**第二个坑：时区。** `created_at` 是 `TIMESTAMPTZ`，库里是 `+00:00`
+（服务器 `TimeZone = Etc/UTC`），而 `slot` 是本地墙钟。**用正则截 ISO 串里的
+`HH:MM` 会拿到 UTC 墙钟，对 UTC+8 的用户偏早 8 小时**（实测决策发生在本地
+15:54，截出来是 07:54）。必须 `new Date(iso).getHours()` 取本地时区。
+⚠️ 这个 bug 是离线渲染测试逮到的，不是「看着对」发现的。
+
+**改动**：`app.py` `/api/paper/trades` 补 `slot`；`paper_trading.rounds()`
+SELECT 补 `created_at` 并在 entry/exit 输出 `decided_at`；`static/index.html`
+加 `paperDecisionAt/Day/Age` 三个 helper，决策流水时间列与理由单元格、
+每笔交易的买入/卖出理由都带上时刻与「多久之前」。理由摘要里也带时刻，
+**不展开 `<details>` 就能看到**。
+
+测试：`test_paper_ui.py`（**34 项**，py_mini_racer 真跑 V8，喂残缺数据断言无
+`undefined`/`NaN`/`slot` 误用/时区换算/标签转义）+ `test_paper_e2e.py`（**17 项**，
+真请求）。回归：`check_full_js.py` 两个 script 块 `node --check` 全过。
+
+**过程中两次「以为好了其实没好」**：
+1. 离线测试脚本报 `helpers 抓不全` / `Unexpected end of input` —— 是**抽取正则坏了**
+   （`const esc = s =>` 占 2 个物理行、固定 42 行截断了 helpers），不是页面 JS 坏了。
+   已改成**按花括号配平抽取**。
+2. E2E 报 `entry 没有 decided_at` —— 服务是**用户在 14:52 用 `uvicorn app:app` 起的**，
+   我的启动器因 `[Errno 10048]` 端口被占而退出（harness 只报了 `Exited with code 1`），
+   我却只看到「8686 在监听」就以为起来了。实际那个进程比 `paper_trading.py`
+   的修改时间**早 3 分钟**，跑的是旧代码。
+   → **重启后必须核对「监听 8686 的 PID + 其 CreationDate 晚于文件修改时间」**，
+   光看端口在监听不够。
+
+### 分析技法学习：后端闭环 + 前端「📚 分析技法」页（2026-10-07 完成）
+
+从 `sa_mp_articles` 萃取「原文参考了什么指标、按什么阈值判读」，落
+`sa_analysis_techniques`，注入 `daily_reports` 的 prompt。
+
+| 组件 | 位置 |
+|---|---|
+| 模块 | `stock-advisor/analysis_learn.py`（DDL / 粗筛 / prompt / 解析 / 注入）|
+| 端点 | `/api/analysis/techniques`、`/techniques/review`、`/learn`、`/config`(GET/POST)、`/injection` |
+| 守护 | `sa_analysis_learn`，**12 小时一轮**（`loop_interval_minutes` 默认 720）|
+| 前端 | `static/index.html` 的 `tab-analysis` + `loadTechniques()` 系列 |
+
+**双模式是同一个字段的两端，不是两个开关**：`status ∈ active/pending/rejected`。
+`mode=ai` 时 `score >= activate_score(7.0)` 直通 `active`；`mode=manual` 一律落
+`pending` 等人点「生效」。审核动作只有一个 = 改 `status`，所以 AI 学歪时人一条
+请求就能止损，不用改代码不用重启。注入按 score 降序取 `limit=12`、
+`max_chars=2600`。`/api/analysis/learn` 默认 `dry_run=true`（LLM 调用花钱）。
+
+### ⚠️ 打分维度定义错了 → 注入的 12 条里 8 条是废的（2026-10-07 修 prompt）
+
+**症状**：`GET /api/analysis/injection` 的 12 条里，排第一（score **10.0**）
+是「异构双模型交叉验算」，来自《华尔街顶级阵容联手：如何评测金融大模型》。
+
+实测构成：**LLM 评测方法论 5 条** + **迪拜楼市尽调 2 条** + **一级市场 LP 出资
+1 条** + 真正有用的 A 股技法 **4 条**（光模块硅光 / 情景估值 / 护城河组件 /
+租赁溢价）。**67% 是废的，而且废的分数更高、排更前。**
+
+**真因（两层，都明确）**：
+1. `EXTRACT_SYSTEM` 把 `SCORE` 定义成「这条技法的**技术含量**」——
+   一套很厉害但用不到 A 股的方法照样 8~10 分。**模型没执行错，是维度定义错。**
+2. prompt 开头虽写「A 股个人自用系统」，但**没有一条规则要求丢弃资产类别 /
+   市场不符的技法**，于是迪拜楼市尽调被忠实地萃取了（按 prompt 它做得对）。
+   这些文章能过 `looks_like_analysis`（≥5 个指标词）—— 它们含 PE/估值/回测/
+   回撤 等词，**粗筛拦不住**。
+
+**修法（只改 prompt，不花钱、不动已有数据）**：
+- 加**规则 6**：适用范围必须是 A 股/港股个股的二级市场分析，否则整条丢弃，
+  并把「海外房产尽调 / 一级市场募资 DPI·TVPI·GP / LLM·ML 评测方法论」三类点名
+- `SCORE` 改成「对 A 股/港股个股分析的**可复用性**」，明写
+  「打的是对我做 A 股决策有没有用，不是这套方法技术上厉不厉害」
+
+**没做的（要人决定）**：库里已有的 8 条跑题技法仍是 `active`、**仍在注入**，
+新 prompt 只管以后抽的，不会自动修正已抽的。两条止损路：
+1. 在「📚 分析技法」页逐条点 ❌ 否决（可逆，改回 status 即可）
+2. `POST /api/analysis/learn {"dry_run":false,"force":true}` 重抽
+   —— **花钱 + 覆盖现有 54 条，没做，等用户点头**
+
+### 前端三处修复（都能「页面看着正常」地藏着）
+
+| 症状 | 真因 | 修法 |
+|---|---|---|
+| 通用弹窗 ✕ 点了没反应 | `#gen-modal` / `.modal-close` 写 `onclick="closeModal(false)"`，**全文件只有两处调用、没有定义** → ReferenceError。遮罩那处因 `#gen-modal` 上另挂了 `addEventListener` 兜底才看不出坏，**只有 ✕ 暴露** | 补 `function closeModal(v){ Modal.close(v \|\| 0); }` |
+| 真跑但筛出 0 篇时显示「抽出 0 条」 | 后端在 `if not picked` 就 `return`，**早于**设 `dry_run`，该路径只有 `reason` 没有标记；汇总函数只认 `skipped`/`dry_run` → 把「根本没跑」说成「跑了没抽到」 | `_analLearnSummary` 加 `if (r.reason)` 分支 |
+| evidence 里的换行被渲染成空格 | HTML 默认把 `\n` 压成空格 = **引文被改写** | `.anal-ev { white-space: pre-wrap; overflow-wrap: break-word }` |
+
+### 验证四层（浏览器全程连不上，所以不靠肉眼看）
+
+| 脚本（`%LOCALAPPDATA%\Temp\opencode\`） | 层数 | 断言 |
+|---|---|---|
+| `check_index_js.py` | JS 语法 | 抽 2 个 script 块 `node --check` |
+| `test_anal_ui.py` | 静态装配 | tab 按钮/section/`TABS`/`TAB_LOADERS` 四处对齐；JS 里 `$('id')` 的 id 都存在；**每个 onclick 引用的函数都有定义**；CSS 类有规则 |
+| `test_anal_render.py` | **V8 真跑**（`py_mini_racer`） | 46 条真实数据 + 21 种残缺数据喂 `_analRow`/`_analRenderList`，断言无 `undefined`/`NaN`/字段丢失、按钮互斥、空态文案、汇总文案含 2 条**反例** |
+| `test_anal_api.py` | 真请求 | 4 个端点 + 页面确实是新文件 + 状态筛选生效 + `evidence` 非空 + `indicators` 可解析 |
+
+**这一轮 4 个失败全是断言写错，不是代码有洞** —— 记下来免得下次被同类假失败带偏：
+
+1. `esc()` 把 `"` 转成 `&quot;` → 拿**原文**去比**转义后**的输出必然假失败
+2. 空态写的是 `textContent`，测试读了 `innerHTML` → 读错属性得到空串，
+   看着像「空态没渲染」
+3. 断言「整页不许出现『✅ 生效』」—— **状态徽标本来就显示它**；
+   要判的是按钮（`✅ 生效</button>`）不是文字
+4. 徽标文案是 `❌ 已否决`、按钮才是 `❌ 否决`，**两个标签不同** ——
+   我拿按钮标签配 `</span>` 去断言徽标
+5. `skipped` 只在早退分支返回，正常路径没有 → 把可选键当必选
+
+> 与 §2「区分 200 和有数据」同源：**断言本身也要独立推导**，
+> 不能拿被测代码的字面值当预期（第 3、4 条就是照抄了实现）。
+
+### 从 index.html 抽 JS 做离线测试的两个正则坑
+
+- `const esc = s => .*?;` 会在 **`&amp;` 的 HTML 实体分号**处截断
+- `.*?\}));` 根本匹配不到（`esc` 结尾是 `}[c]));`）→ 带 `re.S` 一路扫到
+  文件别处，把半截文件吃进来 → V8/node 报 `Unexpected end of input`，
+  **看起来像页面 JS 坏了，其实是测试的抽取正则坏了**
+- 正确：**按物理行**取 `^const esc = s => [^\n]*\n[^\n]*$`（`re.M`）
+
+### 起服务：`import app` 本身就要 81.8 秒（这次卡了很久）
+
+`python -m uvicorn app:app` 起来后端口一直不监听，进程活着但**只有 1 线程、
+4 分钟只用 1.6s CPU**，我一度去查锁、查 DB、查 `ilink_client` 模块级网络调用
+（`ilink_client` 全是 `def`，没有模块级 I/O）—— 全是白查。
+
+`python -X importtime -c "import app"` 实测 **`81802424` µs = 81.8 秒**，
+且 import 期就打印 `[wx] iLink 会话已建立` / `[holiday] 缺 [2027]` ——
+**守护线程在 import 末尾才起，所以 `threads=1` = 还在 import 里**。
+
+→ **判据**：`threads=1` + CPU 几乎不动 = 卡在 import 期，不是卡在端口/锁。
+先 `-X importtime` 拿到真实耗时，再决定「等多久」；100 秒就去查端口是查早了。
+→ 另：后台 shell 会报 `completed/exit` 而**进程其实还活着**，
+**不要拿 shell 的退出状态判断服务死活**，用
+`Get-CimInstance Win32_Process | Where CommandLine -match 'uvicorn'` + `netstat`。
+
+---
+
 ## 新股/打新「提前发现」渠道实测结论（2026-10-01，**别重查**）
 
 起因：打新额度提醒只依赖 `ipo_calendar` 排期，想问「有没有渠道能在排期公布前发现新股」。
@@ -802,6 +1839,150 @@ column=szse 与 column=sse 返回**完全相同**结果（逐条比对一致）�
 ---
 
 ## Python/数据库踩坑（都实测过，别重犯）
+
+### 🔥 服务起不来 40 分钟：`init_db()` 的 DDL 被死连接「接力」占锁（2026-10-07 修）
+
+**症状**：反复重启 8686 都起不来 —— 进程活着、CPU 几乎不动
+（**8 分钟只用 1.4s**、线程数 2、内存 59MB）、`netstat` 永远无监听。
+用 `-X importtime` 定位到 `daily_reports` 之后就停，一度以为是 import 慢/网络挂。
+
+**真因**（`pg_stat_activity` + `pg_locks` 是判据，不是猜）：
+
+```
+7 个后端全在等：
+  ALTER TABLE sa_watchlist ADD COLUMN IF NOT EXISTS keywords TEXT NOT NULL DEFAULT ''
+  wait_event = Lock/relation，granted = FALSE   ← 没有一个拿到锁
+而 keywords 列**早就存在** —— 这些 ALTER 全是空操作，却都要 AccessExclusiveLock
+
+持有锁的：pid=1139082  state='idle in transaction'  已挂 47 分钟
+          最后语句 `SAVEPOINT sp_mp`（= stock_discovery._rows() 跑 mp 源时设的）
+          本地 netstat 反查 client_port=26763 → **无 ESTABLISHED** = 客户端进程已消失
+```
+
+**根因链**：`_discover_loop` 开了事务 → `SAVEPOINT sp_mp` → 客户端进程死掉 →
+后端永远等 ClientRead → 事务不结束 → 持 `AccessShareLock` on `sa_watchlist` →
+挡死 `ALTER`（要 AccessExclusive）→ `init_db()` 阻塞 → **整个服务起不来**。
+
+**最阴的是「接力」**：干掉第一个堵点，第二个等锁者抢到锁、跑完 ALTER，
+然后**自己**也卡成 idle-in-transaction 持锁（它的客户端也死了）——
+一个接一个，要循环清理才能解完（实测 2 轮清干净）。
+
+**修法**（AGENTS.md 第 0 条「资源泄漏 / 死锁」授权直接修，不必先问）：
+循环终止 `state='idle in transaction' AND xact_age > 120s` 的后端，
+每轮复查「仍等 ALTER 数 / 仍超时事务数」，双双归零才停（最多 12 轮）。
+脚本 `%LOCALAPPDATA%\Temp\opencode\unlock2.py`。
+
+**为什么安全**：终止前先取证 —— 该事务最后语句是 SAVEPOINT（其后无任何语句），
+即**没有已执行的写入**，terminate 触发的 ROLLBACK 不丢数据。
+
+**教训**：
+1. **排查「服务起不来」第一步查 `pg_stat_activity`，不是猜 import 慢。**
+   `wait_event` 是 `Lock/relation` 时，问题 100% 在锁，与你的代码无关。
+2. **`ALTER TABLE ... IF NOT EXISTS` 仍是空操作也要抢排他锁** ——
+   「列已经有了所以没问题」是错觉，它照样会死锁。
+3. **进程还活着 ≠ 连接还活着**。判客户端死活用
+   `netstat -ano | findstr <client_port>`，没有 ESTABLISHED 就是死了。
+4. 清理要**循环 + 每轮复查**，单次 terminate 只解一个堵点。
+
+### ⚠️ 列名进了参数位 → 端点从没成功返回过一次（2026-10-07 修）
+
+**症状**：`GET /api/paper/adopted-strategies` 恒 500
+（`InvalidTextRepresentation: invalid input syntax for type boolean: "s.enabled"`）。
+
+**真因 ①**：`WHERE (%s = '' OR %s)` 配 `("FALSE", "s.enabled")` ——
+**列名被塞进参数位**，psycopg2 渲染成带引号的字面量 `'s.enabled'`，
+Postgres 拿它当 boolean 解析 → 炸。而且**两个分支都坏**：
+`include_rejected=True` 时渲染成 `('TRUE' = '' OR 'TRUE')`，把 `'TRUE'` 也当字符串。
+
+**真因 ②（修完 ① 又犯的）**：写成 `cur.execute(sql, (not include_rejected,))` →
+布尔取反了。`include_rejected=True` 渲染成 `WHERE (FALSE OR s.enabled)`
+= **只返回已采纳的**，而库里一条都没采纳过 → **不抛异常、返回 200、恒 0 行**。
+
+**最阴的是**：我当时写的测试断言 `eval_params(False) == (True,)` **照常 PASS** ——
+断言是照抄代码算出来的值，测试和代码错在同一个方向，**等于没测**。
+
+**修法**：`WHERE (%s OR s.enabled)` + `cur.execute(sql, (include_rejected,))`。
+语义钉死（别再靠猜）：`True → TRUE OR s.enabled`（全都要）、
+`False → FALSE OR s.enabled`（只要已采纳）。
+
+**教训**：
+1. **列名永远不能走参数位**，参数位只放值。
+2. **断言必须从语义独立推导**，不能拿被测代码算出的值当预期。
+3. **「不炸但恒 0 行」比 500 难发现得多** —— 必须断言「True 分支必须有行」
+   并与独立查出的基准行数比对（`count(*) FILTER (WHERE enabled)`）。
+
+测试：`%LOCALAPPDATA%\Temp\opencode\test_adopted.py`（23 个断言点，用 `ast` 抽出
+`app.py` 里的**真实** SQL 字面量与参数表达式对真库跑 —— **不 import app**，
+因为 import app 会起整套守护线程并卡在网络调用上）。
+
+### ⚠️ 删 `sa_strategy_def` 重复行：外键是 `ON DELETE CASCADE`，顺序反了丢数据（2026-10-07）
+
+**背景**：策略展示区上线后发现库里 12 行 / 4 个策略，其中
+`505366328b8be8ce53ef9575f22a65e0` 一个 article 占 9 行（根因是
+`jq_sandbox.save_run` 无条件 INSERT，已改成按 `article_id` upsert）。
+页面上就是 9 条几乎一样的行。
+
+**坑（探针实测出来的，不是记得 schema）**：
+
+```
+sa_backtest_run.strategy_id -> sa_strategy_def.id   ondelete=CASCADE
+```
+
+直接 `DELETE ... WHERE id IN (2..9)` 会把挂在这些行上的 **4 条回测记录一起
+级联删掉** —— 而 id=1 当时恰好**没有**回测指标（指标全挂在 6~9 上），
+等于「清掉重复行」清成「指标全丢」。表现还不报错，只是展示区的
+年化/回撤/夏普变成一片 `—`。
+
+**正确顺序（单事务）**：
+
+```sql
+UPDATE sa_backtest_run SET strategy_id = 1 WHERE strategy_id IN (2,...,9);  -- 先迁
+DELETE FROM sa_strategy_def WHERE id IN (2,...,9) AND article_id = '...';   -- 后删
+```
+
+**动手前必须扫一遍还有谁引用**：`information_schema` 查指向该表的外键（含
+`delete_rule`），再逐个 `count(*) WHERE col = ANY(待删id)`。本次扫出 4 个
+`strategy_id` 列（`sa_paper_strategy_bindings` / `sa_paper_strategy_exits` /
+`sa_position_strategies` / `sa_trades`），引用待删 id 的行数**都是 0** 才动手。
+
+> ⚠️ 扫描 SQL 里的字面 `%` 要写 `%%`，否则 `LIKE '%strategy%'` + 空参数 →
+> `IndexError: tuple index out of range`（见下方 psycopg2 那节）。
+
+**结果**：`sa_strategy_def` 12 → **4**；`sa_backtest_run` 4 → 4（一条没丢）；
+id=1 从「有判定无指标」变成**判定+指标齐**（年化 16.48% / 回撤 -19.56% /
+夏普 0.78）；`sa_backtest_daily` 2634 行未受影响；孤儿回测 0。
+23 个断言点全过（`%LOCALAPPDATA%\Temp\opencode\dedup_strategy.py`，
+含「先 UPDATE 再 DELETE 顺序」与「回测总数不减」）。
+
+### ✅ 「策略引用到模拟盘」的桥 = `sa_watchlist`（2026-10-07 实现）
+
+用户要「策略可以直接引用，在实际盘或者虚拟盘中引用」。**前提先验了再说**：
+`paper_trading.py:1095` 的 `SELECT code, name FROM sa_watchlist ORDER BY code`
+就是 `run_decisions` 的候选池 —— 所以把策略的股票池写进自选，等于让它参与
+模拟盘，**不改 schema、不改交易逻辑**。
+
+新增 `POST /api/paper/adopted-strategies/{sid}/to-watchlist`，三个实现要点：
+
+1. **必须后端批量**：`fetch_quotes` 是批量接口（一次请求带全部 A 股代码，
+   `app.py:791`）。前端逐个调 `POST /api/watchlist` 会变成 36 次行情请求。
+2. **单个代码不许中断整批**：`universe` 里混一个格式非法/行情取不到的，
+   分开报 `added / already / invalid / no_quote`。
+3. **`ON CONFLICT DO NOTHING` 而非 `DO UPDATE`**：`POST /api/watchlist` 是
+   「编辑单只」语义、会覆盖 `note/keywords`；批量引用绝不能洗掉用户已有的
+   备注和关键词。
+
+**诚实边界（写在页面上，没藏）**：`enabled=false` 时照样可加池子，但
+`drives_paper=false` —— 写进去的只是策略**声明的股票池**，买不买/何时买卖仍由
+`run_decisions` 的 LLM + 那 6 种**卖出**规则决定。聚宽是**选股**逻辑，
+`sa_strategies` 只有 sell kind，两个维度接不上，搬的只有股票池、没有择时。
+
+端到端：`%LOCALAPPDATA%\Temp\opencode\test_to_watchlist.py`（23 个断言点，
+`ALL PASS`）—— 首次 `added=31 already=5`、**二次 `added=0 already=36`（幂等）**、
+`total=67 distinct=67` 无重复、404/400 边界正确、测完按来源标记
+`来自策略「...」股票池` 精确回滚并断言「恢复集合 == 快照集合」。
+
+> 写这条时的**测试纪律**：测试会真实写生产自选，所以 快照 → 跑 → 回滚 →
+> **再查一次集合相等**。光看「删了 31 行」不够（删错 31 行也看不出来）。
 
 ### 港股 K 线静默全挂：`market_data.tx_symbol` 把港股拼成深市代码（2026-10-04 修）
 
@@ -1328,6 +2509,19 @@ Python 明明抛了 traceback，我只看到「Exited with code 1」没有输出
 - 测试脚本统一放 `%LOCALAPPDATA%\Temp\opencode\`，不要写进仓库。
 - 多行中文脚本**不要用 `python -c "..."`**（PowerShell 会把换行和引号吃掉，
   表现为无输出 exit 1）。写成 `.py` 文件再跑。
+- **别用 `python x.py > file` 落中文输出**（2026-10-07 白花 4 轮才认出来）：
+  PowerShell 的 `>` 写 UTF-16，Python 按 `PYTHONIOENCODING` 写字节，两者一交叉
+  **ASCII 活、CJK 全毁** —— 结果 `PASS ...（1/4）` 被我读成 `（4/4）`，
+  然后去查「为什么和数据库对不上」，其实是输出坏了不是数据坏了。
+  **要落盘就让 Python 自己 `open(..., 'w', encoding='utf-8')` 写**，
+  或者干脆让脚本**只打 ASCII**（`DIAG nonempty=%d/%d`）。
+  一旦怀疑显示不对，**别做编码取证**（试 utf-8/gbk/utf-16 三种解码只会越查越糊），
+  直接改脚本重打一行数字 —— 一次就准。
+- **`> 0` 是弱断言**：`chk(len(nonempty) > 0)` 只要混进一条非空就过，而且
+  「几个非空」是拿被测 SQL 自己的返回算的 = 自证。正确做法是**独立查一条基线**
+  （如 `count(*) FILTER (WHERE universe::text <> '[]')`）当预期。
+  同理：源码里 `chk(` 的**出现次数 ≠ 实际执行条数**（有的在 `if` 分支里），
+  写「N 项全过」前先数清楚是哪种。
 
 ### 提交范围
 
