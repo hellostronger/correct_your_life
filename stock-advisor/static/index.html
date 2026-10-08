@@ -176,6 +176,29 @@
   }
   .jq-err { white-space: pre-wrap; word-break: break-word; max-height: 300px;
             color: var(--up); }
+
+  /* ---------- 分析技法学习页 ---------- */
+  /* 筛选按钮的选中态：与 .jq-sub.active 同规格（这里不复用 jq- 前缀，
+     是因为两页各自会改，共用一个类会互相牵连）。 */
+  .anal-sub.active { color: var(--accent); border-color: var(--accent);
+                     background: var(--accent-soft); }
+  /* 统计块可点 = 直接按该状态筛选，少一层「先看数字再去找筛选器」 */
+  .anal-stat { display: flex; align-items: baseline; gap: 6px; padding: 6px 10px;
+               border-radius: 8px; background: var(--bg-2);
+               border: 1px solid var(--border); font-size: 12px; cursor: pointer; }
+  .anal-stat:hover { border-color: var(--accent); }
+  .anal-stat b { font-family: var(--mono); font-size: 15px;
+                 font-variant-numeric: tabular-nums; }
+  .anal-item { border: 1px solid var(--border); border-radius: 8px;
+               padding: 9px 11px; background: var(--bg-2); margin-bottom: 8px; }
+  /* 原文依据单独成块 + 左侧竖线：审核时「这条是文章说的还是模型编的」要一眼看出，
+     淹在正文里就等于没标。 */
+  /* pre-wrap + break-word：evidence 是**原文引用**，换行必须保留（默认 HTML 会把
+     \n 压成空格 = 引文被改写）；同时防长英文串溢出容器。 */
+  .anal-ev { border-left: 3px solid var(--accent); background: var(--card);
+             padding: 5px 9px; margin-top: 6px; border-radius: 0 6px 6px 0;
+             font-size: 12px; line-height: 1.6; color: var(--text-2);
+             white-space: pre-wrap; overflow-wrap: break-word; }
   .b-duckduckgo { background: #e5f3e2; color: #2e7d32; }
   .b-ok   { background: var(--down-soft); color: var(--down); }
   .b-warn { background: var(--warn-soft); color: var(--warn); }
@@ -220,6 +243,44 @@
   .field input, .field textarea, .field select { width: 100%; }
   .field textarea { resize: vertical; min-height: 62px; font-family: inherit; }
   .modal-msg { white-space: pre-wrap; line-height: 1.7; }
+
+  /* ---------- 加仓试算（cost_estimate 专用） ----------
+     为什么单独一组类而不是内联 style：第一版全用内联 style，且引用了
+     `var(--text-2)` / `var(--line)` —— 这两个变量**本项目不存在**（真实是
+     --text-2 / --border），于是标签全拿到默认前景色，深色模式下直接糊成一片。
+     内联 style 也没法随主题走。 */
+  .cc-inputs { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+               gap: 10px; margin-bottom: 12px; }
+  .cc-inputs .field { margin-bottom: 0; }
+  .cc-hint { font-size: 11px; color: var(--text-3); line-height: 1.5; margin-top: 3px; }
+  /* 结果区：账面 vs 真实 两个数并排，主次分明 */
+  .cc-result { display: grid; gap: 1px; background: var(--border);
+               border: 1px solid var(--border); border-radius: var(--r-sm);
+               overflow: hidden; font-size: 13px; }
+  .cc-result > div { display: flex; justify-content: space-between;
+                     align-items: baseline; gap: 12px; padding: 9px 12px;
+                     background: var(--card); }
+  .cc-result > div > span { color: var(--text-2); font-size: 12px; flex-shrink: 0; }
+  .cc-result > div > b { font-weight: 600; font-variant-numeric: tabular-nums; }
+  /* 真实回本价是重点行 —— 用强调底色，和「账面」区分开 */
+  .cc-result .cc-key { background: var(--accent-soft); }
+  .cc-result .cc-key > span, .cc-result .cc-key > b { color: var(--accent-ink); }
+  .cc-result .cc-sub { font-size: 11px; color: var(--text-3); font-weight: 400;
+                        margin-left: 6px; }
+  /* 回本涨幅：亏损侧用 --up（涨=红），盈利侧用 --down（跌=绿），跟 A 股习惯一致 */
+  .cc-result .cc-warn > b { color: var(--up); }
+  .cc-result .cc-good > b { color: var(--down); }
+  .cc-plan { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+  .cc-plan table { width: 100%; font-size: 12px; border-collapse: collapse; }
+  .cc-plan th { color: var(--text-3); font-weight: 500; text-align: right;
+                padding: 5px 8px; font-size: 11px; }
+  .cc-plan th:first-child, .cc-plan td:first-child { text-align: left; }
+  .cc-plan td { padding: 6px 8px; text-align: right;
+                border-top: 1px solid var(--border); font-variant-numeric: tabular-nums; }
+  .cc-plan tr.cc-plan-best td { background: var(--accent-soft); color: var(--accent-ink); }
+  .cc-notes { margin-top: 12px; padding: 9px 11px; background: var(--bg-2);
+              border-radius: var(--r-sm); font-size: 11px; color: var(--text-3);
+              line-height: 1.65; }
 
   /* ---------- 提示条 ---------- */
   .toast-wrap { position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
@@ -371,6 +432,7 @@
       <button data-tab="reports">分析报告</button>
       <button data-tab="paper">🧪 模拟交易</button>
       <button data-tab="jq">📚 策略库/沙箱<span id="jq-tab-badge" class="tab-badge hide">0</span></button>
+      <button data-tab="analysis">🧠 分析技法<span id="anal-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="notify">🔔 通知</button>
       <button data-tab="schedule">⚙️ 调度</button>
     </div>
@@ -669,6 +731,7 @@
           <button class="btn ghost hold-sort sm" data-sort="loss" onclick="setHoldSort('loss')">📉 亏损最多</button>
           <button class="btn ghost hold-sort sm" data-sort="gain" onclick="setHoldSort('gain')">📈 盈利最多</button>
         </span>
+        <button class="btn sm" onclick="openCostCalc('')" title="按拟买价与股数，预估加仓后摊薄成本">🧮 加仓试算</button>
       </div>
       <table>
         <thead><tr>
@@ -689,6 +752,86 @@
         <button class="modal-close" onclick="hideTrades()" title="关闭（Esc）">×</button>
       </div>
       <div class="modal-body" id="trades-detail"></div>
+    </div>
+  </div>
+
+  <!-- 加仓摊薄成本试算（买入前估算，不写库） -->
+  <div id="cost-modal" class="modal-mask hide" onclick="if(event.target===this)closeCostCalc()">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="cost-modal-title"
+         style="width:min(620px,100%)">
+      <div class="modal-head">
+        <b id="cost-modal-title">加仓摊薄成本试算</b>
+        <button class="modal-close" onclick="closeCostCalc()" title="关闭（Esc）">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="cc-inputs">
+          <div class="field">
+            <label for="cc-pos">选持仓（自动带出现价与成本）</label>
+            <select id="cc-pos" onchange="ccPickPosition()">
+              <option value="">空仓 / 手动输入</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="cc-cur">现价</label>
+            <input id="cc-cur" type="number" step="0.001" placeholder="自动取行情"
+                   oninput="ccCalc()">
+            <div class="cc-hint">留空则不算「回本涨幅」</div>
+          </div>
+        </div>
+        <div class="cc-inputs">
+          <div class="field">
+            <label for="cc-old-shares">现有股数</label>
+            <input id="cc-old-shares" type="number" min="0" step="100" value="0"
+                   oninput="ccCalc()">
+          </div>
+          <div class="field">
+            <label for="cc-old-cost">现有账面成本</label>
+            <input id="cc-old-cost" type="number" step="0.0001" value="0"
+                   oninput="ccCalc()">
+            <div class="cc-hint">不含费，与持仓页一致</div>
+          </div>
+          <div class="field" style="display:flex;align-items:flex-end;padding-bottom:8px">
+            <label style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer">
+              <input type="checkbox" id="cc-fund" onchange="ccCalc()"> 场内基金（免印花税）</label>
+          </div>
+        </div>
+        <div class="cc-inputs">
+          <div class="field">
+            <label for="cc-price">买入价</label>
+            <input id="cc-price" type="number" step="0.001" placeholder="15.00"
+                   oninput="ccCalc()">
+          </div>
+          <div class="field">
+            <label for="cc-shares">买入股数</label>
+            <input id="cc-shares" type="number" min="1" step="100" placeholder="1000"
+                   oninput="ccCalc()">
+            <div class="cc-hint">A 股须 100 股整数倍</div>
+          </div>
+          <div class="field">
+            <label for="cc-amount">或按金额（自动折股数）</label>
+            <input id="cc-amount" type="number" step="100" placeholder="15000"
+                   oninput="ccCalc()">
+            <div class="cc-hint">填了金额就以金额为准</div>
+          </div>
+        </div>
+
+        <div id="cc-out" class="cc-result" style="display:none"></div>
+
+        <div class="cc-plan">
+          <div class="field" style="margin-bottom:8px">
+            <label for="cc-budgets">分批加仓计划（预算档位，逗号分隔）</label>
+            <div class="row tight">
+              <input id="cc-budgets" placeholder="2000, 8000, 30000"
+                     style="flex:1;min-width:180px" oninput="ccPlan()">
+              <button class="btn sm" onclick="ccPlan()">生成</button>
+            </div>
+            <div class="cc-hint">同样 1000 股：1 笔佣金 5 元，分 10 笔就是 50 元 —— 最低佣金按笔收</div>
+          </div>
+          <div id="cc-plan-out"></div>
+        </div>
+
+        <div id="cc-caveats" class="cc-notes" style="display:none"></div>
+      </div>
     </div>
   </div>
 
@@ -1118,7 +1261,7 @@
         <span class="row">
           <input id="jq-post-id" placeholder="post_id（可留空）"
                  style="width:190px;padding:4px 7px;border-radius:6px;font-size:12px;
-                        border:1px solid var(--border);background:var(--bg-2);color:var(--fg)">
+                        border:1px solid var(--border);background:var(--bg-2);color:var(--text)">
           <button class="btn ghost" style="font-size:12px" onclick="jqFetch(this)">抓取文章</button>
           <button class="btn ghost" style="font-size:12px" onclick="jqExtract(this)">LLM 抽取</button>
           <button class="btn ghost" style="font-size:12px" onclick="loadJqLib()">刷新</button>
@@ -1130,6 +1273,26 @@
       </div>
       <div class="jq-stats" id="jq-stats" style="margin-top:8px"></div>
       <div class="muted" id="jq-sandbox" style="font-size:12px;margin-top:6px"></div>
+    </div>
+
+    <!-- 已验证策略库（独立展示区：采纳的可引用，被否决的留原因） -->
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <b style="font-size:13px">🧩 已验证策略库</b>
+        <span class="row">
+          <label class="row tight" style="font-size:12px;cursor:pointer">
+            <input type="checkbox" id="jq-show-rejected" onchange="loadAdopted()"> 显示被否决的
+          </label>
+          <button class="btn ghost" style="font-size:12px" onclick="loadAdopted()">刷新</button>
+        </span>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:4px">
+        沙箱验证通过、可作为<b>选股参考</b>的聚宽策略。采纳 ≠ 已在替你下单 ——
+        聚宽策略是选股逻辑，而模拟盘绑定的 6 种策略都是卖出条件，两者不在一个维度。
+      </div>
+      <div id="adopted-list" style="margin-top:8px"></div>
+      <div id="adopted-empty" class="empty hide"></div>
+      <div id="adopted-refs" style="margin-top:10px"></div>
     </div>
 
     <div class="card">
@@ -1162,15 +1325,15 @@
           <label class="row" style="gap:3px"><span class="muted">起</span>
             <input id="jq-start" value="2024-01-01"
                    style="width:110px;padding:4px 6px;border-radius:6px;font-size:12px;
-                          border:1px solid var(--border);background:var(--bg-2);color:var(--fg)"></label>
+                          border:1px solid var(--border);background:var(--bg-2);color:var(--text)"></label>
           <label class="row" style="gap:3px"><span class="muted">止</span>
             <input id="jq-end" placeholder="空=最新"
                    style="width:110px;padding:4px 6px;border-radius:6px;font-size:12px;
-                          border:1px solid var(--border);background:var(--bg-2);color:var(--fg)"></label>
+                          border:1px solid var(--border);background:var(--bg-2);color:var(--text)"></label>
           <label class="row" style="gap:3px"><span class="muted">截面</span>
             <input id="jq-limit" type="number" value="400" min="1" max="3000"
                    style="width:74px;padding:4px 6px;border-radius:6px;font-size:12px;
-                          border:1px solid var(--border);background:var(--bg-2);color:var(--fg)"></label>
+                          border:1px solid var(--border);background:var(--bg-2);color:var(--text)"></label>
         </span>
       </div>
       <div id="jq-detail" style="margin-top:8px"></div>
@@ -1183,7 +1346,7 @@
         <span class="muted" style="font-size:12px">批量</span>
         <input id="jq-batch-n" type="number" value="3" min="1" max="20"
                style="width:56px;padding:4px 6px;border-radius:6px;font-size:12px;
-                      border:1px solid var(--border);background:var(--bg-2);color:var(--fg)">
+                      border:1px solid var(--border);background:var(--bg-2);color:var(--text)">
         <span class="muted" style="font-size:12px">篇</span>
         <button class="btn ghost" style="font-size:12px" onclick="jqBatch(this)">批量本地跑</button>
       </div>
@@ -1202,6 +1365,64 @@
                 onclick="$('jq-curve-card').classList.add('hide')">收起</button>
       </div>
       <div id="jq-curve" style="margin-top:6px"></div>
+    </div>
+  </section>
+
+  <!-- 分析技法：从已抓取的文章里萃取「别人参考了哪些指标、按什么阈值判读」 -->
+  <section id="tab-analysis" class="hide">
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <b style="font-size:13px">📚 分析技法 · 从文章学到的判读规则</b>
+        <span class="row">
+          <span class="muted" id="anal-meta" style="font-size:12px"></span>
+          <button class="btn ghost" style="font-size:12px" onclick="loadTechniques()">刷新</button>
+        </span>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:4px">
+        LLM 从已抓取的文章里萃取「原文参考了什么指标、按什么阈值判读」。
+        <b>每条必须带原文依据（evidence），取不到依据就整条丢弃</b> —— 不允许模型凭先验编。
+        生效中的技法会注入到分析报告 / 模拟盘决策的 prompt，可预览、可单条否决。
+      </div>
+      <div id="anal-stats" class="pnl-summary" style="margin-top:8px"></div>
+
+      <div class="row" style="margin-top:10px;gap:6px;flex-wrap:wrap;align-items:center">
+        <span class="muted" style="font-size:12px">学习模式</span>
+        <button class="btn ghost" id="anal-mode-ai" style="font-size:12px"
+                onclick="setAnalysisMode('ai')">🤖 AI 自进化</button>
+        <button class="btn ghost" id="anal-mode-manual" style="font-size:12px"
+                onclick="setAnalysisMode('manual')">🧑 人工审核</button>
+        <span class="muted" id="anal-mode-hint" style="font-size:11px"></span>
+      </div>
+
+      <div class="row" style="margin-top:10px;gap:6px;flex-wrap:wrap">
+        <button class="btn ghost" style="font-size:12px"
+                onclick="runAnalysisLearn(this, true)">试跑（dry-run · 不花钱）</button>
+        <button class="btn ghost" style="font-size:12px"
+                onclick="runAnalysisLearn(this, false)">真跑一轮（3 篇 · 花 LLM 费用）</button>
+        <span style="width:8px"></span>
+        <button class="btn ghost" style="font-size:12px"
+                onclick="toggleInjection(this)">查看注入 prompt 的原文</button>
+        <span class="muted" id="anal-learn-out" style="font-size:12px"></span>
+      </div>
+      <div id="anal-injection" class="hide" style="margin-top:8px"></div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <span class="row" style="gap:4px" id="anal-filters">
+          <button class="btn ghost anal-sub active" data-st="" style="font-size:12px"
+                  onclick="analFilter('')">全部</button>
+          <button class="btn ghost anal-sub" data-st="active" style="font-size:12px"
+                  onclick="analFilter('active')">✅ 生效</button>
+          <button class="btn ghost anal-sub" data-st="pending" style="font-size:12px"
+                  onclick="analFilter('pending')">⏸ 待审</button>
+          <button class="btn ghost anal-sub" data-st="rejected" style="font-size:12px"
+                  onclick="analFilter('rejected')">❌ 已否决</button>
+        </span>
+        <span class="muted" id="anal-list-meta" style="font-size:12px"></span>
+      </div>
+      <div id="anal-list" style="margin-top:8px"></div>
+      <div id="anal-empty" class="empty hide"></div>
     </div>
   </section>
   <!-- 通知 -->
@@ -1500,18 +1721,18 @@
           <span class="muted">目标收益率 (%)</span>
           <input id="pg-ret" type="number" step="0.5" min="0.1" placeholder="如 8 表示 8%"
                  style="width:130px;padding:5px 7px;border-radius:6px;
-                        border:1px solid var(--border);background:var(--bg-2);color:var(--fg)">
+                        border:1px solid var(--border);background:var(--bg-2);color:var(--text)">
         </label>
         <label style="font-size:12px;display:flex;flex-direction:column;gap:3px">
           <span class="muted">期限（自然日，含今天）</span>
           <input id="pg-days" type="number" step="1" min="1" placeholder="如 20"
                  style="width:130px;padding:5px 7px;border-radius:6px;
-                        border:1px solid var(--border);background:var(--bg-2);color:var(--fg)">
+                        border:1px solid var(--border);background:var(--bg-2);color:var(--text)">
         </label>
         <label style="font-size:12px;display:flex;flex-direction:column;gap:3px">
           <span class="muted">模式</span>
           <select id="pg-mode" style="width:190px;padding:5px 7px;border-radius:6px;
-                  border:1px solid var(--border);background:var(--bg-2);color:var(--fg)">
+                  border:1px solid var(--border);background:var(--bg-2);color:var(--text)">
             <option value="observe">只度量（可多个，对比用）</option>
             <option value="constrain">临期收紧（限仓位+禁开新仓）</option>
           </select>
@@ -1531,25 +1752,25 @@
           <span class="muted">每隔（分钟）</span>
           <input id="paper-iv" type="number" min="1" max="240" step="1"
                  style="width:84px;padding:5px 7px;border-radius:6px;
-                        border:1px solid var(--border);background:var(--bg-2);color:var(--fg)">
+                        border:1px solid var(--border);background:var(--bg-2);color:var(--text)">
         </label>
         <label style="font-size:12px;display:flex;flex-direction:column;gap:3px">
           <span class="muted">开始</span>
           <input id="paper-start" type="time"
                  style="width:110px;padding:5px 7px;border-radius:6px;
-                        border:1px solid var(--border);background:var(--bg-2);color:var(--fg)">
+                        border:1px solid var(--border);background:var(--bg-2);color:var(--text)">
         </label>
         <label style="font-size:12px;display:flex;flex-direction:column;gap:3px">
           <span class="muted">最后判断</span>
           <input id="paper-end" type="time"
                  style="width:110px;padding:5px 7px;border-radius:6px;
-                        border:1px solid var(--border);background:var(--bg-2);color:var(--fg)">
+                        border:1px solid var(--border);background:var(--bg-2);color:var(--text)">
         </label>
         <label style="font-size:12px;display:flex;flex-direction:column;gap:3px">
           <span class="muted">止损上限(%)</span>
           <input id="paper-slmax" type="number" min="1" max="30" step="0.5"
                  style="width:84px;padding:5px 7px;border-radius:6px;
-                        border:1px solid var(--border);background:var(--bg-2);color:var(--fg)">
+                        border:1px solid var(--border);background:var(--bg-2);color:var(--text)">
         </label>
         <label class="row" style="font-size:12px;gap:5px;cursor:pointer">
           <input id="paper-holdonly" type="checkbox">
@@ -1743,6 +1964,74 @@ const yi = v => (typeof v === 'number' ? (v / 1e8).toFixed(2) + '亿' : '—');
 const esc = s => (s == null ? '' : String(s)).replace(/[&<>"]/g,
   c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
+// ---------- 模拟盘：决策时刻 ----------
+// 为什么要有（2026-10-08）：决策理由不带时间就看不出这条判断是什么时候做的、
+// 行情早就变了、理由是否已经过期。同一天几轮决策尤其分不清。
+//
+// **为什么不能直接用 slot**（实测 400 行）：
+//   slot 是 _paper_loop 决定跑这一轮的时刻，而行是**决策跑完才 INSERT**，
+//   created_at - slot = p50 11.9 / p90 22.5 / max 32.6 分钟（从不为负）。
+//   把 slot 标成「决策时刻」会系统性偏早最多半小时。
+//
+// 优先级：
+//   decided_at  决策实际产出时刻（rounds 的 entry/exit，后端 paper_trading.rounds）
+//   created_at  行写入时间（trades 接口同样有）
+//   slot        轮次标签，仅在前两者都缺时兜底（全表 674 行里有 74 行 slot 为空）
+// 三者都可能没有，此时**显示破折号而不是编一个时间**。
+function paperDecisionAt(t) {
+  if (!t) return '';
+  const iso = String(t.decided_at || t.created_at || '');
+  if (iso) {
+    // 必须 new Date(...).getHours() 取**本地时区**的钟点。
+    // ⚠️ 不要用正则截 ISO 串里的 HH:MM —— created_at 是 TIMESTAMPTZ，
+    // 库里存的是 +00:00（服务器时区 Etc/UTC），截出来的是 UTC 墙钟，
+    // 对 UTC+8 的用户会**系统性偏早 8 小时**（实测 15:54 显示成 07:54）。
+    const d = new Date(iso);
+    if (isFinite(d.getTime())) {
+      return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+    }
+  }
+  const slot = String(t.slot == null ? '' : t.slot).trim();
+  if (slot) return slot.replace(/-m$/, '');          // 手动轮次带 -m 后缀，去掉
+  return '';
+}
+// 决策日期 'MM-DD'（同样按本地时区）。兼容两种字段名：trades 用 trade_date、rounds 用 date。
+function paperDecisionDay(t) {
+  if (!t) return '';
+  const iso = String(t.decided_at || t.created_at || '');
+  if (iso) {
+    const d = new Date(iso);
+    if (isFinite(d.getTime())) {
+      return String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+    }
+  }
+  const d2 = String(t.trade_date || t.date || '').slice(0, 10);
+  return d2.length >= 10 ? d2.slice(5) : d2;
+}
+// 「多久之前」—— 判断过期的关键。算不出来返回 ''，不编造。
+// 有完整 ISO 时间戳就直接用它（最准）；只有 trade_date+slot 时才按墙钟拼。
+function paperDecisionAge(t) {
+  if (!t) return '';
+  const iso = String(t.decided_at || t.created_at || '');
+  let ts = NaN;
+  if (iso) {
+    ts = new Date(iso).getTime();
+  } else {
+    const day = String(t.trade_date || t.date || '').slice(0, 10);
+    const hm = paperDecisionAt(t);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(day) && /^\d{2}:\d{2}$/.test(hm)) {
+      ts = new Date(day + 'T' + hm + ':00').getTime();
+    }
+  }
+  if (!isFinite(ts) || ts <= 0) return '';
+  const mins = Math.floor((Date.now() - ts) / 60000);
+  if (mins < 1) return '刚刚';
+  if (mins < 60) return mins + ' 分钟前';
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return hours + ' 小时前';
+  return Math.floor(hours / 24) + ' 天前';
+}
+
 // ---------- 主题：auto / light / dark 三态循环 ----------
 const THEMES = ['auto', 'light', 'dark'];
 const THEME_LABEL = { auto: '自动', light: '浅色', dark: '深色' };
@@ -1926,6 +2215,19 @@ function showModal(opts) {
   });
 }
 
+/** 通用弹窗 ✕ / 遮罩的内联 onclick 入口。
+
+    ⚠️ 这两个元素（#gen-modal 和 .modal-close）写的是 `onclick="closeModal(false)"`，
+    而 showModal 内部走的却是 `Modal.close(...)` —— 一度 `closeModal` **只有调用点、
+    没有定义**，于是点 ✕ 直接 ReferenceError、弹窗关不掉。遮罩那处因为
+    `#gen-modal` 上另挂了 addEventListener 兜底才看不出坏，只有 ✕ 暴露。
+    教训：内联 onclick 引用的函数名，必须 grep 到定义 —— 「大部分能关」会盖住
+    「这个按钮是死的」。
+
+    `value || 0`：两个调用点传的是 `false`，而 showModal 的取消路径统一用 `0`，
+    归一到 0 免得不同弹窗对取消值的解释不一致。 */
+function closeModal(value) { Modal.close(value || 0); }
+
 // 底部按钮 / 遮罩点击：走统一 close
 $('gen-modal-foot').addEventListener('click', e => {
   if (e.target.closest('button[data-r]')) return;   // showModal 自己的 onclick 处理
@@ -1938,6 +2240,13 @@ $('gen-modal').addEventListener('click', e => {
 // Esc 关闭 + 弹窗内 Enter 提交 + Tab 焦点陷阱
 document.addEventListener('keydown', e => {
   if (!Modal.isOpen()) {
+    // 加仓试算弹窗：优先级低于交易流水（两者互斥，不会同时开）
+    if (e.key === 'Escape' && typeof _ccPositions !== 'undefined'
+        && !$('cost-modal').classList.contains('hide')) {
+      e.stopPropagation();
+      closeCostCalc();
+      return;
+    }
     if (e.key === 'Escape' && typeof _openTradeCode !== 'undefined' && _openTradeCode) {
       e.stopPropagation();
       hideTrades();
@@ -2030,6 +2339,280 @@ async function withBusy(btn, label, fn) {
   try { return await fn(); }
   finally { btn.disabled = false; btn.textContent = old; }
 }
+// ---------- 分析技法学习（anal） ----------
+// 双模式共用一张表 + 一个审核接口：mode=ai 时评分达标的直通 active，
+// mode=manual 时一律落 pending 等人点「生效」。两种模式的分界点只是**默认 status**，
+// 所以 AI 学歪了，人改一条 status 就能止损 —— 不用改代码、不用重启。
+//
+// 审核页的存在意义：抽取产物必须能被「原文依据」验证，所以每条都渲染 evidence，
+// 且把它单独成块（.anal-ev）而不是混在规则正文里。
+let _analTech = { rows: [], status: '', mode: 'ai', conf: {} };
+
+const _ANAL_ST = {
+  active:   { t: '✅ 生效', c: 'b-ok' },
+  pending:  { t: '⏸ 待审', c: 'b-warn' },
+  rejected: { t: '❌ 已否决', c: 'b-bad' },
+};
+
+const _analScore = v => {
+  const n = Number(v);
+  return isFinite(n) ? n.toFixed(1) : '—';
+};
+
+/** 后端存的是 JSON 文本。坏数据只该让这一行少几个标签，
+    不该让整个列表渲染失败 —— 所以解析失败一律当「没有指标」。 */
+function _analIndicators(txt) {
+  try { const a = JSON.parse(txt); return Array.isArray(a) ? a : []; }
+  catch { return []; }
+}
+
+async function loadTechniques() {
+  const list = $('anal-list');
+  if (list && !list.innerHTML.trim()) list.innerHTML = skeletonBox(3);
+  try {
+    const [t, c] = await Promise.all([
+      api('/api/analysis/techniques?status=' + encodeURIComponent(_analTech.status || '')),
+      api('/api/analysis/config'),
+    ]);
+    _analTech.rows = t.techniques || [];
+    _analTech.mode = c.mode || 'ai';
+    _analTech.conf = c;
+    _analRenderStats(t.stats || {}, c);
+    _analRenderMode(c);
+    _analRenderList(_analTech.rows);
+    _analFilterUI();
+  } catch (e) {
+    if (list) list.innerHTML = `<div class="muted">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+/** 统计块可点 = 直接切筛选。tab 徽标只显示「待审」——
+    那是这一页唯一需要人动手的量，生效/否决数是结果不是任务。 */
+function _analRenderStats(stats, conf) {
+  const box = $('anal-stats');
+  if (box) {
+    const cells = [
+      ['active', '✅ 生效', stats.active || 0],
+      ['pending', '⏸ 待审', stats.pending || 0],
+      ['rejected', '❌ 已否决', stats.rejected || 0],
+      ['', '合计', (stats.active || 0) + (stats.pending || 0) + (stats.rejected || 0)],
+    ];
+    box.innerHTML = cells.map(([st, k, v]) =>
+      `<span class="anal-stat"${st ? ` onclick="analFilter('${st}')"` : ''}>` +
+      `<span>${k}</span><b>${v}</b></span>`).join('');
+  }
+  const pend = stats.pending || 0;
+  const bd = $('anal-tab-badge');
+  if (bd) { bd.textContent = pend; bd.classList.toggle('hide', pend === 0); }
+  const m = $('anal-meta');
+  if (m) m.textContent =
+    `自动生效阈值 ${conf.activate_score ?? 7} 分 · 注入上限 ` +
+    `${conf.limit ?? 12} 条 / ${conf.max_chars ?? 2600} 字`;
+}
+
+function _analRenderMode(conf) {
+  ['ai', 'manual'].forEach(m => {
+    const b = $('anal-mode-' + m);
+    if (b) b.classList.toggle('active', _analTech.mode === m);
+  });
+  const h = $('anal-mode-hint');
+  if (!h) return;
+  h.textContent = _analTech.mode === 'ai'
+    ? `新抽到且评分 ≥ ${conf.activate_score ?? 7} 分的技法自动生效并注入 prompt`
+    : '新抽到的一律进「待审」，人点「✅ 生效」才注入 prompt';
+}
+
+function _analFilterUI() {
+  document.querySelectorAll('#anal-filters .anal-sub').forEach(b =>
+    b.classList.toggle('active', (b.dataset.st || '') === (_analTech.status || '')));
+}
+function analFilter(st) {
+  _analTech.status = st || '';
+  _analFilterUI();
+  loadTechniques();
+}
+
+async function setAnalysisMode(mode) {
+  if (_analTech.mode === mode) return;
+  const toAi = mode === 'ai';
+  const ok = await confirmDlg(
+    toAi
+      ? '切到 AI 自进化：之后新抽到且评分达标的技法会自动生效并注入 prompt。'
+        + '已生效 / 已否决的技法不受影响。'
+      : '切到人工审核：之后新抽到的一律进「待审」，要人点「✅ 生效」才注入 prompt。'
+        + '已生效的技法不受影响。',
+    { title: '切换学习模式', okText: toAi ? '切为 AI 自进化' : '切为人工审核' });
+  if (!ok) return;
+  try {
+    const r = await jsonPost('/api/analysis/config', { mode });
+    if (!r.ok) throw new Error(r.error || '切换失败');
+    _analTech.mode = r.mode;
+    _analRenderMode(_analTech.conf);
+    toastOk('已切换为 ' + (r.mode === 'ai' ? 'AI 自进化' : '人工审核'));
+  } catch (e) { toastErr('切换失败：' + e.message); }
+}
+
+function _analLearnSummary(r) {
+  if (r.skipped) return '已跳过：' + (r.reason || '未知原因');
+  if (r.dry_run) {
+    const n = (r.picked || []).length;
+    return n ? `dry-run：筛出 ${n} 篇 / 候选 ${r.candidates} 篇（未调 LLM）`
+             : `dry-run：没有符合筛选的新文章（候选 ${r.candidates} 篇）`;
+  }
+  // 真跑但筛选后一篇都没有：后端在 `if not picked` 就 return 了，**早于**设
+  // `dry_run`，所以这条路径只有 `reason` 没有标记。不读它就会落到下面的
+  // 「抽出 0 条」—— 把「根本一篇都没跑」伪装成「跑了但没抽到」，
+  // 与 AGENTS.md 那条「200 + data:null 被当成源挂」同源。
+  if (r.reason) return r.reason + `（候选 ${r.candidates} 篇）`;
+  const bits = [`抽出 ${r.extracted || 0} 条`, `生效 ${r.active || 0}`,
+                `待审 ${r.pending || 0}`];
+  if ((r.errors || []).length) bits.push(`失败 ${r.errors.length}`);
+  return bits.join(' · ');
+}
+
+async function runAnalysisLearn(btn, dry) {
+  const out = $('anal-learn-out');
+  await withBusy(btn, dry ? '试跑中…' : '抽取中…', async () => {
+    if (out) out.textContent = dry ? '只筛文章，不调 LLM…'
+                                   : 'LLM 抽取中，约 3 篇，可能要几十秒…';
+    try {
+      const r = await jsonPost('/api/analysis/learn', { dry_run: !!dry, articles: 3 });
+      if (r.error) throw new Error(r.error);
+      if (out) out.textContent = _analLearnSummary(r);
+      if (dry) {
+        // dry-run 的全部意义就是「先看筛选对不对」，所以把筛出来的标题摊开给人看
+        const picked = r.picked || [];
+        if (picked.length) {
+          await infoDlg('dry-run：会抽这几篇',
+            `<div class="muted" style="font-size:12px;margin-bottom:6px">
+               候选 ${r.candidates} 篇 → 筛出 ${picked.length} 篇。此步不调 LLM、不写库。
+             </div>` +
+            picked.map(p => `<div style="font-size:12px;padding:3px 0;line-height:1.5">
+               <b>#${p.id}</b> ${esc(p.title)}
+               <span class="muted">（${p.chars} 字）</span></div>`).join(''));
+        }
+      } else {
+        if ((r.errors || []).length)
+          toastErr(`有 ${r.errors.length} 篇失败：${r.errors[0]}`);
+        await loadTechniques();
+      }
+    } catch (e) {
+      if (out) out.textContent = '';
+      toastErr((dry ? '试跑失败：' : '抽取失败：') + e.message);
+    }
+  });
+}
+
+async function toggleInjection(btn) {
+  const box = $('anal-injection');
+  if (box && !box.classList.contains('hide')) {
+    box.classList.add('hide');
+    btn.textContent = '查看注入 prompt 的原文';
+    return;
+  }
+  let opened = false;
+  await withBusy(btn, '取预览中…', async () => {
+    try {
+      const d = await api('/api/analysis/injection');
+      const body = d.block
+        ? `<pre class="jq-code">${esc(d.block)}</pre>`
+        : `<div class="muted">当前没有生效中的技法，注入区块为空。</div>`;
+      box.innerHTML =
+        `<div class="muted" style="font-size:11px">active=${d.active_count} · 区块 ` +
+        `${d.chars} 字符（超上限会被裁掉，见 config.analysis_learn.max_chars）</div>` +
+        body;
+      box.classList.remove('hide');
+      opened = true;
+    } catch (e) { toastErr('预览失败：' + e.message); }
+  });
+  // withBusy 的 finally 会把文案还原成「查看…」，所以成功的文案要在这里补
+  if (opened) btn.textContent = '收起注入预览';
+}
+
+/** 人工审核：改单条 status。这是「人工审核」与「AI 自进化」的唯一分界点。 */
+async function analReview(id, status) {
+  const t = _analTech.rows.find(r => String(r.id) === String(id));
+  if (!t) { toastErr('找不到这条技法（id=' + id + '）'); return; }
+  let note = t.review_note || '';
+  // 只有「否决」要填原因：被否掉的技法将来还得有人能看懂为什么，
+  // 空着的话下次抽到同一条还得重新判断一遍。
+  if (status === 'rejected') {
+    const v = await formDlg('否决这条技法', [{
+      key: 'note', label: '否决原因（必填）', value: note, type: 'textarea',
+      placeholder: '例如：与 A 股无关 / 阈值没有原文支持 / 与已有条目重复',
+      required: true, hint: '与这条技法一起留档，存在 review_note',
+    }], { okText: '否决' });
+    if (!v) return;                       // 用户取消
+    note = v.note || '';
+  }
+  try {
+    const r = await jsonPost('/api/analysis/techniques/review',
+                             { id: Number(id), status, note, mode: 'manual' });
+    if (!r.ok) throw new Error(r.error || '失败');
+    toastOk(`「${r.name}」→ ${(_ANAL_ST[r.status] || {}).t || r.status}`);
+    await loadTechniques();
+  } catch (e) { toastErr('审核失败：' + e.message); }
+}
+
+function _analRow(t) {
+  const st = _ANAL_ST[t.status] || { t: String(t.status || '未知'), c: 'b-mute' };
+  const inds = _analIndicators(t.indicators);
+  const src = t.source_url
+    ? `<a href="${esc(t.source_url)}" target="_blank" rel="noopener">` +
+      `${esc(t.source_title || '来源文章')}</a>`
+    : esc(t.source_title || '来源未知');
+  // 当前状态的按钮不重复渲染 —— 三个都亮着会让人以为点了没反应。
+  // `t.id == null` 时一个都不给：否则会渲染出 `analReview('undefined',...)`
+  // 这种「页面看着正常、点了才报错」的脏链接。
+  const btn = (want, label) => (t.status === want || t.id == null) ? '' :
+    `<button class="btn ghost" style="font-size:11px;padding:3px 7px" ` +
+    `onclick="analReview('${t.id}','${want}')">${label}</button>`;
+  return `<div class="anal-item">
+    <div class="row" style="justify-content:space-between;align-items:flex-start;gap:8px">
+      <span class="row" style="gap:6px;align-items:flex-start;flex:1;min-width:0">
+        <span class="badge b-mute" style="flex:none">${esc(t.category || '未分类')}</span>
+        <b style="font-size:13px">${esc(t.name)}</b>
+        <span class="badge ${st.c}">${st.t}</span>
+        <span class="muted" style="font-size:11px">⭐${_analScore(t.score)}</span>
+        <span class="muted" style="font-size:11px">命中 ${Number(t.hits) || 0} 次</span>
+      </span>
+      <span class="row" style="gap:4px;flex:none">
+        ${btn('active', '✅ 生效')}${btn('pending', '⏸ 待审')}${btn('rejected', '❌ 否决')}
+      </span>
+    </div>
+    <div style="font-size:12px;margin-top:5px;line-height:1.6">${esc(t.rule || '')}</div>
+    ${inds.length ? `<div class="row" style="gap:4px;margin-top:5px">${
+      inds.map(i => `<span class="rel-code">${esc(i)}</span>`).join('')}</div>` : ''}
+    <div class="anal-ev">📎 ${esc(t.evidence || '')}</div>
+    <div class="muted" style="font-size:11px;margin-top:5px">
+      来源：${src} · 学到于 ${esc(String(t.learned_at || '').slice(0, 16))}
+      ${t.reviewed_at ? ` · 审于 ${esc(String(t.reviewed_at).slice(0, 16))}` : ''}
+      ${t.mode === 'ai' ? ' · AI 抽取' : t.mode === 'manual' ? ' · 人工改动过' : ''}
+    </div>
+    ${t.review_note ? `<div class="muted" style="font-size:11px;margin-top:3px">
+      备注：${esc(t.review_note)}</div>` : ''}
+  </div>`;
+}
+
+function _analRenderList(rows) {
+  const list = $('anal-list'), empty = $('anal-empty');
+  if (!list) return;
+  const meta = $('anal-list-meta');
+  if (meta) meta.textContent = rows.length ? `${rows.length} 条` : '';
+  if (!rows.length) {
+    list.innerHTML = '';
+    if (empty) {
+      empty.classList.remove('hide');
+      empty.textContent = _analTech.status
+        ? '这个状态下没有技法'
+        : '还没有学到技法 —— 先点「试跑」核对筛选，再点「真跑一轮」';
+    }
+    return;
+  }
+  if (empty) empty.classList.add('hide');
+  list.innerHTML = rows.map(_analRow).join('');
+}
+
 // ---- 聚宽策略库 + 沙箱验证 ----
 // 这一页串起整条链路：抓文章 -> 抽源码 -> LLM 结构化 -> 静态体检 -> 沙箱回测 -> 验证图。
 // 设计上有三处是刻意的：
@@ -2068,6 +2651,173 @@ function jqScoreBadge(n) {
   const v = Number(n);
   const c = v >= 4 ? 'badge' : v >= 2 ? 'badge b-warn' : 'badge b-bad';
   return `<span class="${c}">${v}/5</span>`;
+}
+
+// ---- 已验证策略库（独立展示区） ----
+// 为什么单独一栏而不是塞进沙箱页的表格：沙箱页回答「跑了吗、跑出什么」，
+// 这里回答「**结论是什么、能不能用、为什么不能用**」。两件事的取数口径不同
+// （前者读 sa_sandbox_run 的原始指标，后者读 sa_strategy_def 的判定结论），
+// 混在一张表里会出现「绿色对勾 + 不可用」这种自相矛盾的行。
+//
+// 关键：**被否决的也要显示**（附原因）。「为什么不���它」和「为什么用它」
+// 一样需要留痕 —— 否则半年后只剩一个「不可用」，没人记得为什么。
+let _adoptedCache = [];
+async function loadAdopted() {
+  const box = $('adopted-list'), empty = $('adopted-empty');
+  const showRejected = $('jq-show-rejected') && $('jq-show-rejected').checked;
+  try {
+    // ⚠️ 这里**必须**恒带 include_rejected=true，再由前端按勾选框分。
+    //    原来是按勾选状态决定要不要传参 —— 但那样不勾时后端就把被否决的
+    //    过滤光了，前端算出来的 `rejected` 恒为空，于是空状态那句
+    //    「另有 N 条被否决，勾选看原因」**永远不会出现** —— 而它恰恰是
+    //    引导用户去勾的那个提示。等于把唯一能发现它们的入口写没了。
+    const d = await api('/api/paper/adopted-strategies?include_rejected=true');
+    _adoptedCache = d.items || [];
+    const adopted = _adoptedCache.filter(i => i.enabled);
+    const rejected = _adoptedCache.filter(i => !i.enabled);
+    const shown = showRejected ? _adoptedCache : adopted;
+    empty.classList.toggle('hide', shown.length > 0);
+    if (!shown.length) {
+      empty.textContent = rejected.length
+        ? `还没有验证通过的策略 —— 有 ${rejected.length} 条被否决`
+          + `，勾选右上「显示被否决的」看原因`
+        : '还没有跑过沙箱验证的策略 —— 去上面「抓文章 → 抽源码 → 沙箱回测」';
+      box.innerHTML = '';
+      loadAdoptedRefs();
+      return;
+    }
+
+    const metric = (label, v, suffix) => v == null ? '' :
+      `<span class="muted" style="font-size:11px">${label} ${
+        typeof v === 'number' ? v.toFixed(2) + (suffix || '') : jqEsc(v)}</span>`;
+    const row = i => {
+      const on = !!i.enabled;
+      // note 形如「不可用｜可移植 1/5｜原因1；原因2」—— 拆开显示，别糊成一坨
+      const parts = String(i.note || '').split('｜').filter(Boolean);
+      const verdict = parts[0] || (on ? '已采纳' : '未验证');
+      const reasons = parts.slice(2);
+      const hasMetric = i.total_return != null || i.annual_return != null
+        || i.max_drawdown != null || i.sharpe != null;
+      // 股票池大小。universe 是后端给的 list（老行可能是 null，后端已兜成 []），
+      // universe_n 是冗余的长度字段 —— 两个都认，免得后端改一次前端就瞎。
+      const pool = Array.isArray(i.universe) ? i.universe.length : (i.universe_n || 0);
+      return `<tr${on ? '' : ' style="opacity:.75"'}>
+        <td><b>${jqEsc(i.name)}</b>
+          <div class="muted" style="font-size:11px">${jqEsc(i.article_id || '')}</div></td>
+        <td><span class="badge ${on ? 'b-ok' : 'b-bad'}">${jqEsc(verdict)}</span></td>
+        <td>${jqScoreBadge(i.portable_score)}</td>
+        <td>${hasMetric
+            ? metric('年化', i.annual_return, '%') + metric(' 回撤', i.max_drawdown, '%')
+              + metric(' 夏普', i.sharpe)
+            : '<span class="muted">—</span>'}</td>
+        <td style="font-size:11px;max-width:340px">
+          ${reasons.length
+            ? reasons.map(r => `<div class="muted">· ${jqEsc(r)}</div>`).join('')
+            : (on ? '<span class="muted">判定通过，可作选股参考</span>'
+                  : '<span class="muted">未跑判定（沙箱登记但没走过 judge）</span>')}
+        </td>
+        <td>
+          ${pool
+            ? `<button class="btn ghost" style="font-size:11px;padding:3px 8px"
+                 onclick="adoptToWatchlist(${i.id}, this)"
+                 title="把该策略声明的 ${pool} 只股票加进自选（= 模拟盘候选池）">加入自选 (${pool})</button>`
+            : `<span class="muted" style="font-size:11px" title="策略没声明股票池，无从加入">无股票池</span>`}
+          <button class="link-btn" onclick="jqGotoArticle('${jqEsc(i.article_id)}')">看原文</button>
+        </td>
+      </tr>`;
+    };
+    let html = '<table style="width:100%;font-size:12px"><thead><tr>'
+      + '<th style="text-align:left">策略</th><th style="text-align:left">判定</th>'
+      + '<th style="text-align:left">可移植</th><th style="text-align:left">沙箱指标</th>'
+      + '<th style="text-align:left">原因</th><th></th></tr></thead><tbody>';
+    html += adopted.length
+      ? adopted.map(row).join('')
+      : `<tr><td colspan="6" class="muted" style="text-align:center;padding:14px">
+         暂无验证通过的策略${rejected.length ? `（${rejected.length} 条被否决）` : ''}</td></tr>`;
+    if (showRejected && rejected.length) html += rejected.map(row).join('');
+    box.innerHTML = html + '</tbody></table>';
+    loadAdoptedRefs();
+  } catch (e) {
+    box.innerHTML = `<span class="down">加载失败：${jqEsc(e.message)}</span>`;
+    empty.classList.add('hide');
+  }
+}
+
+/** 把策略声明的股票池批量加进自选 —— 模拟盘候选池就是 sa_watchlist
+ *  （paper_trading.py:1095 `SELECT code,name FROM sa_watchlist`），
+ *  这是「让策略参与模拟盘」当前唯一不改 schema、不改交易逻辑的路径。
+ *
+ *  必须走后端一次性接口：fetch_quotes 是**批量**的（一次请求带全部 A股代码），
+ *  前端逐个调 POST /api/watchlist 会变成 N 次行情请求。
+ *  后端也不会被一个坏码中断整批 —— invalid / no_quote 分开报。 */
+async function adoptToWatchlist(id, btn) {
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = '加入中…';
+  try {
+    const d = await jsonPost(`/api/paper/adopted-strategies/${id}/to-watchlist`);
+    const bits = [`已加 ${d.added} 只`];
+    if (d.already) bits.push(`${d.already} 只已在自选`);
+    if (d.no_quote && d.no_quote.length)
+      bits.push(`${d.no_quote.length} 只行情取不到（${d.no_quote.map(x => x.code).join(' ')}）`);
+    if (d.invalid && d.invalid.length)
+      bits.push(`${d.invalid.length} 只代码无效（${d.invalid.join(' ')}）`);
+    // 加 0 只也算「成功」—— 可能全都已经在自选里，不该报红。
+    toastOk(`${bits.join('；')}。${d.hint}`);
+    const mk = $('tab-market');
+    if (mk && !mk.classList.contains('hide')) loadWatch();   // 自选页正开着才刷新
+  } catch (e) {
+    toastErr('加入自选失败：' + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = old;
+  }
+}
+
+/** 引用区：说明采纳的策略怎么用、当前能不能参与下单。
+ *  不写假的「一键接入」按钮 —— 判定通过 ≠ 已经能驱动模拟盘，
+ *  差的那一步（编译成 sa_strategies 能表达的卖出规则 / 接成选股信号）
+ *  写在页面上比藏起来强。 */
+function loadAdoptedRefs() {
+  const box = $('adopted-refs');
+  const pool = i => Array.isArray(i.universe) ? i.universe.length : (i.universe_n || 0);
+  // ⚠️ 触发条件是「有股票池的行」，**不是**「已采纳的行」。
+  //    当前库里 0 条采纳（4 条全被否决），按采纳过滤的话这段说明永远不显示，
+  //    而「加入自选」按钮恰恰就在被否决的行上 —— 说明和按钮会互相看不见。
+  const withPool = _adoptedCache.filter(i => pool(i) > 0);
+  if (!withPool.length) { box.innerHTML = ''; return; }
+  const nCodes = withPool.reduce((s, i) => s + pool(i), 0);
+  box.innerHTML = `
+    <div style="border-top:1px solid var(--border);padding-top:10px">
+      <b style="font-size:12px">怎么引用</b>
+      <ul style="font-size:11.5px;color:var(--text-2);line-height:1.75;margin:6px 0 0;padding-left:18px">
+        <li><b>能做的</b>：行上的「加入自选 (N)」把该策略声明的股票池写进
+            <code>sa_watchlist</code> —— 那正是模拟盘 <code>run_decisions</code>
+            的候选池（<code>paper_trading.py:1095</code>
+            <code>SELECT code,name FROM sa_watchlist</code>）。
+            当前 ${withPool.length} 条策略声明了股票池、合计 ${nCodes} 只，
+            加进去后会进入下一轮模拟盘决策。</li>
+        <li><b>不等于策略在替你下单</b>：<span class="down">买不买、何时买卖仍由
+            run_decisions 的 LLM 决策 + 6 种卖出规则决定</span>
+            （<code>drives_paper=false</code>）。聚宽策略决定「买哪只」，
+            模拟盘绑定的 6 种策略（移动止盈/回撤/固定止盈/分批/止损/时间止盈）
+            决定「什么时候卖」—— 写进自选只是把它的<b>股票池</b>变成候选，
+            <b>没有</b>搬动它的<b>择时</b>。</li>
+        <li><b>接上择时的前提</b>：① 该策略的选股逻辑能在本项目的数据上复现
+            （见「数据可行性」判定）；② 把选股结果接成候选池或规则。</li>
+      </ul>
+    </div>`;
+}
+
+function jqGotoArticle(articleId) {
+  if (!articleId) return;
+  // ⚠️ 这里原来写的是 `jqFetch && jqFetch()` —— 那是**「抓取文章」按钮**
+  //    （POST /api/strategy-lib/fetch，真的去爬 20 篇），点「看原文」会
+  //    悄悄触发一次抓取。打开已抓到的文章要用 openJqArticle(pid)。
+  JQ_POST = articleId;
+  const inp = $('jq-post-id');
+  if (inp) inp.value = articleId;
+  const tab = document.querySelector('.tabs button[data-tab="jq"]');
+  if (tab && !tab.classList.contains('active')) tab.click();
+  openJqArticle(articleId);
 }
 
 async function loadJqLib() {
@@ -2282,8 +3032,28 @@ async function openJqArticle(pid) {
         const label = JQ_DIGEST_LABELS[k] || k;
         let val;
         if (Array.isArray(v)) {
-          val = '<ul style="margin:2px 0 0 16px;padding:0">' +
-            v.map(x => `<li style="font-size:12px">${jqEsc(x)}</li>`).join('') + '</ul>';
+          // 数组元素可能是对象（如 steps: [{no, what, detail, evidence}]），
+          // 直接 jqEsc 会显示 [object Object]。先判断元素类型。
+          if (v.length > 0 && typeof v[0] === 'object' && v[0] !== null) {
+            val = '<ul style="margin:2px 0 0 16px;padding:0">' +
+              v.map(x => {
+                if (typeof x !== 'object' || x === null) return `<li style="font-size:12px">${jqEsc(String(x))}</li>`;
+                // steps 的元素：{no, what, detail, evidence}
+                if (x.what !== undefined) {
+                  const no = x.no != null ? `${x.no}. ` : '';
+                  const detail = x.detail ? `<br><span class="muted" style="font-size:11px">${jqEsc(x.detail)}</span>` : '';
+                  const ev = x.evidence ? `<br><span class="muted" style="font-size:10px">依据：${jqEsc(x.evidence)}</span>` : '';
+                  return `<li style="font-size:12px"><b>${no}${jqEsc(x.what)}</b>${detail}${ev}</li>`;
+                }
+                // 其他对象数组：渲染成 key: value 的内联列表
+                return '<li style="font-size:12px">' + Object.entries(x).map(([a2, b2]) =>
+                  `<span class="muted">${jqEsc(a2)}:</span> ${jqEsc(typeof b2 === 'object' ? JSON.stringify(b2) : String(b2))}`
+                ).join('　') + '</li>';
+              }).join('') + '</ul>';
+          } else {
+            val = '<ul style="margin:2px 0 0 16px;padding:0">' +
+              v.map(x => `<li style="font-size:12px">${jqEsc(String(x))}</li>`).join('') + '</ul>';
+          }
         } else if (typeof v === 'object') {
           val = '<table style="margin-top:2px"><tbody>' + Object.entries(v).map(([a2, b2]) =>
             `<tr><td class="muted" style="font-size:11px;padding:1px 8px 1px 0;white-space:nowrap">${jqEsc(a2)}</td>
@@ -2669,7 +3439,7 @@ async function jqExtract(btn) {
 // ---- 标签页 ----
 const TABS = ['market', 'sector', 'holdings', 'strategies', 'plans', 'calendar', 'news',
               'bili', 'wb', 'mp', 'x', 'reports', 'paper', 'notify', 'schedule',
-              'jq'];
+              'jq', 'analysis'];
 const TAB_LOADERS = {
   market:    () => { loadWatch(); loadAlerts(); loadCrypto(); loadDiscover(); loadFutures(); },
   sector:    () => { loadSector(); loadIntraday(); startIntradayAuto(); },
@@ -2685,7 +3455,8 @@ const TAB_LOADERS = {
   reports:   loadReports,
   paper:     loadPaper,
   notify:    () => { loadNotifyConf(); loadNotifyMatrix(); refreshWxChat(); },
-  jq:        () => { loadJqLib(); loadJqList(); },
+  jq:        () => { loadJqLib(); loadJqList(); loadAdopted(); },
+  analysis:  loadTechniques,
   schedule:  () => { loadSchedule(); loadConfigAll(); },
 };
 function switchTab(name) {
@@ -2905,7 +3676,7 @@ async function loadStockBoards() {
           ? ` <span class="${cls(b.snap_pct)}">${signed(b.snap_pct)}%</span>`
             + (b.pct_rank != null ? `<span class="muted">前${100 - b.pct_rank}%</span>` : '')
           : '';
-        return `<span class="badge" style="${style || 'background:var(--bg);color:var(--muted)'}"
+        return `<span class="badge" style="${style || 'background:var(--bg);color:var(--text-2)'}"
           title="${kindLabel || '板块'}（点击看成分股）" ${b.code && b.code.startsWith('BK')
             ? `onclick="switchToBoard('${b.code}')"` : ''}>${b.name}${perf}</span>`;
       }).join(' ');
@@ -2994,20 +3765,48 @@ function capCell(q) {
                                    : q.market_cap.toFixed(2) + '亿';
   return n + (q.market === 'hk' ? '<div class="muted" style="font-size:10px">HKD</div>' : '');
 }
+// 成交额格式化：元 → 万亿/亿。放在「元→亿」这一步用 toFixed(1)，
+// 否则 679398992445 元显示成 "6793989924.45亿" 这种没人能读的数字。
+function amtText(v) {
+  if (typeof v !== 'number' || !isFinite(v) || v <= 0) return '—';
+  if (v >= 1e12) return (v / 1e12).toFixed(2) + ' 万亿';
+  if (v >= 1e8) return (v / 1e8).toFixed(0) + ' 亿';
+  if (v >= 1e4) return (v / 1e4).toFixed(0) + ' 万';
+  return v.toFixed(0);
+}
 async function loadMarketVolume() {
   try {
     const data = await api('/api/volume/status');
     const m = data.market || {};
     const box = $('market-vol');
-    const parts = (m.items || []).map(i =>
-      `<span class="muted">${i.name}</span>` +
-      `<b class="${i.color}">${i.ratio !== null ? i.label + ' ' + i.ratio + 'x' : '—'}</b>`);
+    // 两市合计成交额置顶：这是最该先看到的数字（1.51 万亿 vs 8000 亿
+    // 是完全不同的行情），量比标签退为辅助。
+    let head = '';
+    if (m.total_amount) {
+      head = `<div style="font-size:13px;margin-bottom:6px">` +
+        `<span class="muted">沪深两市成交额</span> ` +
+        `<b style="font-size:16px">${amtText(m.total_amount)}</b> ` +
+        `<span class="muted" style="font-size:11px">（上证+深证，不含创业板重复计）</span>` +
+        `</div>`;
+    }
+    const parts = (m.items || []).map(i => {
+      const amt = typeof i.amount === 'number'
+        ? `<b style="font-size:12px">${amtText(i.amount)}</b>` : '';
+      const pct = typeof i.pct === 'number'
+        ? `<span class="${i.pct >= 0 ? 'up' : 'down'}">` +
+          `${i.pct >= 0 ? '+' : ''}${i.pct.toFixed(2)}%</span>` : '';
+      return `<span class="row" style="gap:4px">` +
+        `<span class="muted">${i.name}</span>` + amt + pct +
+        `<span class="${i.color}">${i.ratio !== null && i.ratio !== undefined
+          ? i.label + ' ' + i.ratio + 'x' : '—'}</span></span>`;
+    });
     if (m.overall_ratio !== null && m.overall_ratio !== undefined)
-      parts.unshift(`<span class="muted">A股整体</span>` +
+      parts.unshift(`<span class="muted">A股整体量比</span>` +
         `<b class="${m.overall_color}">${m.overall_label} ${m.overall_ratio}x</b>`);
-    box.innerHTML = parts.join('');
+    box.innerHTML = head + `<div class="row" style="gap:14px;flex-wrap:wrap">` +
+      parts.join('') + `</div>`;
     $('market-vol-meta').textContent =
-      '判断口径：最新日成交量 ÷ 前5日均量；>1.15x 放量，<0.9x 缩量' +
+      '量比口径：最新日成交量 ÷ 前5日均量；>1.15x 放量，<0.9x 缩量。成交额为实时行情值' +
       (m.checked_at ? ` · 更新于 ${m.checked_at.replace('T', ' ')}` : '');
     // 回填自选表的量能列（避免两套请求时序不一致）
     const stockVol = data.stocks || {};
@@ -3025,7 +3824,9 @@ async function loadMarketVolIntraday() {
   try {
     const d = await api('/api/volume/intraday');
     if (!d.items || !d.items.length) { box.innerHTML = ''; return; }
+    // 成交额也摆出来：盘中「缩量」只有配上绝对额才知道是正常还是枯竭
     const parts = d.items.map(i => `<span class="muted">${i.name}</span>` +
+      (i.amount != null ? `<b>${amtText(i.amount)}</b>` : '') +
       `<b class="${_volColorOf(i.ratio)}">${i.ratio != null ? i.ratio + 'x' : '—'}</b>`);
     const overall = d.ratio != null
       ? `<b class="${_volColorOf(d.ratio)}">大盘 ${d.label || '—'} ${d.ratio}x</b>　` : '';
@@ -3375,13 +4176,165 @@ async function loadHoldings() {
         <td class="${cls(i.realized_pnl)}">${signed(i.realized_pnl_cny ?? i.realized_pnl)}</td>
         <td class="${cls(i.total_pnl)}"><b>${signed(i.total_pnl_cny ?? i.total_pnl)}</b></td>
         <td class="muted">${i.trade_count}</td>
-        <td><button class="del" onclick="event.stopPropagation();clearTrades('${i.code}',${i.trade_count})" title="清账：删除该股全部流水">×</button></td>
+        <td style="white-space:nowrap">
+          <button class="link-btn" onclick="event.stopPropagation();openCostCalc('${i.code}')" title="按拟买价试算加仓后的摊薄成本">试算</button>
+          <button class="del" onclick="event.stopPropagation();clearTrades('${i.code}',${i.trade_count})" title="清账：删除该股全部流水">×</button></td>
       </tr>`;
     }).join('');
     if (_openTradeCode) { if (items.some(i => i.code === _openTradeCode)) await showTrades(_openTradeCode); else hideTrades(); }
   } catch (e) { toastErr('加载持仓失败: ' + e.message); }
 }
 function setHoldSort(mode) { _holdSort = mode; loadHoldings(); }
+
+// ---- 加仓摊薄成本试算 ----
+// 为什么要单独这个而不是在「记一笔」里直接算：
+//   记一笔是**已经成交**的记账，试算是**买入前**的决策辅助。用户要回答的是
+//   「我按 X 价买 N 股，成本会摊到多少、跌到多少才回本」，这些数字在成交前
+//   才有意义。两者口径也必须一致（都取 app.calc_position 的 avg_cost）。
+//
+// 费用规则全在后端（cost_estimate.py），前端只做展示与输入 —— 佣金最低 5 元、
+// 印花税仅卖出、港股双向、基金免税这几条如果在前端再写一遍，
+// 两份实现必然漂移，而漂移方向是「显示的回本价比真实低」。
+let _ccPositions = [];
+function openCostCalc(code) {
+  const sel = $('cc-pos');
+  const held = (_holdingsCache || []).filter(i => i.net_shares > 0);
+  _ccPositions = held;
+  sel.innerHTML = '<option value="">空仓 / 手动输入</option>' +
+    held.map(i => `<option value="${esc(i.code)}">${esc(i.name || '')} ${esc(i.code)}`
+      + `（${fmt(i.net_shares)}股 @${fmt(i.avg_cost)}）</option>`).join('');
+  $('cost-modal').classList.remove('hide');
+  // 首次打开时预填买入价 = 现价，否则用户面对两个空框不知道从哪填起
+  if (code) { sel.value = code; ccPickPosition(); }
+  else if (!$('cc-price').value) {
+    const h = held[0];
+    if (h && h.price) $('cc-price').value = h.price;
+  }
+  ccCalc();
+}
+function closeCostCalc() { $('cost-modal').classList.add('hide'); }
+function ccPickPosition() {
+  const p = _ccPositions.find(i => i.code === $('cc-pos').value);
+  if (!p) return;
+  $('cc-old-shares').value = p.net_shares;
+  $('cc-old-cost').value = p.avg_cost;
+  if (!$('cc-cur').value && p.price) $('cc-cur').value = p.price;
+  if (!$('cc-price').value && p.price) $('cc-price').value = p.price;
+  // 切持仓时清掉上一只的金额输入，否则金额会盖掉新持仓的股数
+  $('cc-amount').value = '';
+  ccCalc();
+}
+function ccSharesFromAmount() {
+  const price = +$('cc-price').value, amt = +$('cc-amount').value;
+  if (!(price > 0) || !(amt > 0)) return 0;
+  return Math.floor(amt / (price * 100)) * 100;
+}
+function ccNum(v) {   // 数值取用统一走这里，坏值给破折号而不是 NaN/undefined
+  return (typeof v === 'number' && isFinite(v)) ? v : null;
+}
+async function ccCalc() {
+  const price = +$('cc-price').value;
+  let shares = +$('cc-shares').value;
+  if ($('cc-amount').value) shares = ccSharesFromAmount();
+  const out = $('cc-out');
+  if (!(price > 0) || !(shares > 0)) {
+    out.style.display = 'none'; out.innerHTML = '';
+    $('cc-caveats').style.display = 'none';
+    return;
+  }
+  const body = {
+    price, shares,
+    old_shares: +$('cc-old-shares').value || 0,
+    old_avg_cost: +$('cc-old-cost').value || 0,
+    current_price: +$('cc-cur').value || 0,
+    is_fund: $('cc-fund').checked,
+  };
+  const code = $('cc-pos').value;
+  if (code) body.code = code;
+  try {
+    const d = await api('/api/cost-estimate', {
+      method: 'POST', body: JSON.stringify(body) });
+    const delta = ccNum(d.cost_delta_pct);
+    const be = ccNum(d.break_even_from_now);
+    const cur = ccNum(d.current_price);
+    // 「回本涨幅」为正 = 还亏着要涨（红色），为负 = 已盈利（绿色）。
+    // A 股习惯涨红跌绿，所以「还需涨」用 --up、「已盈利」用 --down。
+    const beRow = (be !== null && cur)
+      ? `<div class="${be > 0 ? 'cc-warn' : 'cc-good'}">
+           <span>回本所需涨幅（现价 ${fmt(cur)}）</span>
+           <b>${signed(+be.toFixed(2))}%<span class="cc-sub">已含卖出费 ${fmt(ccNum(d.exit_cost_at_new_avg))}</span></b>
+         </div>` : '';
+    out.innerHTML = `
+      <div><span>账面摊薄成本<small class="cc-sub">与持仓页同口径，不含费</small></span>
+        <b>${fmt(ccNum(d.old_avg_cost))} → ${fmt(ccNum(d.new_avg_cost_gross))}
+          ${delta !== null ? `<span class="${delta < 0 ? 'cc-good' : 'cc-warn'}">${signed(+delta.toFixed(2))}%</span>` : ''}
+        </b></div>
+      <div class="cc-key"><span>真实回本价<small class="cc-sub">含全部买入费</small></span>
+        <b>${fmt(ccNum(d.new_avg_cost_net))}
+          <span class="cc-sub">费用累计 ${fmt(ccNum(d.total_fees_paid))} 元</span></b></div>
+      <div><span>本次买入需现金</span>
+        <b>${fmt(ccNum(d.cash_needed))} 元
+          <span class="cc-sub">其中费用 ${fmt(ccNum(d.buy_fees_total))}</span></b></div>
+      ${beRow}`;
+    out.style.display = '';
+    const cav = $('cc-caveats');
+    cav.innerHTML = (d.caveats || []).map(c => '· ' + esc(c)).join('<br>');
+    cav.style.display = (d.caveats || []).length ? '' : 'none';
+  } catch (e) {
+    out.style.display = '';
+    out.innerHTML = `<div><span>试算失败</span><b class="cc-warn">${esc(e.message)}</b></div>`;
+    $('cc-caveats').style.display = 'none';
+  }
+}
+async function ccPlan() {
+  const price = +$('cc-price').value;
+  const raw = $('cc-budgets').value.trim();
+  const box = $('cc-plan-out');
+  if (!(price > 0) || !raw) { box.innerHTML = ''; return; }
+  const budgets = raw.split(/[,，\s]+/).map(Number).filter(v => v > 0);
+  if (!budgets.length) { box.innerHTML = ''; return; }
+  const body = {
+    price, budgets,
+    old_shares: +$('cc-old-shares').value || 0,
+    old_avg_cost: +$('cc-old-cost').value || 0,
+    is_fund: $('cc-fund').checked,
+  };
+  const code = $('cc-pos').value;
+  if (code) body.code = code;
+  try {
+    const d = await api('/api/cost-plan', {
+      method: 'POST', body: JSON.stringify(body) });
+    const rows = d.rows || [];
+    // 找出「买得最多」的那档做高亮 —— 预算是递增的，最后一档买入最多、成本摊得最低
+    let best = -1;
+    rows.forEach((r, i) => { if (r.shares > 0 && r.shares > (rows[best]?.shares || 0)) best = i; });
+    box.innerHTML = rows.length ? `
+      <table><thead><tr>
+        <th>预算</th><th>可买</th><th>账面成本</th><th>真实回本价</th><th>累计费用</th>
+      </tr></thead><tbody>${rows.map((r, i) => {
+        if (!r.shares) {
+          return `<tr><td>${fmt(ccNum(r.budget))}</td>
+            <td colspan="4" style="text-align:right;color:var(--text-3)">${esc(r.note || '买不了')}</td></tr>`;
+        }
+        const real = ccNum(r.avg_after_net), gross = ccNum(r.avg_after);
+        const before = ccNum(d.rows[0]?.avg_after_net);
+        const cut = (real !== null && before !== null && i > 0)
+          ? ` <span class="cc-sub">${signed(+((real / before - 1) * 100).toFixed(2))}%</span>` : '';
+        return `<tr class="${i === best ? 'cc-plan-best' : ''}">
+          <td>${fmt(ccNum(r.budget))}</td>
+          <td>${fmt(r.shares)} 股</td>
+          <td>${fmt(gross)}</td>
+          <td>${fmt(real)}${cut}</td>
+          <td>${fmt(ccNum(r.total_fees_paid))}</td>
+        </tr>`;
+      }).join('')}</tbody></table>
+      <div class="cc-hint" style="margin-top:6px">
+        账面成本与笔数无关，真实回本价随笔数上升 —— 最低佣金按笔收，所以分批越碎越贵</div>`
+      : '';
+  } catch (e) {
+    box.innerHTML = `<div class="cc-hint" style="color:var(--up)">${esc(e.message)}</div>`;
+  }
+}
 
 async function addTrade() {
   const code = $('t-code').value.trim();
@@ -3783,7 +4736,7 @@ async function showAdviceHistory(id) {
       box.innerHTML = rows.map(r => `<details style="margin:3px 0">
         <summary style="cursor:pointer">${esc(r.created_at.replace('T', ' '))}
           · ${esc(r.model || '')} · ${r.auto ? '自动' : '手动'} · #${r.id}</summary>
-        <div style="white-space:pre-wrap;word-break:break-word;color:var(--muted);
+        <div style="white-space:pre-wrap;word-break:break-word;color:var(--text-2);
              padding:4px 0 4px 10px;border-left:2px solid var(--border)">${esc(r.brief || '')}…</div>
       </details>`).join('');
     }
@@ -4230,9 +5183,20 @@ function renderPaperRounds() {
       ? `<div><b>${x.price}</b> × ${fmt(x.shares)}</div>
          <div class="muted">${x.date}${x.slot ? ' ' + x.slot : ''} · 费 ${x.fee}</div>`
       : '<span class="muted">尚未卖出</span>';
-    const reasonCell = t => !t || !t.reasoning
-      ? '<span class="muted">（无）</span>'
-      : `<div style="font-size:12px;line-height:1.5">${esc(t.reasoning)}</div>`;
+    // 理由单元格带上决策时刻 + 「多久之前」（2026-10-08）。
+    // 时刻取不到就只显示理由本身，不显示破折号占位（那看着像 bug）。
+    const reasonCell = (t, label) => {
+      if (!t) return '<span class="muted">（无）</span>';
+      const at = paperDecisionAt(t), day = paperDecisionDay(t), age = paperDecisionAge(t);
+      const stamp = (day || at)
+        ? `<div class="muted" style="font-size:11px;line-height:1.4">
+             ${esc(label || '决策')} ${esc(day)}${at ? ' ' + esc(at) : ''}${age ? ' · ' + esc(age) : ''}
+           </div>` : '';
+      const body = t.reasoning
+        ? `<div style="font-size:12px;line-height:1.5">${esc(t.reasoning)}</div>`
+        : '<span class="muted">（无理由）</span>';
+      return stamp + body;
+    };
     return `<div class="card" style="margin:8px 0;padding:10px 12px">
       <div class="row" style="justify-content:space-between;align-items:center;gap:8px">
         <div>
@@ -4261,7 +5225,7 @@ function renderPaperRounds() {
               <td class="muted">${e.date}${e.slot ? ' ' + e.slot : ''}</td>
               <td>${e.confidence != null ? e.confidence : '—'}</td>
               <td>${e.stop_loss_pct != null ? e.stop_loss_pct + '%' : '—'}</td>
-              <td style="white-space:normal;min-width:260px">${reasonCell(e)}</td>
+              <td style="white-space:normal;min-width:260px">${reasonCell(e, '买入决策')}</td>
             </tr>
             ${x ? `<tr>
               <td><span class="badge" style="background:#e5f3e2;color:#1e7d32">卖出</span></td>
@@ -4270,7 +5234,7 @@ function renderPaperRounds() {
               <td class="muted">${x.date}${x.slot ? ' ' + x.slot : ''}</td>
               <td>${x.confidence != null ? x.confidence : '—'}</td>
               <td class="muted">—</td>
-              <td style="white-space:normal;min-width:260px">${reasonCell(x)}</td>
+              <td style="white-space:normal;min-width:260px">${reasonCell(x, '卖出决策')}</td>
             </tr>` : ''}
           </tbody>
         </table>
@@ -4641,7 +5605,7 @@ function paperStatusBadge(t) {
 // ---- 模拟盘目标模式 ----
 const GOAL_ST = { reached: ['✅ 达标', '#e5f3e2', '#2e7d32'],
                   expired: ['⏰ 到期未达标', '#ffe2e2', '#b32424'],
-                  cancelled: ['✋ 已取消', 'var(--border-2)', 'var(--muted)'],
+                  cancelled: ['✋ 已取消', 'var(--border-2)', 'var(--text-2)'],
                   active: ['▶️ 进行中', 'var(--bg-2)', 'var(--text-2)'] };
 function goalBadge(st) {
   const [t, bg, fg] = GOAL_ST[st] || GOAL_ST.active;
@@ -4818,11 +5782,22 @@ async function loadPaper() {
     renderPaperRounds();
     // 决策流水（审计用，含观望）
     $('paper-trades-empty').classList.toggle('hide', trades.length > 0);
-    $('paper-trades').innerHTML = trades.map(t => `
+    $('paper-trades').innerHTML = trades.map(t => {
+      // 单行损坏只影响这一行 —— 不能让一条 null 记录把整张表炸没。
+      if (!t) return '<tr><td colspan="8" class="muted">（该行记录缺少数据）</td></tr>';
+      // 时间列：日期 + **决策时刻** + 多久之前（2026-10-08）。
+      // 原来只有 MM-DD，同一天几轮决策完全分不清、也看不出是否过期。
+      const at = paperDecisionAt(t), day = paperDecisionDay(t), age = paperDecisionAge(t);
+      const when = (day || at)
+        ? `${esc(day)}${at ? ' ' + esc(at) : ''}${age ? `<div class="muted" style="font-size:11px">${esc(age)}</div>` : ''}`
+        : '<span class="muted">—</span>';
+      const side = paperSideBadge(t.side);
+      const whenVerb = t.side === 'sell' ? '卖出决策' : (t.side === 'hold' ? '观望决策' : '买入决策');
+      return `
       <tr>
-        <td class="muted">${(t.trade_date || '').slice(5)}</td>
+        <td class="muted" style="white-space:nowrap">${when}</td>
         <td>${esc(t.name || t.code)}</td>
-        <td>${paperSideBadge(t.side)}</td>
+        <td>${side}</td>
         <td>${t.price != null ? t.price : '—'}</td>
         <td>${t.shares ? fmt(t.shares) : '—'}</td>
         <td>${paperStatusBadge(t)}</td>
@@ -4831,10 +5806,16 @@ async function loadPaper() {
           + (t.alpha_return != null ? `<span class="muted"> α${signed((t.alpha_return * 100).toFixed(1))}%</span>` : '')
           : '—'}</td>
         <td><details style="white-space:normal;min-width:220px;max-width:420px">
-          <summary style="cursor:pointer" class="muted">理由</summary>
-          <div style="font-size:12px;margin-top:4px">${esc(t.reasoning || '（无）')}</div>
+          <summary style="cursor:pointer" class="muted">理由${at ? ' · ' + esc(at) : ''}</summary>
+          <div style="font-size:12px;margin-top:4px">
+            ${(day || at) ? `<div class="muted" style="font-size:11px;margin-bottom:4px">
+              ${esc(whenVerb)}于 ${esc(day)}${at ? ' ' + esc(at) : ''}${age ? ' · ' + esc(age) : ''}
+            </div>` : ''}
+            <div style="line-height:1.5">${esc(t.reasoning || '（无）')}</div>
+          </div>
         </details></td>
-      </tr>`).join('');
+      </tr>`;
+    }).join('');
     // 经验库（含股票筛选下拉选项）
     const sel = $('paper-lesson-code');
     const cur = sel.value;

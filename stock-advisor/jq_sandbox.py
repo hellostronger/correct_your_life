@@ -572,17 +572,43 @@ def save_run(get_conn, result: dict, name: str, start: str, end: str,
     with get_conn() as conn:
         with conn.cursor() as cur:
             if strategy_id is None and article_id:
-                cur.execute(
-                    """INSERT INTO sa_strategy_def
-                       (name, article_id, runnable, code, params, universe, note)
-                       VALUES (%s,%s,'idea','',%s,%s,%s)
-                       RETURNING id""",
-                    (name[:160], article_id,
-                     json.dumps(params, ensure_ascii=False),
-                     json.dumps(universe, ensure_ascii=False),
-                     "由沙箱回测自动登记"))
-                r = cur.fetchone()
-                strategy_id = r[0] if r else None
+                # ⚠️ 原来是**无条件 INSERT**，同一 article_id 每跑一次沙箱就多一行。
+                # 实测库里 12 行 sa_strategy_def 有 8 行是同一个
+                # 505366328b8be8ce53ef9575f22a65e0（note 都还是
+                # 「由沙箱回测自动登记」、portable_score=0）。
+                # 后果很具体：strategy_gate.submit() 用
+                # `SELECT id ... ORDER BY id LIMIT 1` 找行判定并写 enabled，
+                # 所以只有**最早那一行**拿到判定结论，后面 7 行永远停在
+                # enabled=FALSE / score=0 —— 按 enabled 过滤时它们是隐形的，
+                # 而「为什么不能用它」这个结论被摊成了 8 份散落状态。
+                #
+                # 改成 upsert：同一 article_id 只留一行，重跑只更新元信息，
+                # **不覆盖** portable_score/enabled/note —— 那三个字段归
+                # strategy_gate.submit() 管（判定结论），沙箱只负责登记。
+                cur.execute("SELECT id FROM sa_strategy_def "
+                            "WHERE article_id=%s ORDER BY id LIMIT 1", (article_id,))
+                row = cur.fetchone()
+                if row:
+                    strategy_id = row[0]
+                    cur.execute(
+                        """UPDATE sa_strategy_def
+                           SET name=%s, params=%s, universe=%s, updated_at=now()
+                           WHERE id=%s""",
+                        (name[:160],
+                         json.dumps(params, ensure_ascii=False),
+                         json.dumps(universe, ensure_ascii=False), strategy_id))
+                else:
+                    cur.execute(
+                        """INSERT INTO sa_strategy_def
+                           (name, article_id, runnable, code, params, universe, note)
+                           VALUES (%s,%s,'idea','',%s,%s,%s)
+                           RETURNING id""",
+                        (name[:160], article_id,
+                         json.dumps(params, ensure_ascii=False),
+                         json.dumps(universe, ensure_ascii=False),
+                         "由沙箱回测自动登记"))
+                    r = cur.fetchone()
+                    strategy_id = r[0] if r else None
             cur.execute(
                 """INSERT INTO sa_backtest_run
                    (strategy_id, name, start_date, end_date, universe, params,

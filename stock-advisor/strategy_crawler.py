@@ -250,7 +250,6 @@ def _store_replies(cur, post_id: str, replies: list[dict], author: str = ""):
 
 def _store_article(cur, d: dict, uh: str, url: str, md: str, txt: str,
                    ch: str, src: dict, replies: list[dict]):
-    _store_replies(cur, d["post_id"], replies, author=d.get("author", ""))
     s = src.get("source") or {}
     ev = []
     for e in replies[:20]:
@@ -288,6 +287,8 @@ def _store_article(cur, d: dict, uh: str, url: str, md: str, txt: str,
          d["collect_count"], d["clone_count"],
          d["add_time"] or None, d["mod_time"] or None, d["last_active"] or None,
          True))
+    # 文章插入后才能插回复（外键约束 sa_strategy_reply_article_id_fkey）
+    _store_replies(cur, d["post_id"], replies, author=d.get("author", ""))
     # 抓完就排进 LLM 抽取队列。延迟 import 避免循环依赖
     # （strategy_extract 不 import 本模块，但它 import llm_advisor）
     try:

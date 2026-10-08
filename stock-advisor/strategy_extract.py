@@ -514,7 +514,8 @@ def call_llm(system: str, user: str, conf: dict, max_tokens: int = 16000
         raise RuntimeError("Claude 调用失败：" + " | ".join(errs))
     if getattr(msg, "stop_reason", "") == "refusal":
         raise RuntimeError("被安全策略拒绝（stop_reason=refusal）")
-    text = "".join(b.text for b in msg.content if b.type == "text").strip()
+    # 模型可能返回 ThinkingBlock（思考过程），只取 TextBlock 的内容
+    text = "".join(b.text for b in msg.content if hasattr(b, "text")).strip()
     if not text:
         raise RuntimeError("Claude 返回空内容（stop_reason=%s）"
                            % getattr(msg, "stop_reason", "?"))

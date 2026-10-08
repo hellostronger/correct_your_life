@@ -360,6 +360,17 @@ def _build_context(deps, kind: str) -> str:
             if gated:
                 lines.append("【聚宽策略库沙箱验证（跑通≠可信，见每条⚠）】")
                 lines.extend(gated)
+    # 已学习的分析技法（从历史文章萃取的判读规则，经审核）。
+    # 放在最后：它是「补充检查清单」，不该盖过实盘数据。deps 缺失或查询失败
+    # 都静默跳过 —— 注入失败绝不能让报告生成失败。
+    tech_fn = deps.get("anal_tech_fn")
+    if tech_fn:
+        try:
+            block = tech_fn()
+        except Exception:
+            block = ""
+        if block:
+            lines.append(block)
     return "\n".join(lines)
 
 
