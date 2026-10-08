@@ -44,6 +44,13 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 BOARD_TYPES = [("2", "industry"), ("3", "concept"), ("1", "region")]
 BOARD_KIND_NAME = {"industry": "行业", "concept": "概念", "region": "地域"}
 
+# data_service 能查成分股的板块 code —— **只有同花顺体系**：
+#   881xxx = 同花顺行业（adata 直通，实测 6/6）
+#   886xxx = 同花顺概念（adata 只要这一套）
+# 东财 BKxxxx 和 akshare 口径的 3xxxxx 都不适用，送过去只会拿到 502/404。
+# 用途见 fetch_board_constituents_via_service 的 docstring。
+_THS_BOARD_CODE = re.compile(r"(?:881|886)\d{3}")
+
 # 快照字段（东财 fltt=2 时数值已转好）：
 # f3 涨跌幅% f6 成交额(元) f8 换手% f12 代码 f14 名称 f62 主力净流入(元)
 # f104 上涨家数 f105 下跌家数 f128 领涨股 f140 领涨股代码 f136 领涨股涨幅
@@ -525,13 +532,25 @@ def fetch_board_constituents_via_service(bk_code: str,
     注意 code 体系（实测）：
       - 行业 881xxx -> 服务端 adata 接口直通
       - 概念 3xxxxx -> 服务端要 886xxx，直喂返回 404
+
+    **东财 BKxxxx 是第三套体系，服务端根本不接。** 2026-10-08 实测：把
+    `BK1722` / `BK0437` 原样转发过去，服务端在 adata 内部解析时抛
+    `ValueError('substring not found')`，回 502「成分股接口异常」——
+    看着像上游挂了，实际只是调用方传错了体系。板块总览的行 `data-bk`
+    在快照切到 data_service 之前一直是 BK 码（2026-09-21 那批 1031 行全是），
+    所以点行必然踩到。这里先按体系拦掉，日志说清楚原因，别白花一个请求。
     """
+    code = (bk_code or "").strip()
+    if not _THS_BOARD_CODE.fullmatch(code):
+        print(f"[sector] 成分股 {bk_code}: 非同花顺体系（只支持 881xxx/886xxx），"
+              f"跳过 data_service 直连", flush=True)
+        return []
     url = _data_service_url()
     if not url:
         return []
     try:
         resp = requests.get(
-            f"{url.rstrip('/')}/boards/{bk_code}/constituents",
+            f"{url.rstrip('/')}/boards/{code}/constituents",
             params={"limit": limit}, timeout=60)
         if resp.status_code != 200:
             print(f"[sector] 成分股 {bk_code}: HTTP {resp.status_code} "

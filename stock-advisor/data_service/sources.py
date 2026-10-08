@@ -128,6 +128,24 @@ class SourceError(RuntimeError):
     pass
 
 
+class TransientSourceError(Exception):
+    """上游**瞬时**异常/空结果 —— 值得重试。
+
+    刻意**不继承 SourceError**：fetch() 里 `except SourceError` 是确定性失败
+    分支（记账后直接抛、不重试）。让瞬时故障继承它，等于把可重试的情况变成
+    不可重试 —— 这正是原来 ths 连续 12 次全败却一次都没被重试的原因。
+    """
+
+
+#: ths 瞬时失败的重试参数（2026-10-08 加）。
+#: 依据：ths 连续 12 次全败后第 13 次立刻成功，所以重试 1 次就够，不要更多 ——
+#: 多一次重试意味着多烧一份 q.10jqka/data.10jqka 配额（整轮约 53 请求，
+#: 而 budget_per_host 只有 200，等于白扔 1/4 天的额度去换一个大概率会自愈的故障）。
+THS_FETCH_RETRIES = 1
+#: 重试前的等待。要给同花顺反爬/临时 5xx 一点恢复时间，太短等于立刻重打。
+THS_RETRY_DELAY = 2.0
+
+
 class _BaseSource:
     name = "base"
 
@@ -215,48 +233,88 @@ class ThsSource(_BaseSource):
               f"({time.time()-t0:.1f}s)", flush=True)
 
     def fetch(self, include_concept: bool = True) -> list[dict]:
-        """返回统一结构的板块列表。
+        """取一轮同花顺板块，**瞬时失败重试一次**。
 
         预算检查放在**每一步之前**而不是一次给足。原因：akshare 的
         `stock_board_concept_name_ths` 单次 41 个请求，如果只按「4 个」记账，
         实际会打出 164 个（实测 meter 里 q.10jqka 一天 164）—— 这正是
         原实现 576 请求/日被烧死的机制。逐步检查才真正限得住。
+
+        为什么加重试（2026-10-08 实测）：ths 会间歇性抛
+        `AttributeError: 'NoneType' object has no attribute 'text'`，
+        落点是 akshare 里 `soup.find(name="span", attrs={"class":"page_info"}).text`
+        —— 同花顺返回反爬页/空页时 find() 给回 None。观测到的形态是
+        「连续 12 次全败（last_ok 停在 4 天前），紧接着第 13 次就成功」，
+        属瞬时故障，重试一次通常能把整轮救回来。
+
+        两条纪律（都踩过才会写在这里）：
+          1. **SourceError（含预算不足）不重试**。预算耗尽再打一次只会白烧
+             配额，必须立刻记账并抛出。
+          2. **只有最终失败才 `_fail()`**。中间那次重试失败若也记账，
+             `consec_fail` 会虚增一倍，`/health` 的 healthy=false 就不再
+             反映真实状态了。
         """
-        ak = self._ak()
-        try:
-            self._refresh_codes()          # 内部自行记账
-            out: list[dict] = []
-
-            # 行业：8 字段最全
-            if METER.allow("q.10jqka.com.cn", 3):
-                for _, r in ak.stock_board_industry_summary_ths().iterrows():
-                    nm = str(r["板块"]).strip()
-                    out.append(N.from_ths_industry(r.to_dict(),
-                                                   self._code_ind.get(nm)))
-            else:
-                print("[data_service] q.10jqka 预算不足，跳过行业", flush=True)
-
-            # 概念：只有涨跌幅/资金流/领涨股
-            if include_concept:
-                if METER.allow("data.10jqka.com.cn", 9):
-                    for _, r in ak.stock_fund_flow_concept().iterrows():
-                        nm = str(r["行业"]).strip()
-                        out.append(N.from_ths_concept(r.to_dict(),
-                                                     self._code_con.get(nm)))
-                else:
-                    print("[data_service] data.10jqka 预算不足，跳过概念",
-                          flush=True)
-
-            if not out:
-                raise SourceError("同花顺：预算不足，一个板块都没拿到")
+        last_exc: BaseException | None = None
+        for attempt in range(THS_FETCH_RETRIES + 1):
+            try:
+                out = self._fetch_once(include_concept=include_concept)
+            except SourceError as exc:
+                # 预算类确定性失败：记账 + 直接抛，不重试
+                self._fail(exc)
+                raise
+            except BaseException as exc:                   # noqa: BLE001
+                last_exc = exc
+                if attempt < THS_FETCH_RETRIES:
+                    print(f"[data_service] ths 第 {attempt + 1} 次失败"
+                          f"（{type(exc).__name__}: {str(exc)[:80]}），"
+                          f"{THS_RETRY_DELAY}s 后重试", flush=True)
+                    time.sleep(THS_RETRY_DELAY)
+                    continue
+                self._fail(exc)
+                raise SourceError(f"同花顺源失败: {exc}") from exc
             self._ok()
             return out
-        except SourceError as exc:
-            self._fail(exc)
-            raise
-        except BaseException as exc:                      # noqa: BLE001
-            self._fail(exc)
-            raise SourceError(f"同花顺源失败: {exc}") from exc
+        # 循环内要么 return 要么 raise，走不到这里；留作兜底避免静默返回 None
+        raise SourceError(f"同花顺源失败: {last_exc}")
+
+    def _fetch_once(self, include_concept: bool = True) -> list[dict]:
+        """真正打一次同花顺。**不记账、不吞异常** —— 健康度记账与重试由 fetch() 负责。"""
+        ak = self._ak()
+        self._refresh_codes()          # 内部自行记账（预算 meter，不是健康度）
+        out: list[dict] = []
+        budget_blocked = False
+
+        # 行业：8 字段最全
+        if METER.allow("q.10jqka.com.cn", 3):
+            for _, r in ak.stock_board_industry_summary_ths().iterrows():
+                nm = str(r["板块"]).strip()
+                out.append(N.from_ths_industry(r.to_dict(),
+                                               self._code_ind.get(nm)))
+        else:
+            budget_blocked = True
+            print("[data_service] q.10jqka 预算不足，跳过行业", flush=True)
+
+        # 概念：只有涨跌幅/资金流/领涨股
+        if include_concept:
+            if METER.allow("data.10jqka.com.cn", 9):
+                for _, r in ak.stock_fund_flow_concept().iterrows():
+                    nm = str(r["行业"]).strip()
+                    out.append(N.from_ths_concept(r.to_dict(),
+                                                  self._code_con.get(nm)))
+            else:
+                budget_blocked = True
+                print("[data_service] data.10jqka 预算不足，跳过概念",
+                      flush=True)
+
+        if not out:
+            # 必须区分两种「空」，否则重试形同虚设：
+            #   预算被拒   -> 确定性，重试只是白烧配额 -> SourceError（不重试）
+            #   上游给空页 -> 瞬时，值得再打一次   -> TransientSourceError（重试）
+            if budget_blocked:
+                raise SourceError("同花顺：预算不足，一个板块都没拿到")
+            raise TransientSourceError(
+                "同花顺：上游返回空结果（行业与概念都没拿到任何板块）")
+        return out
 
     def index_history(self, board_name: str, days: int = 30) -> list[dict]:
         """板块指数历史日线 —— 动量分的数据来源，不必自己攒快照。"""

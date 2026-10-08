@@ -333,7 +333,26 @@ http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ss
 | 新浪 | `ssl_bkzj_bk` | 383（行业48+概念181+证监会154） | 辅助，只补空不覆盖 |
 
 - 部署在 **101.43.25.101**：`/opt/sa-data-service`，容器 `sa-data-service`，
-  只绑 `127.0.0.1:8080`（不暴露公网），外部走 SSH 隧道
+  绑 **`0.0.0.0:8080`**（`docker ps` 显示 `0.0.0.0:8080->8080/tcp`，
+  `ss -ltn` 是 `LISTEN 0.0.0.0:8080 users:(("docker-proxy",...))`）。
+  **2026-10-08 更正**：本文件早先写「只绑 `127.0.0.1:8080`（不暴露公网），外部走
+  SSH 隧道」——**已过期，是错的**。实测从本机（出口 `59.34.155.130`）直连
+  `http://101.43.25.101:8080/health` 返回 200、`/boards` 返回 200/826 板块，
+  **不需要隧道**。`stock-advisor/start_tunnel.ps1` 转发的是 **8001/WeRSS**，
+  从来不包含 8080 —— 不要拿它当 8080 的前提。
+- 容器内 akshare 是 **1.18.97**（`/usr/local/lib/python3.12/site-packages/akshare`，
+  解释器 `/usr/local/bin/python3`）。**本地是 1.18.88** —— 版本已漂移，
+  「本机复现」不等于「容器行为」，且本节记的 ths 实测结论都是 1.18.88 时代的。
+  ⚠️ 容器解释器**不是** `/app/env_x86_64/bin/python3`（那是 WeRSS 容器的路径，
+  在 sa-data-service 里会 `no such file or directory`）。
+- ths 源会**间歇性**抛 `AttributeError: 'NoneType' object has no attribute 'text'`
+  （2026-10-08 观测：连续 4 天 `last_ok=2026-10-04T05:10:53`、12 次调用全败，
+  紧接着下一次 `calls=13` 就成功、`consec_fail=0`）。机制上唯一吻合的落点是
+  akshare 里的 `soup.find(name="span", attrs={"class":"page_info"}).text` ——
+  同花顺返回反爬页/空页时 `find()` 返回 `None`，`.text` 就炸。
+  **本机 6 轮有界复现全部成功（90 行/轮），没能复现 → 属推断不属结论**。
+  它表现为**单轮真降级**（`degraded=True`、ths 缺席、板块数 969→697），
+  下一轮自愈，不要据此判定「ths 源已挂」。
 - 已实测：容器内 `/boards` 返回 **969 板块**，`degraded=False`，四个源全部参与。
   涨停池走档 1（push2ex）实测 **52 家**、最高连板 7、炸板 34、32 个板块有涨停家数。
 - **交易日感知**：`/boards` 和 `/health` 都返回 `is_trading_day` + `data_date`。
@@ -349,6 +368,149 @@ http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ss
 **别把 200 请求/日的预算改大来「提高频率」**：一次完整采集约 55 个请求
 （概念名表就 41 个），200 的预算只够 3 轮。预算耗尽会自动降级到新浪，
 而不是像原实现那样无限打同花顺直到被永久封禁。
+
+### 板块 code 是三套体系，混着用会变成「假 502」（2026-10-08 修）
+
+**症状**：日志反复出现
+`[sector] 成分股 BK1722: HTTP 502 {"detail":"成分股接口异常: substring not found"}`，
+点板块行拿不到成分股。看起来像 data_service 或 adata 挂了。
+
+**真因**：`substring not found` 是 Python `str.index()` 的 `ValueError`，
+由 **adata 内部**抛出 —— 它拿到不认识的 code 后在响应里找不到预期片段。
+调用方传的是**东财 BK 体系**，而服务端只认同花顺体系：
+
+| 体系 | 样例 | 谁在用 | 能否查成分股 |
+|---|---|---|---|
+| 同花顺行业 | `881142` `881281` | data_service `/boards` 的 `code` | ✅ adata 直通 |
+| 同花顺概念 | `886xxx` | adata 专用 | ✅（但 akshare 给的是 `3xxxxx`，**缺映射桥**）|
+| akshare 概念 | `308941` | ths 概念名表 | ❌ 直喂 0/6 全败 |
+| **东财板块** | **`BK1722` `BK0437`** | **2026-09-21 前的快照** | ❌ 完全不适用 |
+
+最后一行为什么会出现：`sa_sector_snapshots` 里 **9279 行全是 BK 码**，
+`snap_date` 停在 **2026-09-21**（东财被 WAF 掐死的那天）。前端行的
+`data-bk` 取自这些陈旧快照 → 点行必然发 BK 码 → 必然踩 502。
+东财回落路径也已死（实测 `push2delay` 直接 reset），所以拿不到成分股。
+
+**修法（两侧都拦）**：
+1. `data_service/api.py` 加 `THS_BOARD_CODE = re.compile(r"(?:881|886)\d{3}")`，
+   在打 adata **之前**拦掉非 ths 体系 → 回可读 4xx，不再是 502。
+   ⚠️ 「adata 真抛异常」仍回 502 —— 不能把上游故障也吞成 4xx。
+2. `sector.py` 加同一条 `_THS_BOARD_CODE`，非 ths 体系**根本不发请求**
+   （省一次白跑往返），日志直说原因。
+   ⚠️ 两边正则必须一致（测试里断言了），否则各认各的、守卫形同虚设。
+
+**验证**：`%LOCALAPPDATA%\Temp\opencode\test_fix_board_code.py`（**40 项**，含
+「非 ths 体系一个 HTTP 请求都没发」「adata 没被调用」「上游真异常仍回 502」）；
+端到端 `GET /api/sector/board/BK1722` 由 502 变 404 且日志不再出现 502，
+`881142`/`881281` 正向 200 各 30 只成分股带真实涨跌幅。
+
+**顺带查清但没动的事**：
+- **日快照会自愈**。`sa_sector_daily` 只有 9 行、最后一天 2026-09-21。
+  但链路 `_sector_auto_loop`(app.py:8622) → `collect_once` → `save_snapshot`
+  是通的，且实测 `fetch_all_boards()` 现在能拿 **968~972 板块、
+  `degraded=False`、四源齐全**，所以下一个 15:10 就会补上。
+  ⚠️ **不要在盘中手动 `POST /api/sector/snapshot`** —— `_is_after_close`
+  就是为了防止把半天的数据当全天写进历史表，那会污染动量/评分。
+- **`save_snapshot` 今晚不会炸**：主键是 `(snap_date, code)`，
+  而 `execute_values(..., ON CONFLICT DO UPDATE)` **同批出现重复 code 会直接报**
+  `ON CONFLICT DO UPDATE command cannot affect row a second time`。
+  实测这批 972 个里 `duplicated_codes=0`、code 全是 6 位，安全。
+- **305/972 个板块没有 code**（新浪源不给），`save_snapshot` 会丢弃并计数上报。
+  这是设计如此（主键需要 code），不是 bug。
+- **概念成分股基本查不到**：akshare 概念码是 `3xxxxx`、adata 要 `886xxx`，
+  中间的 name→886xxx 映射桥**服务端没做**。所以 `886xxx` 之外的
+  `3xxxxx` 只会回可读 404。要补得先建那张映射表（AGENTS.md 早前记过方案）。
+
+### ths 瞬时失败重试一次（2026-10-08 修，与上面同一次排查）
+
+`ThsSource.fetch()` 拆成 `fetch()`（记账 + 重试）+ `_fetch_once()`（纯取数）。
+依据是上面那条观测：ths 连续 12 次全败、第 13 次立刻成功，属瞬时故障。
+
+**两条纪律，写错了就静默失效**：
+
+1. **`SourceError` 不重试**。预算耗尽再打一次等于白烧配额（整轮约 53 请求，
+   `budget_per_host` 只有 200）。
+2. **只有最终失败才 `_fail()`**。中间那次重试失败若也记账，`consec_fail`
+   虚增一倍，`/health` 的 `healthy=false` 就不再反映真实状态。
+
+⚠️ **踩到的坑**：原来 `_fetch_once` 结尾那句
+`if not out: raise SourceError("预算不足")` 会让新加的重试**完全失效** ——
+`SourceError` 走的是不重试分支，「上游返回空页」被误判成「预算耗尽」。
+已拆成两种：预算真被拒 → `SourceError`（不重试）；
+上游给空 → 新增的 `TransientSourceError`（重试）。
+`TransientSourceError` **刻意不继承 `SourceError`**，否则又回到不重试。
+
+测试：`%LOCALAPPDATA%\Temp\opencode\test_fix_ths_retry.py`（**19 项**，含
+「中间失败不记账」「SourceError 只打 1 次且不 sleep」「失败只记 1 次不是 2 次」）。
+回归：`selftest` 116 + `test_budget` 15 + `test_pipeline` 25
++ `test_sector_integration` 24 = **180 项零回归**。
+（`test_service_api` 打的是远端 101:8080，跑它验不了本地改动、还烧配额。）
+
+### 部署 data_service 到 101（2026-10-08 实做，磁盘只剩 2.0G 时的正确姿势）
+
+**部署形态**：`/opt/sa-data-service` 是**平铺拷贝**（`api.py` `sources.py`
+`aggregate.py` `normalize.py` `__init__.py` `selftest.py` `tests/` + Dockerfile +
+compose，**没有 `.git`**），所以改代码 = `scp` 覆盖文件，不需要推 git。
+构建上下文就是该目录（compose `build: context: .`）。
+
+**不能全量重建**：磁盘只剩 **2.0G / 95%**。`docker builder prune -f` 释放
+**0B** —— build cache 本来就是空的。⚠️ `docker builder du` 报
+「Reclaimable 5.542GB」是**共享层的重复计数，不可信**，别拿它做决策依据。
+全量重建要重装 pandas/numpy/akshare/levistock/adata（成品镜像 407MB，
+构建期临时层翻倍），有撑爆磁盘的风险 —— 和 WeRSS 那次一样的场景。
+
+**做法：叠层构建**（对 WeRSS 用过的同一手法）
+
+```dockerfile
+FROM sa-data-service:1.0.0
+COPY --chown=svc:svc api.py     /app/data_service/api.py
+COPY --chown=svc:svc sources.py /app/data_service/sources.py
+```
+
+`docker build -f Dockerfile.overlay -t sa-data-service:1.0.1 .` 耗时 ~0.3s、
+新层几十 KB、磁盘纹丝不动。⚠️ `--chown=svc:svc` 要写：基础镜像 `USER svc`
+(uid 10001)，不指定 owner 会 COPY 出 root 拥有的文件。
+
+**切镜像的四道校验（缺一道都可能「看着部署成功了」）**：
+
+1. `scp` 后**逐字节 sha256 比对** + 远端 `ast.parse` —— 传坏了要在这一步炸
+2. `docker run --rm --entrypoint sha256sum <新镜像> /app/data_service/*.py`
+   —— 证明**镜像内部**是新代码，不只是构建目录里改了
+3. `docker inspect sa-data-service --format '{{.Image}}'` 在 rebuild 前后取值，
+   **ID 必须变**。ID 没变 = 没真重建（AGENTS.md 记过 we-mp-rss 的同款教训）
+4. `docker compose up -d` **不要加 `--build`** —— compose 有 `build:` 段，
+   加了会触发全量重建，磁盘不够
+
+compose 改标签**必须用通配**并 `grep` 复核（写死版本号会静默空操作）：
+`sed -i 's|image: sa-data-service:.*|image: sa-data-service:1.0.1|'` +
+`grep -n "image:" docker-compose.yml` + 断言失败就中止。
+
+**回滚**：`api.py.bak.<TS>` / `sources.py.bak.<TS>` /
+`docker-compose.yml.bak.<TS>` 都在 `/opt/sa-data-service/`；
+旧镜像 `sa-data-service:1.0.0`（`916f1de380a6`）也还在，
+改回 compose 的 `image:` 再 `up -d` 即可。
+
+**部署后验收（外部真请求，不是看容器在不在跑）**：
+
+| 检查 | 结果 |
+|---|---|
+| `BK1722`/`BK0437`/`308941` | 404 + 可读指引（**不再是 502**）|
+| `881142` ×10 采样 | **10/10 → 200**，count=56 |
+| `881281` | 200，count=107 |
+| `/boards` | 970 板块、`degraded=False`、`sources=['ths','sina','kph']` |
+| 容器内 selftest | **116/0**（Python 3.12 + akshare **1.18.97** + adata 2.9.5）|
+| 仓库 `test_service_api` | **14/0** |
+| 本地端到端 | `BK1722`→404、`881142`/`881281`→各 30 只；日志零 502 |
+
+⚠️ 验收时踩到一次**假故障**：`881142` 第一次返 502、随后连打 4 次全 200、
+10 次采样零 502 —— 是 adata 自己的间歇故障（与我改的代码无关：
+我只加了打 adata **之前**的体系守卫，合法 code 走的
+`except Exception -> 502` 那段是原封不动的旧代码）。
+**遇到一次 502 不要立刻判定部署失败，要连续采样**。
+
+⚠️ 重启会清空 `/health` 的 `consec_fail`/`last_ok`/`calls`
+（都在进程内存里）—— 所以刚重启后 ths 一律显示 `healthy=true`，
+**不能据此说「ths 好了」**，要看 `calls` 涨过之后的状态。
 
 ### 新闻搜索渠道实测（2026-10-01/02，**别重测**）
 

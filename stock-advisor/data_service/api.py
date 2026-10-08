@@ -19,6 +19,7 @@ POST /collect                强制立刻采集一轮并返回
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 
@@ -29,6 +30,14 @@ from . import aggregate as A
 
 app = FastAPI(title="SA 板块数据服务", version=__version__,
               description="多厂商板块行情服务，替代被 WAF 掐断的东财直连采集器")
+
+#: 本服务只认同花顺体系的板块 code。实测（见 README「code 体系陷阱」）：
+#: 行业 881xxx -> adata 直通；概念要 886xxx；akshare 口径的概念 3xxxxx 直喂 0/6 全败。
+#: 东财的 BKxxxx 是**完全不同的第三套体系**，adata 拿到它会在解析时抛
+#: ``ValueError('substring not found')`` —— 那本来是「调用方传错了」，却以 502
+#: 「成分股接口异常」的形式冒出来，看起来像上游挂了，很难排查。
+#: 所以在打 adata 之前就按体系拦掉，回可读的 4xx。
+THS_BOARD_CODE = re.compile(r"(?:881|886)\d{3}")
 
 # 交易日 / 数据日：collect 时写在这里，供 /health 暴露
 # （调用方在休市日需要知道该按哪一天入库）
@@ -157,22 +166,29 @@ def constituents(board_code: str, limit: int = Query(50, ge=1, le=500)) -> dict:
                         直通，实测 6/6
       - 概念 3xxxxx  -> 直喂 adata **0/6 全败**，它要 886xxx
     所以对 3xxxxx 明确返回可读错误，而不是静默给 0 行。
+
+    东财 BKxxxx 是第三套体系，本服务一律不接（见 THS_BOARD_CODE 的注释）：
+    放它进来只会在 adata 内部炸成 `substring not found` -> 假 502。
     """
+    code = (board_code or "").strip()
+    if not THS_BOARD_CODE.fullmatch(code):
+        raise HTTPException(
+            404,
+            f"板块 code {board_code!r} 不是同花顺体系，本接口只接受 881xxx（行业）"
+            f"或 886xxx（概念）。BKxxxx 是东财体系、3xxxxx 是 akshare 概念口径，"
+            f"两者都不适用。")
     try:
         import adata
     except ImportError as exc:
         raise HTTPException(503, f"adata 未安装: {exc}") from exc
     try:
-        df = adata.stock.info.concept_constituent_ths(index_code=board_code)
+        df = adata.stock.info.concept_constituent_ths(index_code=code)
     except Exception as exc:                            # noqa: BLE001
         raise HTTPException(502, f"成分股接口异常: {exc}") from exc
     rows = list(df.itertuples(index=False)) if len(df) else []
     if not rows:
-        if board_code.startswith("3"):
-            raise HTTPException(
-                404,
-                f"概念 {board_code} 取不到成分股：adata 需要 886xxx 体系的 "
-                f"index_code，而这是 3xxxxx（akshare 口径）。行业 881xxx 可用。")
+        # 881xxx/886xxx 体系但没数据 —— 是真的没成分股或 code 不存在。
+        # （3xxxxx 的那条提示已上移到 THS_BOARD_CODE 守卫里，这里不再重复。）
         raise HTTPException(404, f"板块 {board_code} 无成分股或代码不存在")
     return {"code": board_code, "count": len(rows),
             "items": [{"code": r.stock_code, "name": r.short_name}
