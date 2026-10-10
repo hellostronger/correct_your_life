@@ -27,3 +27,25 @@ mediacrawler-data/
 
 # MediaCrawler 以 git submodule 跟踪（指向 hellostronger/MediaCrawler，锁定补丁版）
 # 注意：MediaCrawler 内部的运行产物由其自己的 .gitignore 管理
+
+# 2026-10-10：下面这些不是本仓库的代码，不入库（用户要求「提交所有代码」时
+# 逐个核过内容后排除的，不是遗漏）：
+#   hardware_fingerprint.json —— 含本机真实 MAC 地址，推上去等于泄露机器身份，
+#     且进了 git 历史就撤不回来；
+#   we-mp-rss/ —— 351MB / 31339 文件，是独立仓库（自带 remote hellostronger/we-mp-rss），
+#     应当作为 submodule 管理而不是把整个 clone vendored 进来；
+#   downloads/ —— 4.8MB 行情数据包（security_list.json、infoharbor_block.dat 等）；
+#   .tmp_gen_*/.tmp_raw_*/clade —— 临时产物；
+#   stock-advisor/_app.js、_dirty_backup_*.json、_p1600.json、_run1600.json ——
+#     前者是从 index.html 抽出来的生成物（253KB，与源重复），其余是一次性运行输出。
+
+hardware_fingerprint.json
+we-mp-rss/
+downloads/
+.tmp_gen_*.py
+.tmp_raw_*.txt
+clade
+stock-advisor/_app.js
+stock-advisor/_dirty_backup_*.json
+stock-advisor/_p1600.json
+stock-advisor/_run1600.json
