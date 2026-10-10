@@ -3,4 +3,4 @@
 	url = https://github.com/hellostronger/MediaCrawler.git
 [submodule "TradingAgents-astock"]
 	path = TradingAgents-astock
-	url = https://github.com/simonlin1212/TradingAgents-astock.git
+	url = https://github.com/hellostronger/TradingAgents-astock.git
