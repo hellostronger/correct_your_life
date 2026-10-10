@@ -1,1 +1,0 @@
-EXPLICIT 判据
