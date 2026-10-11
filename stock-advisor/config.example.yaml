@@ -71,6 +71,10 @@ llm:
   # 本机 base_url 指向 101 网关，用这个（2026-10-04 实测 ~1s 响应）。
   # 用 Anthropic 官方端点时请改成 'claude-opus-5'。
   model: 'nvidia/nemotron-3-ultra-550b-a55b'
+  # 输出上限，全局唯一：模拟盘报告/交易员/辩论/日报/提款建议都读它。
+  # 上限不是消耗 —— 调大不会让短输出变长变贵，只让该写完的长文写完。
+  # 调小会把报告腰斩（页面会在正文末尾标「因 max_tokens 被截断」）。
+  max_tokens: 8000
   auto_advice: true
 
 # 财经日历盘前提醒（econ_calendar.py + app.py _calendar_loop）
@@ -123,6 +127,22 @@ paper:
     # 为什么需要它：实测三只 Judge 判 Sell/Underweight 的票，复判后动作全是 hold
     # —— 辩论当时只是「参考意见」，没有任何约束力。
     enforce_rating: false
+
+  # ---- 做 T（2026-10-11）----
+  # A 股 T+1 下「做T」唯一可行形态是**持仓不变的份额置换**：
+  #   底仓（永不动，拿筹码吃趋势）+ 机动仓（只有这部分允许日内买卖）
+  # 高抛卖掉的是**昨日及更早**的份额，所以 T+1 合规；总持仓不变，赚价差。
+  # 港股 T+0 没有这个限制，但费用高得多（实测同额往返 A股 0.252% /
+  # 港股 0.857%），引擎会**按真实成本自动抬高门槛**，不要手改 min_edge_pct。
+  t_trading:
+    enabled: false          # 默认关。开之前先 POST /api/paper/t-scan 看几天判据
+    t_ratio: 30             # 机动仓占持仓 %，其余是底仓
+    min_edge_pct: 0.45      # 单次最小幅度 = 3 倍往返成本 + 滑点
+    slippage_bps: 5         # 单边滑点 5bp（双边 0.1%）。做T不做滑点建模 = 自我欺骗
+    max_t_per_day: 4        # 单票单日做T次数上限
+    refill_max_per_day: 1   # 单日补回次数上限 —— 防「越跌越买」
+    max_refill_bearish: 2   # 均线空头时买回门槛 ×2（觉得还会跌就先不补）
+    max_codes: 0            # 每轮最多做T标的数，0=不限
 
 # 通知配置（微信走腾讯官方 iLink Bot，凭据存云库；邮件走 SMTP）
 # 网页「通知」标签页可改；auth_code 是邮箱授权码，注意保管
@@ -189,12 +209,23 @@ crypto:
 # `werss` 服务：docker compose --profile werss up -d，然后浏览器开
 # http://127.0.0.1:8001/ 用微信读书扫码登录、在里面订阅公众号。
 # 网页「📰 公众号」页添加订阅源后，这里控制拉取节奏。
+#
+# ⚠️ 远程部署（不是本机 8001）几乎一定要配 auth/base_url 这两个键：
+#    反代通常会给 /rss 加 Bearer 门槛（不配就是每个源都 401
+#    「RSS requires token」，页面上一片红，但 WeRSS 那边文章照常在产出）。
+#    token **不在 WeRSS 里**，它在服务器的反代配置里，取法（本项目这台）：
+#      ssh root@<服务器>  然后
+#      grep -A3 'location /rss' /etc/nginx/conf.d/werss.conf
+#    把 `if ($http_authorization != "Bearer xxxx")` 里的 `Bearer xxxx` 整串
+#    （含 `Bearer ` 前缀和后面的空格）粘到下面 auth，原样放进请求头。
 mp:
   enabled: true
   interval_minutes: 30
   notify_new: true
   max_items: 50
   keep_days: 120
+  base_url: ''                # 远程实例填 http://<服务器IP>:8001；本机留空
+  auth: ''                    # 'Bearer <token>'，取法见上；纯本机 8001 留空
 
 # X(Twitter) 指定用户发言监控（x_monitor.py + twscrape）
 # 需先装依赖：pip install "twscrape[curl]"（curl 后端做浏览器级 TLS 指纹伪装，

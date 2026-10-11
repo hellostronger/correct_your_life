@@ -200,6 +200,204 @@ def fetch_tx_kline(code: str, start: str, end: str, timeout: int = 20) -> list[d
     raise RuntimeError("腾讯 K 线失败 %s: %s" % (code, str(last)[:120]))
 
 
+# ---------------- 分时 / 分钟 K（做 T 的前提，2026-10-11 实测）----------------
+#
+# 实测结论（别重测）：
+#   A 股 分时 minute/query  ✅ 267 点，末条 1530
+#   港股 分时 minute/query  ✅ 332 点，末条 1608（港股收市到 16:00）
+#   A 股 分钟K mkline m5/m30/m60 ✅ 320 根，末根 202610091500
+#   港股 分钟K mkline        ❌ code=-1 "param error" + data:[]  ← 典型「200+空数据」
+#
+# 所以港股只能走分时。这是可接受的：分时是 **1 分钟粒度**，不比 m5 差，
+# 且它同时给出成交额，能算 VWAP —— 做 T 反而只需要价格路径 + 成交额。
+TX_TREND_URLS = [
+    "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/minute/query",
+    "https://ifzq.gtimg.cn/appstock/app/minute/query",
+]
+TX_MKLINE_URLS = [
+    "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/kline/mkline",
+    "https://ifzq.gtimg.cn/appstock/app/kline/mkline",
+]
+
+
+def is_hk(code: str) -> bool:
+    """港股判定。与 tx_symbol 前缀一致，避免各处重复造轮子。"""
+    return tx_symbol(str(code)).startswith("hk")
+
+
+def _get_json(url: str, timeout: int = 15):
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def fetch_tx_trends(code: str, timeout: int = 15) -> dict:
+    """分时（1 分钟）。A 股与港股都可用。
+
+    返回 {"code","date","points":[{"t","price","volume","amount"}], "source"}。
+
+    **成交量单位两边不同 —— 这是算 VWAP 时最容易错 100 倍的地方**：
+      A 股 手（1 手 = 100 股）：`24480690.00 / (195*100) = 1255.42` = 当分钟价格 ✓
+      港股 股：                `179021692.0 / 431380     = 415.00` = 当分钟价格 ✓
+    所以 `volume` 原样返回、由 vwap() 按市场换算，**不要在调用方猜单位**。
+    """
+    sym = tx_symbol(code)
+    last = None
+    for host in TX_TREND_URLS:
+        url = "%s?code=%s" % (host, urllib.parse.quote(sym))
+        try:
+            j = _get_json(url, timeout)
+            data = j.get("data") or {}
+            # 结构和 mkline 不同：data.<sym>.data.data 才是点，data.<sym>.data.date 是日期
+            node = data.get(sym)
+            if not isinstance(node, dict):
+                last = "data 里没有 %s（%s）" % (sym, str(j.get("msg"))[:40])
+                continue
+            inner = node.get("data")
+            if not isinstance(inner, dict):
+                last = "缺少 data.<sym>.data"
+                continue
+            raw = inner.get("data")
+            day = str(inner.get("date") or "")
+            if not isinstance(raw, list) or not raw:
+                last = "points 为空（date=%s）" % day
+                continue
+            pts = []
+            for line in raw:
+                p = str(line).split()
+                if len(p) < 2:
+                    continue
+                pts.append({
+                    "t": p[0][:4],                       # HHMM，如 '0930'
+                    "price": _f(p[1]),
+                    "volume": _f(p[2]) if len(p) > 2 else None,
+                    "amount": _f(p[3]) if len(p) > 3 else None,
+                })
+            if not pts:
+                last = "解析后为空"
+                continue
+            return {"code": code, "date": day, "points": pts, "source": "tx_trend"}
+        except Exception as exc:      # noqa: BLE001
+            last = exc
+    raise RuntimeError("分时失败 %s: %s" % (code, str(last)[:120]))
+
+
+def vwap(code: str, points: list[dict]) -> float | None:
+    """成交量加权均价。**按市场处理成交量单位**，别在调用方算。
+
+    取价兼容两种键名：分时点用 ``price``，分钟 K bar 用 ``close``。
+    （只认其中一种会让另一条路径**静默返回 None** —— 2026-10-11 实测踩到。）
+
+    没有成交额时退化为「收盘价简单平均」。**注意退化结果不是真 VWAP**，
+    判断依据是 `points` 里是否有 ``amount``，见 `has_amount()`。
+    """
+    def px(p):
+        return p.get("price") if p.get("price") is not None else p.get("close")
+
+    amt = sum(p["amount"] for p in points
+              if p.get("amount") and p.get("volume") is not None)
+    if amt <= 0:
+        closes = [px(p) for p in points if px(p)]
+        return sum(closes) / len(closes) if closes else None
+    if is_hk(code):
+        vol = sum(p["volume"] for p in points if p.get("volume"))
+    else:
+        vol = sum(p["volume"] for p in points if p.get("volume")) * 100.0
+    if vol <= 0:
+        return None
+    return amt / vol
+
+
+def has_amount(points: list[dict]) -> bool:
+    """这些 bar 是否带**已验证单位**的成交额。真 VWAP 的前提。
+
+    腾讯 mkline 第 8 字段（实测 694 手那根给 0.55）单位**无法用价格反算验证**，
+    按「不猜单位」的原则不采用 —— 所以 A 股的 VWAP 一律走分时。
+    """
+    return bool(points) and any(p.get("amount") for p in points)
+
+
+def fetch_tx_min_kline(code: str, period: str = "m5", count: int = 320,
+                       timeout: int = 15) -> list[dict]:
+    """分钟 K。**只有 A 股可用**（港股 mkline 返回 code=-1 param error）。
+
+    period: m1/m5/m15/m30/m60。返回 [{datetime, open, close, high, low, volume}]。
+    """
+    if is_hk(code):
+        raise RuntimeError("港股分钟K不可用（mkline param error），请用 fetch_tx_trends")
+    sym = tx_symbol(code)
+    last = None
+    for host in TX_MKLINE_URLS:
+        url = "%s?param=%s,%s,,,%d" % (host, urllib.parse.quote(sym), period, int(count))
+        try:
+            j = _get_json(url, timeout)
+            node = (j.get("data") or {}).get(sym)
+            rows = node.get(period) if isinstance(node, dict) else None
+            if not isinstance(rows, list) or not rows:
+                last = "%s 为空（%s）" % (period, str(j.get("msg"))[:40])
+                continue
+            out = []
+            for r in rows:
+                if not isinstance(r, list) or len(r) < 6:
+                    continue
+                out.append({"datetime": str(r[0]), "open": _f(r[1]),
+                            "close": _f(r[2]), "high": _f(r[3]),
+                            "low": _f(r[4]), "volume": _f(r[5])})
+            if out:
+                return out
+        except Exception as exc:      # noqa: BLE001
+            last = exc
+    raise RuntimeError("分钟K失败 %s %s: %s" % (code, period, str(last)[:120]))
+
+
+def fetch_intraday(code: str, period: str = "m5", count: int = 320) -> dict:
+    """统一的日内数据入口。A 股拿分钟K（带 OHLC）+ 分时（**已验证的 VWAP**）。
+
+    为什么要两个源：mkline 的 OHLC 更全（真实分钟内高开低收），但它第 8 字段
+    的成交额单位**无法用价格反算验证**，按「不猜单位」原则不采用；
+    分时的成交额已用 `amount/volume≈当分钟价` 双向验证过（见 fetch_tx_trends）。
+    所以 **VWAP 只信分时**，OHLC 只信 mkline。港股只有分时，影线失真已标注。
+
+    返回 {"code","date","bars","points","vwap","vwap_is_true","source","has_ohlc"}。
+    做 T 的所有判据都应该只用这一个函数的产物，不要在别处直接打接口。
+    """
+    hk = is_hk(code)
+    bars = None
+    src = None
+    if not hk:
+        try:
+            bars = fetch_tx_min_kline(code, period, count)
+            src = "tx_mkline_" + period
+        except Exception:                   # noqa: BLE001
+            bars = None
+    # 分时是 VWAP 的唯一可信来源，两条路径都要试
+    points = None
+    day = None
+    tv = None
+    try:
+        tr = fetch_tx_trends(code)
+        points, day = tr["points"], tr["date"]
+        tv = vwap(code, points)
+    except Exception:                       # noqa: BLE001
+        points = None
+    if bars is None and points is None:
+        raise RuntimeError("日内数据全部失败 %s（分钟K与分时都取不到）" % code)
+    if bars is None:
+        # 分时没有每分钟 OHLC，用该分钟的成交价同时充当 O/H/L/C。
+        # 这会**低估**分钟内振幅 —— 做 T 的判据必须知道这点：
+        # 任何依赖「分钟 K 影线」的逻辑在分时源上是失真的。
+        bars = [{"datetime": "%s%s" % (day, p["t"]), "open": p["price"],
+                 "close": p["price"], "high": p["price"], "low": p["price"],
+                 "volume": p["volume"], "amount": p["amount"]}
+                for p in points if p.get("price")]
+        src = "tx_trend"
+    return {"code": code, "date": day or (bars[-1]["datetime"][:8] if bars else None),
+            "is_hk": hk, "bars": bars, "points": points,
+            "vwap": tv if tv is not None else vwap(code, bars),
+            "vwap_is_true": tv is not None,
+            "source": src, "has_ohlc": src.startswith("tx_mkline")}
+
+
 def fetch_kline(code: str, start: str, end: str) -> list[dict]:
     """取 K 线：**两个源合并**，不是「东财优先、失败就退」。
 

@@ -27,7 +27,10 @@ import paper_memory
 DEFAULTS = {
     "enabled": False,          # 总开关，false 时线程轮内直接跳过
     "initial_cash": 100000.0,  # 初始虚拟资金
-    "holding_days": 5,         # 持有几个交易日后自动平仓结算
+    "holding_days": 5,         # 默认持有几个交易日后复核（**每笔可被自己的 hold_days 覆盖**）
+    # 做T票豁免到期强平（2026-10-11）：逗号分隔代码。已做过T的票（reasoning
+    # 带 `[做T]`）自动豁免，这里用于「还没做过第一次T」的预先标记。
+    "t_exempt_codes": "",
     "max_position_pct": 25,     # 单票市值上限（% of 总资产）
     "max_positions": 0,         # 同时持仓**只数**上限；0=不限。满了就不再开新仓（卖出不受影响）
     "latest_trade_time": "15:55",  # 轮次级别的最后允许成交时刻（**粗闸**）。
@@ -86,6 +89,12 @@ DEFAULTS = {
 }
 
 EM_FIELDS_OHLCV = "f51,f52,f53,f54,f55,f56,f57"   # 日期,开,收,高,低,量,额
+
+# 最近一次 LLM 调用的 stop_reason / 输出长度（_llm_call 写，读方 llm_truncated）。
+# 为什么不能只看 stop_reason == "max_tokens" 的长度：推理型模型把思维链也吃
+# max_tokens，正文可能只有几百字却照样被判截断 —— 所以只标「被截断」这个事实，
+# 不去猜「本来能写多长」。
+_LLM_LAST_STOP: dict = {"reason": "", "text_len": 0}
 
 
 # ---------------- 交易费用（按真实市场规则扣） ----------------
@@ -438,36 +447,56 @@ TRADER_PROMPT = """\
 只输出一个 JSON 代码块，不要其他文字：
 ```json
 {"action":"buy|sell|hold","confidence":1-10,"target_value_pct":1-20,
- "stop_loss_pct":2-15,"expected_up_pct":1-40,"reasoning":"2-4句操作理由"}
+ "stop_loss_pct":2-15,"expected_up_pct":1-40,"hold_days":1-20,
+ "reasoning":"2-4句操作理由"}
 ```
 字段含义：
 - action：buy=买入（用现金按建议仓位），sell=清仓该股已有持仓，hold=观望不动
 - target_value_pct：本次买入动用资金占总资产百分比（1-20）
 - stop_loss_pct：止损线距买入价的百分比（2-15）
-- expected_up_pct：预期涨幅，到目标位的价格百分比（1-40）。**买的时候必填**，
-  hold/sell 可留空。系统会用它和 confidence、stop_loss_pct 合成一个风险收益
-  比，在现金不够分给所有买入机会时**按这个比值从高到低决定先买哪只**——
-  所以这不是修饰词，它直接决定你能不能被选中。
+- expected_up_pct：**目标涨幅**（1-40）。涨到这个位置是**离场触发**之一，
+  不是修饰词。系统会用它和 confidence、stop_loss_pct 合成风险收益比，
+  在现金不够分给所有买入机会时按这个比值从高到低决定先买哪只。
+- **hold_days：计划持有几个交易日（1-20）。这笔的离场时间是按它算的**，
+  不是全局固定值。买入理由里说的兑现周期，多久就该复核一次，就填多少：
+  · 博「短期反弹」的填 2~3（反弹几天不兑现就是判断错了）
+  · 趋势/业绩驱动的填 10~20
+  · 拿不准就填 5~8
+  **到期末若你的判断仍然成立（没破止损、趋势没坏），系统会让你继续拿着；
+  只有判断被证伪了才会平仓。** 所以填得准比填得小更有利。
 - reasoning：必须引用报告和账户数据的具体数字说明为什么是这笔交易而不是相反
 
 硬性纪律：现金不足时 action 必须是 hold；没有已有持仓时不能 sell；
 必须严格遵守随附的【交易规则约束】——T+1 品种当日买入的份额当日不可卖，
 被锁定时请直接给 hold，不要规划卖不掉的单；
+**卖出时 hold_days 仍需填（写你预期这只回到什么位置、多久）**；
 无充分依据倾向 hold——模拟交易亏的是后续统计的胜率，乱动比不动差。
 全部用中文输出（含 reasoning 字段）。"""
 
 REFLECTOR_PROMPT = """\
-你是交易复盘员。一笔模拟交易已到期结算，你会得到：当时的决策与理由、
-分析师报告要点、入场价→结算价收益、同期基准收益、超额收益 alpha。
+你是交易复盘员。一笔模拟交易已到期平仓，你会得到：当时的**买入理由原文**、
+分析报告要点、入场价→结算价收益、同期基准收益、超额收益 alpha，以及
+这笔当时**计划持有几个交易日**。
 
-请写 2-4 句复盘经验，依次覆盖：
-1. alpha 说明了什么（决策是否真的跑赢市场，还是只是随大盘涨跌）
-2. 结果支持或削弱了当时论点的哪一部分（引用 reasoning 的具体内容）
-3. 一条对下次同类分析的具体、可操作的教训
+核心任务不是「赚没赚」，而是「**当初说的那件事发生了吗**」。
 
-重要：持有窗口只有几个交易日，可能短于当时论点的兑现周期——若结果无法
-评判，就直说「窗口太短无法判断」，不要硬编结论。只输出经验文本本身，
-中文，不要客套话。"""
+请按顺序回答：
+1. **论点核验**：从买入理由里挑出**最具体的那条可验证的判断**
+   （例如「近3日累计上涨1.7%显示短期反弹动能」「量能仅为5日均量0.7倍，
+   上行空间受限」「大股东质押率下降」）。对照实际走势回答：
+   它**兑现了 / 没兑现 / 无法判断**。必须引用理由原文里的数字。
+2. **alpha 说明什么**：跑赢/跑输基准，是否与上面那条判断的方向一致
+   （判断对了但 alpha 为负，说明择时对、时点不对；反之亦然）。
+3. **持有期是否配得上**：这笔计划持 N 个交易日，实际到期收益是正是负。
+   若论点本该更早兑现却被多拿了几日拖累，或本该被止损却拖到期才平，
+   明确指出。
+4. **一条可操作的修正**：下次同类判断该改什么（改持有期 / 改止损 / 改卖点）。
+
+重要：
+- 持有窗口只有几个交易日，可能短于论点的兑现周期 —— 若无法评判，
+  就直说「窗口太短无法判断」，**不要硬编结论**。
+- 不要用「赚了就是判断对」倒推。方向对错与盈亏是两件事。
+- 只输出经验文本本身，中文，不要客套话。"""
 
 
 # ---------------- 免费数据封装 ----------------
@@ -702,12 +731,24 @@ def _kline_summary(bars: list[dict]) -> str:
 
 # ---------------- LLM 调用（照抄 llm_advisor 两段式） ----------------
 
-def _llm_call(system_prompt: str, user_text: str, max_tokens: int = 1500,
+def _llm_call(system_prompt: str, user_text: str, max_tokens: int = 0,
               extra: str = "") -> str:
     """两段式调用：base_url 非空（代理网关）直接 basic；官方端点先试 full。
-    与 llm_advisor.ask_advice 同款降级与 refusal 检查。失败抛 RuntimeError。"""
+    与 llm_advisor.ask_advice 同款降级与 refusal 检查。失败抛 RuntimeError。
+
+    `max_tokens=0` = **读全局配置** `llm.max_tokens`（config.yaml，前端可改）。
+    这里原来写死 1500 且网页无从调整，报告被截断就成了「LLM 只写了这么多」的
+    错觉（实测 35 篇里 32 篇结尾断在半句）。显式传正数仍可覆盖。
+    """
     import llm_advisor
     conf = llm_advisor.load_llm_conf()
+    if not max_tokens:
+        try:
+            max_tokens = int(conf.get("max_tokens") or 0)
+        except (TypeError, ValueError):
+            max_tokens = 0
+    if not max_tokens:
+        max_tokens = 8000          # 配置缺失/非法时的兜底
     if not conf["api_key"]:
         raise RuntimeError("未配置 LLM api_key（config.yaml llm 段或环境变量）")
     from anthropic import Anthropic
@@ -741,7 +782,19 @@ def _llm_call(system_prompt: str, user_text: str, max_tokens: int = 1500,
     text = "".join(b.text for b in msg.content if b.type == "text").strip()
     if not text:
         raise RuntimeError(f"LLM 返回空内容（stop_reason={msg.stop_reason}）")
+    # 截断信号必须留下来（2026-10-11 加）：原来只判 refusal / 空内容，
+    # `stop_reason == "max_tokens"` 被**直接丢掉** —— 报告写到一半被切断，
+    # 代码照样当正常结果存库、照常展示，看起来就是「LLM 只写了这么多」，
+    # 和展示层的截断混在一起，根因完全分不清。
+    # 实测 35 篇买入报告里 32 篇结尾卡在半个字上（如 3187 字那篇停在「…属」）。
+    global _LLM_LAST_STOP
+    _LLM_LAST_STOP = {"reason": msg.stop_reason or "", "text_len": len(text)}
     return text
+
+
+def llm_truncated(text: str = "") -> bool:
+    """上一次 LLM 调用是否撞上 max_tokens（text 传空则只看最近一次）。"""
+    return _LLM_LAST_STOP.get("reason") == "max_tokens"
 
 
 def _extract_json(text: str) -> dict | None:
@@ -839,12 +892,24 @@ def _validate_decision(d: dict) -> dict | None:
         up = None if up in (None, "") else _clip(up, 1, 40, None)
     except (TypeError, ValueError):
         up = None
+    # hold_days（2026-10-11）：这笔**计划持有几个交易日**。
+    # 加它的动因：原来离场只有 `config.holding_days` 一个全局日历计数器，
+    # 买入理由里根本没���「打算持有多久」，于是离场与买入逻辑毫无关系 ——
+    # 到期就无条件平仓。现在到期结算按**这笔自己的** hold_days 走，
+    # 且先判断论点是否兑现。缺省用全局值（向后兼容：没有这个字段的旧决策
+    # 行为与改动前完全一致）。
+    hd = d.get("hold_days")
+    try:
+        hd = int(_clip(hd, 1, 20, 5)) if hd not in (None, "") else None
+    except (TypeError, ValueError):
+        hd = None
     return {
         "action": action,
         "confidence": int(_clip(d.get("confidence"), 1, 10, 5)),
         "target_value_pct": _clip(d.get("target_value_pct"), 1, 20, 5),
         "stop_loss_pct": _clip(d.get("stop_loss_pct"), 2, 15, 8),
         "expected_up_pct": up,
+        "hold_days": hd,
         "reasoning": str(d.get("reasoning") or "")[:2000] or "（未给出理由）",
     }
 
@@ -1379,6 +1444,16 @@ def _decide_one(deps, conf, stock, today, slot: str = ""):
                          account, positions, past, conf, social)
     # 3. LLM 调用 1：分析师
     report = _llm_call(ANALYST_PROMPT, ctx + f"\n\n数据时点 {today}。请给出分析报告。")
+    # 被 max_tokens 截断要在**报告正文末尾留痕**，否则页面上看起来和「模型就写了
+    # 这么多」完全一样（这正是 2026-10-11 查「报告显示不全」时踩的坑：
+    # 展示层 [:1200] 和生成层 max_tokens 两个截断叠在一起，根因分不清）。
+    # 只追加标记、不改动原文 —— 原文就是模型实际吐出来的内容，一个字都不丢。
+    report_truncated = llm_truncated()
+    if report_truncated:
+        report += (f"\n\n【⚠ 本报告因模型输出上限（max_tokens）被截断，"
+                   f"共 {_LLM_LAST_STOP.get('text_len', len(report))} 字，内容未写完】")
+        print(f"[paper] {code} 分析师报告被 max_tokens 截断（"
+              f"{_LLM_LAST_STOP.get('text_len')} 字），已在正文末尾标注", flush=True)
     # 4. LLM 调用 2：交易员（结构化）— 第一轮（无辩论）
     # 把交易规则也告诉它，否则它会规划出真实市场做不到的事（比如让 A 股当天买当天卖）
     with get_conn() as conn:
@@ -1486,16 +1561,35 @@ def _decide_one(deps, conf, stock, today, slot: str = ""):
 
 
 def _execute_decision(deps, conf, stock, today, decision, quote,
-                      slot: str = "", bars: list | None = None) -> tuple[bool, str]:
+                      slot: str = "", bars: list | None = None,
+                      shares_override: int | None = None) -> tuple[bool, str]:
     """按当前价成交（盘中原价，不再是收盘价）。返回 (是否成交, 备注)。资金约束全部代码强制。
 
     bars：近 60 日 OHLCV，供追高闸门与 ATR 止损用（_decide_one 已有，不重复拉）。
     止损扫描路径调本函数时传 None —— 止损只减仓，不触发新开仓闸门。
+
+    shares_override（2026-10-11，做 T 用）：指定本次成交的股数，取代
+    「卖出 = 全部清仓 / 买入 = 按 target_value_pct 算」。仍然受三道硬约束：
+      - 卖出：不超过 `sellable_shares` 的 T+1 可卖数
+      - 买入：不超过现金（含手续费）、按 buy_shares_for 的申报单位取整
+      - 两边：都要过 slot 幂等守卫与交易时段闸门
+    传 None 时行为与原来**逐字节一致**（LLM 路径永远传 None）。
     """
     get_conn = deps["get_conn"]
     code = stock["code"]
     price = float(quote["price"])
     action = decision["action"]
+    # 滑点（2026-10-11）。默认 0 —— 不改变任何现有行为。
+    # 为什么必须显式建模：模拟盘原来用 `quote["price"]` 一分不差地成交，
+    # 而做 T 的每次往返都在为「必然存在的成交价差」付钱。没有滑点时，
+    # 日内 T 的回测会系统性地高估可实现收益，越做越乐观。
+    _slip = 0.0
+    try:
+        _slip = float(conf.get("slippage_bps") or 0) / 10000.0
+    except (TypeError, ValueError):
+        _slip = 0.0
+    if _slip > 0 and action in ("buy", "sell"):
+        price = price * (1 + _slip) if action == "buy" else price * (1 - _slip)
     with get_conn() as conn:
         cur = conn.cursor()
         # 幂等守卫下沉到数据层：**同一 slot 内**同股已有任何决策行（含反向）即拒绝。
@@ -1540,6 +1634,10 @@ def _execute_decision(deps, conf, stock, today, decision, quote,
                                f"不再开新仓（记为 skipped；卖出不受此限）")
             budget = account["total_value"] * float(decision["target_value_pct"]) / 100
             budget = min(budget, account["cash"])
+            if shares_override is not None:
+                # 做 T 买回：额度按「要买回的股数 × 现价」定，不再由 LLM 的
+                # target_value_pct 决定（那一栏对做 T 无意义）。
+                budget = min(budget, max(0, int(shares_override)) * price)
             # 追高闸门：**只拦新开仓**，加仓已持仓的票不受影响（不新增风险敞口）。
             # 放在这里而不是只写进提示词，是因为 LLM 会自己把「不要追高」论证掉
             # —— NeurIPS《The Losing Winner》实证 LLM 系统性 reward-hack 代理目标。
@@ -1642,6 +1740,12 @@ def _execute_decision(deps, conf, stock, today, decision, quote,
                     conn.commit()
                     return False, f"{rule_note}，本次无法卖出（记为 skipped）"
             shares = min(free, held) if free < held else held
+            if shares_override is not None:
+                # 做 T 高抛：**只卖机动仓那一部分**，不是全清。
+                # 这是 AGENTS.md 记了很久的「卖出语义只能清仓」的缺口 ——
+                # 原来 shares 完全由 free/held 决定，决策里根本没有「卖多少」这个字段。
+                # 仍然不能用超过 T+1 可卖数的那部分（free 是硬上限）。
+                shares = min(int(shares_override), free, held)
             if shares < 1:
                 return False, f"{rule_note}，无可卖股"
             value = shares * price
@@ -1776,6 +1880,52 @@ def _alpha_for_round(cur, code: str, me: dict | None, sell_price: float,
 # _settle_buy_rows 的 SELECT 列顺序。普通游标返回 tuple，靠它还原成 dict。
 # 改这条 SELECT 时必须同步改这里，否则字段会**静默错位**（不报错、算出
 # 错的份额和收益）。断言见 %LOCALAPPDATA%\Temp\opencode\test_settle_cursor.py
+def make_slot(base: str, n: int = 0) -> str:
+    """给 slot 加子序号，让**同一分钟内的多次操作**有独立命名空间。
+
+    背景（2026-10-11）：`sa_paper_trades` 的唯一索引是
+    (trade_date, slot, code, side)，且 `_execute_decision` 里还有一条
+    「同 slot 同 code 已有任何决策就跳过」的守卫（不限方向）。做 T 要同一天
+    对同一代码反复高抛低吸，两者都会被挡死。
+
+    n=0 返回 base 本身（**保持现有行为不变**，老轮次不受影响）；
+    n>=1 返回 `base#N`，最长 `10:30#2` = 7 字符，在 VARCHAR(16) 内。
+    手动轮次形如 `10:30-m`，加序号变 `10:30-m#2` = 9 字符。
+    """
+    base = (base or "").strip()
+    if not n or n <= 0:
+        return base
+    return "%s#%d" % (base, int(n))
+
+
+def remainder_slot(slot: str, orig_id) -> str:
+    """部分平仓拆出来的 remainder 行用的 slot。
+
+    为什么必须派生（2026-10-11 修，AGENTS.md 记了很久的未修 bug）：
+    原来的 `INSERT ... SELECT` 把 trade_date/slot/code/side **原样复制**，
+    于是 remainder 行与被拆的行在唯一索引上完全相同，且 INSERT 在 UPDATE
+    **之前**执行 -> 必然 `UniqueViolation:
+    sa_paper_trades_trade_date_slot_code_side_key`。实测卖出 600406 时
+    `(2026-09-25, '', 600406, buy)` 冲突。**只要走非零股数的卖出就必炸**。
+
+    不能置 NULL：AGENTS.md 记过库里 buy 行有 9 行 slot=''、0 行 NULL，
+    **空串会冲突而 NULL 在 PG 唯一索引里不冲突** —— 但 NULL 会让这行在
+    「同 slot 幂等」和「按轮次分组报表」里彻底隐身，得不偿失。
+
+    所以派生一个只在整条生命周期里唯一的串：`原slot` + `~` + 原行 id。
+    长度：slot 最长 16（现已不会超过 9），`~` + id(≤19) 可能超 16 ->
+    超长时退回「时间戳后缀」并截断，保证**永不超长、永不冲突**。
+    """
+    base = (slot or "").strip()
+    suffix = "~%s" % orig_id
+    cand = "%s%s" % (base, suffix)
+    if len(cand) <= 16:
+        return cand
+    # 极端情况（slot 已很长）：用源行的 created_at 近似，保留可追溯性
+    stamp = datetime.now().strftime("%H%M%S%f")[:12]
+    return ("%s~%s" % (base[:16 - len(stamp) - 1], stamp))[:16]
+
+
 _SETTLE_BUY_COLS = ("id", "trade_date", "slot", "shares", "price", "confidence",
                     "stop_loss_pct", "reasoning", "report", "decision_raw",
                     "fee_total")
@@ -1844,14 +1994,15 @@ def _settle_buy_rows(cur, code: str, sell_shares: int, sell_price: float,
             keep_value = keep * keep_price
             keep_fee = float(r["fee_total"] or 0) * keep / bought
             cur.execute("""INSERT INTO sa_paper_trades
-                           (code, name, trade_date, slot, side, shares, price, value,
-                            confidence, stop_loss_pct, reasoning, report, decision_raw,
-                            status, fee_total, fee_detail)
-                           SELECT code, name, trade_date, slot, 'buy', %s, price, %s,
-                                  confidence, stop_loss_pct, reasoning, report,
-                                  decision_raw, 'open', %s, fee_detail
-                           FROM sa_paper_trades WHERE id=%s""",
-                        (keep, keep_value, round(keep_fee, 4), r["id"]))
+                         (code, name, trade_date, slot, side, shares, price, value,
+                           confidence, stop_loss_pct, reasoning, report, decision_raw,
+                           status, fee_total, fee_detail)
+                           SELECT code, name, trade_date, %s, 'buy', %s, price, %s,
+                           confidence, stop_loss_pct, reasoning, report,
+                           decision_raw, 'open', %s, fee_detail
+                         FROM sa_paper_trades WHERE id=%s""",
+                         (remainder_slot(r["slot"], r["id"]), keep, keep_value,
+                           round(keep_fee, 4), r["id"]))
             cur.execute("""UPDATE sa_paper_trades
                            SET status='resolved', settle_date=%s, settle_price=%s,
                                raw_return=%s, alpha_return=%s, benchmark=%s,
@@ -2049,7 +2200,11 @@ def settle_and_reflect(deps: dict) -> dict:
     conf = {**DEFAULTS, **(deps.get("conf") or {})}
     hold_days = int(conf["holding_days"])
     today = datetime.now().strftime("%Y-%m-%d")
-    settled, pending = [], []
+    settled, pending, rolled = [], [], []
+    # 做T票豁免到期强平（2026-10-11）。`_close_trade` 是**全部平仓**，
+    # 而做T的前提是「底仓永不动」—— 不豁免的话，持有到第 N 个交易日
+    # 底仓和机动仓会被一起清掉，做T 白做。
+    exempt = _t_exempt_codes(deps, get_conn)
     with get_conn() as conn:
         cur = conn.cursor(cursor_factory=_real_dict_cursor(deps))
         cur.execute(
@@ -2059,19 +2214,50 @@ def settle_and_reflect(deps: dict) -> dict:
     for t in opens:
         try:
             code = t["code"]
+            if code in exempt:
+                rolled.append({"id": t["id"], "code": code,
+                               "reason": "做T票豁免到期强平（底仓不动）"})
+                continue
+            # 目标价触发（2026-10-11）：`expected_up_pct` 从「只用于买入排序」
+            # 升级为**离场触发**。涨到目标位就止盈离场，不必等到期满。
+            tgt = _target_price_pct(t)
+            # 每笔自己的计划持有期；老决策没有这个字段时退回全局值
+            hold = _hold_days_of(t) or hold_days
             held = trading_days_fn(str(t["trade_date"])[:10], datetime.now()) \
                 if trading_days_fn else 0
-            if held < hold_days:
+            if held < hold and not tgt:
                 continue
             symbol = tx_symbol_fn(code)
-            closes = fetch_close_series(em_kline_fn, symbol, days=hold_days + 30)
+            closes = fetch_close_series(em_kline_fn, symbol, days=hold + 30)
             dates = sorted(closes)
             entry_dates = [d for d in dates if d >= str(t["trade_date"])[:10]]
-            if len(entry_dates) < hold_days + 1:
+            if len(entry_dates) < hold + 1:
                 pending.append({"code": code, "reason": "收盘价序列不足，下轮重试"})
                 continue
-            settle_date = entry_dates[hold_days]
-            settle_price = closes[settle_date]
+            if tgt:
+                # 找第一个「收盘价达到目标」的日子
+                entry_price0 = float(t["price"])
+                goal = entry_price0 * (1 + tgt / 100.0)
+                hit_date = next((d for d in entry_dates if closes[d] >= goal), None)
+                if hit_date:
+                    settle_date, settle_price = hit_date, closes[hit_date]
+                else:
+                    if held < hold:
+                        continue          # 没到目标也没到期，继续拿
+                    settle_date = entry_dates[hold]
+                    settle_price = closes[settle_date]
+            else:
+                settle_date = entry_dates[hold]
+                settle_price = closes[settle_date]
+            # 论点是否兑现（2026-10-11）。**规则判定，不用 LLM 驱动交易** ——
+            # LLM 输出不确定，不能让它决定成交。兑现了就滚动一个持有期继续拿。
+            keep = _thesis_intact(t, settle_price, closes, settle_date)
+            if keep and held >= hold and not tgt:
+                rolled.append({"id": t["id"], "code": code, "settle_date": settle_date,
+                               "price": settle_price, "ret_pct": round(
+                                   (settle_price / float(t["price"]) - 1) * 100, 3),
+                               "reason": keep})
+                continue
             entry_price = float(t["price"])
             raw_ret = settle_price / entry_price - 1
             bench_sym = benchmark_symbol(code)
@@ -2087,13 +2273,16 @@ def settle_and_reflect(deps: dict) -> dict:
                 bench_ret = None
                 alpha = -raw_ret  # 卖出后下跌=卖对了
             _close_trade(deps, t, settle_date, settle_price, raw_ret, alpha,
-                         bench_sym, hold_days, conf.get("fees"))
+                         bench_sym, hold, conf.get("fees"))
             settled.append({"id": t["id"], "code": code, "side": t["side"],
                             "trade_date": str(t["trade_date"])[:10],
                             "entry_price": entry_price,
                             "reasoning": t.get("reasoning") or "",
                             "report": (t.get("report") or "")[:600],
                             "settle_date": settle_date,
+                            "hold_days": hold,
+                            "target_pct": tgt,
+                            "exit_kind": "target" if tgt else "maturity",
                             "raw_return": raw_ret, "alpha": alpha})
         except Exception as exc:
             traceback.print_exc()
@@ -2131,16 +2320,119 @@ def settle_and_reflect(deps: dict) -> dict:
     except Exception as exc:
         print(f"[paper] 目标判定失败（不影响结算）: {exc}", flush=True)
     if notify_fn and settled:
+        def _kind(s):
+            return "达标止盈" if s.get("exit_kind") == "target" else "到期平仓"
         lines = "\n".join(
-            f"{s['side']} {s['code']}：收益 {s['raw_return'] * 100:+.1f}%"
+            f"{s['side']} {s['code']}：{_kind(s)}，收益 {s['raw_return'] * 100:+.1f}%"
             + (f"，alpha {(s['alpha']) * 100:+.1f}%" if s.get("alpha") is not None else "")
+            + (f"，计划持有 {s.get('hold_days')} 日" if s.get("hold_days") else "")
             for s in settled)
         try:
             notify_fn("🧪 模拟交易结算", f"今日结算 {len(settled)} 笔：\n{lines}",
                       event="paper_settle")
         except Exception:
             pass
-    return {"date": today, "settled": settled, "pending": pending, "equity": snap}
+    if rolled:
+        for r in rolled[:10]:
+            print(f"[paper] {r.get('code')} 未平仓：{r.get('reason')}", flush=True)
+    return {"date": today, "settled": settled, "pending": pending,
+            "rolled": rolled, "equity": snap}
+
+
+# ---------------- 闭环：每笔持有期 / 目标价 / 论点兑现 / 做T豁免（2026-10-11） ----------------
+
+def _decision_of(t: dict) -> dict:
+    """从 decision_raw 里取出 LLM 的原始决策结构（取不到返回空 dict）。"""
+    raw = t.get("decision_raw")
+    if isinstance(raw, dict):
+        return raw.get("decision") or raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            j = json.loads(raw)
+            return (j.get("decision") or j) if isinstance(j, dict) else {}
+        except (ValueError, TypeError):
+            return {}
+    return {}
+
+
+def _hold_days_of(t: dict) -> int | None:
+    """这笔**自己**的计划持有期。没有则返回 None（由调用方退回全局值）。"""
+    d = _decision_of(t)
+    v = d.get("hold_days")
+    try:
+        v = int(v)
+        return v if 1 <= v <= 20 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _target_price_pct(t: dict) -> float | None:
+    """目标涨幅（离场的第二种触发）。没有则 None。
+
+    ⚠️ 只在 **buy** 行上取：sell 行的 expected_up_pct 语义是「预期涨回来多少」，
+    拿它当止盈目标会导致刚卖出就又触发买回。
+    """
+    if str(t.get("side")) != "buy":
+        return None
+    v = _decision_of(t).get("expected_up_pct")
+    try:
+        v = float(v)
+        return v if 1.0 <= v <= 40.0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _thesis_intact(t: dict, settle_price: float, closes: dict, settle_date: str) -> str:
+    """到期末，**当初的论点还成立吗**？成立返回理由串（=继续持有），否则返回空。
+
+    判定全部用**规则**而不是 LLM —— LLM 输出不确定，不能让它决定是否成交。
+    三条全过才算论点未破：
+      1. 到期末仍不亏（有浮盈）
+      2. 没跌破买入时自己设的止损线
+      3. 没出现「冲高后大幅回吐」——最高价回撤超过止损幅度，说明预期已实现又吐回去了
+    """
+    entry = float(t.get("price") or 0)
+    if entry <= 0:
+        return ""
+    ret = (float(settle_price) / entry - 1) * 100
+    if ret <= 0:
+        return ""
+    sl = float(t.get("stop_loss_pct") or 0) or 5.0
+    if float(settle_price) < entry * (1 - sl / 100.0):
+        return ""
+    upto = [v for d, v in closes.items() if d <= settle_date]
+    if not upto:
+        return ""
+    peak = max(float(x) for x in upto)
+    dd = (peak - float(settle_price)) / peak * 100 if peak > 0 else 0.0
+    if dd > sl * 2:
+        return ""                       # 冲高后回吐太多，预期已实现又吐回去
+    return ("论点未破：浮盈 %.1f%%、未破 %.0f%% 止损、距最高点仅回撤 %.1f%%"
+            " → 延长一个持有期继续持有" % (ret, sl, dd))
+
+
+def _t_exempt_codes(deps: dict, get_conn) -> set:
+    """做T票集合：**有过做T记录** 或 **在 `paper.t_exempt_codes` 里显式标记**。
+
+    不新增表：① 有 `[做T]` 标记的流水就说明是做T票；② 还没做过第一次T的
+    用配置预标记，格式沿用既有的 `tplus0_extra` 逗号分隔约定。
+    读库失败时返回**空集**（= 不豁免），宁可多平一次也不要静默豁免。
+    """
+    out = set()
+    conf = {**DEFAULTS, **(deps.get("conf") or {})}
+    for c in str(conf.get("t_exempt_codes") or "").replace("，", ",").split(","):
+        c = c.strip()
+        if c:
+            out.add(c)
+    try:
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""SELECT DISTINCT code FROM sa_paper_trades
+                           WHERE reasoning LIKE %s""", ("[做T]%",))
+            out |= {r[0] for r in cur.fetchall() if r[0]}
+    except Exception as exc:              # noqa: BLE001
+        print(f"[paper] 读做T豁免名单失败（按不豁免处理）: {exc}", flush=True)
+    return out
 
 
 def _close_trade(deps, t, settle_date, settle_price, raw_ret, alpha, bench_sym, hold_days,
@@ -2167,7 +2459,8 @@ def _close_trade(deps, t, settle_date, settle_price, raw_ret, alpha, bench_sym, 
              fee["total"], json.dumps(fee, ensure_ascii=False)))
         cur.execute(
             "UPDATE sa_paper_trades SET status = 'resolved', settle_date = %s, "
-            "settle_price = %s, raw_return = %s, alpha_return = %s, benchmark = %s "
+            "settle_price = %s, raw_return = %s, alpha_return = %s, benchmark = %s, "
+            "auto_closed = TRUE "
             "WHERE id = %s",
             (settle_date, settle_price, raw_ret, alpha, bench_sym, t["id"]))
         if side == "buy":       # 买入到期平仓：现金回流（净回款 = 成交额 - 费用）
@@ -2190,22 +2483,26 @@ def _reflect_one(deps, conf, s):
     digest = (f"{s['side']} {s['code']} @ {s['entry_price']:g}："
               f"{(s['reasoning'] or '')[:120]}")
     bench_ret = (s["raw_return"] - (s["alpha"] or 0)) if s.get("alpha") is not None else None
+    hold_n = int(s.get("hold_days") or conf["holding_days"])
+    kind = "涨到目标位止盈" if s.get("exit_kind") == "target" else "到期满平仓"
     user = (
         f"【当时决策】{digest}\n"
         f"【分析报告要点】{(s.get('report') or '')[:600]}\n"
+        f"【计划持有】{hold_n} 个交易日\n"
+        f"【离场方式】{kind}\n"
         f"【结果】{s['trade_date']} 入场 → {s['settle_date']} 结算，区间收益 "
         f"{s['raw_return'] * 100:+.1f}%"
         + (f"，同期基准收益 {bench_ret * 100:+.1f}%，超额 alpha {(s['alpha']) * 100:+.1f}%"
            if bench_ret is not None else "（基准数据缺失，alpha 无法计算）")
-        + f"\n【持有期】{conf['holding_days']} 个交易日\n请写复盘经验。")
-    lesson = _llm_call(REFLECTOR_PROMPT, user, max_tokens=600)
+        + "\n请核验：当初说的那件事发生了吗？")
+    lesson = _llm_call(REFLECTOR_PROMPT, user)
     with get_conn() as conn:
         cur = conn.cursor()
         paper_memory.store_lesson(
             cur, trade_id=trade_id, code=s["code"], action=s["side"],
             decision_digest=digest, raw_return=s["raw_return"],
             alpha_return=s["alpha"] if s.get("alpha") is not None else 0.0,
-            holding_days=int(conf["holding_days"]), benchmark="",
+            holding_days=hold_n, benchmark="",
             lesson_text=lesson[:2000], resolved_at=s["settle_date"])
         conn.commit()
 
@@ -2507,7 +2804,12 @@ def _fifo_rounds(rows: list[dict]) -> list[dict]:
                     "stop_loss_pct": (float(lot["stop_loss_pct"])
                                       if lot["stop_loss_pct"] is not None else None),
                     "reasoning": lot["reasoning"] or "",
-                    "report": (lot["report"] or "")[:1200],
+                    # **不能截断**（2026-10-11 修）：原来写死 [:1200]，而库里
+                    # report 最长 4136 字符 —— 页面上「展开 LLM 原始分析报告」
+                    # 永远只显示前 1200 字，且**不带任何截断标记**，看起来
+                    # 就是「LLM 就写了这么多」。展示层不该有能力悄悄弄丢数据。
+                    "report": lot["report"] or "",
+                    "report_len": len(lot["report"] or ""),
                 },
                 "exit": {
                     "id": r["id"], "date": str(r["trade_date"])[:10],
@@ -2519,6 +2821,11 @@ def _fifo_rounds(rows: list[dict]) -> list[dict]:
                     "net_out": round(net_out, 2),
                     "confidence": r["confidence"],
                     "reasoning": r["reasoning"] or "",
+                    # 卖出侧同样给全文。止损卖出是**免 LLM** 的，本来就没有
+                    # 分析师报告（report 为空串），前端据此显示「免 LLM 自动
+                    # 止损，无分析报告」而不是空白。
+                    "report": r["report"] or "",
+                    "report_len": len(r["report"] or ""),
                 },
                 "pnl": round(net_out - net_in, 2),
                 "pnl_pct": round((net_out / net_in - 1) * 100, 2) if net_in else None,
@@ -2558,7 +2865,8 @@ def _fifo_rounds(rows: list[dict]) -> list[dict]:
                 "stop_loss_pct": (float(lot["stop_loss_pct"])
                                   if lot["stop_loss_pct"] is not None else None),
                 "reasoning": lot["reasoning"] or "",
-                "report": (lot["report"] or "")[:1200],
+                "report": lot["report"] or "",
+                "report_len": len(lot["report"] or ""),
             },
             "exit": None,
             "pnl": None, "pnl_pct": None,

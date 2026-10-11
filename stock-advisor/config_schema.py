@@ -243,7 +243,12 @@ SCHEMAS: dict[str, dict[str, Any]] = {
              "help": "远程实例填 http://<服务器IP>:8001。配一次，网页添加订阅源时自动带入"},
             {"key": "auth", "t": "password", "d": "", "secret": True,
              "label": "Authorization 头",
-             "help": "远程加了反代鉴权时填，原样放进请求头：Basic <base64> / Bearer <token>"},
+             "help": "远程加了反代鉴权时填，原样放进请求头：Basic <base64> / Bearer <token>。"
+                     "**token 在服务器的反代配置里，不在 WeRSS 里**，取法："
+                     "ssh 上服务器后 `grep -A3 'location /rss' /etc/nginx/conf.d/werss.conf`，"
+                     "把 `Bearer xxxx` 整串粘进来（含前缀和空格）。"
+                     "不填的后果很安静：该段所有源全部 401「RSS requires token」，"
+                     "而 WeRSS 那边文章照常在产出 —— 看着像源坏了，其实是没带钥匙"},
             {"key": "use_fresh", "t": "bool", "d": False, "label": "走 /fresh 强制上游更新",
              "help": "开启后能让 WeRSS 真正去微信抓一轮，从而拿到文章正文"
                      "（吃缓存时新文章常常只有标题、没正文）。"
@@ -526,8 +531,66 @@ SCHEMAS: dict[str, dict[str, Any]] = {
              "help": "逗号分隔，匹配代码或名称子串。自动判定：港股=T+0；"
                      "货币/债券/黄金/商品/跨境(QDII) ETF 与 LOF=T+0；其余 A 股=T+1。"
                      "判错了在这里强制纠正。例：518880,511880"},
-            {"key": "tplus1_extra", "t": "str", "d": "", "label": "强制 T+1（覆盖）",
-             "help": "同上，优先级低于 T+0 覆盖。例：某只跨境 ETF 想按 T+1 处理"},
+{"key": "tplus1_extra", "t": "str", "d": "", "label": "强制 T+1（覆盖）",
+              "help": "同上，优先级低于 T+0 覆盖。例：某只跨境 ETF 想按 T+1 处理"},
+            {"key": "slippage_bps", "t": "float", "d": 0, "lo": 0, "hi": 100,
+             "label": "滑点(单边bp)", "adv": True,
+             "help": "成交价相对行情价的偏移，1bp=0.01%。0=不建模滑点。"
+                     "做T必须调（默认 5bp 走 paper.t_trading.slippage_bps），"
+                     "否则模拟盘会系统性高估可实现收益 —— 越高频做越乐观"},
+            # ---- 做 T（2026-10-11）----
+            {"key": "t_trading.enabled", "t": "bool", "d": False,
+             "label": "做T引擎", "adv": True,
+             "help": "机动仓高抛低吸。默认关 —— 它改的是交易口径，不该默认生效。"
+                     "开启前建议先 POST /api/paper/t-scan（只看不做）看几天判据"},
+            {"key": "t_trading.t_ratio", "t": "int", "d": 30, "lo": 5, "hi": 80,
+             "label": "机动仓占比%", "adv": True,
+             "help": "只有这部分仓位允许日内买卖，其余是底仓（永不动）。"
+                     "调大收益弹性更高，但单边下跌时缓冲更小。建议 20~30"},
+            {"key": "t_trading.min_edge_pct", "t": "float", "d": 0.45, "lo": 0.1,
+             "hi": 5, "step": 0.05, "label": "做T最小幅度%", "adv": True,
+             "help": "单次触发幅度下限。0.45% = 3 倍往返成本 + 滑点。"
+                     "**别调小**：A 股 1 万元往返实测 0.252%（含最低佣金 5 元），"
+                     "小额账户实际费率更高；港股同额 0.857%，所以引擎会自动"
+                     "按真实成本抬高门槛，而不是用这个固定值"},
+            {"key": "t_trading.slippage_bps", "t": "float", "d": 5, "lo": 0, "hi": 100,
+             "label": "做T滑点(单边bp)", "adv": True,
+             "help": "做T专用滑点，默认 5bp（双边 0.1%）。进出都算"},
+            {"key": "t_trading.max_t_per_day", "t": "int", "d": 4, "lo": 1, "hi": 20,
+             "label": "单日做T次数上限", "adv": True,
+             "help": "单票单日做T次数上限。防止震荡市里被反复割上甘蔗 —— "
+                     "每次往返都在付费，次数越多风险越大"},
+            {"key": "t_trading.refill_max_per_day", "t": "int", "d": 1, "lo": 0, "hi": 10,
+             "label": "单日补回次数上限", "adv": True,
+             "help": "高抛后买回（接回机动仓）的次数上限。默认 1 就是"
+                     "**防「越跌越买」**：高抛出去后一天只接一次，"
+                     "接回就把机动仓变回持仓，不再裸奔"},
+            {"key": "t_trading.max_refill_bearish", "t": "float", "d": 2, "lo": 1, "hi": 10,
+             "label": "熊市门槛倍数", "adv": True,
+             "help": "均线空头排列时，买回门槛乘以这个数。"
+                     "对应「觉得还会跌就先不补」—— 不是禁止接回，而是"
+                     "要求跌得更深才接"},
+            {"key": "holding_days", "t": "int", "d": 5, "lo": 1, "hi": 60,
+             "label": "默认持有交易日", "adv": True,
+             "help": "**默认**值，作用范围只是「LLM 没给 hold_days 时」。"
+                     "每笔交易现在按 LLM 自己声明的 hold_days（1-20）到期复核 —— "
+                     "博短线的填 2~3，趋势票填 10~20。到期时若论点未破"
+                     "（仍浮盈、未破止损、未大幅回吐）会**延长一个持有期继续拿**"},
+            {"key": "t_exempt_codes", "t": "str", "d": "", "adv": True,
+             "label": "做T票豁免到期强平",
+             "help": "逗号分隔代码。已做过T的票（有 `[做T]` 台账）**自动豁免**，"
+                     "这里用于「还没做过第一次T」的预先标记。原因：到期平仓是"
+                     "**全部清仓**，而做T的前提是底仓不动 —— 不豁免的话"
+                     "做到一半被强平，做T 等于白做"},
+            {"key": "t_trading.safety_mult", "t": "float", "d": 2, "lo": 1, "hi": 5,
+             "step": 0.5, "label": "做T安全倍数", "adv": True,
+             "help": "门槛 = 往返成本 × 这个倍数。**1 会让你做净收益为零的T**"
+                     "（实测 00136 港股：门槛 0.848% 时走一遍净收益 +0.00 元）。"
+                     "2 是最低可接受值：次数少一点，但每笔真有利润"},
+            {"key": "t_trading.max_codes", "t": "int", "d": 0, "lo": 0, "hi": 200,
+             "label": "每轮最多做T标的数", "adv": True,
+             "help": "0=不限制。持仓多时限制一下，"
+                     "每只要打 2 个接口（分钟K+分时），别把行情源打满"},
             {"key": "fees.a_commission_rate", "t": "float", "d": 0.00025,
              "lo": 0, "hi": 0.01, "step": 0.00005, "label": "佣金费率", "adv": True,
              "help": "A 股/场内基金佣金费率，万2.5 = 0.00025。双向收取"},
@@ -559,8 +622,6 @@ SCHEMAS: dict[str, dict[str, Any]] = {
              "label": "港股结算费最高(元)", "adv": True},
             {"key": "initial_cash", "t": "float", "d": 100000, "lo": 1000, "hi": 1e9,
              "label": "初始虚拟资金(元)"},
-            {"key": "holding_days", "t": "int", "d": 5, "lo": 1, "hi": 60,
-             "label": "持有几个交易日平仓"},
             {"key": "max_position_pct", "t": "float", "d": 25, "lo": 1, "hi": 100,
              "label": "单票市值上限(%)", "help": "占总资产比例"},
             {"key": "max_positions", "t": "int", "d": 0, "lo": 0, "hi": 50,
@@ -584,6 +645,12 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             {"key": "base_url", "t": "url", "d": "", "label": "base_url",
              "help": "留空 = Anthropic 官方端点；用代理/网关在此填"},
             {"key": "model", "t": "str", "d": "claude-opus-5", "label": "模型名"},
+            {"key": "max_tokens", "t": "int", "d": 8000, "lo": 500, "hi": 128000,
+             "label": "输出上限 max_tokens",
+             "help": "**全局唯一**，模拟盘报告/交易员/辩论/日报/提款建议都读它。"
+                     "这是上限不是消耗：调大不会让短输出变长变贵，只让该写完的长文"
+                     "写完。调小则可能把报告腰斩（页面会标「被截断」）。"
+                     "日报在不合格重试时会自动翻倍重跑。"},
             {"key": "auto_advice", "t": "bool", "d": True,
              "label": "盘后自动补一条提款建议",
              "help": "每日每计划至多一次"},

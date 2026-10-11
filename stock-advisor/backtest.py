@@ -358,9 +358,18 @@ def _trade(cash, holdings, code, qty, price, d, side, fees, trades,
     shares0, cost0 = float(pos[0]), float(pos[1])
     # 每条提前 return 都要把 cash 带出去
     notional = qty * price
+    # ⚠️ trade_fees 的签名是 (code, name, side, value, fee_conf)。
+    #    原来这里写成 `trade_fees(code, side, notional, fees or {})` ——
+    #    位置参数整体左移一位，`value` 收到的是**dict**，内部 float(value) 抛
+    #    TypeError，又被下面的 except 吞掉 -> 手续费恒为 0，**回测完全没扣钱**
+    #    且不报错。`_trade` 没有 name，用 ""：ETF 仍能靠代码前缀识别（免印花税）。
+    side_s = "buy" if side > 0 else "sell"
     try:
-        f = PT.trade_fees(code, side, notional, fees or {})
-    except Exception:                  # noqa: BLE001
+        f = PT.trade_fees(code, "", side_s, notional, fees or {})
+    except Exception as exc:             # noqa: BLE001
+        # 静默按 0 收费会凭空造出一份漂亮的回测报告。必须出声。
+        print("[backtest] 费用计算失败 %s %s value=%.2f: %s —— 本笔按 0 费处理，"
+              "结果不可信" % (code, side_s, notional, exc), flush=True)
         f = {"total": 0.0}
     ftot = float(f.get("total") or 0)
     pnl = 0.0
@@ -371,6 +380,11 @@ def _trade(cash, holdings, code, qty, price, d, side, fees, trades,
             if qty <= 0:
                 return cash
             notional = qty * price
+            # ⚠️ 降档后必须按**新的** notional 重算费用。原来沿用降档前的 ftot，
+            #    少买 100 股却按原数量收费 —— 实测 1000 股 @100 元、10 万现金
+            #    降到 900 股，却按 1000 股的 26.00 收，只买了 90026 却付 26.00。
+            f2 = PT.trade_fees(code, "", "buy", notional, fees or {})
+            ftot = float(f2.get("total") or 0)
             cost = notional + ftot
         cash -= cost
         # 新的加权平均成本（含买入费，与模拟盘的 cost 口径一致）

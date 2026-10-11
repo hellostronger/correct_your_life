@@ -85,6 +85,10 @@ DEFAULT_INTERVALS = {
     "wb": {"enabled": True, "interval_minutes": 60},
     "sector": {"enabled": True, "interval_minutes": 5},
     "volume": {"enabled": True, "interval_minutes": 5},
+    # 实盘做T建议（2026-10-11）。登记进这一张表就自动出现在「⚙️ 调度」页：
+    # 复选框 + 间隔输入框都由 SCH_INTERVALS 通用生成，不用写任何专用 UI。
+    # ⚠️ 只读、只推建议、**绝不下单**（实盘操作始终由本人手动执行）。
+    "t_adv": {"enabled": False, "interval_minutes": 15},
 }
 # ⚠️ news 的周期真身是 `news.fetch_interval_minutes`（_auto_fetch_loop 和
 # news_fetcher 都读它），而 `news.interval_minutes` 是历史遗留的**幽灵键**：
@@ -560,7 +564,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS sa_paper_cycles (
         id          BIGSERIAL PRIMARY KEY,
         trade_date  DATE NOT NULL,
-        slot        VARCHAR(8) NOT NULL,          -- 'HH:MM'，如 '10:30'
+        slot        VARCHAR(16) NOT NULL,         -- 'HH:MM'，做 T 时可带子序号 '10:30#2'
         kind        VARCHAR(12) NOT NULL DEFAULT 'intraday',  -- intraday|catchup|manual
         trigger     VARCHAR(16) NOT NULL DEFAULT '',        -- 触发原因（stoploss/interval…）
         planned     INTEGER NOT NULL DEFAULT 0,   -- 计划判断的标的数
@@ -589,6 +593,16 @@ def init_db():
         ON sa_paper_trades (trade_date, slot, code, side);
     CREATE INDEX IF NOT EXISTS idx_sa_paper_trades_slot
         ON sa_paper_trades (trade_date, slot);
+    -- slot 扩宽到 16（2026-10-11，做 T 的前提）。
+    -- 做 T 要「同一天同一分钟对同一代码做两次操作」（如 10:30 卖机动仓、
+    -- 10:30:30 买回），VARCHAR(8) 放不下子序号，且唯一索引会把这两次判成同一笔。
+    -- 扩宽是 PG 里最便宜的 ALTER（不重写表、不加锁排他），历史值最长 7 字符
+    -- （'10:30-m'），全部兼容，不需要回填。
+    -- 子序号格式：`HH:MM#N`（N 从 1 起），见 paper_trading.make_slot()。
+    ALTER TABLE sa_paper_trades
+        ALTER COLUMN slot TYPE VARCHAR(16);
+    ALTER TABLE sa_paper_cycles
+        ALTER COLUMN slot TYPE VARCHAR(16);
     -- 板块轮动快照（建表 DDL 以 sector.py 的 SNAPSHOT_TABLE_DDL 为准，那里也幂等）
     """
     # ---- 追加：量化策略库 / 本地行情 / 回测的建表（schema_strategy_lib.sql）----
@@ -3753,7 +3767,19 @@ def schedule_update(body: ScheduleIn):
         for key in body_obj:
             if key not in defaults:
                 raise HTTPException(400, f"{section} 不支持字段 {key}")
-        out = {**defaults, **{k: v for k, v in body_obj.items() if v is not None}}
+        # 兜底必须取**现有配置**，不能取模块默认值。
+        # 事故（2026-10-10 09:45）：调度页只回传它界面上有的字段
+        # （mp 只有 enabled/interval_minutes/notify_new），而这里是
+        # `{**DEFAULT_MP_CONF, **请求}` —— 请求里没有的键一律回默认值，
+        # 于是「保存调度设置」一次就把用户填的 mp.auth 抹成空串。
+        # 后果不是配置难看，是同步直接死：nginx 的 /rss 反代要求
+        # `Authorization: Bearer <token>`，token 一没，13 个订阅源全 401，
+        # 公众号同步静默停摆 35 小时（WeRSS 侧文章照常在产出）。
+        # 同 AGENTS.md 记的「网页保存 LLM 设置把 llm.model 清空」，同一类洞。
+        # 只认 defaults 里有的键：段里出现未知键时不该被渲染出去。
+        current = _conf_section(section)
+        base = {**defaults, **{k: v for k, v in current.items() if k in defaults}}
+        out = {**base, **{k: v for k, v in body_obj.items() if v is not None}}
         for key, lo, hi in int_fields:
             if key in body_obj:
                 try:
@@ -4176,7 +4202,7 @@ def _run_analysis_learn_once(limit_articles: int = 3, force: bool = False,
             published_at=str(a["published_at"] or ""), body=body)
         try:
             raw = llm_advisor.ask(analysis_learn.EXTRACT_SYSTEM, user, conf=conf,
-                                  max_tokens=8000, thinking=True)
+                                  thinking=True)
         except Exception as exc:
             result["errors"].append(f"id={a['id']} LLM 失败: {exc}")
             continue
@@ -4467,6 +4493,91 @@ def global_markets_snapshot(days: int = 30):
         return {"ok": False, "error": str(exc)}
 
 
+def _t_advisory_loop():
+    """实盘做T建议守护线程：**只读、只通知、绝不下单**。
+
+    为什么要有这个线程（2026-10-11）：`/api/t/advisory` 原来只在页面打开时算
+    一次。而做T抓的是**瞬时价差** —— 10:30 刚够门槛的那 10 分钟，如果你没在看
+    页面，这个机会就没了。实测 00136 这类港股 2 分钟内就能走完一个门槛。
+
+    两条纪律：
+    1. **不成交**。本线程只调 `t_trading.advisory`（纯读），实盘操作永远由
+       本人手动执行。这不是「还没接券商」，是刻意的 —— 建议与执行分离。
+    2. **只在信号集合变化时推**。每 N 分钟推一次同样的内容 = 噪音，噪音等于
+       没报警。所以记上一次的「可执行代码集合」，集合没变就不推。
+    """
+    last_sig: set = set()
+    while True:
+        try:
+            conf = _conf_section("paper") or {}
+            tc = conf.get("t_trading") or {}
+            # 开关/间隔走**通用的** `intervals` 表（DEFAULT_INTERVALS / SCH_INTERVALS
+            # 那一套），所以「⚙️ 调度」页里是自动出现的复选框，不用专用 UI。
+            # 但做T引擎本身也要开 —— 只开调度不开启引擎就像「让车跑但没驾照」。
+            iv_conf = (conf.get("intervals") or {}).get("t_adv") or {}
+            if not (tc.get("enabled") and iv_conf.get("enabled")):
+                time.sleep(300)
+                continue
+            now = datetime.now()
+            _td = holiday_calendar.is_trading_day(now.date())
+            # 交易日闸门用 `is_trading_day()` 而不是 `is_trading()`：
+            # 日历不可用时折叠成「周一~周五」会把**节假日**当成交易日，
+            # 于是拿休市日的陈旧价判方向（见 AGENTS.md 2026-10-04 那条）。
+            if not paper_trading.calendar_gate(_td, allow_when_unknown=False):
+                time.sleep(300)
+                continue
+            hm = now.hour * 60 + now.minute
+            # A股 09:30-11:30 / 13:00-15:00；港股多半小时，统��放到 15:20
+            if not ((9 * 60 + 30 <= hm <= 11 * 60 + 35)
+                    or (13 * 60 <= hm <= 15 * 60 + 20)):
+                time.sleep(300)
+                continue
+            iv = max(5, int(iv_conf.get("interval_minutes") or 15))
+            deps = _paper_deps(conf)
+            positions = {h["code"]: {"name": h.get("name", ""),
+                                     "shares": int(h.get("net_shares") or 0),
+                                     "cost": h.get("avg_cost")}
+                         for h in (_derive_holdings() or [])
+                         if int(h.get("net_shares") or 0) > 0}
+            if not positions:
+                last_sig = set()
+                time.sleep(iv * 60)
+                continue
+            res = t_trading.advisory(deps, tc, positions)
+            if res.get("error"):
+                print(f"[t-adv] 判定失败: {res['error']}", flush=True)
+                time.sleep(iv * 60)
+                continue
+            acts = [i for i in (res.get("items") or [])
+                    if i.get("action") in ("t_sell", "t_buy")]
+            sig = {i["code"] for i in acts}
+            if sig and sig != last_sig:
+                lines = []
+                for i in acts[:8]:
+                    tk = i.get("ticket") or {}
+                    b = tk.get("buy_back") or {}
+                    if i["action"] == "t_sell":
+                        lines.append(
+                            f"⬆ 高抛 {i['code']} {i.get('name','')} "
+                            f"{tk.get('sell',{}).get('price')} 卖 "
+                            f"{tk.get('sell',{}).get('shares')} 股"
+                            f"｜跌到 {b.get('price')} 买回"
+                            f"｜净赚约 {tk.get('net')} 元（{i.get('bias_label')}）")
+                    else:
+                        lines.append(
+                            f"⬇ 接回 {i['code']} {i.get('name','')} "
+                            f"{b.get('price')} 买 {tk.get('shares')} 股"
+                            f"（{i.get('bias_label')}）")
+                _notifier_notify_safe(
+                    "🔁 实盘做T建议", f"{len(sig)} 只达到门槛：\n" + "\n".join(lines),
+                    event="t_advisory")
+            last_sig = sig
+            time.sleep(iv * 60)
+        except Exception as exc:      # noqa: BLE001
+            print(f"[t-adv] loop error: {exc}", flush=True)
+            time.sleep(120)
+
+
 def _supply_market_loop():
     """每日推送：全市场供给冲击日历 + 海外市场资金抽离视角。
 
@@ -4525,8 +4636,9 @@ def _supply_market_loop():
 
 # ---------------- 模拟交易（LLM 决策 + 结算反思沉淀，见 paper_trading.py） ----------------
 
-import paper_trading
+import paper_trading 
 import paper_strategy
+import t_trading
 import market_data
 import backtest
 import joinquant_source
@@ -4668,7 +4780,110 @@ def _paper_event_lines(code: str, days: int = 14) -> list[str]:
 
 
 _paper_state = {"running": False, "settling": False, "current_slot": None,
-                "last_decision": None, "last_settle": None}
+                "last_decision": None, "last_settle": None, "last_t": None}
+
+
+@app.get("/api/t/advisory")
+def t_advisory(max_codes: int = 0):
+    """**实盘做 T 建议**（纯只读，绝不下单）。
+
+    实盘持仓来自 `sa_trades` 流水推导（`_derive_holdings`），**不是**
+    `sa_holdings` —— 后者早已废弃，app.py:3220-3227 有明确注释。
+    判据与模拟盘完全同源（同一个 `t_trading.decide`），差别只在不成交。
+
+    每条都带 `bias`（方向）与 `invalidate`（什么信号说明方向错了）。
+    实际下单由你本人手动执行 —— 所以「什么时候该认错」比结论本身更该显示。
+    """
+    conf = _conf_section("paper") or {}
+    tc = conf.get("t_trading") or {}
+    deps = _paper_deps(conf)
+    # ⚠️ `_derive_holdings()` 返回的是 **list[dict]**，不是 dict ——
+    #    按 dict 写会 `AttributeError: 'list' object has no attribute 'items'`
+    #    直接 500（2026-10-11 真请求验证逮到，路由表注册成功≠能返回）。
+    positions = {h["code"]: {"name": h.get("name", ""),
+                             "shares": int(h.get("net_shares") or 0),
+                             "cost": h.get("avg_cost")}
+                 for h in (_derive_holdings() or [])
+                 if int(h.get("net_shares") or 0) > 0}
+    return t_trading.advisory(deps, tc, positions, max_codes=max_codes)
+
+
+class TRecordIn(BaseModel):
+    """用户手动做完一次做 T 后回报一笔 —— 让建议的锚定价跟得上真实操作。"""
+    code: str
+    side: str = Field(..., pattern="^(buy|sell)$")
+    shares: int = Field(..., gt=0)
+    price: float = Field(..., gt=0)
+    trade_date: str = ""
+    note: str = ""
+
+
+@app.post("/api/t/record")
+def t_record(rec: TRecordIn):
+    """记录一笔**已由你手动完成**的做 T 操作。
+
+    写 `sa_trades`（与实盘流水同一张表，`ON CONFLICT` 不适用——这里必须新增行），
+    note 强制带 `[做T]` 前缀，`t_trading.real_anchor` 靠它识别。
+
+    ⚠️ 这条**不会**替你下单，也**不校验**你是否有对应持仓 ——
+    它是台账录入，不是交易接口。录错了用 DELETE /api/trades/{id} 改。
+    """
+    if not re.fullmatch(r"[0-9a-zA-Z]{5,8}", rec.code or ""):
+        raise HTTPException(400, "代码格式不对（5~8 位数字/字母）")
+    d = (rec.trade_date or datetime.now().strftime("%Y-%m-%d"))
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+        raise HTTPException(400, "日期格式应为 YYYY-MM-DD")
+    note = (t_trading.T_TAG + " " + (rec.note or "手动做T")).strip()[:255]
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT name FROM sa_trades WHERE code=%s ORDER BY id DESC LIMIT 1",
+                    (rec.code,))
+        r = cur.fetchone()
+        name = (r[0] if r else "") or rec.code
+        cur.execute("""INSERT INTO sa_trades (code, trade_date, side, shares, price, note)
+                       VALUES (%s,%s::date,%s,%s,%s,%s) RETURNING id""",
+                    (rec.code, d, rec.side, int(rec.shares), float(rec.price), note))
+        tid = cur.fetchone()[0]
+        conn.commit()
+    return {"ok": True, "id": tid, "code": rec.code, "name": name,
+            "side": rec.side, "shares": rec.shares, "price": rec.price,
+            "trade_date": d, "note": note,
+            "hint": "已记入 sa_trades 做T台账；下一次建议会以这个价格为锚"}
+
+
+@app.get("/api/paper/t-status")
+def paper_t_status():
+    """做 T 现状：每只持仓的底仓/机动仓拆分、锚定价、待买回标记。
+
+    「待买回」= 最后一笔做 T 成交是卖出。**这是最该盯的字段**：它意味着
+    有一笔机动仓已经高抛出去、正在等回调接回。没接回就一直拿着现金，
+    这在震荡市是正常的，但也意味着这段时间它不跟涨。
+    """
+    conf = _conf_section("paper") or {}
+    tc = conf.get("t_trading") or {}
+    return t_trading.status(_paper_deps(), tc)
+
+
+@app.post("/api/paper/t-scan")
+def paper_t_scan(max_codes: int = 0, execute: bool = False):
+    """手动跑一轮做 T 扫描。
+
+    默认 `execute=false` —— **只看不做**，返回每只票的判断与理由。
+    真要成交必须显式 `execute=true`：这是改交易口径的操作，误触一次就
+    真的动仓，而「只看」永远不会造成损失。
+    """
+    conf = _conf_section("paper") or {}
+    tc = dict(conf.get("t_trading") or {})
+    if not tc.get("enabled"):
+        return {"enabled": False,
+                "why": "做T 未开启（config.yaml -> paper.t_trading.enabled）"}
+    deps = _paper_deps(conf)
+    if not execute:
+        tc["enabled"] = False
+        # 只看：用 scan_once 的判据但不走成交。scan_once 在 enabled=False
+        # 时直接返回空，所以这里单独走 preview。
+        return t_trading.preview(deps, tc, max_codes=max_codes)
+    return t_trading.scan_once(deps, tc, slot=datetime.now().strftime("%H:%M"),
+                               max_codes=max_codes)
 
 
 @app.get("/api/paper/overview")
@@ -6487,6 +6702,25 @@ def _paper_run_cycle(conf: dict, slot: str, kind: str = "intraday",
             else:
                 skipped += 1
         planned = len(decided) + len(sl.get("sold", []))
+        # 2.5) 做 T（2026-10-11）。**必须排在止损之后** —— 止损优先是不可
+        # 协商的纪律：不允许「今天做 T 所以先不卖」。做 T 只动机动仓（默认 30%），
+        # 且成交仍走 _execute_decision 的 T+1 / 资金 / 时段闸门。
+        t_res = None
+        if (conf.get("t_trading") or {}).get("enabled"):
+            try:
+                t_res = t_trading.scan_once(deps, conf.get("t_trading") or {},
+                                            slot=slot,
+                                            max_codes=int(
+                                                (conf.get("t_trading") or {}).get(
+                                                    "max_codes") or 0))
+                acted += int(t_res.get("acted") or 0)
+                planned += sum(1 for it in (t_res.get("items") or [])
+                               if it.get("action") in ("t_sell", "t_buy"))
+            except Exception as exc:      # noqa: BLE001
+                # 做 T 失败绝不能带走整轮 —— 它是最后一步，前面止损/决策已经完成
+                print(f"[paper] 做T扫描失败（不影响本轮其它决策）: {exc}", flush=True)
+                t_res = {"error": str(exc)[:160]}
+            _paper_state["last_t"] = t_res
         _paper_state["last_decision"] = res
         print(f"[paper] {slot} {me} {kind}: 判断 {planned} 成交 {acted} 观望 {holds} "
               f"未成交 {skipped} 用时 {time.time()-t0:.0f}s", flush=True)
@@ -8755,6 +8989,12 @@ _start_daemon(_market_volume_loop, "sa_market_volume")
 # paper.enabled=false 轮内跳过）
 _start_daemon(_paper_loop, "sa_paper")
 _start_daemon(_paper_strategy_loop, "sa_paper_strategy")
+
+# 实盘做T建议线程（2026-10-11）。**只给建议、只读不写、不下单**，
+# 存在的理由：建议原来只在你打开页面时才算一次 —— 盘中价差到门槛的那 10 分钟
+# 你没看页面就错过了，而做T本来就是抓瞬时波动。
+# 只在「有可执行单」且「与上次通知的集合不同」时推，否则噪音等于没报警。
+_start_daemon(_t_advisory_loop, "sa_t_advisory")
 
 # 每日报告线程（盘前简报 / 盘后复盘；时间点见 config.yaml schedule 段，网页可改）
 _start_daemon(_daily_reports_loop, "sa_daily_reports")

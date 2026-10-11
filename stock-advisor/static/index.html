@@ -209,7 +209,32 @@
   [data-theme="dark"] .b-baidu      { background: #16233d; color: #7ea6ff; }
   [data-theme="dark"] .b-sina       { background: #3a1a1a; color: #f08b86; }
   [data-theme="dark"] .b-duckduckgo { background: #16301c; color: #74c98c; }
-  .tab-badge { display: inline-block; min-width: 17px; padding: 0 5px; margin-left: 4px;
+  /* ---------- 做T页 ---------- */
+/* 筛选按钮选中态。用 t- 前缀，不复用 .anal- / .jq- ——
+   那两页各自会改样式，共用一个类会互相牵连。 */
+.t-sub.active { color: var(--accent); border-color: var(--accent);
+                background: var(--accent-soft); }
+/* 每只票的「依据/方向/失效条件」三段：底色微深，与主表格行区分开 */
+tr > td[colspan="13"] { background: var(--bg-2); white-space: normal; }
+tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
+/* 执行单：两条腿并排。左边卖右边买，中间夹净收益 —— 一眼看懂是往返 */
+.t-ticket { border: 1px solid var(--border); border-radius: 8px;
+            padding: 9px 11px; background: var(--card); margin-top: 7px; }
+.t-leg { border-left: 3px solid var(--border-2); padding: 3px 0 3px 9px;
+         margin-bottom: 7px; }
+.t-leg:last-of-type { margin-bottom: 0; }
+.t-leg-t { font-size: 11.5px; color: var(--text-2); }
+.t-leg-p { font-family: var(--mono); font-size: 14px; font-weight: 600;
+           margin: 2px 0; font-variant-numeric: tabular-nums; }
+.t-net { border-top: 1px dashed var(--border); padding-top: 6px;
+         margin-top: 6px; font-size: 13px; }
+.t-warn { margin-top: 6px; padding: 5px 8px; border-radius: 6px;
+          background: var(--up-soft); color: var(--up); font-size: 12px; }
+.t-ticket-blocked { border: 1px dashed var(--border-2); border-radius: 8px;
+                    padding: 7px 10px; margin-top: 7px; font-size: 12px;
+                    line-height: 1.6; }
+
+.tab-badge { display: inline-block; min-width: 17px; padding: 0 5px; margin-left: 4px;
                border-radius: 9px; background: var(--up); color: #fff; font-size: 10.5px;
                line-height: 17px; text-align: center; vertical-align: 1px; }
   .rel-code { display: inline-block; padding: 0 7px; border: 1px solid var(--border-2);
@@ -431,6 +456,7 @@
       <button data-tab="x">🐦 X<span id="x-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="reports">分析报告</button>
       <button data-tab="paper">🧪 模拟交易</button>
+      <button data-tab="tdesk">🔁 做T<span id="t-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="jq">📚 策略库/沙箱<span id="jq-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="analysis">🧠 分析技法<span id="anal-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="notify">🔔 通知</button>
@@ -1670,6 +1696,8 @@
         <input type="number" id="sch-iv-sector-min" min="0" max="1440" style="width:70px;padding:5px 7px"> 分钟
         <label class="muted"><input type="checkbox" id="sch-iv-volume"> 大盘量能</label>
         <input type="number" id="sch-iv-volume-min" min="0" max="1440" style="width:70px;padding:5px 7px"> 分钟
+        <label class="muted" title="实盘做T建议。只读、只推建议，绝不下单 —— 实盘操作始终由你本人手动执行"><input type="checkbox" id="sch-iv-t_adv"> 🔁 实盘做T建议</label>
+        <input type="number" id="sch-iv-t_adv-min" min="5" max="120" style="width:70px;padding:5px 7px"> 分钟
       </div>
       <div class="hint">
         0 = 关闭该模块的自动抓取。写的是各模块自己的配置键——新闻写的是
@@ -1684,6 +1712,107 @@
         <button class="btn ghost" onclick="loadSchedule()">重新载入</button>
         <span class="muted" id="schedule-status" style="font-size:12px"></span>
       </div>
+    </div>
+  </section>
+
+  <!-- 做 T：实盘只给建议（本人手动执行） + 模拟盘可自动/预览 -->
+  <section id="tab-tdesk" class="hide">
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <b style="font-size:13px">🔁 做T · 机动仓高抛低吸</b>
+        <span class="row">
+          <span class="muted" id="t-meta" style="font-size:12px"></span>
+          <button class="btn ghost" style="font-size:12px" onclick="loadTDesk()">刷新</button>
+        </span>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:4px">
+        <b>底仓</b>（永不动，拿筹码吃趋势） + <b>机动仓</b>（默认 30%，唯一允许日内买卖的部分）。
+        A股 T+1 下当日买入不可卖，所以做T只能是<b>持仓不变的份额置换</b>：卖掉机动仓、回调再买回。
+        四层周期（当日VWAP / 5日 / 20日 / 60日）<b>共用同一份额度</b>，不是四份仓位叠加。
+      </div>
+      <div class="hint" style="margin-top:6px">
+        <b>方向决定先做哪一步</b>，这不是预测涨跌：
+        <span class="badge b-ok">上行</span> 均线多头且价在VWAP上 → <b>高抛门槛×2（别急着卖）、买回×0.7（尽快接回）</b>；
+        <span class="badge b-mute">震荡</span> → 经典高抛低吸，先卖后买；
+        <span class="badge b-bad">下行</span> → <b>高抛×0.7（反弹就减）、买回×2 且必须先确认止跌</b>；
+        方向判不出 → <b>什么都不做</b>。
+      </div>
+    </div>
+
+    <!-- 实盘建议 -->
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <span class="row" style="gap:6px;align-items:center">
+          <b style="font-size:13px">💼 实盘做T建议</b>
+          <span class="badge b-info">只读 · 不会下单</span>
+        </span>
+        <span class="row">
+          <span class="muted" id="t-adv-meta" style="font-size:12px"></span>
+          <button class="btn ghost" style="font-size:12px" onclick="loadTAdvisory()">重新判定</button>
+        </span>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:4px">
+        实盘持仓来自「我的持仓」流水。判据与模拟盘<b>完全同源</b>，差别只在不成交 ——
+        <b>实际下单由你本人手动执行</b>。做完后用「记一次做T」回报，下一次建议会以那个价格为锚。
+      </div>
+      <div class="row" style="margin-top:8px;gap:6px;flex-wrap:wrap;align-items:center">
+        <span class="muted" style="font-size:12px">筛选</span>
+        <span class="row" id="t-filters" style="gap:4px">
+          <button class="btn ghost t-sub active" data-k="act" style="font-size:12px"
+                  onclick="tFilter('act')">🎯 有操作</button>
+          <button class="btn ghost t-sub" data-k="all" style="font-size:12px"
+                  onclick="tFilter('all')">全部</button>
+          <button class="btn ghost t-sub" data-k="bull" style="font-size:12px"
+                  onclick="tFilter('bull')">📈 上行</button>
+          <button class="btn ghost t-sub" data-k="bear" style="font-size:12px"
+                  onclick="tFilter('bear')">📉 下行</button>
+          <button class="btn ghost t-sub" data-k="pending" style="font-size:12px"
+                  onclick="tFilter('pending')">⏳ 待接回</button>
+        </span>
+        <span style="width:8px"></span>
+        <button class="btn ghost" style="font-size:12px" onclick="openTRecord()">✍️ 记一次做T</button>
+        <span class="muted" id="t-adv-out" style="font-size:12px"></span>
+      </div>
+      <div class="table-scroll" style="margin-top:8px">
+        <table>
+          <thead><tr>
+            <th>代码</th><th>名称</th><th>持仓</th><th>底仓/机动</th>
+            <th>现价</th><th>成本</th><th>浮盈%</th><th>方向</th>
+            <th>建议</th><th>数量</th><th>锚价</th><th>触发位</th><th>门槛%</th>
+          </tr></thead>
+          <tbody id="t-adv-body"></tbody>
+        </table>
+      </div>
+      <div id="t-adv-empty" class="empty hide">没有符合条件的标的</div>
+    </div>
+
+    <!-- 模拟盘做T -->
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <span class="row" style="gap:6px;align-items:center">
+          <b style="font-size:13px">🧪 模拟盘做T</b>
+          <span class="badge b-mute" id="t-paper-flag">未开启</span>
+        </span>
+        <span class="row">
+          <button class="btn ghost" style="font-size:12px" onclick="tPaperPreview()">👁 预演（只看不成交）</button>
+          <button class="btn ghost" style="font-size:12px" onclick="tPaperScan()">⚡ 执行一轮</button>
+        </span>
+      </div>
+      <div class="hint" style="margin-top:6px">
+        预演与执行走<b>同一个判据函数</b>（<code>_judge_one</code>），只差最后一步成交 ——
+        若预览另写一套估算逻辑，预览就是骗人的。执行只在交易时段生效，且排在<b>止损之后</b>。
+      </div>
+      <div id="t-paper-out" class="muted" style="font-size:12px;margin-top:6px"></div>
+      <div class="table-scroll" style="margin-top:8px">
+        <table>
+          <thead><tr>
+            <th>代码</th><th>名称</th><th>持仓</th><th>底仓/机动</th>
+            <th>方向</th><th>状态</th><th>锚价</th><th>判定说明</th>
+          </tr></thead>
+          <tbody id="t-paper-body"></tbody>
+        </table>
+      </div>
+      <div id="t-paper-empty" class="empty hide">模拟盘暂无持仓</div>
     </div>
   </section>
 
@@ -3438,7 +3567,7 @@ async function jqExtract(btn) {
 
 // ---- 标签页 ----
 const TABS = ['market', 'sector', 'holdings', 'strategies', 'plans', 'calendar', 'news',
-              'bili', 'wb', 'mp', 'x', 'reports', 'paper', 'notify', 'schedule',
+              'bili', 'wb', 'mp', 'x', 'reports', 'paper', 'tdesk', 'notify', 'schedule',
               'jq', 'analysis'];
 const TAB_LOADERS = {
   market:    () => { loadWatch(); loadAlerts(); loadCrypto(); loadDiscover(); loadFutures(); },
@@ -3454,6 +3583,7 @@ const TAB_LOADERS = {
   x:         () => { loadXAccounts(); loadXWatch(); loadXTweets(); loadXStatus(); },
   reports:   loadReports,
   paper:     loadPaper,
+  tdesk:     loadTDesk,
   notify:    () => { loadNotifyConf(); loadNotifyMatrix(); refreshWxChat(); },
   jq:        () => { loadJqLib(); loadJqList(); loadAdopted(); },
   analysis:  loadTechniques,
@@ -5151,6 +5281,30 @@ function paperSideBadge(side) {
   if (side === 'sell') return '<span class="badge" style="background:#e5f3e2;color:#1e7d32">卖出</span>';
   return '<span class="badge" style="background:#eee;color:#666">观望</span>';
 }
+// ---- LLM 原始分析报告弹窗（2026-10-11） ----
+// 正文动辄 2000~4000 字符：原地 <details> 展开会把整张卡片撑开、把下面的行顶出
+// 屏幕，而且一页几十张卡片全展开后基本没法用。所以走弹窗 + 限高滚动。
+// 报告文本放 window 缓存、按钮只传 key —— inline onclick 里塞几千字正文会被
+// 引号/换行/尖括号打穿，是典型的「把数据拼进代码」事故。
+let _paperReportSeq = 0;
+const _paperReports = {};
+function putPaperReport(code, side, text, label) {
+  const key = 'pr' + (++_paperReportSeq);
+  _paperReports[key] = { code: code || '', side: side, text: text, label: label || '' };
+  return key;
+}
+function showPaperReport(key) {
+  const d = _paperReports[key];
+  if (!d) { toastErr('报告内容不在缓存里，刷新页面后重试'); return; }
+  showModal({
+    title: `${d.code} ${d.label}（${d.text.length} 字）`,
+    wide: true,
+    body: `<div style="max-height:62vh;overflow:auto;font-size:13px;line-height:1.75;`
+        + `white-space:pre-wrap;overflow-wrap:break-word;color:var(--text)">${esc(d.text)}</div>`,
+    footer: '<button class="btn ghost" data-r="0">关闭</button>',
+  });
+}
+
 function renderPaperRounds() {
   const all = window.__paperRounds || [];
   const box = $('paper-rounds');
@@ -5197,6 +5351,22 @@ function renderPaperRounds() {
         : '<span class="muted">（无理由）</span>';
       return stamp + body;
     };
+    // LLM 原始分析报告（2026-10-11：买入/卖出两侧都给，且改成**弹窗**看）。
+    // 为什么不用 <details> 原地展开：正文动辄 2000~4000 字符，原地展开会把
+    // 整张回合卡片撑成一大坨、把下面的行顶出屏幕；弹窗限高滚动更稳。
+    // 卖出侧以前根本没有这个框 —— 卖出也是跑过分析师的（只有**免 LLM 的盘中止损**
+    // 没有报告），于是「为什么卖」永远只能看一行 reasoning 摘要。
+    const reportBlock = (t, side, label) => {
+      if (!t) return '';
+      const txt = (t.report || '').trim();
+      if (!txt) {
+        return `<div class="muted" style="font-size:11px;margin-top:4px">${esc(label)}：免 LLM 自动执行，无分析报告</div>`;
+      }
+      const n = t.report_len || txt.length;
+      const key = putPaperReport(r.code, side, txt, label);
+      return `<button class="link-btn" style="margin-top:6px;font-size:12px"
+        onclick="showPaperReport('${esc(key)}')">📄 ${esc(label)}（全文 ${n} 字）</button>`;
+    };
     return `<div class="card" style="margin:8px 0;padding:10px 12px">
       <div class="row" style="justify-content:space-between;align-items:center;gap:8px">
         <div>
@@ -5239,10 +5409,7 @@ function renderPaperRounds() {
           </tbody>
         </table>
       </div>
-      ${e.report ? `<details style="margin-top:6px">
-        <summary class="muted" style="cursor:pointer;font-size:12px">展开 LLM 原始分析报告</summary>
-        <div style="font-size:12px;line-height:1.6;white-space:normal;margin-top:4px;color:#555">${esc(e.report)}</div>
-      </details>` : ''}
+      ${reportBlock(e, 'entry', '买入 LLM 原始分析报告')}${reportBlock(x, 'exit', '卖出 LLM 原始分析报告')}
     </div>`;
   }).join('');
 }
@@ -5718,6 +5885,345 @@ async function paperGoalCheck() {
   } catch (e) { toastErr(e.message); }
 }
 
+// ================= 做 T（2026-10-11）=================
+// 实盘**只给建议**、绝不自动下单；模拟盘可预演/执行。
+// 渲染层铁律（AGENTS.md 记过一次 90 分钟成果全丢的事故）：
+//   任何可能缺失的字段都走 `tNum(v, spec)` 兜底，绝不 `v.toFixed()` / `${v}%`。
+const _T = { adv: [], filter: 'act', paper: [], paperOn: false };
+
+/** 数值格式化出口。null/undefined/非数值/NaN -> 破折号。绝不让渲染层因数据缺失崩掉。 */
+const tNum = (v, spec = '2') => {
+  const n = Number(v);
+  return (v === null || v === undefined || v === '' || !isFinite(n)) ? '—' : n.toFixed(spec);
+};
+/** 做T的**价格**必须 4 位小数。实测 00136 的买回价 1.4844 用 2 位会显示成
+    1.48 —— 差 0.0044 元，用户照着挂单就挂在错位置。低到 0.0001 的标的
+    （港股/低价 ETF）更需要更多位，所以给到 6 位由 toFixed 自己补零。 */
+const tPx = v => tNum(v, '4');
+/** 做T的**百分比**要 3 位：往返成本实测 0.8482%，2 位会显示 0.85%
+    —— 门槛判断就靠这个数，糊掉就等于没显示。 */
+const tPct4 = v => {
+  const n = Number(v);
+  return (v === null || v === undefined || v === '' || !isFinite(n)) ? '—' : n.toFixed(3) + '%';
+};
+const tPct = v => {
+  const n = Number(v);
+  return (v === null || v === undefined || !isFinite(n)) ? '—' : (n > 0 ? '+' : '') + n.toFixed(2) + '%';
+};
+const tInt = v => {
+  const n = Number(v);
+  return (v === null || v === undefined || !isFinite(n)) ? '—' : Math.round(n).toLocaleString('zh-CN');
+};
+const T_BIAS = {
+  bull:  { t: '📈 上行', c: 'b-ok',   d: '顺势：先接回、涨透再抛' },
+  range: { t: '〰️ 震荡', c: 'b-mute', d: '经典高抛低吸：先卖后买' },
+  bear:  { t: '📉 下行', c: 'b-bad',  d: '逆势：反弹就减、跌透且止跌才接' },
+  flat:  { t: '❔ 不明', c: 'b-warn', d: '方向判不出 → 什么都不做' },
+};
+const T_ACT = {
+  t_sell: { t: '⬆ 高抛（先卖）', c: 'b-warn' },
+  t_buy:  { t: '⬇ 低吸（买回）', c: 'b-info' },
+  hold:   { t: '— 不做',        c: 'b-mute' },
+};
+
+async function loadTDesk() {
+  $('t-paper-body').innerHTML = skeletonBox(2);
+  await Promise.all([loadTAdvisory(), loadTPaper()]);
+}
+
+function tFilter(k) {
+  _T.filter = k || 'act';
+  document.querySelectorAll('#t-filters .t-sub').forEach(b =>
+    b.classList.toggle('active', (b.dataset.k || '') === _T.filter));
+  renderTAdv();
+}
+
+// ---------- 执行单（双腿 + 真实费率实算） ----------
+// 做T的本质是**一次往返**：只给一条腿没法执行。所以每条建议都渲染成单子，
+// 不可做时也要说清「差多少」。
+function _tTicketHtml(tk, it) {
+  if (!tk) return '';
+  const nb = tk.status === 'blocked'
+    ? `<div class="t-ticket-blocked">
+         <div><b>不做</b> · ${esc(tk.blocked_reason || '不满足做T条件')}</div>
+         ${tk.blocked_hint ? `<div class="muted">${esc(tk.blocked_hint)}</div>` : ''}
+         ${tk.trigger_price != null
+            ? `<div>触发价 <b>${tPx(tk.trigger_price)}</b>
+                 <span class="muted">（需 ${tPct4(tk.threshold_pct)} ＝ 往返成本
+                 ${tPct4(tk.cost_pct)} × ${tk.safety_mult}）</span></div>` : ''}
+       </div>`
+    : '';
+  // ⚠️ 顺序要紧：**买回单必须先判**。`status==='ready'` 的两腿单模板在前，
+  //    t_buy 落进去会渲染成「第1腿·卖出（现在执行）」—— 用户照着卖就是反向操作
+  //    （2026-10-11 实测发现）。宁可分支顺序写反也不能让买回单显示成卖出单。
+  if (tk.legs === 't_buy' && tk.buy_back) {
+    return `<div class="t-ticket">
+      <div class="t-leg">
+        <div class="t-leg-t">接回机动仓<span class="muted">（现价已达接回位）</span></div>
+        <div class="t-leg-p">${tPx(tk.buy_back.price)} 买回 ${tInt(tk.shares)} 股</div>
+        <div class="muted">门槛 ${tPct4(tk.threshold_pct)}（往返成本 ${tPct4(tk.cost_pct)}
+          × ${tk.safety_mult}）</div>
+      </div>
+      <div class="muted"><b>接回后</b>：机动仓恢复满仓，此后按同一套门槛判断下一次高抛。
+        若此时均线空头且未止跌，接回会被拦下</div>
+    </div>`;
+  }
+  if (tk.status === 'ready') {
+    const s = tk.sell || {}, b = tk.buy_back || {};
+    const netCls = (tk.net || 0) > 0 ? 'up' : 'down';
+    return `<div class="t-ticket">
+      <div class="t-leg">
+        <div class="t-leg-t">第1腿 · 卖出<span class="muted">（现在执行）</span></div>
+        <div class="t-leg-p">${tPx(s.price)} <span class="muted">×</span> ${tInt(s.shares)} 股</div>
+        <div class="muted">机动仓 · 底仓 ${tInt(tk.base_shares)} 股不动
+          · 到手约 ${tInt(s.net_cash)} 元（已扣卖出费 ${tNum(s.fee)}）</div>
+      </div>
+      <div class="t-leg">
+        <div class="t-leg-t">第2腿 · 买回<span class="muted">（等回调，不追买）</span></div>
+        <div class="t-leg-p">跌到 <b>${tPx(b.price)}</b> 以下 买回 ${tInt(b.shares)} 股</div>
+        <div class="muted">需回撤 ${tPct4(b.trigger_pct)}（门槛 =
+          往返成本 ${tPct4(tk.cost_pct)} × 安全倍数 ${tk.safety_mult}）</div>
+      </div>
+      <div class="t-net">
+        净收益 <b class="${netCls}">${tk.net != null ? signed(tk.net) + ' 元' : '—'}</b>
+        <span class="muted">＝ 毛利 ${tNum(tk.gross)} − 手续费 ${tNum(tk.fees)}
+          − 滑点 ${tNum(tk.slippage)}</span>
+      </div>
+      <div class="muted"><b>不回落怎么办</b>：${esc(tk.if_not_returning || '')}</div>
+      ${tk.warn ? `<div class="t-warn">⚠️ ${esc(tk.warn)}</div>` : ''}
+    </div>`;
+  }
+  return nb;
+}
+
+// ---------- 实盘建议 ----------
+async function loadTAdvisory() {
+  const out = $('t-adv-out');
+  if (out) out.textContent = '判定中…';
+  try {
+    const r = await api('/api/t/advisory');
+    _T.adv = r.items || [];
+    const n = _T.adv.filter(i => i.action === 't_sell' || i.action === 't_buy').length;
+    const m = $('t-adv-meta');
+    if (m) m.textContent = `${_T.adv.length} 只持仓 · ${n} 只有操作`;
+    const badge = $('t-tab-badge');
+    if (badge) { badge.textContent = n; badge.classList.toggle('hide', n === 0); }
+    const t = $('t-meta');
+    if (t) {
+      // 方向正确率与盈亏**分开报**（借鉴 TradingAgents performance.py 的教训：
+      // 方向对了但亏钱，不能被记成判断失败）
+      const da = r.direction_accuracy || {};
+      const rate = (da.rate === null || da.rate === undefined)
+        ? '暂无样本' : `${da.rate}%（${da.hits}/${da.total}）`;
+      t.textContent = `${r.scanned || 0} 只 · ${n} 只可操作 · 方向正确率 ${rate}`;
+    }
+    if (out) out.textContent = '';
+    renderTAdv();
+  } catch (e) {
+    _T.adv = [];
+    renderTAdv();
+    if (out) out.textContent = '加载失败：' + e.message;
+  }
+}
+
+function renderTAdv() {
+  const tb = $('t-adv-body'), em = $('t-adv-empty');
+  if (!tb) return;
+  const f = _T.filter;
+  // ⚠️ 必须先剔掉非对象元素。后端理论上不会返回 null，但渲染层要能扛住
+  // 任何脏数据 —— 否则一行坏数据就让整页白屏（AGENTS.md 记过 90 分钟成果
+  // 因渲染层崩掉全丢）。
+  const src = _T.adv.filter(i => i && typeof i === 'object');
+  const rows = src.filter(i =>
+    f === 'all' ? true :
+    f === 'act' ? (i.action === 't_sell' || i.action === 't_buy') :
+    f === 'pending' ? !!i.pending : i.bias === f);
+  if (!rows.length) {
+    tb.innerHTML = '';
+    if (em) {
+      em.classList.remove('hide');
+      em.textContent = f === 'act'
+        ? (src.length ? '当前没有达到门槛的标的 —— 这通常是对的：做T只在价差足够覆盖成本时才做'
+                      : '实盘没有持仓（持仓来自「我的持仓」流水）')
+        : '这个筛选下没有标的';
+    }
+    return;
+  }
+  if (em) em.classList.add('hide');
+  tb.innerHTML = rows.map(i => {
+    const b = T_BIAS[i.bias] || T_BIAS.flat;
+    const a = T_ACT[i.action] || T_ACT.hold;
+    const trig = i.trigger_price != null ? tNum(i.trigger_price)
+               : (i.action === 't_buy' && i.anchor_price
+                  ? tNum(i.anchor_price * (1 - Number(i.threshold || 0) / 100)) : '—');
+    return `<tr data-trow="${esc(i.code || '')}">
+      <td class="mono">${esc(i.code || '')}</td>
+      <td>${esc(i.name || '')}</td>
+      <td class="num">${tInt(i.shares)}</td>
+      <td class="num" title="底仓 ${tInt(i.base_shares)} / 机动仓 ${tInt(i.movable)}">${
+        tInt(i.base_shares)}/${tInt(i.movable)}</td>
+      <td class="num">${tNum(i.price)}</td>
+      <td class="num">${tNum(i.cost)}</td>
+      <td class="num ${cls(i.pnl_pct)}">${tPct(i.pnl_pct)}</td>
+      <td><span class="badge ${b.c}" title="${esc(b.d)}">${b.t}</span>${
+        i.pending ? ' <span class="badge b-warn">待接回</span>' : ''}</td>
+      <td><span class="badge ${a.c}">${a.t}</span></td>
+      <td class="num">${i.shares_suggest ? tInt(i.shares_suggest) : '—'}</td>
+      <td class="num">${tNum(i.anchor_price)}</td>
+      <td class="num">${trig}</td>
+      <td class="num">${tNum(i.threshold)}</td>
+    </tr>
+    <tr data-tdetail="${esc(i.code || '')}"><td colspan="13" style="padding:0 8px 8px">
+      <div style="font-size:12px;line-height:1.65">
+        <div><b>依据</b> ${esc(i.why || '—')}</div>
+        <div><b>方向</b> ${esc(i.bias_why || '—')}</div>
+        <div style="color:var(--text-2)"><b>失效条件</b>（出现即说明这个方向错了，应重新评估）${esc(i.invalidate || '—')}</div>
+      <div class="muted">${i.intraday_vwap != null ? `日内VWAP ${tNum(i.intraday_vwap)}（${
+        esc(i.intraday_src || '')}）` : ''}${
+        i.direction_check ? ` · <b>方向判定</b> <span class="badge ${
+          i.direction_check.verdict === '对' ? 'b-ok' : i.direction_check.verdict === '错' ? 'b-bad' : 'b-mute'
+        }">${esc(i.direction_check.verdict || '未判')}</span>
+        <span class="muted">${esc(i.direction_check.note || '')}</span>` : ''}</div>
+      </div>
+      ${_tTicketHtml(i.ticket, i)}
+      <div style="margin-top:3px">
+        <button class="btn ghost" style="font-size:11px;padding:3px 7px"
+          onclick="openTRecord('${esc(i.code || '')}','${i.action === 't_buy' ? 'buy' : 'sell'}')">✍️ 记一次做T</button>
+      </div>
+    </td></tr>`;
+  }).join('');
+}
+
+// ---------- 模拟盘做T ----------
+async function loadTPaper() {
+  try {
+    const r = await api('/api/paper/t-status');
+    _T.paper = r.items || [];
+    _T.paperOn = !!r.enabled;
+    const flag = $('t-paper-flag');
+    if (flag) {
+      flag.textContent = r.enabled ? '已开启' : '未开启';
+      flag.className = 'badge ' + (r.enabled ? 'b-ok' : 'b-mute');
+    }
+    renderTPaper();
+  } catch (e) {
+    _T.paper = [];
+    renderTPaper();
+    const o = $('t-paper-out');
+    if (o) o.textContent = '加载失败：' + e.message;
+  }
+}
+
+function renderTPaper() {
+  const tb = $('t-paper-body'), em = $('t-paper-empty');
+  if (!tb) return;
+  const src = _T.paper.filter(i => i && typeof i === 'object');
+  if (!src.length) {
+    tb.innerHTML = '';
+    if (em) { em.classList.remove('hide'); em.textContent = '模拟盘暂无持仓'; }
+    return;
+  }
+  if (em) em.classList.add('hide');
+  tb.innerHTML = src.map(i => `<tr data-tprow="${esc(i.code || '')}">
+    <td class="mono">${esc(i.code || '')}</td>
+    <td>${esc(i.name || '')}</td>
+    <td class="num">${tInt(i.shares)}</td>
+    <td class="num" title="底仓 ${tInt(i.base_shares)} / 机动仓 ${tInt(i.movable)}">${
+      tInt(i.base_shares)}/${tInt(i.movable)}</td>
+    <td class="muted">${tNum(i.cost)}</td>
+    <td>${i.pending ? '<span class="badge b-warn">⏳ 已抛待接回</span>'
+                    : '<span class="badge b-mute">机动仓在仓</span>'}</td>
+    <td class="num">${tNum((i.anchor || {}).price)}</td>
+    <td class="muted" style="font-size:11.5px">${
+      i.pending ? '等回调到接回位再买回（不会主动追买）' : '尚未做过T，锚定持仓成本'}</td>
+  </tr>`).join('');
+}
+
+async function tPaperPreview() {
+  const o = $('t-paper-out');
+  if (o) o.textContent = '预演中…（只看不成交）';
+  try {
+    const r = await api('/api/paper/t-scan?execute=false', { method: 'POST' });
+    if (!r.enabled) { if (o) o.textContent = r.why || '做T 未开启'; return; }
+    if (o) o.textContent = `预演完成：扫 ${r.scanned || 0} 只，会动 ${r.would_act || 0} 只（未成交）`;
+    renderTPaperPreview(r.items || []);
+  } catch (e) {
+    if (o) o.textContent = '预演失败：' + e.message;
+  }
+}
+
+async function tPaperScan() {
+  if (!confirm('确认对模拟盘执行一轮做T？\n\n会在交易时段真实改动模拟持仓（只动机动仓，默认 30%）。\n实盘不受影响。')) return;
+  const o = $('t-paper-out');
+  if (o) o.textContent = '执行中…';
+  try {
+    const r = await api('/api/paper/t-scan?execute=true', { method: 'POST' });
+    if (!r.enabled) { if (o) o.textContent = r.why || '做T 未开启'; return; }
+    if (r.error) { if (o) o.textContent = '执行出错：' + r.error; return; }
+    if (o) o.textContent = `执行完成：扫 ${r.scanned || 0} 只，成交 ${r.acted || 0} 笔`;
+    renderTPaperPreview(r.items || []);
+    loadTPaper();
+  } catch (e) {
+    if (o) o.textContent = '执行失败：' + e.message;
+  }
+}
+
+function renderTPaperPreview(items) {
+  const acts = items.filter(i => i.action === 't_sell' || i.action === 't_buy');
+  const tb = $('t-paper-body');
+  if (!tb || !acts.length) return;
+  // 把预演/执行结果直接顶到表格上方，不另开弹窗 —— 免得信息分散在两处
+  const tip = document.getElementById('t-paper-out');
+  if (tip) {
+    tip.innerHTML = acts.map(i => {
+      const a = T_ACT[i.action] || T_ACT.hold;
+      const b = T_BIAS[i.bias] || T_BIAS.flat;
+      return `<div style="margin-top:3px"><span class="badge ${a.c}">${a.t}</span>
+        <span class="badge ${b.c}">${b.t}</span>
+        <b class="mono">${esc(i.code || '')}</b> ${tInt(i.shares)} 股
+        ${i.executed === undefined ? '' : (i.executed ? '<span class="badge b-ok">已成交</span>'
+          : '<span class="badge b-mute">未成交</span>')}
+        <span class="muted">${esc(i.why || '')}</span></div>`;
+    }).join('');
+  }
+}
+
+// ---------- 记一次做T ----------
+function openTRecord(code, side) {
+  // formDlg 收的是**字段数组**不是 HTML 串（传字符串会在 fields.map 上炸）。
+  const d = new Date();
+  const today = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  const v = formDlg('记一次做T（已完成的手动操作）', [
+    { key: 'code', label: '代码', value: code || '', placeholder: '如 600519' },
+    { key: 'side', label: '方向', type: 'select', value: side || 'sell',
+      options: ['sell', 'buy'],
+      hint: '卖出=高抛（先卖机动仓）；买入=接回。' },
+    { key: 'shares', label: '股数', type: 'number', value: '' },
+    { key: 'price', label: '成交价', type: 'number', value: '' },
+    { key: 'date', label: '日期', type: 'date', value: today },
+    { key: 'note', label: '备注', value: '', placeholder: '可选' },
+  ], { okText: '记入台账', wide: true });
+  Promise.resolve(v).then(async val => {
+    if (!val) return;                       // 取消
+    try {
+      const body = {
+        code: (val.code || '').trim(),
+        side: val.side,
+        shares: parseInt(val.shares, 10),
+        price: parseFloat(val.price),
+        trade_date: val.date || '',
+        note: (val.note || '').trim(),
+      };
+      if (!body.code) throw new Error('请填代码');
+      if (!isFinite(body.shares) || body.shares <= 0) throw new Error('股数要正整数');
+      if (!isFinite(body.price) || body.price <= 0) throw new Error('成交价要大于 0');
+      await jsonPost('/api/t/record', body);
+      toastOk('已记入做T台账，下一次建议会以这个价格为锚');
+      loadTAdvisory(); loadTPaper();
+    } catch (e) { toastErr(e.message); }
+  }).catch(e => { if (e) toastErr(e.message); });
+}
+
 async function loadPaper() {
   try {
     const [ov, trades, lessons, cfg, pstat, rounds] = await Promise.all([
@@ -6025,7 +6531,7 @@ function filterByCode(code) {
 }
 
 // ---- 调度设置（config.yaml schedule 段 + 各模块抓取周期 + 币圈监控） ----
-const SCH_INTERVALS = ['news', 'bili', 'wb', 'sector', 'volume'];
+const SCH_INTERVALS = ['news', 'bili', 'wb', 'sector', 'volume', 't_adv'];
 async function loadSchedule() {
   try {
     const d = await api('/api/schedule');
@@ -6255,6 +6761,17 @@ function sparkDual(ser, w = 88, h = 24) {
           stroke-linejoin="round"/></svg>`;
 }
 
+// 比价 = 股票收盘 / 合约收盘（crypto_watch 的 ratio）。所以：
+//   偏离为正 → 股票相对合约**变贵**（合约折价 / 股票溢价）
+//   偏离为负 → 股票相对合约**变便宜**（合约溢价 / 股票折价）
+// 只写「比价偏离 +1.71%」读者无法判断是哪一边贵，必须带方向词（2026-10-11 修）。
+const devWord = dev => (dev == null ? '' : dev > 0.05 ? '股票偏贵'
+                       : dev < -0.05 ? '股票偏便宜' : '基本持平');
+const devTitle = dev => (dev == null ? '' :
+  `比价 = 股票收盘 / 合约收盘。${dev > 0 ? '为正 = 股票相对合约偏贵（合约折价/股票溢价）'
+    : dev < 0 ? '为负 = 股票相对合约偏便宜（合约溢价/股票折价）' : ''}`
+  + '。偏离常来自合约溢价或股票除权跳空，仅提示不构成建议。');
+
 // 关联列：已配且算出来了 → 迷你双线图 + 可点的「相关度」徽标；配了没数据 → 警示；
 // 没配 → 「设关联」按钮
 function linkCell(contract) {
@@ -6276,7 +6793,8 @@ function linkCell(contract) {
   const stale = s.status !== 'ok';
   const dev = s.ratio_dev_pct;
   const devTxt = (dev == null ? '' :
-    ` 比价偏离 <b class="${Math.abs(dev) >= 5 ? 'up' : ''}">${signed(dev)}%</b>`);
+    ` 比价偏离 <b class="${Math.abs(dev) >= 5 ? 'up' : ''}" title="${esc(devTitle(dev))}">${signed(dev)}%</b>`
+    + `<span class="faint">（${devWord(dev)}）</span>`);
   const spark = sparkDual(s.series);
   const corrTxt = s.corr == null ? '相关 —' : `相关 ${s.corr.toFixed(2)}`;
   const tip = `合约日涨跌 ${s.vol_crypto ?? '—'}% / 股票 ${s.vol_stock ?? '—'}%；`
@@ -6369,7 +6887,8 @@ async function showCryptoLink(contract) {
         ${card('波动率 股票', (s.vol_stock ?? 0) + '%')}
         ${card('比价', s.ratio?.toFixed(3) ?? '—', '', '股票收盘 / 合约收盘')}
         ${card('比价偏离', (dev == null ? '—' : signed(dev) + '%'),
-               Math.abs(dev ?? 0) >= 5 ? 'up' : '', '相对中位比价')}
+               Math.abs(dev ?? 0) >= 5 ? 'up' : '',
+               dev == null ? '相对中位比价' : `相对中位比价 · ${devWord(dev)}`)}
       </div>
       <div class="hint" style="margin:0 0 8px">
         两边价格各自以首日=100 归一化后叠加（量纲差 7 倍，不归一化看不出关系）。
@@ -6558,6 +7077,22 @@ async function loadMpArticles() {
     $('mp-empty').classList.toggle('hide', items.length > 0);
     $('mp-list').innerHTML = items.map(a => {
       const ts = a.published_at || a.fetched_at || '';
+      // ⚠️ 时区（2026-10-11 修）：接口给的是 ISO 带时区的串（如 2026-10-11T14:00+00:00），
+      // 服务器 TimeZone 是 Etc/UTC。**用 slice(0,16) 截字符串拿到的是 UTC 墙钟**，
+      // 对 UTC+8 的用户整整偏早 8 小时 —— 和模拟盘流水那个坑是同一类。
+      // 必须 new Date(ts) 走本地时区再格式化。
+      const when = ts ? new Date(ts) : null;
+      const tsText = when && !isNaN(when)
+        ? `${when.getFullYear()}-${String(when.getMonth()+1).padStart(2,'0')}-`
+          + `${String(when.getDate()).padStart(2,'0')} `
+          + `${String(when.getHours()).padStart(2,'0')}:${String(when.getMinutes()).padStart(2,'0')}`
+        : '';
+      // 时间来源标注：WeRSS 给的 published_at 是它自己的入库时刻（实测最大偏 32 小时），
+      // 不标注的话看的人会当成发布时间。
+      const srcMark = { wx: ['', '微信原文时间'],
+                        fetched: ['~', '抓取时间（未取到发布时间）'],
+                        rss: ['~', 'WeRSS 时间（可能不准）'] }[a.published_at_src]
+                     || ['~', '时间来源未知'];
       // summary 的坑（2026-10-02 实测）：**无正文的文章 summary 100% 等于 title**，
       // 页面上是标题重复两遍、正文区一片空白。这时改用 content_text 开头当预览。
       let pv = (a.summary || '').trim();
@@ -6569,7 +7104,8 @@ async function loadMpArticles() {
           <span class="dyn-author">${esc(a.mp_name || a.source_name)}</span>
           <a href="${esc(a.url)}" target="_blank" rel="noopener"
              class="muted" style="font-size:12px">原文 ↗</a>
-          <span class="muted" style="margin-left:auto;font-size:12px">${ts.replace('T', ' ').slice(0, 16)}</span>
+          <span class="muted" style="margin-left:auto;font-size:12px"
+                title="${esc(srcMark[1])}">${srcMark[0]}${esc(tsText)}</span>
         </div>
         <div class="dyn-text" style="font-weight:600;cursor:pointer"
              onclick="toggleMpBody(${a.id}, this)"
