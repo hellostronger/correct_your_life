@@ -1113,15 +1113,36 @@ def _check_link_alerts(deps, rows: list[dict], conf: dict) -> list[str]:
     lines = []
     for r, dev in hits:
         lines.append(f"- {r['contract']} ↔ {r['stock_code']}：比价 {r['ratio']:g}"
-                     f"（中位 {r['ratio_ma']:g}，偏离 {dev:+.2f}%），"
+                     f"（中位 {r['ratio_ma']:g}，偏离 {dev:+.2f}%＝{dev_word(dev)}），"
                      f"合约收 {r['crypto_close']:g} / 股票收 {r['stock_close']:g}，"
                      f"相关 {r['corr']:.2f}、beta {r['beta']:.2f}")
     body = ("永续合约与锚定股票的日收盘比价明显偏离（阈值 "
             f"±{threshold:g}%）：\n" + "\n".join(lines)
-            + "\n\n（比价=股票收盘/合约收盘；偏离常来自合约溢价或股票除权，"
+            + "\n\n（比价=股票收盘/合约收盘：为正说明股票相对合约偏贵，"
+               "为负说明合约相对股票偏贵；偏离常来自合约溢价或股票除权，"
                "仅提示，不构成投资建议。数据源 gate.io + 东财/腾讯）")
     deps.get("notify_fn")("🔗 币股比价偏离", body, event="crypto_link")
     return [f"{len(hits)} 条"]
+
+
+def dev_word(dev) -> str:
+    """把「比价偏离 ±x%」翻译成**哪一边贵**（2026-10-11 加）。
+
+    比价 = 股票收盘 / 合约收盘，所以正偏离是股票相对合约变贵（合约折价/股票
+    溢价），负偏离反之。只给一个带符号的百分比，读者（包括看日报的 LLM）
+    无从判断方向，容易把「合约溢价」和「股票溢价」读反。
+    """
+    if dev is None:
+        return ""
+    try:
+        d = float(dev)
+    except (TypeError, ValueError):
+        return ""
+    if d > 0.05:
+        return "股票相对合约偏贵"
+    if d < -0.05:
+        return "股票相对合约偏便宜"
+    return "与中位基本持平"
 
 
 def link_lines(deps) -> list[str]:
@@ -1141,7 +1162,7 @@ def link_lines(deps) -> list[str]:
             f"日涨跌相关 {corr:.2f}、beta {r['beta']:.2f}，"
             f"波动率 合约 {r['vol_crypto']:.1f}% / 股票 {r['vol_stock']:.1f}%，"
             f"比价 {r['ratio']:g}（中位 {r['ratio_ma']:g}"
-            + (f"，偏离 {dev:+.2f}%" if dev is not None else "")
+            + (f"，偏离 {dev:+.2f}%＝{dev_word(dev)}" if dev is not None else "")
             + f"），样本 {r['n_obs']} 个重叠交易日"
             + ("，比价明显偏离，注意溢价/除权" if dev is not None and abs(dev) >= 5 else ""))
     return lines

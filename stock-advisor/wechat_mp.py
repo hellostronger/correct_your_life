@@ -33,12 +33,15 @@ RSS/Atom/JSON 源**，因此它对上游是谁毫不在意：
 本模块不 import app（避免循环依赖）：`get_conn` / `notify_fn` 由 app.py 注入。
 """
 
+import concurrent.futures
 import json
 import re
 import threading
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from html import unescape as _html_unescape
+
+import requests
 
 
 # 块级标签换行用的（正文转纯文本时保留段落结构）
@@ -77,6 +80,14 @@ DEFAULT_MP_CONF = {
     "max_items": 50,          # 每源每轮最多取多少条
     "keep_days": 120,         # 文章保留天数，超期清理
     "timeout": 25,
+    # ---- 真实发布时间（2026-10-11 加）----
+    # 新文章入库后并发抓一次微信文章页取 var ct，失败就退 published_at=抓取时刻。
+    # 关掉 = 只信 WeRSS 给的值（实测那是它的入库时刻，中位偏 18 分钟、最大偏 32 小时）。
+    "resolve_true_time": True,
+    "true_time_workers": 4,   # 别调高：对 mp.weixin.qq.com 并发越高越容易被风控
+    # 把公众号文章写进 sa_news，让它进模拟盘/日报的决策上下文。
+    # 关掉 = 只在「📰 公众号」页看，不参与决策。
+    "publish_to_news": True,
     # ---- 远程独立部署用（一次配好，网页添加源时自动带入）----
     # WeRSS 服务的地址，如 http://192.168.1.10:8001 或 https://mp.example.com
     "base_url": "",
@@ -550,6 +561,21 @@ def _ensure_tables(deps) -> None:
         # 真正的正文检索交给 ILIKE 全表扫（存档量级下够用）。
         cur.execute("CREATE INDEX IF NOT EXISTS idx_sa_mp_articles_title "
                     "ON sa_mp_articles (md5(title))")
+        # ---- 真实发布时间（2026-10-11 加，见下方 resolve_true_time 的注释）----
+        # published_at_src 的三个取值：
+        #   'wx'      = 从微信文章页 var ct 抽到的真值（唯一可信的）
+        #   'fetched' = 没抽到，退回**我们自己的**抓取时刻（宁可粗糙也不造假）
+        #   'rss'     = WeRSS 给的值，**已知是入库时刻不是发布时间**，只留档
+        # rss_published_at 永远保留上游原值做审计对照 —— 这次事故的教训就是
+        # 「看起来有值、实际是错的」，没有对照列就发现不了上游哪天又变了。
+        cur.execute("ALTER TABLE sa_mp_articles "
+                    "ADD COLUMN IF NOT EXISTS published_at_src TEXT")
+        cur.execute("ALTER TABLE sa_mp_articles "
+                    "ADD COLUMN IF NOT EXISTS rss_published_at TIMESTAMPTZ")
+        cur.execute("UPDATE sa_mp_articles SET published_at_src = 'rss' "
+                    "WHERE published_at_src IS NULL")
+        cur.execute("UPDATE sa_mp_articles SET rss_published_at = published_at "
+                    "WHERE rss_published_at IS NULL AND published_at IS NOT NULL")
 
 
 def list_sources(deps) -> list[dict]:
@@ -706,7 +732,8 @@ def list_articles(deps, source_id: int | None = None, unread_only: bool = False,
     # 体积实测：60 篇 38 KB、200 篇 128 KB（content_html 才是大的，60 篇 784 KB，
     # 所以正文 HTML 走单独的 /body 接口按需取）。
     sql = ("SELECT a.id, a.source_id, a.title, a.url, a.author, a.mp_name, a.summary, "
-           "a.published_at, a.fetched_at, a.is_read, s.name, a.content_text "
+           "a.published_at, a.fetched_at, a.is_read, s.name, a.content_text, "
+           "a.published_at_src "
            "FROM sa_mp_articles a JOIN sa_mp_sources s ON s.id = a.source_id")
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -723,6 +750,12 @@ def list_articles(deps, source_id: int | None = None, unread_only: bool = False,
             "author": r[4], "mp_name": r[5], "summary": r[6],
             "published_at": r[7].isoformat(timespec="minutes") if r[7] else None,
             "fetched_at": r[8].isoformat(timespec="seconds") if r[8] else None,
+            # 时间来源标注（2026-10-11）。必带：WeRSS 给的 published_at 是**它自己
+            # 的入库时刻**，页面不给标注的话，看的人会以为那就是发布时间。
+            #   wx      = 微信文章页 var ct 抽到的真值
+            #   fetched = 没抽到，用的是我们自己的抓取时刻
+            #   rss     = WeRSS 原值（已知不准，保留只为可见）
+            "published_at_src": r[12] or "rss",
             "is_read": r[9], "source_name": r[10],
             "content_text": r[11] or "",
             # 有没有可展开的正文（决定标题要不要显示展开箭头）
@@ -881,7 +914,9 @@ def _fetch_source(deps, src: dict, conf: dict,
     —— 避免在 build_url 内部再判一次：两处各判一次会因秒级时间差与抖动导致
     「判了要 fresh 却没走 /fresh」这种不一致。"""
     result = {"source_id": src["id"], "name": src["name"], "new": 0,
-              "total": 0, "fresh": [], "backfilled": 0, "backfilled_titles": []}
+              "total": 0, "fresh": [], "backfilled": 0, "backfilled_titles": [],
+              # 本轮真插入的行（带库内 id），供 run_once 回填真时间 + 推 sa_news
+              "new_rows": []}
     try:
         if force_fresh is None:
             url = build_url(src, conf)
@@ -925,21 +960,38 @@ def _fetch_source(deps, src: dict, conf: dict,
             for it in items:
                 body = it.get("content_html", "") or ""
                 body_txt = it.get("content_text", "") or ""
+                # published_at **不写 WeRSS 的值**（2026-10-11）。
+                # 那个值是它的入库时刻：实测 40 篇对微信真值中位偏 +18 分钟、
+                # 最大偏 32 小时（详见 resolve_true_time 的注释）。先落我们自己的
+                # fetched 时刻并标 src='fetched'，本函数末尾再回填真值；
+                # 真值拿不到就保持 'fetched' —— 宁可粗糙，也不让假时间冒充发布时间。
                 cur.execute(
                     """
                     INSERT INTO sa_mp_articles
                         (source_id, guid, title, url, author, mp_name, summary,
-                         published_at, content_html, content_text)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                         published_at, content_html, content_text,
+                         published_at_src, rss_published_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'fetched',%s)
                     ON CONFLICT (source_id, guid) DO NOTHING
                     """,
                     (src["id"], it["guid"][:512], it["title"], it["url"],
                      it.get("author", "") or "", it.get("mp_name", "") or src["name"],
-                     it.get("summary", ""), it.get("published_at") or now,
-                     body, body_txt))
+                     it.get("summary", ""), now, body, body_txt,
+                     it.get("published_at") or None))
                 if cur.rowcount:            # rowcount=1 才是真插入（冲突时为 0）
                     result["new"] += 1
                     result["fresh"].append(it)
+                    cur.execute("SELECT id FROM sa_mp_articles "
+                                "WHERE source_id=%s AND guid=%s",
+                                (src["id"], it["guid"][:512]))
+                    r2 = cur.fetchone()
+                    if r2:
+                        result["new_rows"].append({
+                            "id": int(r2[0]), "url": it["url"],
+                            "title": it["title"],
+                            "mp_name": it.get("mp_name", "") or src["name"],
+                            "summary": it.get("summary", "") or "",
+                        })
                     continue
                 # ---- 冲突：已存在。补正文（2026-09-29 加）----
                 # 实测踩到的坑：文章首次被抓到时 WeRSS 往往只有标题+短摘要，正文
@@ -1018,6 +1070,24 @@ def run_once(deps) -> dict:
                              r.get("new", 0) + r.get("backfilled", 0),
                              src["id"]))
         _cleanup(deps, conf)
+        # ---- 新文章的后处理：回填真实发布时间 → 推入 sa_news ----
+        # 两步都只作用于**本轮真插入**的行，且都是「失败不阻断主流程」：
+        # 抓时间失败只是时间粗糙一点，推 news 失败只是不进决策上下文，
+        # 都不该让这一轮的抓取结果作废。
+        new_rows = [r for it in items for r in (it.get("new_rows") or [])]
+        tstat = {"n": 0, "ok": 0, "fail": 0, "skipped": 0}
+        nstat = {"n": 0, "inserted": 0, "skipped_no_time": 0,
+                 "skipped_old": 0, "linked": 0, "unlinked": 0}
+        if new_rows and conf.get("resolve_true_time", True):
+            try:
+                tstat = fill_true_times(deps, new_rows)
+            except Exception as exc:
+                print("[mp] 回填真实发布时间失败：%s" % str(exc)[:150], flush=True)
+        if new_rows and conf.get("publish_to_news", True):
+            try:
+                nstat = publish_to_news(deps, new_rows)
+            except Exception as exc:
+                print("[mp] 推入 sa_news 失败：%s" % str(exc)[:150], flush=True)
         fresh = [i for it in items for i in it.get("fresh", [])]
         pushed = 0
         # 两道门：本段 notify_new（粗粒度，用户可能整段关掉）与
@@ -1032,7 +1102,8 @@ def run_once(deps) -> dict:
             except Exception as exc:
                 print(f"[mp] notify failed: {exc}", flush=True)
         result = {"items": items, "new": sum(i["new"] for i in items),
-                  "pushed": pushed, "ts": datetime.now().isoformat(timespec="seconds")}
+                  "pushed": pushed, "true_time": tstat, "news": nstat,
+                  "ts": datetime.now().isoformat(timespec="seconds")}
         _state["last_result"] = result
         return result
     finally:
@@ -1106,3 +1177,235 @@ def digest_lines(deps, hours: int = 36) -> list[str]:
         if len(out) >= 25:
             break
     return out
+
+
+# ---------------- 真实发布时间（2026-10-11 加）----------------
+#
+# 为什么要自己抓
+# --------------
+# WeRSS 的 `articles` 表里确实有 4 个时间列（publish_time / create_time /
+# updated_at / 记录 created_at），看起来直接拿就行 —— **但它们全是同一个值**。
+# 实测（把 101 上67MB 的 db.db 拉下来逐条对）：
+#
+#   id             publish_time    create_time     updated_at     记录 created_at
+#   2397491920-…   10-11 22:00:03  22:00:03        22:00:03        2026-10-11 22:00:03
+#   3964712822-…   10-11 21:00:13  21:00:13        21:00:13        2026-10-11 21:00:13
+#
+# 四列逐条相同，publish_info 是空 {}，fetch_started_at 是 NULL；
+# 30 条样本的 create_time − publish_time 的 min/中位/max **全是 0**。
+# 结论：fork 走 /web/mp/articles 列表接口时**根本没取微信侧的 update_time**，
+# 四个列全被盖成了入库时刻。
+#
+# 那个值有多不准（基准 = 微信原文页的 var ct，40 篇样本）：
+#   中位 +18 分钟，p25 +10、p75 +43；>60 分钟的 9/39；最大 +1933 分钟（32 小时）；
+#   偏早的 0 条。（秒数连号 20:49:04/:13/:14 就是「插入循环里的 time.time()」的指纹）
+#
+# 真值在哪
+# --------
+# 微信文章页底部有个 JS 变量 `var ct = "1791721889"`（10 位 Unix 秒）——
+# 页面顶上那个肉眼可见的 `id="publish_time"` 元素**是空的**，靠 JS 填，
+# 所以抓 HTML 元素拿不到，只能读这个变量。
+#
+# 成本（实测）
+#   单篇线传输 0.8MB（gzip；解压后 3.3MB）、1.4s
+#   并发 4 抓 12 篇 = 5.5s；并发 6 = 4.1s；12/12 全部抽到，没被风控
+#   → 每轮 21 篇新文章 ≈ 17MB / 约 10 秒，完全可接受
+
+WX_ARTICLE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                 "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 "
+                 "MicroMessenger/8.0")
+_WX_CT = re.compile(rb'var ct\s*=\s*"(\d{9,11})"')
+# 兜底：约 18% 的页面（实测 1158 篇里 23 篇首抓失败、另有十几篇页面完整但无 var ct）
+# 没有 var ct，却带 `create_time: <unix秒>`。
+# **这个等价性是实测出来的，不是推的**：在 25 个「var ct 存在」的页面上交叉比对，
+# create_time == var ct 是 25/25；而同页的 update_time == var ct 是 **0/25** ——
+# 所以只能用 create_time，用 update_time 会拿到另一个值。
+_WX_CREATE = re.compile(rb'create_time[^0-9]{0,20}(\d{9,11})')
+# 合理性边界：早于 2000 年（不是真实文章）或晚于「现在 +1 小时」
+# （时钟错/预发布）的一律拒绝 —— 宁可当成抽不到，也不能写进去一个假时间。
+_CT_MIN = 946684800          # 2000-01-01T00:00:00Z
+
+
+def fetch_true_publish_time(url: str, timeout: int = 25):
+    """抓一篇公众号文章的真实发布时间。抽不到返回 None。
+
+    来源优先级：`var ct` → `create_time`（见 _WX_CREATE 的交叉验证注释）。
+    页面上的 `#publish_time` 元素是空的（JS 填），JSON-LD / og:published_time /
+    <time datetime> 在 mp.weixin.qq.com 上实测全部不存在 —— 不写那些永远走不到的分支。
+    """
+    if not url or not url.startswith("http"):
+        return None
+    try:
+        r = requests.get(url, headers={"User-Agent": WX_ARTICLE_UA}, timeout=timeout)
+        if r.status_code != 200:
+            return None
+        body = r.content
+        m = _WX_CT.search(body) or _WX_CREATE.search(body)
+        if not m:
+            return None
+        ts = int(m.group(1))
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        if ts < _CT_MIN or dt > datetime.now(timezone.utc) + timedelta(hours=1):
+            return None
+        return dt
+    except Exception:
+        return None
+
+
+def resolve_true_times(urls, workers: int = 4, timeout: int = 25) -> dict:
+    """批量取真实发布时间。返回 {url: aware_datetime}，抽不到的url不在结果里。
+
+    workers 默认 4：实测 12 篇并发 4 要 5.5s、并发 6 要 4.1s，再往上收益不大，
+    而对 mp.weixin.qq.com 的并发越高越容易被风控，**宁可慢也别被拦**。
+    """
+    urls = [u for u in dict.fromkeys(urls or []) if u]
+    if not urls:
+        return {}
+    out = {}
+    with concurrent.futures.ThreadPoolExecutor(max(1, int(workers))) as ex:
+        futs = {ex.submit(fetch_true_publish_time, u, timeout): u for u in urls}
+        for fut in concurrent.futures.as_completed(futs):
+            u = futs[fut]
+            try:
+                dt = fut.result()
+            except Exception:
+                dt = None
+            if dt:
+                out[u] = dt
+    return out
+
+
+def fill_true_times(deps, rows: list[dict]) -> dict:
+    """给本轮新插入的文章回填真实发布时间。返回统计。
+
+    rows: [{'id': int, 'url': str, ...}]（_fetch_source 攒的 new_rows）
+    抽不到的**保持 src='fetched' 不动** —— published_at 已经是我们的抓取时刻，
+    比上游那个假时间诚实。丢弃/失败必须打印，否则「时间对不上」会变成无人知晓的静默。
+    """
+    rows = [r for r in rows if r.get("id") and r.get("url")]
+    stat = {"n": len(rows), "ok": 0, "fail": 0, "skipped": 0}
+    if not rows:
+        return stat
+    try:
+        found = resolve_true_times([r["url"] for r in rows])
+    except Exception as exc:                      # 网络层整体失败
+        print("[mp] 真实发布时间批量抓取失败：%s（%d 篇保持抓取时刻）"
+              % (str(exc)[:120], len(rows)), flush=True)
+        stat["fail"] = len(rows)
+        return stat
+    conn = deps["get_conn"]()
+    try:
+        with conn.cursor() as cur:
+            for r in rows:
+                dt = found.get(r["url"])
+                if not dt:
+                    stat["fail"] += 1
+                    continue
+                cur.execute(
+                    "UPDATE sa_mp_articles SET published_at=%s, published_at_src='wx' "
+                    "WHERE id=%s", (dt, r["id"]))
+                stat["ok"] += cur.rowcount or 0
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+    if stat["fail"]:
+        print("[mp] 真实发布时间：%d 篇取到 var ct，%d 篇没取到（published_at "
+              "保持抓取时刻 src='fetched'）" % (stat["ok"], stat["fail"]), flush=True)
+    return stat
+
+
+def publish_to_news(deps, rows: list[dict], max_age_days: int = 7) -> dict:
+    """把公众号文章写进 sa_news，让它参与模拟盘/日报的决策上下文。
+
+    口径与 news_fetcher.save_to_db 完全一致（2026-10-08 用户定的规矩）：
+      · **没有真实发布时间就不写** —— 只处理 published_at_src='wx' 的行。
+        这里没有「抽不到就退 fetched_at」的兜底：那是「抓取时间冒充发布时间」，
+        正是 6 月旧闻被当成当日新闻的根因。
+      · 7 天以外的旧文对决策没有价值，直接丢。
+    主 code 列写 ''（还不知道是哪只票），命中到的公司全称走 sa_news_related
+    多对多 —— 和视频号（wx_channels）同一套路，也和 _paper_news_rows 的
+    `n.code = %s OR r.code = %s` 查询对得上。
+    """
+    rows = [r for r in rows if r.get("id") and r.get("url")]
+    stat = {"n": len(rows), "inserted": 0, "skipped_no_time": 0,
+            "skipped_old": 0, "linked": 0, "unlinked": 0}
+    if not rows:
+        return stat
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=max_age_days)
+    try:
+        from stock_roster import load_name_index
+    except Exception:
+        load_name_index = None
+
+    payload = []
+    conn = deps["get_conn"]()
+    try:
+        with conn.cursor() as cur:
+            index = {}
+            if load_name_index is not None:
+                try:
+                    index = load_name_index(cur)
+                except Exception:
+                    index = {}
+            for r in rows:
+                cur.execute("SELECT title, published_at, published_at_src, "
+                            "COALESCE(content_text,'') "
+                            "FROM sa_mp_articles WHERE id=%s", (r["id"],))
+                got = cur.fetchone()
+                if not got:
+                    continue
+                title, pub, src, body_txt = got
+                if src != "wx" or not pub:
+                    stat["skipped_no_time"] += 1
+                    continue
+                if pub < cutoff:
+                    stat["skipped_old"] += 1
+                    continue
+                senti = ""
+                try:
+                    import news_fetcher
+                    senti = news_fetcher.classify_sentiment(title or "") or ""
+                except Exception:
+                    senti = ""
+                cur.execute(
+                    "INSERT INTO sa_news (code, title, url, source, media, "
+                    "publish_time, sentiment) "
+                    "VALUES ('',%s,%s,'mp',%s,%s,%s) ON CONFLICT (url) DO NOTHING",
+                    (title, r["url"], (r.get("mp_name") or "")[:120], pub, senti))
+                new_row = bool(cur.rowcount)
+                stat["inserted"] += int(new_row)
+                codes = []
+                if index:
+                    import stock_discovery as sd
+                    norm = sd._norm((title or "") + " " + (body_txt or "")[:6000])
+                    for name in sd._find_names(norm, index):
+                        codes.append(index[name])
+                for code in codes:
+                    cur.execute("INSERT INTO sa_news_related (url, code) "
+                                "VALUES (%s,%s) ON CONFLICT (url, code) DO NOTHING",
+                                (r["url"], code))
+                if codes:
+                    stat["linked"] += 1
+                else:
+                    stat["unlinked"] += 1
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+    print("[mp] 推入 sa_news：新增 %d 条，关联到股票的文章 %d 篇"
+          "（丢弃 无真值时间 %d / 超%d天 %d）"
+          % (stat["inserted"], stat["linked"], stat["skipped_no_time"],
+             max_age_days, stat["skipped_old"]), flush=True)
+    return stat

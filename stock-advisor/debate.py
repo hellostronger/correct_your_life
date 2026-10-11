@@ -169,7 +169,7 @@ def run_risk_critic(
     if llm_call is None:
         llm_call = llm_advisor.ask
     prompt = RISK_CRITIC_PROMPT.format(name=name, code=code, ctx=_compact_history(ctx))
-    return llm_call(prompt, "", max_tokens=900)
+    return llm_call(prompt, "")
 
 
 def run_debate(
@@ -267,7 +267,7 @@ Context (market data, news, events):
 
 Deliver a compelling bull argument that integrates A-share market dynamics. Refute the bear's concerns. Output in Chinese, conversational, no special formatting."""
 
-        bull_resp = llm_call(bull_prompt, "", max_tokens=1500)
+        bull_resp = llm_call(bull_prompt, "")
         llm_calls += 1
         bull_argument = f"Bull Analyst: {bull_resp}"
         bull_history += "\n" + bull_argument
@@ -304,7 +304,7 @@ Context (market data, news, events):
 
 Deliver a compelling bear argument grounded in A-share market realities. Refute the bull's claims. Output in Chinese, conversational, no special formatting."""
 
-        bear_resp = llm_call(bear_prompt, "", max_tokens=1500)
+        bear_resp = llm_call(bear_prompt, "")
         llm_calls += 1
         bear_argument = f"Bear Analyst: {bear_resp}"
         bear_history += "\n" + bear_argument
@@ -349,7 +349,7 @@ Reasoning: [2-4 sentences summarizing the strongest arguments from both sides an
 
 Output in Chinese."""
 
-    manager_resp = llm_call(manager_prompt, "", max_tokens=800)
+    manager_resp = llm_call(manager_prompt, "")
     llm_calls += 1
 
     return {

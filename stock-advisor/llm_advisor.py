@@ -34,6 +34,15 @@ DEFAULT_LLM_CONF = {
     "base_url": "",        # 留空 = Anthropic 官方端点；代理/网关在此填
     "model": "",           # 留空 = 沿用 config.yaml；两处都没有则调用时报错
     "auto_advice": False,  # 盘后里程碑推送后自动补一条 AI 建议（每日至多一次）
+    # 全局输出长度上限（2026-10-11 加）。以前是各调用点各自写死
+    # —— paper_trading 1500 / debate 800~1500 / daily_reports 8000~28000，
+    # 网页上一个都改不了。模拟盘报告被截断的根因就在这：实测 35 篇买入报告里
+    # 32 篇结尾卡在半个字上（3187 字那篇停在「…今日成交量为5日均量的0.6倍，属」）。
+    #
+    # 为什么统一取 8000：**max_tokens 是上限不是消耗**，成本按实际输出 token 计。
+    # 调大不会让短输出（交易员 JSON 只有 250 字）变长变贵，只让本来就该写完的长文
+    # 写完。各调用点仍可显式传值覆盖（日报续写就翻倍重试），但不再各写各的常量。
+    "max_tokens": 8000,
 }
 
 SYSTEM_PROMPT = """\
@@ -105,6 +114,10 @@ def _render_llm_block(conf: dict) -> str:
         # 空就写空，下次调用会在 client 构造前明确报错。
         f"  model: {q(conf.get('model', ''))}",
         f"  auto_advice: {str(bool(conf.get('auto_advice'))).lower()}",
+        # 下面这行**必须**跟着 _render_llm_block 一起加：这个函数是 llm 段的
+        # **整块替换**模板，少写一行就会把用户在网页上填的 max_tokens 抹掉，
+        # 而 GET 回来的还是默认值 —— 症状是「我改了没生效，重启后又变回去」。
+        f"  max_tokens: {int(conf.get('max_tokens') or 8000)}",
     ])
 
 
@@ -136,18 +149,27 @@ def mask_key(key: str) -> dict:
 
 
 def ask(system: str, user: str, conf: dict | None = None,
-        max_tokens: int = 4096, thinking: bool = True) -> str:
+        max_tokens: int = 0, thinking: bool = True) -> str:
     """调 Claude 拿一段文本。**本项目所有 LLM 调用的统一出口**。
 
     只有 ask_advice 时不需要这个函数；抽出它是因为微信对话（wx_chat.py）
     要用同一套配置和同一套降级链，只是 system prompt 与 max_tokens 不同。
     复制一份降级逻辑只会让两份代码各自漂移。
 
+    `max_tokens=0` = 读 config.yaml `llm.max_tokens`（全局唯一，默认 8000）。
+    传正数 = 本次调用显式覆盖（日报续写翻倍重试就是这么用的）。
+
     降级策略：带 thinking/betas/fallbacks 的完整特性**仅 Anthropic 官方端点**
     支持，代理网关（配了 base_url）会挂到超时 —— 所以 base_url 非空时直接走
     最简调用，不做无谓的尝试。
     """
     conf = conf or load_llm_conf()
+    if not max_tokens:
+        try:
+            max_tokens = int(conf.get("max_tokens") or 0)
+        except (TypeError, ValueError):
+            max_tokens = 0
+        max_tokens = max_tokens or 8000
     if not conf["api_key"]:
         raise RuntimeError("未配置 Anthropic API key（config.yaml llm.api_key "
                            "或环境变量 ANTHROPIC_API_KEY）")

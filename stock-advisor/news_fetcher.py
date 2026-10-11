@@ -1345,7 +1345,7 @@ def _llm_filter_news_items(code: str, name: str, items: list[dict]) -> list[dict
     )
     user = f"股票代码: {code}\n股票名称: {name}\n\n新闻列表:\n" + "\n".join(lines)
     try:
-        raw = llm.ask(system, user, conf=conf, max_tokens=4096, thinking=False)
+        raw = llm.ask(system, user, conf=conf, thinking=False)
     except Exception:
         return items
     try:

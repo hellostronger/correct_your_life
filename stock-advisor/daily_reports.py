@@ -122,7 +122,7 @@ POSTMARKET_PROMPT = """\
 """ % DISCLAIMER
 
 
-def _llm_call(system_prompt: str, user_text: str, max_tokens: int = 8000) -> tuple[str, str]:
+def _llm_call(system_prompt: str, user_text: str, max_tokens: int = 0) -> tuple[str, str]:
     """两段式调用（抄 paper_trading._llm_call）：base_url 非空（代理网关）直接 basic；
     官方端点先试 full（adaptive thinking + server-side fallback）。失败抛 RuntimeError。
 
@@ -392,7 +392,24 @@ REQUIRED_SECTIONS = {
 }
 
 # 首选预算 / 纠正重跑时的预算。盘后逐股复盘天生更长，给得宽些。
-BUDGET = {"盘前": (8000, 16000), "盘后": (16000, 28000)}
+# 重试预算倍数（2026-10-11 改）：原来这里写死「盘前 8000/16000、盘后
+# 16000/28000」两套绝对值，和 config.yaml 的 llm.max_tokens 各调各的 ——
+# 网页上改了 max_tokens，日报仍然按旧常量跑。现在统一以全局 max_tokens 为基数，
+# 第一次用原值、纠正重试翻倍，**分档的绝对值不再各写一份**。
+BUDGET_MULTIPLIER = {"盘前": 1, "盘后": 2}
+
+
+def _llm_budget(kind_label: str) -> tuple[int, int]:
+    """(第一次, 纠正重试) 的 max_tokens。以 llm.max_tokens 为基数。"""
+    base = 0
+    try:
+        import llm_advisor
+        base = int(llm_advisor.load_llm_conf().get("max_tokens") or 0)
+    except Exception:
+        base = 0
+    base = base or 8000
+    mult = BUDGET_MULTIPLIER.get(kind_label, 1)
+    return base * mult, base * mult * 2
 
 
 def _looks_like_draft(text: str) -> bool:
@@ -431,7 +448,7 @@ def _generate(system_prompt: str, context: str, kind_label: str) -> tuple[str, b
     is_pre = "盘前" in kind_label
     user_text = (f"以下是{'盘前' if is_pre else '盘后'}上下文，"
                  f"请生成{'简报' if is_pre else '复盘'}：\n\n{context}")
-    first, second = BUDGET.get(kind_label, (8000, 16000))
+    first, second = _llm_budget(kind_label)
     body, stop = _llm_call(system_prompt, user_text, max_tokens=first)
 
     def problems(text: str, stop_reason: str) -> list[str]:

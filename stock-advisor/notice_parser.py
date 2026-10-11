@@ -160,7 +160,7 @@ def extract_json(raw: str) -> Any:
 
 
 def parse_with_llm(text: str, *, system_prompt: str, schema_hint: str,
-                   conf: dict | None = None, max_tokens: int = 3072,
+                   conf: dict | None = None, max_tokens: int = 0,
                    temperature_note: str = "") -> tuple[Any, str]:
     """把正文喂 LLM 要结构化 JSON。返回 (data, model)。
 
@@ -188,7 +188,7 @@ def parse_notice(url: str, *, system_prompt: str, schema_hint: str,
                  fallback: Callable[[str], Any] | None = None,
                  must_contain: str | list[str] | None = None,
                  llm_conf: dict | None = None, timeout: int = DEFAULT_TIMEOUT,
-                 max_tokens: int = 3072) -> ParseResult:
+                 max_tokens: int = 0) -> ParseResult:
     """一条龙：抓 → LLM 抽 →（失败）回落。
 
     任何一步失败都会记进 notes 并回落；只有两条路都失败才抛 NoticeError。

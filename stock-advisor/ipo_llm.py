@@ -160,7 +160,7 @@ def judge(new_stock: dict, *, market_ctx: dict, holdings_summary: str,
     try:
         raw = llm_advisor.ask(SYSTEM + "\n\n【输出 JSON 结构】\n" + json.dumps(
             SCHEMA, ensure_ascii=False, indent=1),
-            user, conf=conf, max_tokens=2048, thinking=False)
+            user, conf=conf, thinking=False)
         data = json.loads(_strip_fence(raw))
     except Exception as exc:
         return {"available": False, "why": f"{type(exc).__name__}: {str(exc)[:200]}",
