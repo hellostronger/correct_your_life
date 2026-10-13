@@ -452,6 +452,7 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       <button data-tab="news">📰 新闻</button>
       <button data-tab="bili">📺 B站<span id="bili-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="wb">🔥 微博<span id="wb-tab-badge" class="tab-badge hide">0</span></button>
+<button data-tab="xhs">📕 小红书<span id="xhs-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="mp">📰 公众号<span id="mp-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="x">🐦 X<span id="x-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="reports">分析报告</button>
@@ -1150,6 +1151,32 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       </div>
       <div id="wb-list"></div>
       <div id="wb-empty" class="empty hide">还没有微博。添加博主后点「立即检查」抓取。</div>
+    </div>
+  </section>
+
+  <!-- 小红书关键词舆情（MediaCrawler 搜索模式，见 xhs_watch.py） -->
+  <section id="tab-xhs" class="hide">
+    <div class="card">
+      <div class="row">
+        <button class="btn" id="xhs-fetch-btn" onclick="triggerXhsFetch()">立即抓取</button>
+        <button class="btn ghost" onclick="xhsLogin()">登录小红书</button>
+        <button class="btn ghost" onclick="markAllXhsRead()">全部已读</button>
+        <span class="muted" id="xhs-status"></span>
+      </div>
+      <div class="muted" style="margin-top:4px">
+        首次使用请先点「登录小红书」：会弹出浏览器，扫码登录后自动保存登录态。
+        抓取词 = config.yaml <code>xhs.keywords</code> + 自选股票名（<code>use_watchlist</code>），
+        每轮最多 12 个词。小红书风控严，默认每 120 分钟一轮；
+        匹配到自选股的笔记会推进新闻流（source=xhs）供模拟盘舆情引用。
+      </div>
+    </div>
+    <div class="card">
+      <div class="row" style="justify-content:space-between;margin-bottom:6px">
+        <b style="font-size:13px">最新笔记</b>
+        <label class="muted"><input type="checkbox" id="xhs-unread-only" onchange="loadXhsNotes()"> 只看未读</label>
+      </div>
+      <div id="xhs-list"></div>
+      <div id="xhs-empty" class="empty hide">还没有笔记。点「立即抓取」触发一轮搜索。</div>
     </div>
   </section>
 
@@ -3567,7 +3594,7 @@ async function jqExtract(btn) {
 
 // ---- 标签页 ----
 const TABS = ['market', 'sector', 'holdings', 'strategies', 'plans', 'calendar', 'news',
-              'bili', 'wb', 'mp', 'x', 'reports', 'paper', 'tdesk', 'notify', 'schedule',
+              'bili', 'wb', 'xhs', 'mp', 'x', 'reports', 'paper', 'tdesk', 'notify', 'schedule',
               'jq', 'analysis'];
 const TAB_LOADERS = {
   market:    () => { loadWatch(); loadAlerts(); loadCrypto(); loadDiscover(); loadFutures(); },
@@ -3579,6 +3606,7 @@ const TAB_LOADERS = {
   news:      () => { loadNews(); loadConfig(); },
   bili:      () => { loadBiliCreators(); loadBiliDynamics(); loadBiliStatus(); },
   wb:        () => { loadWbCreators(); loadWbPosts(); loadWbStatus(); },
+  xhs:       () => { loadXhsNotes(); loadXhsStatus(); },
   mp:        () => { loadMpSources(); loadMpArticles(); loadMpStatus(); },
   x:         () => { loadXAccounts(); loadXWatch(); loadXTweets(); loadXStatus(); },
   reports:   loadReports,
@@ -7869,6 +7897,124 @@ async function wbLogin() {
   } catch (e) { toastErr('登录失败: ' + e.message); }
 }
 
+// ---- 小红书舆情 ----
+async function loadXhsNotes() {
+  try {
+    const unreadOnly = $('xhs-unread-only').checked ? '&unread_only=true' : '';
+    const items = await api('/api/xhs/notes?limit=50' + unreadOnly);
+    $('xhs-empty').classList.toggle('hide', items.length > 0);
+    $('xhs-list').innerHTML = items.map(d => {
+      const st = d.stats || {};
+      const ts = (d.pub_ts || '').replace('T', ' ').slice(0, 16);
+      const body = d.desc || '';
+      const link = d.note_url || `https://www.xiaohongshu.com/explore/${d.note_id}`;
+      return `
+      <div class="dyn-item ${d.is_read ? '' : 'unread'}">
+        <div class="dyn-head">
+          ${d.is_read ? '' : '<span class="unread-dot" title="未读"></span>'}
+          <span class="dyn-author" onclick="toggleXhsComments('${d.note_id}', this, ${st.comments || 0})" title="点击展开/收起评论">${esc(d.nickname || '匿名')}</span>
+          <a href="${link}" target="_blank" rel="noopener" class="muted" style="font-size:12px">原文 ↗</a>
+          <span class="muted" style="margin-left:auto;font-size:12px">${ts}</span>
+        </div>
+        <div class="dyn-text"><b>${esc(d.title || '')}</b>${body ? '<br>' + esc(body) : ''}</div>
+        <div class="dyn-stats">❤️ ${fmt(st.liked)} · ⬆️ ${fmt(st.collected)} · <span onclick="toggleXhsComments('${d.note_id}', this, ${st.comments || 0})"
+          style="cursor:pointer;text-decoration:underline dotted" title="点击展开/收起评论">💬 ${fmt(st.comments)} 条评论</span>
+          · 词「${esc(d.source_keyword || '')}」
+          ${d.is_read ? '' : ' · <b style="color:var(--accent)">新</b>'}</div>
+        <div class="dyn-cmt hide"></div>
+      </div>`;
+    }).join('');
+    loadXhsUnreadBadge();
+  } catch (e) { toastErr('加载小红书失败: ' + e.message); }
+}
+async function toggleXhsComments(noteId, toggleEl, hintCount = 0) {
+  const box = toggleEl.closest('.dyn-item').querySelector('.dyn-cmt');
+  if (!box.classList.contains('hide')) { box.classList.add('hide'); box.innerHTML = ''; return; }
+  box.classList.remove('hide');
+  box.textContent = '加载评论…';
+  try {
+    const rows = await api(`/api/xhs/notes/${noteId}/comments`);
+    box.innerHTML = rows.length ? rows.map(c => `
+      <div class="dyn-cmt-item">
+        <b>${esc(c.author || '匿名')}</b>
+        <span class="muted">· ${(c.pub_ts || '').replace('T', ' ').slice(5, 16)}</span>
+        <span class="muted" style="float:right">❤️ ${fmt(c.like_count)}</span>
+        <div>${esc(c.content)}</div>
+      </div>`).join('')
+      : `<span class="muted">${hintCount > 0 ? `暂无本地评论（笔记信息显示有 ${hintCount} 条，可能被风控拦截，等下轮抓取补齐）` : '暂无评论'}</span>`;
+  } catch (e) { box.textContent = '评论加载失败: ' + e.message; }
+}
+async function markAllXhsRead() {
+  try {
+    const r = await api('/api/xhs/read', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ all: true }) });
+    toast(`已标记 ${r.updated} 条为已读`); loadXhsNotes();
+  } catch (e) { toastErr(e.message); }
+}
+async function loadXhsUnreadBadge() {
+  try {
+    const r = await api('/api/xhs/notes/unread-count');
+    const badge = $('xhs-tab-badge');
+    badge.textContent = r.unread;
+    badge.classList.toggle('hide', r.unread === 0);
+  } catch { /* 忽略 */ }
+}
+async function loadXhsStatus() {
+  try {
+    const st = await api('/api/xhs/status');
+    const el = $('xhs-status');
+    if (st.fetching) { el.textContent = '抓取中…'; $('xhs-fetch-btn').disabled = true; pollXhsStatus(); }
+    else {
+      el.textContent = st.last_run ? '上次抓取: ' + st.last_run.replace('T', ' ') : '';
+      const r = st.last_result;
+      if (r && r.error) el.textContent += ' · 上轮错误: ' + r.error.slice(0, 60);
+      else if (r && r.warning) el.textContent += ' · ' + r.warning.slice(0, 60);
+      $('xhs-fetch-btn').disabled = false;
+    }
+    if (!st.browser_data_ready && st.mediacrawler_exists)
+      el.textContent += ' · 首次使用请先「登录小红书」';
+  } catch { /* 忽略 */ }
+}
+async function triggerXhsFetch() {
+  try {
+    await api('/api/xhs/fetch', { method: 'POST' });
+    toast('抓取已启动，通常 1-5 分钟（小红书风控较严，速度偏慢属正常）');
+    $('xhs-fetch-btn').disabled = true;
+    pollXhsStatus();
+  } catch (e) { toastErr(e.message); }
+}
+function pollXhsStatus() {
+  const timer = setInterval(async () => {
+    try {
+      const st = await api('/api/xhs/status');
+      $('xhs-status').textContent = st.fetching ? '抓取中…' :
+        (st.last_run ? '上次抓取: ' + st.last_run.replace('T', ' ') : '');
+      if (!st.fetching) {
+        clearInterval(timer);
+        $('xhs-fetch-btn').disabled = false;
+        loadXhsNotes();
+        const r = st.last_result;
+        if (r) {
+          if (r.error) toast('抓取出错: ' + r.error.slice(0, 80));
+          else if (r.warning) toast(r.warning.slice(0, 100));
+          else if (r.total_notes !== undefined)
+            toast(`本轮新笔记 ${r.new_notes} 条 / 新评论 ${r.new_comments} 条 / 推新闻 ${r.notes_for_sa_news} 条`);
+        }
+      }
+    } catch { clearInterval(timer); $('xhs-fetch-btn').disabled = false; }
+  }, 4000);
+}
+async function xhsLogin() {
+  if (!await confirmDlg('即将弹出浏览器窗口，请在小红书登录页扫码登录。\n完成后窗口会自动关闭。',
+                        { title: '登录 小红书', okText: '拉起浏览器' })) return;
+  toast('浏览器已拉起，请在窗口中登录小红书（最长等待数分钟）…');
+  try {
+    const r = await api('/api/xhs/login', { method: 'POST' });
+    toast(r.message || (r.ok ? '登录成功' : '登录未完成'));
+    loadXhsStatus();
+  } catch (e) { toastErr('登录失败: ' + e.message); }
+}
+
 // ---- 通知（微信 iLink Bot / 邮件 SMTP） ----
 async function loadNotifyConf() {
   try {
@@ -8199,6 +8345,7 @@ api('/api/watchlist?with_quotes=false').then(items => fillWatchlistDatalist(item
 $('page-date').textContent = '页面打开于 ' + new Date().toLocaleString('zh-CN', {hour12: false});
 setInterval(() => { if (!$('tab-market').classList.contains('hide')) loadWatch(); }, 30000);
 setInterval(loadUnreadBadge, 60000);
+setInterval(loadXhsUnreadBadge, 60000);
 </script>
 </body>
 </html>

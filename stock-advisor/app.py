@@ -83,6 +83,8 @@ DEFAULT_INTERVALS = {
     "news": {"enabled": True, "interval_minutes": 30},
     "bili": {"enabled": True, "interval_minutes": 30},
     "wb": {"enabled": True, "interval_minutes": 60},
+    # 小红书关键词舆情（笔记+评论，调 MediaCrawler 搜索模式）；风控严，周期别太短
+    "xhs": {"enabled": True, "interval_minutes": 120},
     "sector": {"enabled": True, "interval_minutes": 5},
     "volume": {"enabled": True, "interval_minutes": 5},
     # 实盘做T建议（2026-10-11）。登记进这一张表就自动出现在「⚙️ 调度」页：
@@ -319,6 +321,33 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_sa_wb_post_pub ON sa_wb_posts (pub_ts DESC);
     CREATE INDEX IF NOT EXISTS idx_sa_wb_post_uid ON sa_wb_posts (uid);
     CREATE INDEX IF NOT EXISTS idx_sa_wb_cmt_post ON sa_wb_comments (note_id);
+    CREATE TABLE IF NOT EXISTS sa_xhs_notes (
+        note_id        VARCHAR(64) PRIMARY KEY,
+        ntype          VARCHAR(16) NOT NULL DEFAULT '',
+        title          TEXT NOT NULL DEFAULT '',
+        note_desc      TEXT NOT NULL DEFAULT '',
+        nickname       VARCHAR(128) NOT NULL DEFAULT '',
+        pub_ts         TIMESTAMPTZ,
+        stats          JSONB NOT NULL DEFAULT '{}'::jsonb,
+        note_url       TEXT NOT NULL DEFAULT '',
+        source_keyword VARCHAR(128) NOT NULL DEFAULT '',
+        tag_list       TEXT NOT NULL DEFAULT '',
+        is_read        BOOLEAN NOT NULL DEFAULT FALSE,
+        fetched_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS sa_xhs_comments (
+        comment_id        VARCHAR(128) PRIMARY KEY,
+        note_id           VARCHAR(64) NOT NULL DEFAULT '',
+        content           TEXT NOT NULL DEFAULT '',
+        author            VARCHAR(128) NOT NULL DEFAULT '',
+        pub_ts            TIMESTAMPTZ,
+        like_count        INTEGER NOT NULL DEFAULT 0,
+        parent_comment_id VARCHAR(128) NOT NULL DEFAULT '',
+        fetched_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_sa_xhs_note_pub ON sa_xhs_notes (pub_ts DESC);
+    CREATE INDEX IF NOT EXISTS idx_sa_xhs_note_kw ON sa_xhs_notes (source_keyword);
+    CREATE INDEX IF NOT EXISTS idx_sa_xhs_cmt_note ON sa_xhs_comments (note_id);
     -- 提款计划：某日期前要从账户提取多少现金；提款流水累计记进度。
     -- notified 记录已推送过的里程碑键（ready/d10/d5/d1/deadline），防重复轰炸
     CREATE TABLE IF NOT EXISTS sa_withdrawal_plans (
@@ -7835,6 +7864,131 @@ def _wb_auto_loop():
             time.sleep(300)  # 配置读取失败等异常，5 分钟后重试
 
 
+# ---------------- 小红书关键词舆情（MediaCrawler 搜索模式，见 xhs_watch.py） ----------------
+
+import xhs_watch
+
+
+@app.get("/api/xhs/notes")
+def xhs_notes(limit: int = 50, unread_only: bool = False, keyword: str = ""):
+    sql = ("SELECT note_id, ntype, title, note_desc, nickname, pub_ts, stats, "
+           "note_url, source_keyword, tag_list, is_read, fetched_at "
+           "FROM sa_xhs_notes ")
+    conds, params = [], []
+    if unread_only:
+        conds.append("is_read = FALSE")
+    if keyword:
+        conds.append("source_keyword = %s")
+        params.append(keyword)
+    if conds:
+        sql += "WHERE " + " AND ".join(conds) + " "
+    sql += "ORDER BY pub_ts DESC NULLS LAST LIMIT %s"
+    params.append(min(max(limit, 1), 200))
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(sql, params)
+        return [dict(r) for r in cur.fetchall()]
+
+
+@app.get("/api/xhs/notes/unread-count")
+def xhs_unread_count():
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM sa_xhs_notes WHERE is_read = FALSE")
+        return {"unread": cur.fetchone()[0]}
+
+
+@app.get("/api/xhs/notes/{note_id}/comments")
+def xhs_comments(note_id: str):
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT comment_id, note_id, content, author, pub_ts, like_count, "
+            "parent_comment_id FROM sa_xhs_comments WHERE note_id = %s "
+            "ORDER BY like_count DESC, pub_ts DESC NULLS LAST LIMIT 100",
+            (note_id,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+class XhsReadIn(BaseModel):
+    ids: list[str] = Field(default_factory=list, description="笔记ID列表；空列表配合 all=true 全部已读")
+    all: bool = False
+
+
+@app.post("/api/xhs/read")
+def xhs_mark_read(body: XhsReadIn):
+    with get_conn() as conn, conn.cursor() as cur:
+        if body.all:
+            cur.execute("UPDATE sa_xhs_notes SET is_read = TRUE WHERE is_read = FALSE")
+        elif body.ids:
+            cur.execute("UPDATE sa_xhs_notes SET is_read = TRUE WHERE note_id = ANY(%s)",
+                        (body.ids,))
+        else:
+            raise HTTPException(400, "ids 为空时需 all=true")
+        return {"ok": True, "updated": cur.rowcount}
+
+
+@app.post("/api/xhs/fetch")
+def xhs_fetch():
+    """线程触发一次完整抓取（关键词 → MediaCrawler 搜索 → 入库 → 推 sa_news）。"""
+    if _xhs_state_flag():
+        raise HTTPException(409, "已有抓取任务在运行")
+
+    def _run():
+        try:
+            result = xhs_watch.fetch_xhs()
+            xhs_watch._state["last_result"] = result
+        except Exception as exc:
+            xhs_watch._state["last_result"] = {"error": str(exc)}
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True, "message": "抓取已开始，请稍后刷新状态"}
+
+
+@app.post("/api/xhs/login")
+def xhs_login():
+    """弹出浏览器扫码登录小红书（阻塞请求直到流程结束，前端提示用户扫码）。"""
+    if _xhs_state_flag():
+        raise HTTPException(409, "已有抓取/登录任务在运行")
+    try:
+        result = xhs_watch.login_xhs()
+        return {"ok": result.get("ok", False),
+                "message": "登录成功" if result.get("ok") else "未检测到登录态，请重试并完成扫码"}
+    except Exception as exc:
+        raise HTTPException(500, f"登录失败：{exc}")
+
+
+@app.get("/api/xhs/status")
+def xhs_status():
+    return xhs_watch.get_status()
+
+
+@app.get("/api/xhs/digest")
+def xhs_digest(hours: int = 24):
+    if not 1 <= hours <= 168:
+        raise HTTPException(400, "hours 取值 1-168")
+    return {"hours": hours, "markdown": xhs_watch.digest_markdown(hours)}
+
+
+def _xhs_state_flag() -> bool:
+    return xhs_watch.get_status()["fetching"]
+
+
+def _xhs_auto_loop():
+    """按 config.yaml xhs.interval_minutes 周期搜小红书笔记+评论；0 = 关闭。"""
+    while True:
+        try:
+            conf = xhs_watch.load_xhs_conf()
+            interval = int(conf.get("interval_minutes", 120)) if conf.get("enabled", True) else 0
+            if interval and not xhs_watch.get_status()["fetching"]:
+                try:
+                    result = xhs_watch.fetch_xhs()
+                    xhs_watch._state["last_result"] = result
+                except Exception as exc:
+                    xhs_watch._state["last_result"] = {"error": str(exc)}
+            time.sleep(max(interval or 60, 1) * 60)
+        except Exception:
+            time.sleep(300)  # 配置读取失败等异常，5 分钟后重试
+
+
 # ---------------- 板块轮动监控（sector.py） ----------------
 
 import sector as sector_mod
@@ -8946,6 +9100,9 @@ _start_daemon(_bili_auto_loop, "sa_bili")
 
 # 微博博主动态定时抓取后台线程（wb.interval_minutes=0 时轮内直接跳过）
 _start_daemon(_wb_auto_loop, "sa_wb")
+
+# 小红书关键词舆情定时抓取后台线程（xhs.interval_minutes=0 时轮内直接跳过）
+_start_daemon(_xhs_auto_loop, "sa_xhs")
 
 # 止盈策略监控后台线程（交易时段每 60s 扫一次，触发即通知）
 _start_daemon(_strategy_loop, "sa_strategy")

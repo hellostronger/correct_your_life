@@ -35,6 +35,20 @@ wb:
   interval_minutes: 60
   fetch_timeout_minutes: 15
 
+# 小红书关键词舆情监控（调 MediaCrawler 搜索模式，见 xhs_watch.py）
+# 抓关键词（+ 自选股名，use_watchlist）的笔记与评论，入库 sa_xhs_*，
+# 匹配到自选股的笔记推进 sa_news（source=xhs）供模拟盘舆情引用。
+# 小红书风控严，interval_minutes 建议 ≥120；首次使用先 POST /api/xhs/login 扫码。
+xhs:
+  enabled: true
+  interval_minutes: 120
+  fetch_timeout_minutes: 12
+  max_notes: 40
+  max_comments: 20
+  use_watchlist: true
+  # 额外搜索词（list 或逗号分隔字符串）；单轮关键词总数上限 12
+  keywords: []
+
 # 板块轮动监控（sector.py + sector_intraday）
 # 盘中：交易时段每 interval_minutes 采样一次全量板块，急拉/涨停骤增即时推微信
 # alert_notify: 盘中异动推送开关（盘后轮动预警不受此开关控制，始终推送）

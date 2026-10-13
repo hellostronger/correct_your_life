@@ -229,6 +229,25 @@ SCHEMAS: dict[str, dict[str, Any]] = {
              "label": "单轮爬取超时(分钟)", "adv": True},
         ],
     },
+    "xhs": {
+        "label": "📕 小红书舆情",
+        "help": "调 MediaCrawler 搜索关键词（含自选股名）抓笔记+评论，匹配到自选的推进新闻流。"
+                "小红书风控严，周期别设太短；首次使用先扫码登录。",
+        "fields": [
+            {"key": "enabled", "t": "bool", "d": True, "label": "启用"},
+            {"key": "interval_minutes", "t": "int", "d": 120, "lo": 0, "hi": 1440,
+             "label": "抓取周期(分钟)", "help": "0 = 关闭；风控严，建议 ≥120"},
+            {"key": "fetch_timeout_minutes", "t": "int", "d": 12, "lo": 1, "hi": 120,
+             "label": "单轮爬取超时(分钟)", "adv": True},
+            {"key": "max_notes", "t": "int", "d": 40, "lo": 20, "hi": 200,
+             "label": "单轮最多笔记数", "adv": True,
+             "help": "MediaCrawler 搜索页 20/页，下限 20"},
+            {"key": "max_comments", "t": "int", "d": 20, "lo": 1, "hi": 100,
+             "label": "每篇最多评论数", "adv": True},
+            {"key": "use_watchlist", "t": "bool", "d": True, "label": "关键词包含自选股名",
+             "help": "开启后每轮把自选股名并入搜索词（单轮关键词上限 12 个）"},
+        ],
+    },
     # ---------------- 公众号 ----------------
     "mp": {
         "label": "📰 公众号（拉 WeRSS 的 RSS）",
