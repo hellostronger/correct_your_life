@@ -68,6 +68,11 @@ DEFAULT_CONF = {
         #   本机装：        http://127.0.0.1:8888
         #   101（需放行安全组 8888）：http://101.43.25.101:8888
         "searxng": {"enabled": False, "min_interval": 2.0, "timeout": 25, "url": ""},
+        # 雪球讨论（2026-10-13 新增）。**不是直接抓雪球** —— 直连三个端点全部
+        # 返回 WAF 挑战页（`{"_waf_bd8ce2ce37":...}`），HTTP 200 但零内容。
+        # 走 SearXNG 的 `site:` 限定反而稳：不需要登录 cookie。
+        "xueqiu": {"enabled": False, "min_interval": 3.0, "timeout": 40,
+                   "url": "", "time_range": "month", "max_keywords": 2},
         # DDG 已死（见文件头），默认关闭；留着开关是为了哪天网络通了能直接开回来
         "duckduckgo": {"enabled": False, "min_interval": 5.0, "timeout": 8},
     },
@@ -313,7 +318,7 @@ def _prog_finish() -> None:
 SOURCE_LABEL = {
     "eastmoney": "东方财富", "baidu": "百度新闻", "sina": "新浪财经",
     "duckduckgo": "DuckDuckGo", "bing": "必应", "searxng": "SearXNG",
-    "ak_em": "东财个股新闻",
+    "ak_em": "东财个股新闻", "xueqiu": "雪球讨论",
 }
 
 # 搜索结果里「明显不是新闻」的链接（行情页/官网首页/百科）。
@@ -1231,6 +1236,171 @@ def fetch_searxng(code: str, name: str, limit: int, conf: dict,
     return items
 
 
+def _xq_aliases(name: str, code: str) -> list[str]:
+    """一只票在雪球上可能出现的写法。
+
+    港股雪球标题惯例是 `$MINIMAX-W(00100)$ …`（带 -W 后缀、带括号代码），
+    所以既要比全名，也要比**去掉 -W/-U/-SW 后缀**的短名，还要比纯代码。
+    """
+    out = [n for n in (name or "").split() if n]
+    base = (name or "").strip()
+    for suf in ("-W", "-U", "-SW", "-B", "-WS"):
+        if base.endswith(suf) and len(base) - len(suf) >= 2:
+            out.append(base[: -len(suf)])
+            break
+    if code:
+        out.append(str(code))
+    return list(dict.fromkeys(out))
+
+
+def fetch_xueqiu(code: str, name: str, limit: int, conf: dict,
+                  keyword: str = "") -> list[dict]:
+    """雪球讨论 —— **解禁/锁定这类事件的主要落点**（2026-10-13 用户提出）。
+
+    用户实例：MINIMAX-W 7 月解禁期到了，但创始团队自愿锁定 12 个月。
+    这条信息在**雪球**，不在任何现有渠道（实测 eastmoney/baidu/searxng/ak_em
+    搜「MiniMax + 解禁/锁定」全部 0 命中）。
+
+    ## 为什么不直连雪球
+    实测首页 / 搜索 API / 个股页**三个端点全部**返回同一个 WAF 挑战页
+    （`<textarea id="renderData">{"_waf_bd8ce2ce37":...}`），HTTP 200 但零内容。
+    而 `site:xueqiu.com` 经 SearXNG 反而稳定且**不需要登录 cookie**。
+
+    ## 🔴 time_range 不是可选优化，是**能不能用的开关**
+    实测同一句查询、同一台 searxng、同一批 6 条结果：
+
+    | | yandex 返回的 publishedDate |
+    |---|---|
+    | **不带** time_range | **0/6**（3 次重跑全 0） |
+    | 带 `time_range=month` | **6/6**（6 次重跑全 6，36/36） |
+
+    原因：yandex 只有在**必须按时间过滤**时才会去解析并回填日期字段。
+    而 `save_to_db` 按项目铁律丢弃没有 `publish_time` 的条目 ——
+    **不带 time_range 等于这个渠道 100% 静默产出 0 条入库**，且不报错。
+
+    ## 日期可信度（实测，别只听我说）
+    20 条命中分布在 **7 个不同日期**（09-14 ~ 10-09），不是全挤在抓取当天
+    → 不是索引时间；且带时分秒（01:52 / 23:57），索引时间通常不会这么随机。
+    交叉验证：标题自称 `2026.10.05` 的一篇，引擎给 2026-10-08（聚合页会晚几天）。
+    ⚠️ 仍不是 100% 的「发帖时间」：热门话题页（`/hashtag/…`）的日期是**话题聚合
+    时间**。所以**只收文章页**（`/数字/数字`），话题页直接丢掉。
+
+    ## 为什么不用 `_looks_like_news`
+    它按 `_NOT_NEWS_HOSTS` 过滤，而 `xueqiu.com` **正在那个黑名单里** ——
+    当初加它是因为搜公司名会返回雪球的**股票主页**（`/S/00100`），不是新闻。
+    现在我们用 `site:` + **事件关键词**搜，返回的是文章页，判据完全不同：
+    这里自己按 URL 形态收文章页、拒股票页与话题页。
+    """
+    ch_conf = (conf.get("channels") or {}).get("xueqiu") or {}
+    base = (ch_conf.get("url") or "").strip().rstrip("/")
+    if not base:
+        # 没单独配就复用 searxng 的地址（同一个实例，省一份配置）
+        base = ((conf.get("channels") or {}).get("searxng") or {}).get(
+            "url") or ""
+        base = base.strip().rstrip("/")
+    if not base:
+        return []
+    ready, _why = _channel_ready("xueqiu", conf)
+    if not ready:
+        return []
+    # 事件词：默认围绕「解禁/锁仓」，这正是常规新闻渠道覆盖不到的部分
+    kws = [k for k in str(ch_conf.get("keywords")
+                          or "解禁 禁售 锁定 锁仓").split() if k]
+    if keyword:
+        kws = [keyword] + [k for k in kws if k != keyword]
+    max_kw = max(1, int(ch_conf.get("max_keywords") or 2))
+    kws = kws[:max_kw]
+    time_range = (ch_conf.get("time_range") or "month").strip()
+    seen: set[str] = set()
+    items: list[dict] = []
+    # 🔴 查询写法决定成败（2026-10-13 实测 8 种形式）：
+    #   `site:xueqiu.com MINIMAX 解禁`   6 命中 / **0 条**关于该股
+    #   `site:xueqiu.com 00100 解禁`     5 命中 / **0 条**关于该股
+    #   `site:xueqiu.com MINIMAX-W 解禁` 6 命中 / **3 条**关于该股
+    #   `site:xueqiu.com $MINIMAX-W$ 解禁` 6 命中 / **4 条**关于该股 ✅
+    #   `site:xueqiu.com/S/00100`         0 命中（雪球股票页不被索引成结果）
+    # 裸名字/裸代码相关召回为 0，是因为雪球标题写的是 **`$MINIMAX-W(00100)$`** ——
+    # 港股带 `-W/-U/-SW` 后缀。所以**必须用带后缀的全名**，`$…$` 最准。
+    # （与 mp_retrieval 里「名称变体」同一个道理，但这里错的是**查询词**不是过滤。）
+    forms = [("ticker", "site:xueqiu.com $%s$ %%s" % name),
+             ("plain", "site:xueqiu.com %s %%s" % name)]
+    for kw in kws:
+        for tag, form in forms:
+            if len(items) >= limit:
+                break
+            _rate_limit("xueqiu", ch_conf.get("min_interval", 3.0))
+            t0 = time.time()
+            q = form % kw
+            try:
+                r = requests.get(base + "/search",
+                                 params={"q": q, "format": "json",
+                                         "language": "zh-CN",
+                                         "time_range": time_range},
+                                 headers=UA, timeout=ch_conf.get("timeout", 40))
+                r.raise_for_status()
+                data = r.json()
+            except Exception as exc:                               # noqa: BLE001
+                _mark_fail("xueqiu", f"{type(exc).__name__}: {exc}",
+                           ms=int((time.time() - t0) * 1000),
+                           threshold=conf.get("health_fail_threshold", 3),
+                           cooldown_minutes=conf.get("health_cooldown_minutes", 30))
+                continue
+            try:
+                for it in (data.get("results") or []):
+                    url = str(it.get("url") or "").strip()
+                    if url in seen:
+                        continue
+                    # 只收**文章页** xueqiu.com/<用户id>/<文章id>
+                    m = re.search(r"xueqiu\.com/(\d{4,})/(\d{4,})", url)
+                    if not m:
+                        continue      # /S/ 股票页、/hashtag/ 话题页都不收
+                    title = re.sub(r"<[^>]+>", "",
+                                   str(it.get("title") or "")).strip()
+                    if not title:
+                        # yandex 偶尔把 title 解析成 URL 本身；这种没有信息量，
+                        # 宁可丢掉也不要一条「xueqiu.com/4918530069/409879673」进库
+                        continue
+                    if re.fullmatch(r"(https?://)?(www\.)?xueqiu\.com/\S+", title):
+                        continue
+                    # 🔴 相关性闸门：`site:` 的召回**很脏**，实测一次 6 条里 5 条
+                    # 与目标公司无关（固态电池/台积电提价/医疗瓶颈…）。不设闸门就会
+                    # 把它们灌进 sa_news 直接参与决策 —— 比没有这个渠道更糟。
+                    # 判据用**标题或摘要里出现公司名/代码**，不靠语义模型（贵且不稳）。
+                    blob = (title + " " + str(it.get("content") or "")).lower()
+                    aliases = [a for a in _xq_aliases(name, code) if len(a) >= 2]
+                    if aliases and not any(a.lower() in blob for a in aliases):
+                        continue
+                    when = _normalize_pub_dt(str(it.get("publishedDate") or ""))
+                    if not when:
+                        # 没有真实发布时间一律丢弃（项目铁律：宁可不写，不要假时间）
+                        continue
+                    seen.add(url)
+                    engine = str(it.get("engine") or "").strip()
+                    item = _norm(code, title, url, "xueqiu",
+                                 "雪球" + (f"·{engine}" if engine else ""),
+                                 when)
+                    # 解禁/锁仓这类**状态**信息不受 2 天时效限制，标记后由
+                    # fetch_for_stock 在 LLM 过滤后加回（见 _is_event_item）
+                    if _is_event_item(item):
+                        item["_event"] = True
+                    items.append(item)
+                    if len(items) >= limit:
+                        break
+            except Exception as exc:                               # noqa: BLE001
+                _mark_fail("xueqiu", f"解析失败 {type(exc).__name__}: {exc}",
+                           ms=int((time.time() - t0) * 1000),
+                           threshold=conf.get("health_fail_threshold", 3),
+                           cooldown_minutes=conf.get("health_cooldown_minutes", 30))
+                continue
+            _mark_ok("xueqiu", ms=int((time.time() - t0) * 1000))
+    if not items:
+        # 静默 0 条是最难查的故障，明确说出来（AGENTS.md：别让「没产出」看起来像「没新闻」
+        _mark_fail("xueqiu", "搜索有结果但没有可用条目（多半是时间或标题被过滤）",
+                   threshold=conf.get("health_fail_threshold", 3),
+                   cooldown_minutes=conf.get("health_cooldown_minutes", 30))
+    return items
+
+
 def fetch_duckduckgo(code: str, name: str, limit: int, conf: dict,
                      keyword: str = "") -> list[dict]:
     """DDG Lite HTML 搜索 —— **已死**（2026-09-23 起本机与 101 均 TCP 443 超时）。
@@ -1292,6 +1462,7 @@ FETCHERS = {
     "sina": fetch_sina,
     "bing": fetch_bing,
     "searxng": fetch_searxng,
+    "xueqiu": fetch_xueqiu,
     "duckduckgo": fetch_duckduckgo,
 }
 
@@ -1299,10 +1470,31 @@ FETCHERS = {
 # 搜索类渠道单次 8~25s，关键词轮一轮可能有 5~10 个词 × 3 类，
 # 跑全了整轮会到小时级 —— 比抓取周期还长，等于永远追不上。
 # 个股轮照跑（那里才需要多一个厂商的独立视角）。
-_KEYWORD_SKIP_CHANNELS = {"duckduckgo", "bing", "searxng"}
+_KEYWORD_SKIP_CHANNELS = {"duckduckgo", "bing", "searxng", "xueqiu"}
 
 
 # ---------------- 聚合入口 ----------------
+
+
+_EVENT_KW = ("解禁", "禁售", "锁定", "鎖定", "锁仓", "禁售期",
+             "不减持", "减持", "自愿延长", "自願延長", "限售")
+
+
+def _is_event_item(item: dict) -> bool:
+    """这条是不是「股份状态类」信息（解禁/禁售/锁定期/减持承诺）。
+
+    为什么单独分一类：`_llm_filter_news_items` 只保留**近 2 天**的新闻 ——
+    这对新闻是对的（我们要新消息），但解禁/锁仓描述的是**当前仍生效的约束**
+    （「自愿锁仓 12 个月」），一个月前发的帖子今天读依然有价值。
+    实测：雪球上「$MINIMAX-W(00100)$ 7月份暴跌是解禁期股份太多」这类帖
+    被 2 天窗口**全部丢弃**（kept 0 of 4），而它正是用户要找的信息。
+
+    所以这类条目打 `_event` 标记，LLM 过滤后**加回来**。
+    ⚠️ 不是所有条目都加回 —— 只有标题命中事件词的，
+    否则会把雪球闲聊一起灌进决策（那比没有这个渠道更糟）。
+    """
+    title = str(item.get("title") or "")
+    return any(k in title for k in _EVENT_KW)
 
 
 def _llm_filter_news_items(code: str, name: str, items: list[dict]) -> list[dict]:
@@ -1338,6 +1530,9 @@ def _llm_filter_news_items(code: str, name: str, items: list[dict]) -> list[dict
         "因为你不可能穷举下一次的关键词。\n"
         "  (2) 有明确的发布时间且在该股票近期窗口内；publish_time 为空的"
         "条目一律剔除（时效未知，不能当作新消息）。\n"
+        "      **例外**：解禁 / 禁售 / 锁定期 / 减持承诺这类**股份状态**信息，"
+        "即使发布于数周前也要保留 —— 它描述的是**当前仍生效的约束**，"
+        "不是「今天发生的事」，时效窗口不适用。\n"
         "  (3) 与该股票或其行业直接相关（公司自身、行业、上下游、竞争对手的重要动态）。\n"
         "同一件事的多家转载只留一条。\n"
         "只输出满足条件的编号 JSON 数组，例如 [0,3,5]。不要包含任何额外说明、"
@@ -1345,7 +1540,7 @@ def _llm_filter_news_items(code: str, name: str, items: list[dict]) -> list[dict
     )
     user = f"股票代码: {code}\n股票名称: {name}\n\n新闻列表:\n" + "\n".join(lines)
     try:
-        raw = llm.ask(system, user, conf=conf, thinking=False)
+        raw = llm.ask(system, user, conf=conf, thinking=False, task="fast")
     except Exception:
         return items
     try:
@@ -1424,6 +1619,17 @@ def fetch_for_stock(code: str, name: str, conf: dict | None = None,
             seen[url] = item
             uniq.append(item)
     uniq = _llm_filter_news_items(code, name, uniq)
+    # 🔴 把「股份状态类」条目加回来。LLM 仍可能不认这条例外（prompt 不是保证），
+    # 而实测它确实把 4/4 条解禁讨论全判成「不在近期窗口」丢掉了 ——
+    # 静默 0 条 = 这个渠道看起来在工作、其实什么都没产出。
+    # 只加回**标题命中事件词**的，不放宽其它条目。
+    kept_urls = {u["url"] for u in uniq}
+    rescued = [it for it in seen.values()
+               if it.get("_event") and it.get("url") and it["url"] not in kept_urls]
+    if rescued:
+        print("[news] 事件类条目（解禁/禁售/锁定）被 LLM 时效过滤丢弃，"
+              "已加回 %d 条" % len(rescued), flush=True)
+        uniq = uniq + rescued
     return {"code": code, "name": name, "results": uniq, "errors": errors}
 
 
@@ -1515,6 +1721,13 @@ def save_to_db(items: list[dict], related_map: dict[str, list[str]] | None = Non
     skipped_too_old = 0
     now = datetime.now()
     max_age_days = 7  # 只保留最近 7 天的新闻，旧新闻对决策没有价值
+    # ⚠️ 例外：**股份状态类**（解禁/禁售/锁定期/减持承诺，见 `_is_event_item`）
+    # 用更宽的窗口。理由：这类描述的是**当前仍生效的约束**
+    # （「自愿锁仓 12 个月」），一个月前发的讨论今天读依然有决策价值，
+    # 而 7 天窗口会把它们全丢掉 —— 实测 MiniMax 那条解禁讨论就是这么没的。
+    # ⚠️ 仍然要求**有真实发布时间**（下面两道检查不放宽）：
+    # 放宽的是「多久算过期」，不是「时间未知也收」。
+    event_max_age_days = 180
     # 先试着从正文抽发布时间；抽不到的在下面被丢弃。
     # 「抓取时间不等于发布时间」—— 用户 2026-10-08 定的规矩。
     _bf = backfill_publish_times(items)
@@ -1539,7 +1752,9 @@ def save_to_db(items: list[dict], related_map: dict[str, list[str]] | None = Non
             except (ValueError, TypeError):
                 skipped_bad_time += 1
                 continue
-            if (now - pub_dt).days > max_age_days:
+            # 时效闸门按**条目类别**取窗口：普通新闻 7 天，状态类 180 天。
+            limit_days = event_max_age_days if it.get("_event") else max_age_days
+            if (now - pub_dt).days > limit_days:
                 skipped_too_old += 1
                 continue
             sw = senti_words.get(it.get("code")) or {}

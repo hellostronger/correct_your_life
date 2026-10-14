@@ -500,8 +500,35 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
           <button class="btn ghost" style="font-size:12px" onclick="pushAlerts()">推送提醒</button>
         </span>
       </div>
-      <div id="alerts-box" class="muted" style="margin-top:6px;font-size:12px">加载中…（未来 14 天自选股限售解禁、增发新股上市，以及减持预披露计划与已发生的董监高减持；工作日 8:30 自动推微信）</div>
+      <div id="alerts-box" class="muted" style="margin-top:6px;font-size:12px">加载中…（未来半年自选股限售解禁、增发新股上市，以及减持预披露计划与已发生的董监高减持；工作日 8:30 自动推微信）</div>
+      <hr style="margin:10px 0;border:none;border-top:1px solid var(--border)">
+      <div class="row" style="justify-content:space-between">
+        <b style="font-size:13px">🔐 港股解禁期<span id="hksup-count" class="muted" style="font-weight:normal"></span></b>
+        <span class="row">
+          <button class="btn ghost" style="font-size:12px" onclick="loadHKSupply()">查我的港股</button>
+        </span>
+      </div>
+      <div class="muted" style="font-size:11px;margin-top:2px">
+        港股**没有**东财那样的解禁表，条款写在公告 PDF 里，只能逐份解析。
+        两条线语义不同，分开展示。
+      </div>
+      <div id="hksup-box" class="muted" style="margin-top:6px;font-size:12px">加载中…</div>
     </div>
+    <style>
+      /* 港股解禁的进度条：解析要 3~6 分钟，没有进度条用户只能干等
+         （2026-10-13 用户连报三次「一直没结果不知道什么情况」）。 */
+      .hksup-prog { padding:2px 0; }
+      .hksup-bar {
+        height:6px; border-radius:3px; overflow:hidden;
+        background:var(--border-2); margin:3px 0 4px;
+      }
+      .hksup-fill {
+        height:100%; width:2%; border-radius:3px;
+        background:linear-gradient(90deg, var(--accent), #6aa0ff);
+        transition:width .4s ease;
+      }
+      .hksup-txt { font-size:12px; }
+    </style>
     <div class="card">
       <details>
         <summary style="cursor:pointer">
@@ -735,7 +762,7 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
           <option value="sell">卖出</option>
         </select>
         <input id="t-shares" placeholder="股数" type="number" min="1" style="width:90px">
-        <input id="t-price" placeholder="成交价" type="number" step="0.01" min="0.01" style="width:100px">
+        <input id="t-price" placeholder="成交价" type="number" step="0.0001" min="0.0001" style="width:100px">
         <input id="t-date" placeholder="交易日期" style="width:130px"
                onfocus="this.type='date'" onblur="if(!this.value)this.type='text'">
         <select id="t-strategy" style="padding:8px 10px;border:1px solid var(--border);border-radius:7px;width:190px">
@@ -800,7 +827,7 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
           </div>
           <div class="field">
             <label for="cc-cur">现价</label>
-            <input id="cc-cur" type="number" step="0.001" placeholder="自动取行情"
+            <input id="cc-cur" type="number" step="0.0001" placeholder="自动取行情"
                    oninput="ccCalc()">
             <div class="cc-hint">留空则不算「回本涨幅」</div>
           </div>
@@ -825,7 +852,7 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
         <div class="cc-inputs">
           <div class="field">
             <label for="cc-price">买入价</label>
-            <input id="cc-price" type="number" step="0.001" placeholder="15.00"
+            <input id="cc-price" type="number" step="0.0001" placeholder="15.00"
                    oninput="ccCalc()">
           </div>
           <div class="field">
@@ -1233,6 +1260,49 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       </div>
       <div id="mp-list"></div>
       <div id="mp-empty" class="empty hide">还没有文章。添加订阅源后点「立即拉取」。</div>
+    </div>
+
+    <!-- 🔍 语义检索：把公众号正文段落喂进模拟盘决策 -->
+    <div class="card">
+      <div class="card-head">
+        <b>🔍 语义检索（喂进决策）</b>
+        <div class="row tight">
+          <span class="muted" id="mpr-index-info"></span>
+          <button class="btn ghost sm" id="mpr-reindex-btn" onclick="mprReindex(true)">重建索引</button>
+          <button class="btn ghost sm" onclick="loadMprConfig()">刷新</button>
+        </div>
+      </div>
+      <div class="row">
+        <label class="muted" style="min-width:200px">
+          <input type="checkbox" id="mpr-enabled" onchange="mprSave()">
+          把检索到的公众号正文注入决策</label>
+        <label class="muted">每次最多
+          <input id="mpr-topk" type="number" min="1" max="20" step="0.5"
+                 style="width:62px" onchange="mprSave()"> 条</label>
+        <label class="muted">检索近
+          <input id="mpr-days" type="number" min="1" max="180" step="0.5"
+                 style="width:62px" onchange="mprSave()"> 天</label>
+      </div>
+      <div class="hint">
+        原来喂给 LLM 的只有<b>标题 + 正文前 160 字</b>，而近 7 天文章正文中位数 <b>630 字</b> ——
+        不是内容太长，是<b>只读了 25%</b>。这里用 Milvus（稠密 bge-m3 + 服务端 BM25）按段落召回原文。
+        每条会标注 <b>「点名」</b>（文章真的提到这只票，可作依据）或 <b>「题材」</b>（只是行业/政策层面）；
+        一篇都不点名时会如实说明，而不是把行业文章伪装成个股信息。
+        <br>⚠️ 检索热路径是<b>确定性</b>的（同一份数据两次决策拿到同样的片段）——
+        这是决策可复现的前提；开放问题请用 <code>--agentic</code>。
+      </div>
+      <div class="row" style="margin-top:8px">
+        <input id="mpr-q" placeholder="手工检索一句，如「存储芯片涨价」"
+               style="flex:1;min-width:200px" onkeydown="if(event.key==='Enter')mprQuery()">
+        <button class="btn" id="mpr-q-btn" onclick="mprQuery()">检索</button>
+        <button class="btn ghost" id="mpr-ctx-btn" onclick="mprQueryContext()"
+                title="按股票走决策那条路，返回的就是决策上下文里的原文">按股票看注入内容</button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <input id="mpr-code" placeholder="代码 600036" style="width:110px">
+        <input id="mpr-name" placeholder="名称 招商银行" style="width:140px">
+      </div>
+      <div id="mpr-result" style="margin-top:10px"></div>
     </div>
   </section>
 
@@ -2117,6 +2187,17 @@ const fmt = v => (v === null || v === undefined || v === '') ? '—' :
 const cls = v => (typeof v === 'number' ? (v > 0 ? 'up' : v < 0 ? 'down' : '') : '');
 const signed = v => (typeof v === 'number' && v > 0 ? '+' : '') + fmt(v);
 const yi = v => (typeof v === 'number' ? (v / 1e8).toFixed(2) + '亿' : '—');
+/** **价格**的显示位数不能写死 2 位：1.5 元的 ETF/港股用 2 位会把 1.5151 显示成
+    1.52，币价 <1 的更是直接变成 0.00 —— 照着挂单就挂在错位置（AGENTS.md
+    「展示层绝不该有能力弄丢数据」同源）。按量级自适应：≥1 最多 4 位、
+    <1 最多 8 位，尾零去掉，NaN/缺失一律破折号。金额、百分比不要用它。 */
+const fmtPx = v => {
+  if (v === null || v === undefined || v === '') return '—';
+  const n = Number(v);
+  if (!isFinite(n)) return '—';
+  if (n === 0) return '0';
+  return String(+(Math.abs(n) >= 1 ? n.toFixed(4) : n.toFixed(8)));
+};
 const esc = s => (s == null ? '' : String(s)).replace(/[&<>"]/g,
   c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
@@ -2453,7 +2534,7 @@ function formDlg(title, fields, { okText = '保存', wide = false } = {}) {
           ).join('')}</select>`
         : `<input ${common} value="${esc(f.value || '')}"
              ${f.type ? `type="${f.type}"` : ''}
-             ${f.type === 'number' ? 'min="0" step="1"' : ''}>`;
+             ${f.type === 'number' ? `min="0" step="${f.step || '1'}"` : ''}>`;
     return `<div class="field"><label for="${id}">${esc(f.label)}</label>${ctrl}
       ${f.hint ? `<div class="faint" style="margin-top:3px">${esc(f.hint)}</div>` : ''}</div>`;
   }).join('');
@@ -3597,7 +3678,13 @@ const TABS = ['market', 'sector', 'holdings', 'strategies', 'plans', 'calendar',
               'bili', 'wb', 'xhs', 'mp', 'x', 'reports', 'paper', 'tdesk', 'notify', 'schedule',
               'jq', 'analysis'];
 const TAB_LOADERS = {
-  market:    () => { loadWatch(); loadAlerts(); loadCrypto(); loadDiscover(); loadFutures(); },
+  // ⚠️ 港股解禁**不**挂在 market 的自动加载里（2026-10-13 用户报「一直加载中」）：
+  //   ① 真解析每份公告约 40 秒 × N 只，会把整个自选页拖住几��钟；
+  //   ② 它在 101 上异步跑，本机只是转发，页面早关了就白等。
+  //   所以这里只做**零成本的**状态探测（探 101 的 /health，约 15ms），
+  //   把「有 N 只港股可查」显示出来，让人自己点「查我的港股」。
+  //   —— 之前我漏了这个注册，页面永远停在初始的「加载中…」。
+  market:    () => { loadWatch(); loadAlerts(); loadCrypto(); loadDiscover(); loadFutures(); loadHKSupplyStatus(); },
   sector:    () => { loadSector(); loadIntraday(); startIntradayAuto(); },
   holdings:  () => { loadHoldings(); refreshTradeStrategyOptions(); },
   strategies:() => { loadStrategies(); refreshTradeStrategyOptions(); },
@@ -3607,7 +3694,7 @@ const TAB_LOADERS = {
   bili:      () => { loadBiliCreators(); loadBiliDynamics(); loadBiliStatus(); },
   wb:        () => { loadWbCreators(); loadWbPosts(); loadWbStatus(); },
   xhs:       () => { loadXhsNotes(); loadXhsStatus(); },
-  mp:        () => { loadMpSources(); loadMpArticles(); loadMpStatus(); },
+  mp:        () => { loadMpSources(); loadMpArticles(); loadMpStatus(); loadMprConfig(); },
   x:         () => { loadXAccounts(); loadXWatch(); loadXTweets(); loadXStatus(); },
   reports:   loadReports,
   paper:     loadPaper,
@@ -3804,7 +3891,7 @@ async function toggleBoardDetail(bk) {
       <table style="margin-top:6px"><thead><tr><th>代码</th><th>名称</th><th>现价</th><th>涨跌幅</th><th>主力净流入</th></tr></thead>
       <tbody>${data.items.map(s => `<tr>
         <td>${s.code}</td><td>${s.name}</td>
-        <td class="${cls(s.price)}">${fmt(s.price)}</td>
+        <td class="${cls(s.price)}">${fmtPx(s.price)}</td>
         <td class="${cls(s.pct)}">${s.pct != null ? signed(s.pct) + '%' : '—'}</td>
         <td class="${cls(s.main_inflow)}">${s.main_inflow != null ? yi(s.main_inflow) : '—'}</td>
       </tr>`).join('')}</tbody></table>`;
@@ -3867,11 +3954,16 @@ function togglePwd(btn, inputId) {
 async function loadAlerts() {
   const box = $('alerts-box');
   try {
-    const data = await api('/api/alerts/upcoming?days=14');
+    // 半年窗口（后端 alerts.DEFAULT_DAYS = 183）。**别在这里写死天数** ——
+    // 之前前端写 14、后端也写 14，改一处忘另一处就会「文案说半年、数据是14天」。
+    // 窗口以后端返回的为准。
+    const data = await api('/api/alerts/upcoming');
     const evs = data.events || [];
+    const DAYS = data.days || 183;
+    const MONTHS = Math.round(DAYS / 30);
     $('alerts-count').textContent = evs.length ? `（${evs.length}）` : '';
     if (!evs.length) {
-      box.innerHTML = '<span class="muted">未来 14 天自选股暂无解禁/增发事件，'
+      box.innerHTML = `<span class="muted">未来 ${MONTHS} 个月自选股暂无解禁/增发事件，`
         + `最近 ${data.reduce_lookback_days} 天也暂无减持 ✓</span>`
         + '<span class="muted" style="margin-left:8px">（A股口径；港股不适用。数据源东财，'
         + '工作日 8:30 自动扫描推微信）</span>';
@@ -3884,7 +3976,13 @@ async function loadAlerts() {
       const soon = past || e.event_date <= _plusDays(today, 3);
       // 图标/标签由后端随事件下发（alerts.KIND_META），别在这里再写一份映射
       const icon = e.icon || '•', label = e.label || e.type;
-      const amt = [e.shares_txt, e.cap_yi ? `约${e.cap_yi}亿元` : '']
+      // 显示串由后端 alerts.fmt_shares / fmt_cap 按量级生成（亿/万/股、亿/万元）。
+      // ⚠️ 别在这里写死 `约${cap_yi}亿元` —— 那会把 0.0829 亿显示成「约0.08亿元」，
+      //    和同一条里的「约0.19亿元」没法比较（2026-10-12 用户报）。
+      //    cap_txt 为空（数据源没给市值 / 旧事件）时才回退到旧拼法。
+      const capTxt = e.cap_txt != null ? e.cap_txt
+        : (e.cap_yi ? `约${e.cap_yi}亿元` : '');
+      const amt = [e.shares_txt, capTxt]
         .filter(Boolean).join(' / ');
       return `<div style="padding:2px 0">` +
         `<span class="${soon ? 'down' : ''}">${icon} <b>${e.event_date}</b></span> ` +
@@ -3900,6 +3998,201 @@ function _plusDays(iso, n) {
   const d = new Date(iso + 'T00:00:00');
   d.setDate(d.getDate() + n);
   return d.toISOString().slice(0, 10);
+}
+
+// ---- 港股解禁期（IPO 股东锁定期 / 融资禁售承诺，分开显示）----
+// ⚠️ 两条线**语义不同，绝不能合并成一种**（用户 2026-10-12 明确要求）：
+//   ipo_lockup   股东股份被锁 -> 锁定期满那批股票真的可以卖（这才是解禁）
+//   issuer_pledge 发行人承诺不再发新股 -> 不是股份解禁。
+//   混在一起会让人以为「解禁后有货」，直接误导买卖判断。
+// 渲染铁律：任何字段缺失都要显式说明，**不许显示成「本来就没有」**。
+// 天数 -> 人读。⚠️ 不能用 `n % 30 === 0 ? 月 : 日` —— 60 日会被显示成
+// 「2 个月」，而条款原文写的就是「60 日」。这里只在 **>= 90 天**（约 3 个月，
+// 港股 IPO 锁定期的最短量级）时才折成月，否则一律按日显示，保���与原文一致。
+const _hkDays = d => {
+  const n = Number(d);
+  if (!isFinite(n) || n <= 0) return '—';
+  return n >= 90 ? (Math.round(n / 30 * 10) / 10) + ' 个月' : n + ' 日';
+};
+/** 单只港股一行。纯函数，可离线 V8 测。 */
+function _hkRow(it) {
+  // ⚠️ 逐个兜底：`it.code` 缺失时 `${it.code}` 会把 undefined 拼进 HTML。
+  //    渲染层绝不该有能力输出 undefined（AGENTS.md 同类坑）。
+  const code = esc(it && it.code != null ? it.code : '?');
+  const nm = `${code} ${esc((it && it.name) || '')}`.trim();
+  if (!it || it.ok === false) {
+    return `<div style="padding:2px 0"><b>${nm}</b> ` +
+      `<span class="muted">⚠ 未取到：${esc((it && it.error) || '未知原因')}</span></div>`;
+  }
+  const ipo = (it.ipo_lockup || []).map(c =>
+    `🔓 股东锁定期 ${esc(_hkDays(c.days))}` +
+    (c._date ? `<span class="muted">（${esc(c._date)} ${esc((c._title || '').slice(0, 18))}）</span>` : '')
+  );
+  const pledge = (it.issuer_pledge || []).map(c =>
+    `✋ 发行人禁售 ${esc(_hkDays(c.days))}` +
+    (c._date ? `<span class="muted">（${esc(c._date)} ${esc((c._title || '').slice(0, 18))}）</span>` : '')
+  );
+  const lines = [];
+  if (ipo.length) {
+    // ⚠️ nm 在上面已 esc 过，这里**不能**再 esc —— 二次转义会把 &lt; 变成
+    //    &amp;lt;，页面上就显示出字面量 &lt;（XSS 测试曾靠这条抓到过）。
+    lines.push(`<div style="padding:2px 0"><b>${nm}</b> ${ipo.join('；')}</div>`);
+  }
+  if (pledge.length) {
+    lines.push(`<div style="padding:2px 0 0 12px">` +
+      `<span class="muted">↳ 非股份解禁（公司不再发新股）：</span> ${pledge.join('；')}</div>`);
+  }
+  if (!ipo.length && !pledge.length) {
+    // ⚠️ 必须是「没在公告里识别到」而不是空白：空白 = 用户以为查过了没有。
+    const why = it.error || '未在近 12 个月的公告里识别到禁售条款';
+    lines.push(`<div style="padding:2px 0"><b>${esc(nm)}</b> ` +
+      `<span class="muted">${esc(why)}</span></div>`);
+  }
+  return lines.join('');
+}
+/** 只探状态（零成本，约 15ms）。挂在 market tab 的自动加载里。 */
+async function loadHKSupplyStatus() {
+  const box = $('hksup-box');
+  if (!box) return;
+  try {
+    const st = await api('/api/hk-supply/status');
+    $('hksup-count').textContent = st.hk_count ? `（${st.hk_count} 只）` : '';
+    if (!st.hk_count) {
+      box.innerHTML = '<span class="muted">自选股里没有港股（A 股解禁见上面那块）</span>';
+    } else if (!st.service_ok) {
+      box.innerHTML = `<span class="muted">⚠ 解析服务不可用：${esc(st.reason || '未知')}</span>`;
+    } else {
+      // ⚠️ 绝不在这里自动发起解析 —— 慢（每份公告约 40 秒），会拖住整个自选页。
+      box.innerHTML = `<span class="muted">自选中 ${st.hk_count} 只港股可查。`
+        + `点「查我的港股」逐份解析港交所公告 PDF（每份约 40 秒，解析结果会缓存；`
+        + `首次较慢，之后很快）</span>`;
+    }
+  } catch (e) {
+    box.innerHTML = '<span class="muted">港股服务探测失败: ' + esc(e.message) + '</span>';
+  }
+}
+// 正在轮询的定时器。**模块级**而不是函数内的局部变量 ——
+// 轮询的生命周期比 loadHKSupply() 长（它 return 之后还在跑），
+// 所以「有没有正在跑的进度条」这件事必须是全局状态，
+// 否则用户在轮询途中再点一次按钮，就会起第二个轮询，
+// 两个定时器同时往同一个 #hksup-box 写，进度条来回跳。
+let _hkPoll = null;
+let _hkPollBox = null;
+
+function _hkPollStop() {
+  if (_hkPoll) { clearInterval(_hkPoll); _hkPoll = null; }
+  _hkPollBox = null;
+  const b = document.querySelector('button[onclick="loadHKSupply()"]');
+  if (b) b.disabled = false;
+}
+
+async function loadHKSupply() {
+  const box = $('hksup-box');
+  const t0 = Date.now();
+  const btn = document.querySelector('button[onclick="loadHKSupply()"]');
+  // 已经有进度条在跑就直接返回，绝不叠加第二个轮询
+  if (_hkPoll) return;
+  if (btn) btn.disabled = true;
+  // 进度条骨架。⚠️ 先把它 render 出来**再**发请求 —— 否则请求慢的时候
+  // 页面连「正在启动」都看不到（用户 2026-10-13 连报三次「一直没结果」）。
+  box.innerHTML = `<div class="hksup-prog">
+      <div class="hksup-bar"><div class="hksup-fill" style="width:2%"></div></div>
+      <div class="muted hksup-txt" style="font-size:12px">正在启动…</div>
+    </div>`;
+  const fill = () => box.querySelector('.hksup-fill');
+  const txt = () => box.querySelector('.hksup-txt');
+  const paint = (pct, text) => {
+    const f = fill(), t = txt();
+    if (f) f.style.width = (pct == null ? (f.style.width || '2%')
+                                      : Math.max(2, Math.min(100, pct)) + '%');
+    if (t) t.textContent = text;
+  };
+  paint(2, '正在启动…');
+  // 成功启动轮询后置位：finally 就**不再**清理（轮询要活得比本函数长）
+  let handedOff = false;
+  try {
+    const st = await api('/api/hk-supply/status');
+    $('hksup-count').textContent = st.hk_count ? `（${st.hk_count} 只）` : '';
+    if (!st.hk_count) {
+      box.innerHTML = '<span class="muted">自选股里没有港股（A 股解禁见上面那块）</span>';
+      return;
+    }
+    // ⚠️ 字段名是 service_ok（后端已改成代理到 101），不是 configured ——
+    //   留着旧名会让这里永远走成「未配置」，点了按钮没反应也没报错。
+    if (!st.service_ok) {
+      box.innerHTML = `<span class="muted">⚠ 解析服务不可用：${esc(st.reason || '未知')}</span>`;
+      return;
+    }
+    const d = await api('/api/hk-supply/scan');
+    if (d.error || !d.job_id) {
+      box.innerHTML = `<span class="muted">⚠ ${esc(d.error || '未能启动解析')}</span>`;
+      return;
+    }
+    // 轮询进度。间隔 1.5s：MinerU 一份约 40 秒，1.5s 足够跟得上，
+    // 又不至于把 101 打爆。
+    let last = null;
+    handedOff = true;
+    _hkPollBox = box;
+    _hkPoll = setInterval(async () => {
+      try {
+        // 切到别的标签页时**不请求**（但定时器留着）—— 回来时自动续上。
+        // 不这么做的话，用户去别的页干别的事，后台每 1.5s 还在打 101。
+        if (document.hidden) return;
+        const p = await api('/api/hk-supply/job/' + d.job_id);
+        // ⚠️ 容器可能被切页/重渲染换掉了，此时别往旧节点写（写进去看不见）
+        if (_hkPollBox !== box || !box.isConnected) { _hkPollStop(); return; }
+        if (p.error && p.state === 'gone') {
+          _hkPollStop();
+          box.innerHTML = `<span class="muted">⚠ ${esc(p.error)}</span>`;
+          return;
+        }
+        const pct = p.total ? (p.done / p.total * 100) : 2;
+        const cur = [p.code, p.name].filter(Boolean).join(' ');
+        const secs = p.elapsed_sec != null ? Math.round(p.elapsed_sec) : 0;
+        const line = `解析公告 ${p.done || 0}/${p.total || '?'}`
+          + (cur ? ` ｜ ${cur}` : '')
+          + (p.status ? ` ｜ ${p.status}` : '')
+          + ` ｜ 已用 ${secs}s`;
+        if (line !== last) { paint(pct, line); last = line; }
+        if (p.state === 'done' || p.state === 'error') {
+          _hkPollStop();               // 先停表，再渲染（顺序反了会闪一下旧内容）
+          if (p.state === 'error') {
+            box.innerHTML = `<span class="muted">⚠ ${esc(p.error || '解析失败')}</span>`;
+            return;
+          }
+          renderHKSupplyResult(box, p);
+        }
+      } catch (e) {
+        // 单次轮询失败**不要**终止整个进度条（网络抖动很常见）。
+        // pct 传 null = 保持当前宽度，只换文字 —— 传 undefined 会被
+        // `Math.min(100, undefined)` 变成 NaN，进度条宽度写进 'NaN%' 直接消失。
+        paint(null, `进度获取失败，正在重试…（${Math.round((Date.now() - t0) / 1000)}s）`);
+      }
+    }, 1500);
+    return;                       // 结果由轮询回调渲染（finally 见下面）
+  } catch (e) {
+    box.innerHTML = '<span class="muted">港股解禁查询失败: ' + esc(e.message) + '</span>';
+  } finally {
+    // ⚠️ 这里**必须区分**「失败早退」和「已交接给轮询」——
+    //   3 个早退分支（无港股 / 服务不可用 / 启动失败）必须清定时器，
+    //   否则 setInterval 泄漏后每秒把错误提示覆盖成进度文字（AGENTS.md 记过
+    //   同款：定时器泄漏把渲染好的结果冲掉）。
+    //   但成功路径 handedOff=true 时**绝不能**清 —— 轮询必须活得比本函数长。
+    //   写错这一行就是「进度条只跳一次就永远冻住」，而且**不报任何错**。
+    if (!handedOff) {
+      _hkPollStop();
+    }
+  }
+}
+
+/** 进度完成后渲染结果（从 loadHKSupply 里拆出来，轮询回调也用）。 */
+function renderHKSupplyResult(box, d) {
+    const items = d.items || [];
+    const head = `<div class="muted" style="font-size:11px;margin-bottom:3px">` +
+      `⚠ ${esc(d.boundary || '')}</div>`;
+    box.innerHTML = head + (items.length
+      ? items.map(_hkRow).join('')
+      : '<span class="muted">没有可分析的港股</span>');
 }
 async function pushAlerts() {
   toast('检查中…');
@@ -4211,7 +4504,7 @@ async function loadWatch() {
       if (i.keywords_neg) kwParts.push(`<div class="kw-line"><span class="badge" style="background:#ffe2e2;color:#b32424">🔴利空</span> ${esc(i.keywords_neg)}</div>`);
       return `<tr data-code="${i.code}">
         <td>${i.code}</td><td>${q.name || i.name || ''}</td>
-        <td class="${cls(q.price)}">${fmt(q.price)}</td>
+        <td class="${cls(q.price)}">${fmtPx(q.price)}</td>
         <td class="${cls(q.change_pct)}">${typeof q.change_pct === 'number' ? signed(q.change_pct) + '%' : '—'}</td>
         <td>${fmt(q.open)}</td><td>${fmt(q.high)}</td><td>${fmt(q.low)}</td>
         <td>${yi(q.amount)}</td>
@@ -4322,12 +4615,12 @@ async function loadHoldings() {
       const isHK = i.fx_rate;   // 有汇率标记=港股，金额列显示折算后人民币，悬浮看原币
       const hkTag = isHK ? '<span class="muted" style="font-size:10px"> ₸</span>' : '';
       const priceCell = i.net_shares === 0 ? '<td class="muted">—</td>'
-        : `<td class="${cls(i.price)}">${fmt(i.price_cny ?? i.price)}${isHK ? `<div class="muted" style="font-size:10px">原${fmt(i.price)}HKD</div>` : ''}</td>`;
+        : `<td class="${cls(i.price)}">${fmtPx(i.price_cny ?? i.price)}${isHK ? `<div class="muted" style="font-size:10px">原${fmtPx(i.price)}HKD</div>` : ''}</td>`;
       const mvCny = i.market_value_cny ?? i.market_value;
       return `<tr${dim} onclick="toggleTrades('${i.code}')" title="点击查看交易流水">
         <td>${i.code}</td><td>${esc(i.name)}${(i.position_strategies || []).length
           ? ` <span class="muted" title="已挂整仓策略">🎯${i.position_strategies.filter(s => !s.triggered_at).length ? '监控中' : '已触发'}</span>` : ''}${isHK ? ' <span class="muted" style="font-size:10px">港</span>' : ''}</td>
-        <td>${fmt(i.net_shares)}</td><td>${fmt(i.avg_cost)}${hkTag}</td>
+        <td>${fmt(i.net_shares)}</td><td>${fmtPx(i.avg_cost)}${hkTag}</td>
         ${priceCell}
         <td>${fmt(mvCny)}${isHK ? `<div class="muted" style="font-size:10px">${fmt(i.market_value)}HKD</div>` : ''}</td>
         <td class="${cls(i.pnl)}">${signed(i.pnl_cny ?? i.pnl)}</td>
@@ -4360,7 +4653,7 @@ function openCostCalc(code) {
   _ccPositions = held;
   sel.innerHTML = '<option value="">空仓 / 手动输入</option>' +
     held.map(i => `<option value="${esc(i.code)}">${esc(i.name || '')} ${esc(i.code)}`
-      + `（${fmt(i.net_shares)}股 @${fmt(i.avg_cost)}）</option>`).join('');
+      + `（${fmt(i.net_shares)}股 @${fmtPx(i.avg_cost)}）</option>`).join('');
   $('cost-modal').classList.remove('hide');
   // 首次打开时预填买入价 = 现价，否则用户面对两个空框不知道从哪填起
   if (code) { sel.value = code; ccPickPosition(); }
@@ -4419,16 +4712,16 @@ async function ccCalc() {
     // A 股习惯涨红跌绿，所以「还需涨」用 --up、「已盈利」用 --down。
     const beRow = (be !== null && cur)
       ? `<div class="${be > 0 ? 'cc-warn' : 'cc-good'}">
-           <span>回本所需涨幅（现价 ${fmt(cur)}）</span>
+           <span>回本所需涨幅（现价 ${fmtPx(cur)}）</span>
            <b>${signed(+be.toFixed(2))}%<span class="cc-sub">已含卖出费 ${fmt(ccNum(d.exit_cost_at_new_avg))}</span></b>
          </div>` : '';
     out.innerHTML = `
       <div><span>账面摊薄成本<small class="cc-sub">与持仓页同口径，不含费</small></span>
-        <b>${fmt(ccNum(d.old_avg_cost))} → ${fmt(ccNum(d.new_avg_cost_gross))}
+        <b>${fmtPx(ccNum(d.old_avg_cost))} → ${fmtPx(ccNum(d.new_avg_cost_gross))}
           ${delta !== null ? `<span class="${delta < 0 ? 'cc-good' : 'cc-warn'}">${signed(+delta.toFixed(2))}%</span>` : ''}
         </b></div>
       <div class="cc-key"><span>真实回本价<small class="cc-sub">含全部买入费</small></span>
-        <b>${fmt(ccNum(d.new_avg_cost_net))}
+        <b>${fmtPx(ccNum(d.new_avg_cost_net))}
           <span class="cc-sub">费用累计 ${fmt(ccNum(d.total_fees_paid))} 元</span></b></div>
       <div><span>本次买入需现金</span>
         <b>${fmt(ccNum(d.cash_needed))} 元
@@ -4553,7 +4846,7 @@ async function showTrades(code) {
           ? ` <span class="muted">🎯${esc(t.strategy_name || '')}` +
             (t.strategy_triggered_at ? ' ✓已触发'
               : (['drawdown', 'trailing'].includes(t.strategy_kind) && t.strategy_peak_price
-                 ? ` 峰值${(+t.strategy_peak_price).toFixed(2)}`
+                 ? ` 峰值${fmt(+t.strategy_peak_price)}`
                  : (t.strategy_kind === 'ladder' && t.strategy_ladder_step
                     ? ` 已到${t.strategy_ladder_step}档` : ''))) + '</span>'
           : '';
@@ -4561,7 +4854,7 @@ async function showTrades(code) {
         <td class="muted">${t.trade_date}</td>
         <td class="${t.side === 'buy' ? 'up' : 'down'}" style="font-weight:600">${t.side === 'buy' ? '买入' : '卖出'}</td>
         <td>${fmt(t.shares)} 股</td>
-        <td>@ ${fmt(t.price)}</td>
+        <td>@ ${fmtPx(t.price)}</td>
         <td class="muted">${fmt((t.shares * t.price).toFixed(2))}</td>
         <td>${pnlCell}</td>
         <td class="muted">${esc(t.note || '')}${strat}</td>
@@ -4587,12 +4880,12 @@ async function renderPosStrategies(code) {
     .filter(s => !linked.some(l => l.strategy_id === s.id))
     .map(s => `<option value="${s.id}">🎯 ${esc(s.name)}（${s.target_display}）</option>`)
     .join('');
-  box.innerHTML = `<div class="muted" style="font-size:12px;margin-bottom:4px"><b>整仓策略</b>（按摊薄成本 ${fmt(pos.avg_cost)} 判定，触发推微信）</div>` +
+  box.innerHTML = `<div class="muted" style="font-size:12px;margin-bottom:4px"><b>整仓策略</b>（按摊薄成本 ${fmtPx(pos.avg_cost)} 判定，触发推微信）</div>` +
     (linked.length ? linked.map(l => `<div class="row" style="gap:6px;margin-bottom:3px">
         <span style="font-size:12px">🎯 ${esc(l.strategy_name || '')}
           ${l.triggered_at ? '<b class="up">✓已触发</b>' : '<span class="muted">监控中</span>'}
           ${l.kind === 'ladder' && l.ladder_step ? `<span class="muted">已到${l.ladder_step}档</span>` : ''}
-          ${(['drawdown','trailing'].includes(l.kind) && l.peak_price) ? `<span class="muted">峰值${(+l.peak_price).toFixed(2)}</span>` : ''}
+          ${(['drawdown','trailing'].includes(l.kind) && l.peak_price) ? `<span class="muted">峰值${fmt(+l.peak_price)}</span>` : ''}
           ${!held ? '<span class="badge" style="background:#e2ecff;color:#2456b3">清仓暂停</span>' : ''}</span>
         <button class="del" style="font-size:12px" onclick="unbindPosStrategy(${l.id},'${code}')" title="解绑">×</button>
       </div>`).join('') : '<div class="muted" style="font-size:12px;margin-bottom:4px">未挂策略</div>') +
@@ -5514,8 +5807,8 @@ function paperStatusBadge(t) {
               + fmt(it.live_shares) + ' 股</span>'
             : '<span class="badge" style="background:#f4f4f5;color:#71717a">'
               + 'LLM 已平仓</span>')
-        + '<span class="muted" style="font-size:12px">现价 ' + fmt(it.price)
-        + ' · 基准成本 ' + fmt(it.rows[0] && it.rows[0].base_cost) + '</span>'
+        + '<span class="muted" style="font-size:12px">现价 ' + fmtPx(it.price)
+        + ' · 基准成本 ' + fmtPx(it.rows[0] && it.rows[0].base_cost) + '</span>'
         + (it.llm_pct == null ? ''
             : '<span class="muted" style="font-size:12px">· LLM 实际 '
               + '<b class="' + cls(it.llm_pct) + '">' + pct(it.llm_pct) + '</b>'
@@ -5525,7 +5818,7 @@ function paperStatusBadge(t) {
         const sb = stratStatusBadge[r.status] || ['—', '#f4f4f5', '#71717a'];
         const exits = (r.exits || []).map(e =>
           '<div class="muted" style="font-size:11px;padding-left:8px">'
-          + '└ 影子卖出 ' + esc(e.date) + ' @' + fmt(e.price)
+          + '└ 影子卖出 ' + esc(e.date) + ' @' + fmtPx(e.price)
           + (e.ratio < 1 ? '（卖 ' + (e.ratio * 100).toFixed(0) + '%）' : '')
           + ' 收益 <b class="' + cls(e.pnl_pct) + '">' + pct(e.pnl_pct) + '</b>'
           + (e.pnl_amount == null ? ''
@@ -5655,11 +5948,11 @@ function paperStatusBadge(t) {
           + bs.map(b =>
             '<tr><td>' + esc(b.code) + '</td>'
             + '<td>' + esc(b.strategy_name) + '</td>'
-            + '<td>' + fmt(b.base_cost) + '</td>'
+            + '<td>' + fmtPx(b.base_cost) + '</td>'
             + '<td>' + fmt(b.base_shares) + '</td>'
             + '<td>' + (b.base_entry_date || '—') + '</td>'
             + '<td>' + (b.held_days == null ? '—' : b.held_days) + '</td>'
-            + '<td>' + fmt(b.peak_price) + '</td>'
+            + '<td>' + fmtPx(b.peak_price) + '</td>'
             + '<td>' + (b.ladder_step || 0) + '</td>'
             + '<td>' + (b.exit_count || 0) + '</td>'
             + '<td>' + (b.enabled ? '启用' : '<span class="muted">停用</span>')
@@ -6081,32 +6374,35 @@ function renderTAdv() {
   tb.innerHTML = rows.map(i => {
     const b = T_BIAS[i.bias] || T_BIAS.flat;
     const a = T_ACT[i.action] || T_ACT.hold;
-    const trig = i.trigger_price != null ? tNum(i.trigger_price)
+    // ⚠️ 这张表里凡是**价格**（现价/成本/锚价/触发位/VWAP）一律 tPx（4 位）。
+    //    曾用 tNum() 默认 2 位 -> 1.515 显示成 1.52，用户照着挂单挂在错位置。
+    //    百分比（门槛/浮盈）另走 tPct/tPct4，别混用 —— 价格和百分比的精度要求不同。
+    const trig = i.trigger_price != null ? tPx(i.trigger_price)
                : (i.action === 't_buy' && i.anchor_price
-                  ? tNum(i.anchor_price * (1 - Number(i.threshold || 0) / 100)) : '—');
+                  ? tPx(i.anchor_price * (1 - Number(i.threshold || 0) / 100)) : '—');
     return `<tr data-trow="${esc(i.code || '')}">
       <td class="mono">${esc(i.code || '')}</td>
       <td>${esc(i.name || '')}</td>
       <td class="num">${tInt(i.shares)}</td>
       <td class="num" title="底仓 ${tInt(i.base_shares)} / 机动仓 ${tInt(i.movable)}">${
         tInt(i.base_shares)}/${tInt(i.movable)}</td>
-      <td class="num">${tNum(i.price)}</td>
-      <td class="num">${tNum(i.cost)}</td>
+      <td class="num">${tPx(i.price)}</td>
+      <td class="num">${tPx(i.cost)}</td>
       <td class="num ${cls(i.pnl_pct)}">${tPct(i.pnl_pct)}</td>
       <td><span class="badge ${b.c}" title="${esc(b.d)}">${b.t}</span>${
         i.pending ? ' <span class="badge b-warn">待接回</span>' : ''}</td>
       <td><span class="badge ${a.c}">${a.t}</span></td>
       <td class="num">${i.shares_suggest ? tInt(i.shares_suggest) : '—'}</td>
-      <td class="num">${tNum(i.anchor_price)}</td>
+      <td class="num">${tPx(i.anchor_price)}</td>
       <td class="num">${trig}</td>
-      <td class="num">${tNum(i.threshold)}</td>
+      <td class="num">${tNum(i.threshold, '3')}</td>
     </tr>
     <tr data-tdetail="${esc(i.code || '')}"><td colspan="13" style="padding:0 8px 8px">
       <div style="font-size:12px;line-height:1.65">
         <div><b>依据</b> ${esc(i.why || '—')}</div>
         <div><b>方向</b> ${esc(i.bias_why || '—')}</div>
         <div style="color:var(--text-2)"><b>失效条件</b>（出现即说明这个方向错了，应重新评估）${esc(i.invalidate || '—')}</div>
-      <div class="muted">${i.intraday_vwap != null ? `日内VWAP ${tNum(i.intraday_vwap)}（${
+      <div class="muted">${i.intraday_vwap != null ? `日内VWAP ${tPx(i.intraday_vwap)}（${
         esc(i.intraday_src || '')}）` : ''}${
         i.direction_check ? ` · <b>方向判定</b> <span class="badge ${
           i.direction_check.verdict === '对' ? 'b-ok' : i.direction_check.verdict === '错' ? 'b-bad' : 'b-mute'
@@ -6158,10 +6454,10 @@ function renderTPaper() {
     <td class="num">${tInt(i.shares)}</td>
     <td class="num" title="底仓 ${tInt(i.base_shares)} / 机动仓 ${tInt(i.movable)}">${
       tInt(i.base_shares)}/${tInt(i.movable)}</td>
-    <td class="muted">${tNum(i.cost)}</td>
+    <td class="muted">${tPx(i.cost)}</td>
     <td>${i.pending ? '<span class="badge b-warn">⏳ 已抛待接回</span>'
                     : '<span class="badge b-mute">机动仓在仓</span>'}</td>
-    <td class="num">${tNum((i.anchor || {}).price)}</td>
+    <td class="num">${tPx((i.anchor || {}).price)}</td>
     <td class="muted" style="font-size:11.5px">${
       i.pending ? '等回调到接回位再买回（不会主动追买）' : '尚未做过T，锚定持仓成本'}</td>
   </tr>`).join('');
@@ -6227,7 +6523,7 @@ function openTRecord(code, side) {
       options: ['sell', 'buy'],
       hint: '卖出=高抛（先卖机动仓）；买入=接回。' },
     { key: 'shares', label: '股数', type: 'number', value: '' },
-    { key: 'price', label: '成交价', type: 'number', value: '' },
+    { key: 'price', label: '成交价', type: 'number', step: '0.0001', value: '' },
     { key: 'date', label: '日期', type: 'date', value: today },
     { key: 'note', label: '备注', value: '', placeholder: '可选' },
   ], { okText: '记入台账', wide: true });
@@ -6265,6 +6561,7 @@ async function loadPaper() {
     fillPaperCadence(cfg.sections);
     renderPaperCadenceStatus(pstat);
     loadPaperCycles();
+    watchPaperCycles();
     loadPaperGoal();
     // 策略对照单独拉：它要逐票取行情 + 逐 code 做 FIFO 配对，比上面几个重，
     // 不能塞进 Promise.all 里拖慢模拟盘主体加载。
@@ -6306,8 +6603,8 @@ async function loadPaper() {
       <tr>
         <td>${p.code}</td><td>${esc(p.name)}</td>
         <td>${fmt(p.shares)}</td>
-        <td>${p.avg_cost != null ? p.avg_cost : '—'}</td>
-        <td>${p.price != null ? p.price : '—'}</td>
+        <td>${p.avg_cost != null ? fmtPx(p.avg_cost) : '—'}</td>
+        <td>${p.price != null ? fmtPx(p.price) : '—'}</td>
         <td>¥${fmt(Math.round(p.market_value || 0))}</td>
         <td class="${cls(p.pnl_pct)}">${p.pnl_pct != null ? signed(p.pnl_pct) + '%' : '—'}</td>
       </tr>`).join('');
@@ -6479,19 +6776,59 @@ async function loadPaperCycles() {
     tb.innerHTML = items.map(c => {
       const bd = (c.breakdown || []).map(b =>
         b.side + '/' + b.status + '×' + b.n).join(' ');
-      return `<tr>
+      // ⚠️ 轮次**进行中**时 planned/acted/holds/skipped 全是 0 —— 那是刻意的：
+      //   它们是「整轮跑完后的最终值」，中途写会污染最终口径。真正的进度在
+      //   note 里（「已判 6/43，最后 000839」）。所以「计划」列**从 note 取进度**，
+      //   而不是把 0 摆出来让人以为这一轮什么都不判。
+      //   （2026-10-14 用户报「评股数不对」：note 有值，但这一列没渲染它。）
+      const prog = /已判\s*(\d+)\s*\/\s*(\d+)/.exec(c.note || '');
+      const plannedCell = c.planned
+        ? String(c.planned)
+        : (prog ? `${prog[1]}/${prog[2]}` : '—');
+      const running = !!c.note && !c.planned && !(c.breakdown || []).length;
+      return `<tr${running ? ' style="background:var(--bg2)"' : ''}>
         <td class="tabular-nums">${esc((c.trade_date || '').slice(5))} ${esc(c.slot)}</td>
         <td>${KIND[c.kind] || esc(c.kind)}</td>
         <td class="muted">${esc(c.trigger || '')}</td>
-        <td class="tabular-nums">${c.planned}</td>
+        <td class="tabular-nums">${plannedCell}</td>
         <td class="tabular-nums" style="color:${c.acted ? 'var(--up,#e5534b)' : ''}">${c.acted}</td>
         <td class="tabular-nums">${c.holds}</td>
         <td class="tabular-nums">${c.skipped}</td>
         <td class="tabular-nums">${c.elapsed_ms ? Math.round(c.elapsed_ms / 1000) + 's' : '-'}</td>
-        <td class="muted" style="font-size:11px">${esc(bd || (c.error || '').slice(0, 40))}</td>
+        <td class="muted" style="font-size:11px;white-space:normal;overflow-wrap:anywhere;min-width:220px"
+            title="${esc(c.note || c.error || '')}">${esc(bd || c.note || (c.error || '').slice(0, 40))}</td>
       </tr>`;
     }).join('');
   } catch (e) { /* 静默 */ }
+}
+
+// 🔴 轮次进行中必须**自动刷新**，否则页面就是「开跑瞬间」的快照。
+//   2026-10-14 用户报「10-14 11:30 … 4s，评股数不对」：那一行开跑时 elapsed
+//   才 4 秒、planned 0，后端其实已跑到 394 秒 / 已判 6 只 —— 而
+//   `loadPaperCycles` 全文件**只在切换标签时调一次**，没有任何轮询。
+//   只在**有进行中的轮次**时轮（最后一行 note 非空且 planned 为空），跑完自动停。
+let _paperCyclesTimer = null;
+function watchPaperCycles() {
+  if (_paperCyclesTimer) clearInterval(_paperCyclesTimer);
+  _paperCyclesTimer = setInterval(async () => {
+    const tb = $('paper-cycles');
+    if (!tb || !tb.isConnected) {          // 容器被重渲染/切走 → 停表
+      clearInterval(_paperCyclesTimer);
+      _paperCyclesTimer = null;
+      return;
+    }
+    if (document.hidden) return;          // 页面不可见时不发请求
+    try {
+      const r = await api('/api/paper/cycles?limit=1');
+      const top = (r.items || [])[0] || {};
+      const busy = !!top.note && !top.planned;
+      await loadPaperCycles();
+      if (!busy) {                         // 这一轮跑完了 → 停表
+        clearInterval(_paperCyclesTimer);
+        _paperCyclesTimer = null;
+      }
+    } catch (e) { /* 静默 */ }
+  }, 10000);
 }
 async function paperSettle() {
   try {
@@ -6697,10 +7034,10 @@ async function loadFutures() {
     $('futures-body').innerHTML = items.map(i => `<tr>
       <td><b>${esc(i.name || i.symbol)}</b></td>
       <td class="muted">${esc(i.symbol)}</td>
-      <td class="num">${i.last != null ? Number(i.last).toFixed(2) : '—'}</td>
+      <td class="num">${fmtPx(i.last)}</td>
       <td class="${cls(i.change_pct)}">${i.change_pct != null ? (i.change_pct>0?'+':'')+Number(i.change_pct).toFixed(2)+'%' : '—'}</td>
-      <td class="muted num">${i.high != null ? Number(i.high).toFixed(2) : '—'}</td>
-      <td class="muted num">${i.low != null ? Number(i.low).toFixed(2) : '—'}</td>
+      <td class="muted num">${fmtPx(i.high)}</td>
+      <td class="muted num">${fmtPx(i.low)}</td>
       <td class="muted num">${i.vol != null ? Number(i.vol).toFixed(0) : '—'}</td>
       <td class="muted">${i.ts ? i.ts.replace('T',' ').slice(0,16) : ''}</td>
     </tr>`).join('');
@@ -6727,10 +7064,10 @@ async function loadCrypto(force = false) {
       return `<tr>
         <td><b>${esc(i.name || i.contract)}</b></td>
         <td class="muted">${esc(i.contract)}</td>
-        <td class="num">${i.last != null ? i.last.toFixed(2) : '—'}</td>
+        <td class="num">${fmtPx(i.last)}</td>
         <td class="${cls(pct)}"><b>${typeof pct === 'number' ? (pct > 0 ? '+' : '') + pct.toFixed(2) + '%' : '—'}</b></td>
-        <td class="muted num">${i.high_24h != null ? i.high_24h.toFixed(2) : '—'}</td>
-        <td class="muted num">${i.low_24h != null ? i.low_24h.toFixed(2) : '—'}</td>
+        <td class="muted num">${fmtPx(i.high_24h)}</td>
+        <td class="muted num">${fmtPx(i.low_24h)}</td>
         <td class="muted num">${vol}</td>
         <td>${linkCell(i.contract)}</td>
         <td class="muted"><button class="btn ghost sm" onclick="delCrypto('${esc(i.contract)}')">移除</button></td>
@@ -7216,6 +7553,108 @@ async function loadMpStatus() {
       ? `${s.sources} 个启用源${s.last_run ? ' · 上次 ' + s.last_run.replace('T', ' ').slice(5, 16) : ''}`
       : '暂无启用的订阅源';
   } catch { /* 静默 */ }
+}
+
+// ---- 公众号语义检索（喂进决策） ----
+// 页面要能回答两个问题：① 开关关没关 ② 索引里到底有没有东西。
+// 第②个必须有数字 —— 「开着但检索不出内容」有两种完全不同的原因
+//（库是空的 / 语料里真的没有），不给数字用户只能看到「没结果」。
+function mprIndexText(ix) {
+  if (!ix) return '索引状态未知';
+  if (ix.error) return '索引不可用：' + ix.error;
+  if (!ix.exists) return '索引未建立' + (ix.hint ? '（' + ix.hint + '）' : '');
+  const total = ix.indexable_articles ? ` / 可索引 ${ix.indexable_articles} 篇` : '';
+  return `已索引 ${ix.rows} 块${total}`;
+}
+
+async function loadMprConfig() {
+  try {
+    const d = await api('/api/mp-retrieval/config');
+    const c = d.conf || {};
+    $('mpr-enabled').checked = !!c.enabled;
+    $('mpr-topk').value = c.topk ?? 6;
+    $('mpr-days').value = c.days ?? 14;
+    $('mpr-index-info').textContent = mprIndexText(d.index);
+  } catch (e) { $('mpr-index-info').textContent = '读取失败: ' + e.message; }
+}
+
+async function mprSave() {
+  const body = {
+    enabled: $('mpr-enabled').checked,
+    topk: Number($('mpr-topk').value),
+    days: Number($('mpr-days').value),
+  };
+  try {
+    await jsonPost('/api/mp-retrieval/config', body);
+    toast('已保存，下一轮决策生效');
+    loadMprConfig();
+  } catch (e) { toastErr('保存失败: ' + e.message); }
+}
+
+async function mprReindex(drop) {
+  if (drop && !confirm(drop
+    ? '重建索引会先删掉现有 collection 再全量灌入（约 9 分钟，期间检索查不到内容）。继续？'
+    : '')) return;
+  await withBusy($('mpr-reindex-btn'), '启动中', async () => {
+    try {
+      await jsonPost('/api/mp-retrieval/reindex?drop=' + (drop ? 'true' : 'false'));
+      toast('索引已在后台启动，完成后这行会自动更新');
+      const timer = setInterval(async () => {
+        const st = await api('/api/mp-retrieval/reindex').catch(() => null);
+        if (!st || !st.running) {
+          clearInterval(timer);
+          loadMprConfig();
+          if (st && st.result) {
+            const r = st.result;
+            toast(r.error ? '索引失败：' + r.error
+              : `索引完成：${r.inserted} 块 / ${r.articles} 篇，用时 ${r.elapsed_s}s`);
+          }
+        }
+      }, 4000);
+    } catch (e) { toastErr('启动失败: ' + e.message); }
+  });
+}
+
+function mprRenderHits(hits) {
+  if (!hits || !hits.length) return '<div class="empty">没有命中</div>';
+  return hits.map((h, i) => `<div class="card" style="margin:6px 0">
+    <div><b>${i + 1}. ${esc(h.mp_name || '公众号')}</b>
+      <span class="muted">｜${esc((h.published_at || '').slice(0, 10))}</span>
+      <span class="muted">｜${esc(h.title || '')}</span></div>
+    <div class="muted" style="margin-top:4px">${esc((h.text || '').slice(0, 400))}</div>
+    ${h.url ? `<div class="muted" style="margin-top:4px"><a href="${esc(h.url)}"
+        target="_blank" rel="noopener">原文</a></div>` : ''}
+  </div>`).join('');
+}
+
+async function mprQuery() {
+  const q = $('mpr-q').value.trim();
+  if (!q) return toastErr('请填检索词');
+  await withBusy($('mpr-q-btn'), '检索中', async () => {
+    try {
+      const d = await api('/api/mp-retrieval/query?q=' + encodeURIComponent(q));
+      $('mpr-result').innerHTML = mprRenderHits(d.hits);
+    } catch (e) { toastErr('检索失败: ' + e.message); }
+  });
+}
+
+async function mprQueryContext() {
+  const code = $('mpr-code').value.trim();
+  const name = $('mpr-name').value.trim();
+  if (!code || !name) return toastErr('「按股票看」需要同时填代码和名称');
+  await withBusy($('mpr-ctx-btn'), '生成中', async () => {
+    try {
+      const d = await api('/api/mp-retrieval/query?code=' + encodeURIComponent(code)
+        + '&name=' + encodeURIComponent(name));
+      // 注入文本要按原样显示（pre-wrap 保留换行）——它就是模型看到的东西
+      $('mpr-result').innerHTML =
+        `<div class="muted" style="margin-bottom:4px">下面就是决策上下文里
+         ${esc(d.code)} ${esc(d.name)} 那一段（逐字相同）</div>
+         <pre style="white-space:pre-wrap;overflow-wrap:break-word;font-size:12px;
+              background:var(--bg2);padding:8px;border-radius:6px;margin:0"
+         >${esc(d.text)}</pre>`;
+    } catch (e) { toastErr('生成失败: ' + e.message); }
+  });
 }
 
 // ---- X(Twitter) 指定用户发言 ----
@@ -8334,9 +8773,16 @@ async function loadNewsFilter() {
 // 注意 market 是默认激活的页，**不会**经过 switchTab()，所以它的 loader 在
 // 首屏不会被触发——这里必须显式调一次 loadCrypto()，否则币圈卡片在「打开页面
 // 但没点过自选行情标签」时一直是空的（2026-09-26 截图才发现的既有 bug）。
+//
+// ⚠️⚠️ 这份清单是**手写的、不读 TAB_LOADERS**，所以往 TAB_LOADERS 里加东西
+//   **对首屏无效**（2026-10-13 用户报「港股解禁一直加载中」的真凶）：
+//   我把 loadHKSupplyStatus() 加进了 TAB_LOADERS.market，以为完事了，
+//   结果首屏那条路压根不看它 -> 页面永远停在初始的「加载中…」。
+//   以后**任何**要在首屏出现的东西，都要在这里显式加一行。
 loadWatch();
 loadAlerts();
 loadCrypto();
+loadHKSupplyStatus();
 loadNewsFilter();
 loadUnreadBadge();
 refreshTradeStrategyOptions();

@@ -43,6 +43,7 @@ A 股 T+1：**当日买入的份额当日不可卖**。所以日内反复买卖�
 """
 from __future__ import annotations
 
+import math
 import time
 from datetime import datetime
 
@@ -86,18 +87,38 @@ def _conf(raw: dict | None) -> dict:
 
 
 def fnum(v, spec="%.2f", dash="—"):
-    """所有数值的格式化出口。None/非数值 -> 破折号。
+    """所有数值的格式化出口。None/非数值/NaN/Inf -> 破折号。
 
     AGENTS.md 记过一次真事故：15 只持仓跑完 90 分钟 LLM，最后写报告时
     `f"{r.get('price'):.2f}"` 遇到 None 抛 TypeError，成果全丢。
     渲染层不该有能力弄丢数据。
+
+    ⚠️ `math.isfinite` 这道闸**不是**多余的。`"%.2f" % float("nan")` 不抛
+       异常，直接返回字符串 `"nan"` —— 于是 `why` 文案里会出现「现价 nan」，
+       而 except 分支永远拦不到它（2026-10-12 离线断言逮到）。Inf 同理
+       会输出 `inf`。这两类值必须在**格式化之前**拒掉。
     """
     try:
         if isinstance(v, bool) or not isinstance(v, (int, float)):
             return dash
+        if not math.isfinite(v):          # NaN / ±Inf：宁可显示破折号，也不显示 nan
+            return dash
         return spec % v
     except (TypeError, ValueError):
         return dash
+
+
+# 价格专用：4 位小数，与前端 tPx 同精度。
+# ⚠️ 价格和百分比**不能**共用 fnum 的默认 2 位 —— 1.515 会被拼成「现价 1.52」，
+#    用户照着挂单挂在错位置（与 index.html 的 tPx 注释是同一个坑，2026-10-12 用户报）。
+#    百分比 2 位是够的（门槛/成本本来就是 0.85% 这个量级），所以默认不动，
+#    只有价格走 FMT_PX。
+FMT_PX = "%.4f"
+
+
+def fpx(v, dash="—"):
+    """价格出口：4 位小数。语义 = 「这是钱的单价」，调用方别拿它格式化百分比。"""
+    return fnum(v, FMT_PX, dash)
 
 
 # ---------------- 往返成本（决定 min_edge_pct，不该手填）----------------
@@ -450,8 +471,8 @@ def decide(code: str, name: str, held: int, price: float, quote: dict,
             if not stab_ok and price > bp * (1 - thr / 100.0):
                 out["why"] = ("下行方向，接回需先确认止跌：%s。价未到接回位 %s"
                               "（锚价 %s，门槛 %s%%）" % (
-                                  stab_why, fnum(bp * (1 - thr / 100.0)),
-                                  fnum(bp), fnum(thr)))
+                                  stab_why, fpx(bp * (1 - thr / 100.0)),
+                                  fpx(bp), fnum(thr)))
                 out["threshold"] = round(thr, 4)
                 out["edge_pct"] = round(edge, 4)
                 out["anchor_price"] = bp
@@ -466,14 +487,14 @@ def decide(code: str, name: str, held: int, price: float, quote: dict,
             out["edge_pct"] = round(edge, 4)
             out["anchor_price"] = bp
             out["trigger_price"] = round(need, 4)
-            reached = "" if price <= need else ("（价格已跌破接回位 %s）" % fnum(need))
+            reached = "" if price <= need else ("（价格已跌破接回位 %s）" % fpx(need))
             out["why"] = ("下行方向，未确认止跌，**不接回**%s：%s。"
                           "等止跌确认后再看接回位 %s（门槛 %s%%）" % (
-                              reached, stab_why, fnum(need), fnum(thr)))
+                              reached, stab_why, fpx(need), fnum(thr)))
             return out
         if price <= need:
             if n_buy >= int(c.get("refill_max_per_day") or 1):
-                out["why"] = (f"已跌破买回位 {fnum(need)}（锚价 {fnum(bp)}，"
+                out["why"] = (f"已跌破买回位 {fpx(need)}（锚价 {fpx(bp)}，"
                               f"门槛 {fnum(thr)}%），但今日补回 {n_buy} 次已达上限")
                 return out
             cost = cost_for_amount(code, bp * mv, c, fees_c)
@@ -497,7 +518,7 @@ def decide(code: str, name: str, held: int, price: float, quote: dict,
                         "edge_pct": round(edge, 4), "threshold": round(thr, 4),
                         "anchor_price": bp, "trigger_price": round(need, 4),
                         "why":
-                        f"高抛后回落：锚价 {fnum(bp)} → 现价 {fnum(price)}"
+                        f"高抛后回落：锚价 {fpx(bp)} → 现价 {fpx(price)}"
                         f"（{fnum(edge)}%），门槛 {fnum(thr)}%"
                         f"（{bias['label']}方向 ×{bias['buy_mult']}，"
                         f"往返成本 {fnum(cost)}%）{extra}。机动仓 {qty} 股买回"})
@@ -506,9 +527,9 @@ def decide(code: str, name: str, held: int, price: float, quote: dict,
         out["edge_pct"] = round(edge, 4)
         out["anchor_price"] = bp
         out["trigger_price"] = round(need, 4)
-        out["why"] = (f"待买回但未到价：锚价 {fnum(bp)}，需跌到 {fnum(need)}"
+        out["why"] = (f"待买回但未到价：锚价 {fpx(bp)}，需跌到 {fpx(need)}"
                       f"（门槛 {fnum(thr)}%，{bias['label']}方向 ×{bias['buy_mult']}），"
-                      f"现价 {fnum(price)}")
+                      f"现价 {fpx(price)}")
         # 结构化字段也要回填：why 里已经报了门槛，字段却是 0 会让任何读
         # threshold/edge_pct 的界面显示成 0 —— 「看起来有值、实际是错的」。
         out["threshold"] = round(thr, 4)
@@ -529,8 +550,8 @@ def decide(code: str, name: str, held: int, price: float, quote: dict,
             best = (lname, a)
     if not best:
         top = max(anchors.values(), key=lambda x: x["edge_pct"])
-        out["why"] = (f"未高抛：最接近的基准 {fnum(top['anchor'])}，"
-                      f"现价 {fnum(price)}（{fnum(top['edge_pct'])}%），"
+        out["why"] = (f"未高抛：最接近的基准 {fpx(top['anchor'])}，"
+                      f"现价 {fpx(price)}（{fnum(top['edge_pct'])}%），"
                       f"门槛 {fnum(base_edge)}%")
         return out
     lname, a = best
@@ -553,7 +574,7 @@ def decide(code: str, name: str, held: int, price: float, quote: dict,
     out.update({"action": "t_sell", "shares": qty, "layer": lname,
                 "edge_pct": a["edge_pct"], "threshold": round(thr, 4),
                 "anchor_price": a["anchor"], "why":
-                f"{lname} 基准 {fnum(a['anchor'])}，现价 {fnum(price)}"
+                f"{lname} 基准 {fpx(a['anchor'])}，现价 {fpx(price)}"
                 f"（+{fnum(a['edge_pct'])}%）≥ 门槛 {fnum(thr)}%"
                 f"（{bias['label']}方向 ×{bias['sell_mult']}，含往返成本 {fnum(cost)}%），"
                 f"机动仓 {qty} 股高抛"})
@@ -994,13 +1015,13 @@ def t_direction_result(cur, code: str, leg: str, anchor: float,
     if leg == "t_sell":
         out["verdict"] = "对" if latest < anchor else "错"
         out["note"] = ("高抛 %s 之后价格%s %s（%s%%）" % (
-            fnum(anchor), "跌破" if latest < anchor else "涨回",
-            fnum(latest), fnum(out["ret_pct"])))
+            fpx(anchor), "跌破" if latest < anchor else "涨回",
+            fpx(latest), fnum(out["ret_pct"])))
     elif leg == "t_buy":
         out["verdict"] = "对" if latest > anchor else "错"
         out["note"] = ("低吸 %s 之后价格%s %s（%s%%）" % (
-            fnum(anchor), "涨过" if latest > anchor else "未涨回",
-            fnum(latest), fnum(out["ret_pct"])))
+            fpx(anchor), "涨过" if latest > anchor else "未涨回",
+            fpx(latest), fnum(out["ret_pct"])))
     else:
         out["note"] = "未知腿类型 %r" % leg
     return out
@@ -1073,13 +1094,13 @@ def _build_ticket(it: dict, dec: dict, c: dict, fees_c, price: float) -> dict:
         gap = (price / float(ap) - 1) * 100.0
         t["blocked_reason"] = (
             "现价较 %s 基准 %s 低 %.2f%%（是往下不是往上）—— 方向不对"
-            % (layer, fnum(ap), abs(gap)) if gap < 0 else
+            % (layer, fpx(ap), abs(gap)) if gap < 0 else
             "偏离 %s%% < 需 %s%%（= 往返成本 %s%% × %.1f）"
             % (fnum(edge), fnum(need_thr), fnum(t["cost_pct"]), _safety_mult(c)))
         if gap > 0:
             t["trigger_price"] = round(float(ap) * (1 + need_thr / 100.0), 4)
             t["blocked_hint"] = "涨到 %s 才够门槛（还差 %.2f%%）" % (
-                t["trigger_price"], need_thr - edge)
+                fpx(t["trigger_price"]), need_thr - edge)
         else:
             t["blocked_hint"] = "这是往基准方向跌，不构成高抛条件"
     elif dec.get("bias") == "flat":

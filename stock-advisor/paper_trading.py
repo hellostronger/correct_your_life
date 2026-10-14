@@ -18,8 +18,10 @@ deps = {"get_conn", "em_kline_fn", "tx_symbol_fn", "quote_fn", "conf",
 import json
 import os
 import re
+import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 import paper_memory
@@ -40,6 +42,11 @@ DEFAULTS = {
                                   # 超过它一律不再成交，避免用收盘价成交
     "quote_max_age_min": 0,     # >0 时要求行情快照比现在新不超过这么多分钟（0=不额外限制）
     "sleep_seconds": 3,         # 逐股决策间 sleep（防 LLM 网关限流）
+    # 阶段一「逐股决策」的并发度（2026-10-14，用户批准）。
+    # 串行 43 只 × 每只 4~10 分钟（辩论开着）= 5.7 小时一轮，且循环同步调用
+    # → 一天只跑 1 轮、卖单还要等整轮判完才成交。并发把它压到十几分钟。
+    # ⚠️ 上限 12：网关实测会回 `503 ResourceExhausted (16/16)`，拉满会成片失败。
+    "decision_concurrency": 6,
     "n_same": 5, "n_cross": 3,  # 经验注入条数
     "keep_per_ticker": 30,      # 经验库每股保留条数
     # —— 盘中每 30 分钟判断一轮（替代原来「盘后单点」）——
@@ -732,16 +739,28 @@ def _kline_summary(bars: list[dict]) -> str:
 # ---------------- LLM 调用（照抄 llm_advisor 两段式） ----------------
 
 def _llm_call(system_prompt: str, user_text: str, max_tokens: int = 0,
-              extra: str = "") -> str:
+              extra: str = "", task: str = "") -> str:
     """两段式调用：base_url 非空（代理网关）直接 basic；官方端点先试 full。
     与 llm_advisor.ask_advice 同款降级与 refusal 检查。失败抛 RuntimeError。
 
     `max_tokens=0` = **读全局配置** `llm.max_tokens`（config.yaml，前端可改）。
     这里原来写死 1500 且网页无从调整，报告被截断就成了「LLM 只写了这么多」的
     错觉（实测 35 篇里 32 篇结尾断在半句）。显式传正数仍可覆盖。
+
+    `task` = 模型档位（fast/standard/deep，见 llm_advisor.model_for）。为空则沿用
+    `llm.model`（老行为不变）。
+
+    ⚠️ 这里的客户端超时原来**写死 120 秒**，而网关退化时单次要 46~360 秒 ——
+    实测 2026-10-13 决策成片报 `APITimeoutError`（决策失败 ≠ 降级成 hold，
+    是这只票这一轮**没有决策**）。已改为读 `llm.timeout`（默认 420）。
     """
     import llm_advisor
     conf = llm_advisor.load_llm_conf()
+    if task:
+        picked = llm_advisor.model_for(task, conf)
+        if picked:
+            conf = dict(conf)
+            conf["model"] = picked
     if not max_tokens:
         try:
             max_tokens = int(conf.get("max_tokens") or 0)
@@ -751,8 +770,13 @@ def _llm_call(system_prompt: str, user_text: str, max_tokens: int = 0,
         max_tokens = 8000          # 配置缺失/非法时的兜底
     if not conf["api_key"]:
         raise RuntimeError("未配置 LLM api_key（config.yaml llm 段或环境变量）")
+    try:
+        llm_timeout = float(conf.get("timeout") or 0) or 420.0
+    except (TypeError, ValueError):
+        llm_timeout = 420.0
     from anthropic import Anthropic
-    kwargs = {"api_key": conf["api_key"], "timeout": 120.0, "max_retries": 2}
+    kwargs = {"api_key": conf["api_key"], "timeout": llm_timeout,
+              "max_retries": 2}
     if conf.get("base_url"):
         kwargs["base_url"] = conf["base_url"]
     client = Anthropic(**kwargs)
@@ -1055,7 +1079,8 @@ def _social_block(social: dict) -> str:
 def _build_context(stock: dict, quote: dict, bars: list[dict],
                    news: list[dict], events: list[dict],
                    market_note: str, account: dict, positions: dict,
-                   past_context: str, conf: dict, social: dict | None = None) -> str:
+                   past_context: str, conf: dict, social: dict | None = None,
+                   event_news: list[dict] | None = None) -> str:
     ctx = [
         f"【股票】{stock['name']}（{stock['code']}）",
         f"【实时行情】现价 {quote.get('price') or '—'}，"
@@ -1072,6 +1097,21 @@ def _build_context(stock: dict, quote: dict, bars: list[dict],
             ctx.append(f"- [{tag}] {n['title']}（{n.get('media') or n.get('source') or '媒体'}）")
     else:
         ctx.append("【近7日新闻】无相关新闻")
+    # 解禁/禁售/锁定类**单独成块**，不与新闻抢 limit。
+    # ⚠️ 为什么必须分开（2026-10-13 实测）：新闻块是 `ORDER BY publish_time
+    # DESC LIMIT 10`，近 4 天就占满 12 个名额，而解禁讨论往往是**几周前**的帖子
+    # —— 混在一起时它必然被挤掉（实测 12 条全在 10-09~10-13，解禁那条 09-13
+    # 一次都没出现）。模型于是只看到「跌了 13%」，看不到「解禁期有争议」。
+    if event_news:
+        ctx.append("【解禁/禁售/锁定期讨论（事件类，非新增新闻；"
+                   "描述的是当前仍生效的股份约束，可信度以公告为准）】")
+        for n in event_news[:6]:
+            # ⚠️ publish_time 从 DB 出来是 **datetime 对象**，不是字符串 ——
+            #    直接 `[:10]` 会 TypeError 让整轮决策崩掉（渲染层绝不能弄丢数据）。
+            #    `str()` 之后再切，前导 ISO 的前 10 位正好是 YYYY-MM-DD。
+            when = str(n.get("publish_time") or "")[:10]
+            ctx.append(f"- [{when}] {n['title']}"
+                       f"（{n.get('media') or n.get('source') or '社区'}）")
     if events:
         ctx.append("【未来14日解禁/增发事件】")
         for e in events:
@@ -1115,7 +1155,8 @@ def position_limit_status(cur, conf: dict) -> dict:
             "room": (max(0, cap - n) if cap > 0 else None)}
 
 
-def run_decisions(deps: dict, slot: str = "", only: set | None = None) -> dict:
+def run_decisions(deps: dict, slot: str = "", only: set | None = None,
+                  progress_fn=None, concurrency: int = 0) -> dict:
     """为每只自选股生成买卖决策并按当前价成交（盘中每 30 分钟一轮）。
 
     两阶段（2026-10-05 改）：**先收集齐全部决策，再决定谁拿到现金**。
@@ -1130,6 +1171,19 @@ def run_decisions(deps: dict, slot: str = "", only: set | None = None) -> dict:
     省下 LLM 调用。
     逐股 try/except 隔离，一股失败不影响其余（仿新闻抓取循环）。
     返回 {date, slot, decided: [...], position_limit, skipped_by_limit}。
+
+    progress_fn(done, total, code)：每判完一只回调一次（2026-10-14 加）。
+    **纯观测**，不参与任何决策/成交逻辑；默认 None 时行为与从前逐字节一致。
+    为什么需要它：一轮 43 只、每只 4~10 分钟（辩论开着）→ 整轮要好几小时，
+    而 `record_cycle` 只在整轮结束的 finally 里写，于是「今日各轮记录」在
+    轮次进行中**一直是空的**（用户 2026-10-14 报的现象）。
+
+    **阶段一已并发化**（`decision_concurrency`，默认 6、上限 12；
+    也可用 `concurrency=` 单独覆盖，主要给测试/临时调参用）。
+    ⚠️ 并发只作用于「逐股决策」这一步；阶段二的成交仍然**严格串行**
+    （`_execute_plans`），并且 `plans` 在进阶段二前已按 `sa_watchlist` 原序还原
+    —— 否则卖出的成交顺序会随机，而**卖出没有 ROI 排序兜底**，
+    「同输入必须同输出」的对账口径就破了。
     """
     get_conn = deps["get_conn"]
     conf = {**DEFAULTS, **(deps.get("conf") or {})}
@@ -1193,15 +1247,52 @@ def run_decisions(deps: dict, slot: str = "", only: set | None = None) -> dict:
     # 以前是决策完立刻成交，循环按 sa_watchlist 的 ORDER BY code 走，等于
     # 「谁代码字典序靠前谁先拿到现金」——与这只票值不值得买毫无关系。
     plans = []
-    for stock in stocks:
+    # 分母先算准（扣掉本 slot 已决策过的），进度条才不会中途变长。
+    # ⚠️ 用 `not in done` 而不是「已判数」——done 里还可能有别的 slot 混进来的。
+    _todo = [s for s in stocks if s["code"] not in done]
+    _total = len(_todo)
+    # ---- 并发度（2026-10-14，用户批准）----
+    # 为什么必须并发：串行 43 只 × 每只 4~10 分钟（辩论开着，每只多 3 次 LLM）
+    # = **5.7 小时一轮**，而循环是同步调用的 → 一天实际只跑 1 轮，
+    # 而且**卖单要等整轮判完才成交**（两阶段设计），用户看到的就是「两天没触发」。
+    #
+    # ⚠️ 上限 12：网关侧实测会返回 `503 ResourceExhausted: Worker local total
+    #   request limit reached (16/16)`，并发拉满会成片失败。宁可慢，不要整轮崩。
+    try:
+        _conc = int(concurrency or conf.get("decision_concurrency") or 6)
+    except (TypeError, ValueError):
+        _conc = 6
+    _conc = max(1, min(_conc, 12, _total or 1))
+    if _conc == 1:
+        _conc = 1
+
+    _lock = threading.Lock()
+    _seen = 0
+    # (原始下标, plan) —— 并发完成顺序是随机的，阶段二之前必须按原顺序还原，
+    # 否则**卖出的成交顺序**会变（买入有 ROI 排序兜底，卖出没有）。
+    _collected: list[tuple[int, dict]] = []
+
+    def _prog(code):
+        nonlocal _seen
+        with _lock:
+            _seen += 1
+            n = _seen
+        if progress_fn:
+            try:
+                progress_fn(n, _total, code)
+            except Exception:               # noqa: BLE001  进度回调绝不影响决策
+                pass
+
+    def _one(idx_stock):
+        idx, stock = idx_stock
         code = stock["code"]
-        if code in done:
-            continue
         try:
             plan = _decide_one(deps, conf, stock, today, slot)
-            done.add(code)   # 股间也不重入（并发手动触发/线程双写防护）
+            with _lock:
+                done.add(code)   # 股间不重入（并发手动触发/线程双写防护）
             if plan:
-                plans.append(plan)
+                with _lock:
+                    _collected.append((idx, plan))
                 # 立刻落 sidecar：阶段二（排序成交）之前崩了/被 kill，
                 # DB 里一条都没有，但 LLM 的钱和时间已经花掉了。
                 append_decision_sidecar(stock, plan["decision"], slot)
@@ -1212,7 +1303,23 @@ def run_decisions(deps: dict, slot: str = "", only: set | None = None) -> dict:
             else:
                 traceback.print_exc()
                 print(f"[paper] decide {code} failed: {exc}", flush=True)
+        # 无论成功/失败都算「处理过一只」—— 解析失败也是真花掉了 LLM 的钱
+        _prog(code)
         time.sleep(float(conf.get("sleep_seconds", 3)))
+
+    _work = [(i, s) for i, s in enumerate(stocks) if s["code"] not in done]
+    if _conc == 1 or len(_work) <= 1:
+        for w in _work:
+            _one(w)
+    else:
+        print(f"[paper] 本轮 {len(_work)} 只，并发 {_conc} 路决策"
+              f"（decision_concurrency={_conc}）", flush=True)
+        with ThreadPoolExecutor(max_workers=_conc,
+                                thread_name_prefix="sa_decide") as pool:
+            list(pool.map(_one, _work))
+    # 按原始 sa_watchlist 顺序还原，保证成交顺序可复现（同输入永远同输出）
+    _collected.sort(key=lambda x: x[0])
+    plans = [p for _, p in _collected]
     # ---- 阶段二：先卖后买，买入按 ROI 从高到低分配现金 ----
     results = _execute_plans(deps, conf, plans, today, slot)
     return {"date": today, "slot": slot, "decided": results,
@@ -1360,6 +1467,48 @@ def _pack_debate(debate_result: dict, rating: str, round2_failed: bool = False) 
     }
 
 
+def build_miss_note(decided: list, sl: dict | None = None, limit: int = 2000) -> str:
+    """把「未成交」的逐条理由拼成一行人读文本（写进 sa_paper_cycles.note）。
+
+    **为什么需要**（2026-10-14 用户报「10-14 11:30 未成交4，我想看未成交的
+    具体是什么，怎么看？」）：`_execute_decision` 的所有拒绝路径都是
+    `return False, 理由`，**一个字节都不写库**；而理由原先只留在
+    `_paper_state["last_decision"]` 的内存态里，**下一轮就被覆盖**。
+    结果就是页面上「未成交 4」永远是个没有下文的黑箱，事后也查不到。
+
+    为什么写 note 而不是给 sa_paper_trades 插 `status='skipped'` 行：
+    插流水会污染成交流水与持仓推导口径，而这里只需要「可读的原因」。
+
+    ⚠️ **hold（观望）不算未成交** —— 它是有效结论，不是执行失败。
+    漏掉这个判断会写出「000858 五粮液 hold→（无理由）」，看着像被拒了，纯误导。
+
+    抽成独立函数而不是内联在 app.py 里：内联的版本无法离线测试 ——
+    第一版测试就因此「测了自己复抄的副本」，白跑一轮。
+    """
+    miss = []
+    for d in decided or []:
+        if d.get("executed"):
+            continue
+        if (d.get("action") or "") == "hold":
+            continue
+        why = str(d.get("note") or "").strip()
+        miss.append("%s %s %s→%s" % (d.get("code"), d.get("name") or "",
+                                      d.get("action") or "?", why or "（无理由）"))
+    for s in ((sl or {}).get("failed") or []):
+        miss.append("%s 止损失败→%s" % (s.get("code"), s.get("reason") or ""))
+    if not miss:
+        return ""
+    return ("未成交：" + "；".join(miss))[:limit]
+
+
+# 侧车写入的进程内互斥（2026-10-14 并发化后必需）。
+# ⚠️ 为什么必需：`append_decision_sidecar` 是 `open(d,"a")` + 一次 write + close。
+#    单线程下没问题；多线程下两个线程各自缓冲，close 时**交错写**就会拼出半行 JSON，
+#    之后 json.loads 整行失败 → 一条决策的复盘材料就没了。
+#    症状是「侧车偶发解析失败」，而且只在高并发时出现，极难定位。
+_SIDECAR_LOCK = threading.Lock()
+
+
 def append_decision_sidecar(stock: dict, decision: dict, slot: str = "") -> str:
     """把单只股票的决策**立即**追加到 data/paper_decisions_YYYYMMDD.jsonl。
 
@@ -1384,8 +1533,9 @@ def append_decision_sidecar(stock: dict, decision: dict, slot: str = "") -> str:
             "name": (stock or {}).get("name", ""),
             "decision": decision,
         }
-        with open(d, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        with _SIDECAR_LOCK:
+            with open(d, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
         return d
     except Exception as exc:
         print(f"[paper] sidecar 写入失败（不影响主流程）: {exc}", flush=True)
@@ -1403,6 +1553,7 @@ def _decide_one(deps, conf, stock, today, slot: str = ""):
     get_conn, em_kline_fn = deps["get_conn"], deps["em_kline_fn"]
     quote_fn, tx_symbol_fn = deps["quote_fn"], deps["tx_symbol_fn"]
     news_fn, events_fn = deps.get("news_fn"), deps.get("events_fn")
+    event_news_fn = deps.get("event_news_fn")
     market_fn = deps.get("market_fn")
     code, name = stock["code"], stock["name"]
     symbol = tx_symbol_fn(code)
@@ -1418,6 +1569,13 @@ def _decide_one(deps, conf, stock, today, slot: str = ""):
         return
     news = news_fn(code, limit=10) if news_fn else []
     events = events_fn(code, days=14) if events_fn else []
+    # 解禁/禁售/锁定讨论：单独取、单独渲染（新闻块会被 LIMIT 挤掉它）
+    event_news: list[dict] = []
+    if event_news_fn:
+        try:
+            event_news = event_news_fn(code, limit=6) or []
+        except Exception as exc:                     # noqa: BLE001
+            print(f"[paper] {code} 解禁讨论取数失败: {exc}", flush=True)
     # 社媒信号（公众号/B站/微博/X）。取数失败返回空 dict，_social_block 会渲染成
     # 「近期无内容」，不会因为某个采集模块挂掉而让整轮决策失败。
     social_fn = deps.get("social_fn")
@@ -1440,10 +1598,56 @@ def _decide_one(deps, conf, stock, today, slot: str = ""):
         past = paper_memory.get_past_context(
             cur, code, n_same=int(conf.get("n_same", 5)),
             n_cross=int(conf.get("n_cross", 3)), as_of=today)
+        # 自进化注入（2026-10-12，默认关闭）。Curriculum 选出的「下一轮重点」
+        # + 仍有效的规则，追加在同股历史经验之后。
+        # ⚠️ **必须在 with get_conn() 块内**——出块连接就关了，再 execute 是 500
+        # （app.py 记过同一个坑）。异常一律吞掉：注入是锦上添花，
+        # 绝不能因为「经验库读不出来」让整轮决策失败。
+        evo_block = ""
+        try:
+            import self_evolution as _evo
+            _ec = {**_evo.DEFAULTS, **(conf.get("self_evolution") or {})}
+            if _ec.get("enabled"):
+                evo_block = _evo.build_injection(cur, as_of=today,
+                                                 limit=int(_ec.get("inject_limit", 6)))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[paper] 自进化注入跳过: {exc}", flush=True)
+        # 机构信号注入（2026-10-12，默认关闭）：券商评级分布 / 机构与社保持仓
+        # 环比 / 指数成分（含近期调入调出）。同样必须在 with get_conn() 块内。
+        inst_block = ""
+        try:
+            import institution_signals as _inst
+            _ic = {**_inst.DEFAULTS, **(conf.get("inst_signals") or {})}
+            if _ic.get("enabled"):
+                inst_block = _inst.build_injection(cur, code, as_of=today,
+                                                   conf=_ic)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[paper] 机构信号注入跳过: {exc}", flush=True)
+        # 公众号语义检索片段（Milvus+bge-m3，默认关闭）。
+        # 为什么不是「再多截 160 字」：实测社媒块只给正文前 160 字，而近 7 天
+        # 文章正文中位数 630 字 —— 我们一直在丢 75% 的内容；而长文（>2500 字）
+        # 用检索给**相关段落**比整篇塞进去更准、也更省。
+        mp_block = ""
+        try:
+            import mp_retrieval as _mpr
+            _mc = _mpr.load_conf(conf.get("mp_retrieval") or {})
+            if _mc.get("enabled"):
+                mp_block = _mpr.build_context(cur, code, stock.get("name", ""),
+                                              conf=_mc)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[paper] 公众号检索注入跳过: {exc}", flush=True)
     ctx = _build_context(stock, quote, bars, news, events, market_note,
-                         account, positions, past, conf, social)
+                         account, positions, past, conf, social,
+                         event_news=event_news)
+    if evo_block:
+        ctx += "\n" + evo_block
+    if inst_block:
+        ctx += "\n" + inst_block
+    if mp_block:
+        ctx += "\n" + mp_block
     # 3. LLM 调用 1：分析师
-    report = _llm_call(ANALYST_PROMPT, ctx + f"\n\n数据时点 {today}。请给出分析报告。")
+    report = _llm_call(ANALYST_PROMPT, ctx + f"\n\n数据时点 {today}。请给出分析报告。",
+                       task="deep")
     # 被 max_tokens 截断要在**报告正文末尾留痕**，否则页面上看起来和「模型就写了
     # 这么多」完全一样（这正是 2026-10-11 查「报告显示不全」时踩的坑：
     # 展示层 [:1200] 和生成层 max_tokens 两个截断叠在一起，根因分不清）。
@@ -1479,7 +1683,7 @@ def _decide_one(deps, conf, stock, today, slot: str = ""):
         if code in positions else
         f"【分析报告】\n{report}\n\n【账户现状】\n可用现金 {account['cash']:,.0f} 元，"
         f"总资产 {account['total_value']:,.0f} 元，该股无持仓",
-        extra=rules + _vol_hint)
+        extra=rules + _vol_hint, task="standard")
     decision = _validate_decision(_extract_json(raw_trader) or {})
     if decision is None:
         decision = {"action": "hold", "confidence": 1, "target_value_pct": 0,
@@ -2052,7 +2256,10 @@ def check_stop_loss(deps: dict, slot: str = "", max_pct: float | None = None) ->
         positions = _derive_paper_positions(cur)
     targets = [c for c in positions if c in stops]
     if not targets:
-        return {"date": today, "slot": slot, "checked": 0, "sold": []}
+        # ⚠️ 早退也要给全字段：调用方/前端可能直接取 skipped、off_session、
+        #   failed，少一个键就变成 KeyError（与下面「混装类型」同一类坑）。
+        return {"date": today, "slot": slot, "checked": 0, "sold": [],
+                "skipped": [], "off_session": [], "failed": []}
     # 收市后**不成交**，但仍然要报：否则「止损触发了却没走」会静默。
     # 停牌/隔夜的止损要等下一个交易时段的第一轮处理。
     off_session = [c for c in targets if not market_session_state(c)["open"]]
@@ -2068,7 +2275,17 @@ def check_stop_loss(deps: dict, slot: str = "", max_pct: float | None = None) ->
                 today)
             sellable[code] = (free, held, note)
     quotes = quote_fn(tradable) if tradable else {}
-    sold, skipped = [], list(off_session)
+    # ⚠️ `skipped` 里**必须是 dict**，不能塞代码字符串。
+    # 2026-10-08 加的「止损失败告警」在收尾处按 `s.get("FAILED")` 遍历 skipped，
+    # 而 `off_session` 恰好是**代码字符串** —— 收盘后（或任何有标的休市/非交易
+    # 时段的轮次）全部标的都进 off_session，于是 check_stop_loss **每轮必崩**：
+    # 止损卖单已经提交进库，但返回值、失败告警、周期台账全丢。
+    # 实测 2026-10-13 15:35 的 cycle 报 `'str' object has no attribute 'get'`。
+    # 这类「混装类型」的坑只有测试覆盖到 off_session 分支才抓得到。
+    sold, skipped = [], [
+        {"code": c, "name": (positions.get(c) or {}).get("name", ""),
+         "reason": "非交易时段（收盘/休市），止损待下一交易时段处理"}
+        for c in off_session]
     for code in tradable:
         try:
             q = quotes.get(code) or {}
@@ -2169,20 +2386,25 @@ def check_stop_loss(deps: dict, slot: str = "", max_pct: float | None = None) ->
 def record_cycle(deps: dict, cycle_date: str, slot: str, kind: str = "intraday",
                  trigger: str = "", planned: int = 0, acted: int = 0,
                  holds: int = 0, skipped: int = 0, elapsed_ms: int = 0,
-                 error: str = "") -> None:
-    """写一条周期台账（同一 date+slot 覆盖写，重试不会堆重复行）。"""
+                 error: str = "", note: str = "") -> None:
+    """写一条周期台账（同一 date+slot 覆盖写，重试不会堆重复行）。
+
+    `note`：运行中进度文案（2026-10-14 加）。整轮跑完后由调用方清空，
+    否则页面会一直显示「已判 12/43」这种中途数字。
+    """
     try:
         with deps["get_conn"]() as conn:
             conn.cursor().execute(
                 "INSERT INTO sa_paper_cycles "
                 "(trade_date, slot, kind, trigger, planned, acted, holds, skipped, "
-                " elapsed_ms, error) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                " elapsed_ms, error, note) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
                 "ON CONFLICT (trade_date, slot) DO UPDATE SET "
                 " kind=EXCLUDED.kind, trigger=EXCLUDED.trigger, planned=EXCLUDED.planned, "
                 " acted=EXCLUDED.acted, holds=EXCLUDED.holds, skipped=EXCLUDED.skipped, "
-                " elapsed_ms=EXCLUDED.elapsed_ms, error=EXCLUDED.error, created_at=now()",
+                " elapsed_ms=EXCLUDED.elapsed_ms, error=EXCLUDED.error, "
+                " note=EXCLUDED.note, created_at=now()",
                 (cycle_date, slot, kind, trigger, planned, acted, holds, skipped,
-                 elapsed_ms, error[:2000]))
+                 elapsed_ms, error[:2000], note[:2000]))
             conn.commit()
     except Exception as exc:
         print(f"[paper] record_cycle 失败: {exc}", flush=True)
@@ -2190,9 +2412,82 @@ def record_cycle(deps: dict, cycle_date: str, slot: str, kind: str = "intraday",
 
 # ---------------- 结算与反思 ----------------
 
+_SETTLE_LOCK_KEY = 918273646
+
+
+def _settle_lock(deps: dict):
+    """PG 咨询锁 contextmanager：拿不到就让调用方**跳过本轮结算**。
+
+    🔴 为什么结算也必须上锁（2026-10-13 实测撞出来的）：
+    `settle_and_reflect` 原本**完全没有互斥**，而 `_paper_run_cycle` 有（进程内锁 +
+    咨询锁）。结算的流程是「查 open 行 → 逐个到期 → INSERT 卖行 → UPDATE 买行 resolved」，
+    两步之间没有任何保护，于是**两个进程同时结算同一笔**时：
+
+        进程 A INSERT (2026-10-06, '', 00136, sell)  ✅
+        进程 B INSERT 同一行                            💥 UniqueViolation
+
+    这在本机不算罕见：多实例部署（AGENTS.md 记过还有两台远端机器连同一个 PG），
+    或者本机同时跑着两个实例（我为了验证连开几个 `import app` 就撞上了）。
+    后果不是「重复卖出」—— 唯一索引正好挡住了重复卖出，**账本是对的**；
+    后果是**失败的那个进程整轮结算中断**（后面的到期交易全部没结算）。
+
+    会话级锁：连接断开自动释放，进程被 kill 也不会留死锁（这正是选它而不是
+    `pg_advisory_xact_lock` 的原因 —— 结算跨多个事务，事务级锁早就没了）。
+    """
+    conn = None
+    holder = {}
+
+    class _Lock:
+        def __enter__(self):
+            nonlocal conn
+            try:
+                conn = deps["get_conn"]()
+                cur = conn.cursor()
+                cur.execute("SELECT pg_try_advisory_lock(%s)", (_SETTLE_LOCK_KEY,))
+                holder["got"] = bool(cur.fetchone()[0])
+                conn.commit()
+            except Exception as exc:                  # noqa: BLE001
+                print(f"[paper] 取结算锁失败: {exc}", flush=True)
+                holder["got"] = False
+            return holder["got"]
+
+        def __exit__(self, *a):
+            if conn is not None:
+                try:
+                    cur = conn.cursor()
+                    cur.execute("SELECT pg_advisory_unlock(%s)", (_SETTLE_LOCK_KEY,))
+                    conn.commit()
+                except Exception:                     # noqa: BLE001
+                    pass
+                try:
+                    conn.close()
+                except Exception:                     # noqa: BLE001
+                    pass
+
+    return _Lock()
+
+
 def settle_and_reflect(deps: dict) -> dict:
     """结算到期 open 交易（持有满 holding_days 个交易日自动平仓）+ LLM 复盘 +
-    经验入库 + 当日资产快照。价格取不到的交易保持 open 下轮重试。"""
+    经验入库 + 当日资产快照。价格取不到的交易保持 open 下轮重试。
+
+    ⚠️ 多实例部署时**必须**只有一个进程在结算：已用 PG 咨询锁挡住
+    （见 `_settle_lock` 的注释：并发结算会撞 `sa_paper_trades` 的唯一索引）。
+    """
+    # ⚠️ 必须用 `with`：早先写成 `if not lock.__enter__(): ...` + `try/finally: pass`
+    # 的版本**永远不会释放锁**（连接不关 = 会话级锁一直持有）→ 自己把自己锁死。
+    with _settle_lock(deps) as got:
+        if not got:
+            print("[paper] 别的进程正在结算，本轮跳过", flush=True)
+            return {"date": datetime.now().strftime("%Y-%m-%d"), "settled": [],
+                    "pending": [], "rolled": [],
+                    "skipped_reason": "他进程在结算"}
+        return _settle_and_reflect_locked(deps)
+
+
+def _settle_and_reflect_locked(deps: dict) -> dict:
+    """真正干活的结算实现。**调用方必须已持有结算咨询锁**（`settle_and_reflect`
+    是唯一对外入口，它在 `with _settle_lock(...)` 里调本函数）。"""
     get_conn, em_kline_fn = deps["get_conn"], deps["em_kline_fn"]
     tx_symbol_fn, quote_fn = deps["tx_symbol_fn"], deps["quote_fn"]
     trading_days_fn = deps.get("trading_days_fn")
@@ -2307,6 +2602,34 @@ def settle_and_reflect(deps: dict) -> dict:
         except Exception as exc:
             print(f"[paper] prune failed: {exc}", flush=True)
         conn.commit()
+    # 自进化：补历史经验 + 规则退役（2026-10-12）。
+    # 放在**结算主流程之外**：补历史会烧 LLM，绝不能拖住/打断平仓与快照。
+    evo_state: dict = {}
+    try:
+        import self_evolution as _evo
+        _ec = {**_evo.DEFAULTS, **(conf.get("self_evolution") or {})}
+        if _ec.get("enabled") and _ec.get("backfill"):
+            with get_conn() as conn2:
+                cur2 = conn2.cursor(cursor_factory=_real_dict_cursor(deps))
+                _bf = _evo.backfill(cur2, _llm_call,
+                                    max_rows=int(_ec.get("max_backfill", 20)),
+                                    keep_per_ticker=int(conf.get("keep_per_ticker", 30)))
+                cur2.execute("SELECT count(*) AS n FROM sa_paper_reflections")
+                _n = cur2.fetchone()
+                _n = (_n.get("n") if isinstance(_n, dict) else _n[0]) if _n else 0
+                conn2.commit()
+            _bf["lessons_total"] = int(_n)
+            _bf["added_count"] = len(_bf.get("added") or [])
+            _bf["failed_count"] = len(_bf.get("failed") or [])
+            evo_state = _bf
+            if _bf["added_count"]:
+                print(f"[paper] 自进化补经验 {_bf['added_count']} 条"
+                      f"（经验库现共 {int(_n)} 条）", flush=True)
+            if _bf["failed_count"]:
+                print(f"[paper] 自进化补经验失败 {_bf['failed_count']} 条: "
+                      f"{_bf['failed'][:3]}", flush=True)
+    except Exception as exc:
+        print(f"[paper] 自进化 backfill 失败（不影响结算）: {exc}", flush=True)
     snap = _snapshot_equity(deps)
     # 目标模式：结算完净值就该判定目标（达标/到期）。放在快照之后——进度要用
     # 当日收盘总资产，提前判会用到昨天的数。失败不阻塞结算主流程。
@@ -2336,7 +2659,7 @@ def settle_and_reflect(deps: dict) -> dict:
         for r in rolled[:10]:
             print(f"[paper] {r.get('code')} 未平仓：{r.get('reason')}", flush=True)
     return {"date": today, "settled": settled, "pending": pending,
-            "rolled": rolled, "equity": snap}
+            "rolled": rolled, "equity": snap, "evolution": evo_state}
 
 
 # ---------------- 闭环：每笔持有期 / 目标价 / 论点兑现 / 做T豁免（2026-10-11） ----------------
@@ -2495,7 +2818,7 @@ def _reflect_one(deps, conf, s):
         + (f"，同期基准收益 {bench_ret * 100:+.1f}%，超额 alpha {(s['alpha']) * 100:+.1f}%"
            if bench_ret is not None else "（基准数据缺失，alpha 无法计算）")
         + "\n请核验：当初说的那件事发生了吗？")
-    lesson = _llm_call(REFLECTOR_PROMPT, user)
+    lesson = _llm_call(REFLECTOR_PROMPT, user, task="deep")
     with get_conn() as conn:
         cur = conn.cursor()
         paper_memory.store_lesson(

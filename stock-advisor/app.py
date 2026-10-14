@@ -602,6 +602,7 @@ def init_db():
         holds       INTEGER NOT NULL DEFAULT 0,   -- 观望
         elapsed_ms  INTEGER NOT NULL DEFAULT 0,
         error       TEXT NOT NULL DEFAULT '',
+        note        TEXT NOT NULL DEFAULT '',   -- 运行中进度（已判 X/Y，最后 code）
         created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
         UNIQUE (trade_date, slot)
     );
@@ -632,6 +633,12 @@ def init_db():
         ALTER COLUMN slot TYPE VARCHAR(16);
     ALTER TABLE sa_paper_cycles
         ALTER COLUMN slot TYPE VARCHAR(16);
+    -- note 列（2026-10-14，用户批准）。可空 + 有默认值，纯追加，
+    -- 现有消费者（/api/paper/cycles、页面表格）不受影响。
+    -- 为什么需要：一轮 43 只串行要几小时，而台账原本只在整轮结束的 finally 里写，
+    -- 于是「今日各轮记录」进行中永远是空的（用户报的现象）。
+    ALTER TABLE sa_paper_cycles
+        ADD COLUMN IF NOT EXISTS note TEXT NOT NULL DEFAULT '';
     -- 板块轮动快照（建表 DDL 以 sector.py 的 SNAPSHOT_TABLE_DDL 为准，那里也幂等）
     """
     # ---- 追加：量化策略库 / 本地行情 / 回测的建表（schema_strategy_lib.sql）----
@@ -645,6 +652,23 @@ def init_db():
     # 顺带：防重复爬取靠 sa_crawl_queue.url_hash 唯一键，不是「先查再插」
     #（那是竞态：两个进程同时插都会成功）。
     ddl += STRATEGY_LIB_DDL
+    # 自进化层（2026-10-12 新增，借鉴 AetherLabsAI/RSIAgent）：
+    # sa_evo_focus（Curriculum 选的「下一轮练什么」）+ sa_evo_rules
+    # （带 supports/refutes 计数的规则，可被证伪后退役）。
+    # 同样用 `+=` 而不是字符串内插，避免 DDL 里的分号把语句拆断。
+    try:
+        import self_evolution as _evo_mod
+        ddl += _evo_mod.DDL
+    except Exception as exc:
+        print(f"[init_db] 自进化层 DDL 跳过: {exc}", flush=True)
+    # 机构信号层（2026-10-12 新增，用户要求「机构看多看空/机构与社保持仓变化/
+    # 被挪出重要指数」参与决策）：sa_analyst_rating / sa_holder_inst /
+    # sa_index_cons / sa_index_cons_change。同样用 `+=`。
+    try:
+        import institution_signals as _inst_mod
+        ddl += _inst_mod.DDL
+    except Exception as exc:
+        print(f"[init_db] 机构信号 DDL 跳过: {exc}", flush=True)
     last_exc: Exception | None = None
     # 旧版 sa_strategies 是「按股票建行」的，列结构与现在完全不同，
     # CREATE TABLE IF NOT EXISTS 修不了它，只能重建。只在确实是旧结构时动手。
@@ -3066,11 +3090,18 @@ def _advice_sector_lines(held_codes: list[str]) -> list[str]:
 
 
 def _advice_event_lines(codes: list[str]) -> list[str]:
-    """未来 21 天解禁/增发 + 近 N 天减持的事件行（提款计划的 LLM 上下文）。"""
+    """未来 21 天解禁/增发 + 近 N 天减持的事件行（提款计划的 LLM 上下文）。
+
+    ⚠️ 这里刻意**不用** alerts.DEFAULT_DAYS（半年）。页面给人看要看半年
+    （什么时候会砸下来），但 LLM 决策只关心近期：把 6 个月后的解禁塞进
+    prompt 只会稀释重点、烧 token，还可能让模型为半年后的事提前动作。
+    两者窗口不同是**有意的**，别当漏改的 bug「顺手统一」掉。
+    """
+    LLM_EVENT_DAYS = 21
     try:
         conf = _alerts_conf()
         evs = alerts_mod.all_events(
-            codes, days=21,
+            codes, days=LLM_EVENT_DAYS,
             reduce_lookback_days=int(conf.get("reduce_lookback_days",
                                               alerts_mod.DEFAULT_REDUCE_LOOKBACK)),
             include_reduce=bool(conf.get("reduce_enabled", True)))
@@ -3078,7 +3109,8 @@ def _advice_event_lines(codes: list[str]) -> list[str]:
         return []
     return [f"- {alerts_mod.KIND_META.get(e['type'], ('•', e['type']))[1]} "
             f"{e['event_date']} {e['name']}（{e['code']}）"
-            f"{e.get('shares_txt') or ''} {e.get('detail') or ''}".strip()
+            f"{' '.join(x for x in (e.get('shares_txt') or '', e.get('cap_txt') or '') if x)} "
+            f"{e.get('detail') or ''}".strip()
             for e in evs[:10]]
 
 
@@ -3851,13 +3883,19 @@ def _alerts_conf() -> dict:
 
 
 @app.get("/api/alerts/upcoming")
-def alerts_upcoming(days: int = 14):
+def alerts_upcoming(days: int = 0):
     """自选股事件（页面每次现拉，不受已推送状态影响）。
 
     含**未来**的解禁/增发（days 窗口）和**刚过去**的减持（reduce_lookback_days
     回看）——两类时间方向相反，见 alerts.py 模块头。
+
+    `days=0` = 用 alerts.DEFAULT_DAYS（半年）。⚠️ 上限从 90 放宽到 366 的原因：
+    原来写死 `days: int = 14` + `min(days, 90)`，于是**前端写半年、后端静默
+    砍成 90 天** —— 页面文案说「未来半年」，数据其实只有 3 个月，典型的
+    「看起来改了其实没改」。默认值改为跟随模块常量，以后改一处即可。
     """
-    days = max(1, min(days, 90))
+    days = int(days or alerts_mod.DEFAULT_DAYS)
+    days = max(1, min(days, 366))
     conf = _alerts_conf()
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT code FROM sa_watchlist")
@@ -3875,6 +3913,126 @@ def alerts_upcoming(days: int = 14):
             "reduce_lookback_days": int(conf.get("reduce_lookback_days",
                                                   alerts_mod.DEFAULT_REDUCE_LOOKBACK)),
             "events": events}
+
+
+# ---------------- 港股供给冲击（IPO 锁定期 / 融资禁售承诺）----------------
+# 为什么单独开一组端点而不是塞进 /api/alerts/upcoming：
+#   1. **数据来源完全不同** —— 那边是东财 A 股报表（零成本、毫秒级），
+#      这边要走 HKEXnews + MinerU 解析 + LLM 抽取（分钟级、还要配额）。
+#      混在一起会让「页面加载慢」被误判成「东财挂了」。
+#   2. **两条线的语义不同**，不能共用一份事件列表（见 hk_supply_scan 模块头）。
+#   3. 前端要能**分别**显示，并各自显示「未取到」的原因。
+#
+# ⚠️ 本机**必须**代理到 101 的 hk-supply 服务，不能直接跑解析：
+#    2026-10-12 实测本机到 hkexnews **连续 8 次全失败**（WinError 10054
+#    连接被重置 + TLS 握手超时，api.ipify.org 同样不通 —— 本机被 wmsxwd 的
+#    TUN 劫持全流量）；101 侧 prefix 200、PDF 1049004 字节完整。
+#    所以本机只负责「查 sa_watchlist 得到持仓港股」+「转发」，解析在 101。
+#
+# 分层（2026-10-12 用户纠正后定）：**101 服务对任意港股代码通用，不内置
+# 任何持仓清单**；「你持有哪些」是会变的业务状态，由本机查库得到后传过去。
+# 曾经把当时 8 只持仓写进 .env 的 HK_CODES 当默认值，那等于把会变的业务
+# 状态固化进部署配置 —— 加一只票就要改配置重新部署，且从配置上看不出
+# 服务支持哪些股票。
+
+HK_SUPPLY_URL = os.environ.get("HK_SUPPLY_URL", "http://101.43.25.101:8090")
+
+
+def _hk_watchlist_codes() -> list[str]:
+    """自选股里的港股代码（按代码排序，去重）。
+
+    这是「谁持有」的唯一真相来源。**刻意不放配置里** —— 配置是部署期的
+    静态事实，持仓是每天都在变的业务状态。
+    """
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT code FROM sa_watchlist ORDER BY code")
+            rows = cur.fetchall()
+        return [r[0] for r in rows if _market_of(r[0]) == "hk"]
+    except Exception:
+        return []
+
+
+@app.get("/api/hk-supply/status")
+def hk_supply_status():
+    """港股这条线的状态。**不发解析请求**，只探 101 的 /health。"""
+    conf = _conf_section("hk_supply") or {}
+    codes = _hk_watchlist_codes()
+    svc, svc_err = None, None
+    try:
+        r = requests.get(HK_SUPPLY_URL + "/health", timeout=15)
+        svc = r.json() if r.status_code == 200 else {"ok": False}
+        if r.status_code != 200:
+            svc_err = "服务返回 HTTP %s" % r.status_code
+    except Exception as exc:                            # noqa: BLE001
+        svc_err = "连不上 %s：%s" % (HK_SUPPLY_URL, str(exc)[:120])
+    return {
+        # 本机不再需要 MinerU token —— 它配在 101 服务那边了
+        "service_url": HK_SUPPLY_URL,
+        "service_ok": bool(svc and svc.get("ok")),
+        "service_health": svc,
+        "service_error": svc_err,
+        "enabled": bool(conf.get("enabled", True)),
+        "max_docs": int(conf.get("max_docs") or 3),
+        "retention_days": hk_supply.HS.HKEX_RETENTION_DAYS,
+        "hk_codes": codes,                 # 来自 sa_watchlist，不是配置
+        "hk_count": len(codes),
+        "reason": (svc_err or "") if not (svc and svc.get("ok"))
+                  else ((svc or {}).get("reason") or ""),
+    }
+
+
+@app.get("/api/hk-supply/scan")
+def hk_supply_scan(codes: str = "", max_docs: int = 0):
+    """港股禁售/锁定条款。**只读，绝不下单**。**异步**：立刻返回 job_id。
+
+    `codes` 留空 = 查自选股里的全部港股（来自 sa_watchlist）。
+    传 `codes=00700` 就能查**任意**港股，与持仓无关。
+
+    ⚠️ 为什么要异步（2026-10-13 用户要求进度条）：解析要 3~6 分钟，
+       同步请求期间前端只有转圈，用户连报三次「一直没结果不知道什么情况」。
+       现在立即返回 job_id，页面轮询 `/api/hk-supply/job/{id}` 拿**真实进度**
+       （已处理公告份数 / 总份数 / 当前在解析哪一份）。
+    """
+    conf = _conf_section("hk_supply") or {}
+    if not conf.get("enabled", True):
+        return {"job_id": None, "error": "港股供给冲击已关闭"
+                                        "（config.yaml hk_supply.enabled）"}
+    st = hk_supply_status()
+    if not st["service_ok"]:
+        return {"job_id": None, "error": st["reason"] or "101 服务不可用",
+                "service_url": HK_SUPPLY_URL}
+    want = [c.strip() for c in (codes or "").split(",") if c.strip()] or st["hk_codes"]
+    if not want:
+        return {"job_id": None, "error": "自选股里没有港股（A 股解禁见上面那块）",
+                "service_url": HK_SUPPLY_URL}
+    docs = int(max_docs or conf.get("max_docs") or 3)
+    url = "%s/scan?codes=%s&max_docs=%d" % (HK_SUPPLY_URL, ",".join(want), docs)
+    try:
+        r = requests.post(url, timeout=60)          # 只等「启动」，不等解析
+        d = r.json()
+    except Exception as exc:                            # noqa: BLE001
+        return {"job_id": None, "error": "调用 101 解析服务失败：%s" % str(exc)[:200],
+                "service_url": HK_SUPPLY_URL}
+    if r.status_code != 200:
+        return {"job_id": None, "error": "101 服务 HTTP %s：%s"
+                % (r.status_code, r.text[:200]), "service_url": HK_SUPPLY_URL}
+    d["service_url"] = HK_SUPPLY_URL
+    d.setdefault("queried_codes", want)
+    return d
+
+
+@app.get("/api/hk-supply/job/{jid}")
+def hk_supply_job(jid: str):
+    """轮询进度。done/total 是**已处理的公告份数**，不是股票数。"""
+    try:
+        r = requests.get("%s/job/%s" % (HK_SUPPLY_URL, jid), timeout=30)
+        d = r.json()
+    except Exception as exc:                            # noqa: BLE001
+        return {"state": "error", "error": "轮询失败：%s" % str(exc)[:160],
+                "done": 0, "total": 0}
+    d["service_url"] = HK_SUPPLY_URL
+    return d
 
 
 @app.post("/api/alerts/check")
@@ -3929,6 +4087,7 @@ def _alerts_loop():
 #   supply_events.py = 全市场（解禁/增发/减持按日聚合 + 历史分位数判「潮」）
 #   global_markets.py= 美日韩 + 港股相对强弱（港资可买美日韩 → 资金抽离视角）
 import supply_events
+import hk_supply_scan as hk_supply
 import global_markets
 import channels_watch
 import analysis_learn
@@ -4231,6 +4390,7 @@ def _run_analysis_learn_once(limit_articles: int = 3, force: bool = False,
             published_at=str(a["published_at"] or ""), body=body)
         try:
             raw = llm_advisor.ask(analysis_learn.EXTRACT_SYSTEM, user, conf=conf,
+                                task="fast",
                                   thinking=True)
         except Exception as exc:
             result["errors"].append(f"id={a['id']} LLM 失败: {exc}")
@@ -4721,6 +4881,9 @@ def _paper_deps(conf: dict | None = None) -> dict:
         "conf": conf if conf is not None else _conf_section("paper"),
         "news_fn": _paper_news_rows,
         "events_fn": _paper_event_lines,
+          # 解禁/禁售/锁定讨论 —— 单独一份名额，见 `_paper_event_rows` 的说明
+          # （混在新闻块里必然被 LIMIT 挤掉，实测 12 条全在近 4 天）
+          "event_news_fn": _paper_event_rows,
           # 社媒信号（公众号/B站/微博/X）—— 2026-09-29 加。之前这些源一直在抓、
           # 一直在推微信，但一条都没进过决策上下文，等于白抓。
           "social_fn": _paper_social,
@@ -4741,6 +4904,14 @@ def _paper_news_rows(code: str, limit: int = 10) -> list[dict]:
     2) 去重和排序要分开：DISTINCT ON 要求 ORDER BY 以 url 打头，于是
        `LIMIT` 实际取的是**url 序最靠前的 N 条**，不是最新的 N 条 ——
        实测 6 条全被丢掉。DISTINCT 放子查询里，外层再按时间排。
+
+    ⚠️ 第三条（2026-10-13 加）：**解禁/禁售/锁定这类「股份状态」信息用 180 天窗口**。
+    用户实例：MINIMAX-W 7 月解禁期到了，但创始团队自愿锁定 12 个月 ——
+    这类信息在雪球上是**9 月的讨论帖**（`$MINIMAX-W(00100)$ 7月份暴跌是解禁期
+    股份太多…`）。它描述的是**当前仍生效的约束**，不是「今天发生的事」，
+    7 天窗口会把它挡掉，于是模型只看到「跌了 13%」看不到「为什么有争议」。
+    判据用**标题命中事件词**（与 `news_fetcher._EVENT_KW` 同一套词），
+    仍然是硬编码词表而非语义判断 —— 这里要的是**可复现**，不是聪明。
     """
     try:
         with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -4752,12 +4923,59 @@ def _paper_news_rows(code: str, limit: int = 10) -> list[dict]:
                 "    LEFT JOIN sa_news_related r ON r.url = n.url "
                 "   WHERE (n.code = %s OR r.code = %s) "
                 "     AND n.publish_time IS NOT NULL "
-                "     AND n.publish_time > now() - interval '7 days' "
+                # ⚠️ LIKE 的字面 % 必须写成带引号的 '%%解禁%%'：
+                #    写成 '%(解禁%%' 会被 psycopg2 当成**命名占位符**，
+                #    整条语句报 `argument formats can't be mixed` —— 而
+                #    _paper_news_rows 的 except 把它吞成「返回 0 行」，
+                #    症状看起来像「这个票没有新闻」（AGENTS.md 记过的老坑）。
+                "     AND (n.publish_time > now() - interval '7 days' "
+                "           OR (n.publish_time > now() - interval '180 days' "
+                "               AND (n.title LIKE '%%解禁%%' OR n.title LIKE '%%禁售%%'"
+                "                    OR n.title LIKE '%%锁定%%' OR n.title LIKE '%%锁仓%%'"
+                "                    OR n.title LIKE '%%不减持%%' OR n.title LIKE '%%限售%%'))) "
                 "   ORDER BY n.url, n.publish_time DESC"
                 ") t ORDER BY publish_time DESC LIMIT %s",
                 (code, code, limit))
             return [dict(r) for r in cur.fetchall()]
     except Exception:
+        return []
+
+
+def _paper_event_rows(code: str, limit: int = 6) -> list[dict]:
+    """该股的**解禁/禁售/锁定**讨论帖（独立于新闻块，另给名额）。
+
+    ⚠️ 为什么要单独一个函数：`_paper_news_rows` 是
+    `ORDER BY publish_time DESC LIMIT 10`，近几天就能占满，于是**几周前的解禁讨论
+    必然被挤掉**（实测 12 条全落在 10-09~10-13，09-13 那条一次都没出现）。
+    而这类信息恰恰是「当前仍生效的约束」，不能用新闻的时效口径挤掉。
+
+    窗口 180 天、比新闻宽，但仍要求 `publish_time IS NOT NULL`
+    —— 绝不用 `fetched_at` 兜底（AGENTS.md 的血泪教训）。
+    """
+    try:
+        with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT title, media, source, publish_time FROM ("
+                "  SELECT DISTINCT ON (n.url) n.title, n.media, n.source,"
+                "         n.publish_time"
+                "    FROM sa_news n "
+                "    LEFT JOIN sa_news_related r ON r.url = n.url "
+                "   WHERE (n.code = %s OR r.code = %s) "
+                "     AND n.publish_time IS NOT NULL "
+                "     AND n.publish_time > now() - interval '180 days' "
+                # 字面 % 用 '%%'；写成 '%(…' 会被 psycopg2 当成命名占位符，
+                # 整条报 `argument formats can't be mixed`，而调用方的 except
+                # 把它吞成「没查到」—— 症状看起来像「这票没有相关讨论」。
+                "     AND (n.title LIKE '%%解禁%%' OR n.title LIKE '%%禁售%%'"
+                "          OR n.title LIKE '%%锁定%%' OR n.title LIKE '%%锁仓%%'"
+                "          OR n.title LIKE '%%不减持%%' OR n.title LIKE '%%限售%%'"
+                "          OR n.title LIKE '%%自愿延长%%') "
+                "   ORDER BY n.url, n.publish_time DESC"
+                ") t ORDER BY publish_time DESC LIMIT %s",
+                (code, code, limit))
+            return [dict(r) for r in cur.fetchall()]
+    except Exception as exc:
+        print(f"[paper] 解禁讨论查询失败: {exc}", flush=True)
         return []
 
 
@@ -4801,8 +5019,12 @@ def _paper_event_lines(code: str, days: int = 14) -> list[str]:
   lines = []
   for e in events[:8]:
       kind = alerts_mod.KIND_META.get(e.get("type"), ("•", e.get("type")))[1]
-      amt = " ".join(x for x in (e.get("shares_txt") or "",
-                                 f"约{e['cap_yi']}亿元" if e.get("cap_yi") else "") if x)
+      # 显示串走后端的 cap_txt（自适应 亿/万/元），别在这儿自己拼「X亿元」——
+      # 那正是「解禁 0.08亿」这种看不懂的数的来源。旧事件没有 cap_txt 才回退。
+      cap_txt = e.get("cap_txt")
+      if cap_txt is None:
+          cap_txt = ("约" + alerts_mod.fmt_cap(e["cap_yi"])) if e.get("cap_yi") else ""
+      amt = " ".join(x for x in (e.get("shares_txt") or "", cap_txt or "") if x)
       lines.append(f"{e.get('event_date')} {kind} {amt}（{e.get('detail') or ''}）"
                    .rstrip("（）").replace("  ", " "))
   return lines
@@ -5045,6 +5267,408 @@ def paper_settle():
 
     threading.Thread(target=_run, daemon=True).start()
     return {"ok": True, "status": "结算复盘已启动"}
+
+
+@app.get("/api/evo/status")
+def evo_status():
+    """自进化回路体检：经验库覆盖、成败结构、以及**卡住的行**。
+
+    这个端点存在的意义是「让断掉的回路可见」。2026-10-12 实测：
+    682 条流水只有 3 条经验、12 条超期未结 —— 这些数字在页面上
+    原本完全看不出来，表现只是「模型好像没长进」。
+    """
+    try:
+        import self_evolution as evo
+    except Exception as exc:                       # noqa: BLE001
+        return {"ok": False, "error": f"自进化模块不可用: {exc}"}
+    conf = {**evo.DEFAULTS, **(_conf_section("paper").get("self_evolution") or {})}
+    out: dict = {"ok": True, "enabled": bool(conf.get("enabled")), "conf": conf}
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        # 流水 vs 经验的覆盖比 —— 判断「学不到东西」最直接的指标
+        cur.execute("SELECT count(*) AS n FROM sa_paper_trades")
+        out["trades"] = cur.fetchone()["n"]
+        cur.execute("""SELECT count(*) AS n,
+                              count(*) FILTER (WHERE code <> '') AS per_ticker,
+                              count(*) FILTER (WHERE code = '')   AS rules,
+                              max(created_at) AS latest
+                       FROM sa_paper_reflections""")
+        d = dict(cur.fetchone())
+        out["lessons"] = int(d["n"] or 0)
+        out["lessons_per_ticker"] = int(d["per_ticker"] or 0)
+        out["lesson_rules"] = int(d["rules"] or 0)
+        out["lessons_latest"] = d["latest"]
+        # 覆盖率：有结的决策单元里，有多少真的学到了
+        stats = evo.outcome_stats(cur)
+        out["closed_units"] = stats["total"]
+        out["coverage_pct"] = (round(out["lessons_per_ticker"] / stats["total"] * 100, 1)
+                               if stats["total"] else None)
+        out["performance"] = stats
+        out["stranded"] = evo.stranded_rows(cur)
+        out["stranded_count"] = len(out["stranded"])
+        out["current_focus"] = evo.load_focus(cur)
+        try:
+            cur.execute("""SELECT rule_text, supports, refutes, status
+                           FROM sa_evo_rules ORDER BY id DESC LIMIT 20""")
+            out["rules"] = [dict(r) for r in cur.fetchall()]
+        except Exception:                          # noqa: BLE001
+            conn.rollback()
+            out["rules"] = []
+    return out
+
+
+@app.post("/api/evo/backfill")
+def evo_backfill(max_rows: int = 20, dry_run: bool = True):
+    """给**已平仓但从未产生经验**的决策补经验（含止损单）。
+
+    默认 `dry_run=true`：这条路径要烧 LLM（每条经验一次调用），
+    必须显式确认才会真写。与 `/api/analysis/learn` 同一纪律。
+    """
+    try:
+        import self_evolution as evo
+        import paper_trading
+    except Exception as exc:                       # noqa: BLE001
+        return {"ok": False, "error": f"自进化模块不可用: {exc}"}
+    n = max(1, min(int(max_rows or 20), 100))
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(evo._BACKFILL_SQL, (n,))
+        cands = []
+        for r in cur.fetchall():
+            d = dict(r)
+            cands.append({"id": d.get("id"), "code": d.get("code"),
+                          "settle_date": str(d.get("settle_date") or ""),
+                          "exit_kind": evo._classify_exit(d),
+                          "alpha": (None if d.get("alpha_return") is None
+                                    else round(float(d["alpha_return"]) * 100, 2))})
+    if dry_run:
+        return {"ok": True, "dry_run": True, "candidates": len(cands),
+                "detail": cands,
+                "hint": "加 ?dry_run=false 真执行（每条经验烧一次 LLM）"}
+    conf = _conf_section("paper")
+    deps = _paper_deps(conf)
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        res = evo.backfill(cur, paper_trading._llm_call, max_rows=n,
+                           keep_per_ticker=int(conf.get("keep_per_ticker", 30)))
+        cur.execute("SELECT count(*) AS n FROM sa_paper_reflections")
+        res["lessons_total"] = int(cur.fetchone()["n"])
+        conn.commit()
+    res["added_count"] = len(res.get("added") or [])
+    res["failed_count"] = len(res.get("failed") or [])
+    return {"ok": True, "dry_run": False, **res}
+
+
+@app.post("/api/evo/next-focus")
+def evo_next_focus(dry_run: bool = True):
+    """Curriculum 角色：根据已平仓的成败结构，选出**下一轮**要重点练的薄弱点。
+
+    RSIAgent 原文对 Curriculum 的三条约束，这里都照做了：
+      - 只输出「练什么」，**不评价任何一笔交易对错**
+      - **不修改已有规则**（只写 `sa_evo_focus`）
+      - 样本不足就明说「样本不足，暂不调整」→ 此时**不写库**
+
+    默认 dry_run：这条要烧一次 LLM。
+    """
+    try:
+        import self_evolution as evo
+        import paper_trading
+    except Exception as exc:                       # noqa: BLE001
+        return {"ok": False, "error": f"自进化模块不可用: {exc}"}
+    conf = {**evo.DEFAULTS, **(_conf_section("paper").get("self_evolution") or {})}
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        stats = evo.outcome_stats(cur)
+        stranded = evo.stranded_rows(cur)
+        min_n = int(conf.get("min_samples_focus", 3))
+        enough = stats["with_alpha"] >= min_n
+        prompt_user = (
+            f"已平仓决策样本 {stats['total']} 笔（其中 {stats['with_alpha']} 笔有基准 alpha）。\n"
+            f"跑赢基准 {stats['wins']} 笔、跑输 {stats['losses']} 笔，"
+            f"平均超额收益 {stats['avg_alpha'] if stats['avg_alpha'] is not None else '—'}%。\n"
+            f"最差 {stats['worst'] if stats['worst'] is not None else '—'}%，"
+            f"最好 {stats['best'] if stats['best'] is not None else '—'}%。\n"
+            f"另有 {len(stranded)} 笔已超期却仍未平仓（论点未破被无限续持）。\n")
+    if not enough:
+        return {"ok": True, "skipped": True,
+                "reason": f"有基准 alpha 的样本仅 {stats['with_alpha']} 笔"
+                          f"（门槛 {min_n}），样本不足，暂不调整",
+                "stats": stats, "stranded": len(stranded)}
+    if dry_run:
+        return {"ok": True, "dry_run": True, "stats": stats,
+                "stranded": len(stranded), "prompt_input": prompt_user,
+                "hint": "加 ?dry_run=false 真调用 Curriculum（烧一次 LLM）"}
+    try:
+        raw = paper_trading._llm_call(evo.CURRICULUM_PROMPT, prompt_user)
+    except Exception as exc:                       # noqa: BLE001
+        return {"ok": False, "error": f"Curriculum 调用失败: {exc}"}
+    focus = evo.parse_focus(raw)
+    if not focus:
+        return {"ok": True, "stored": False, "raw": raw[:500],
+                "reason": "未能解析出 FOCUS 行，不写库（宁缺毋滥）"}
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            stored = evo.store_focus(cur, focus, stats)
+            conn.commit()
+        except Exception as exc:                   # noqa: BLE001
+            conn.rollback()
+            return {"ok": False, "error": f"focus 写入失败: {exc}"}
+    return {"ok": True, "stored": bool(stored), "focus": focus,
+            "raw": raw[:500], "stats": stats}
+
+
+@app.get("/api/evo/focus")
+def evo_focus(limit: int = 20):
+    """Curriculum 历史：每轮选出的「下一轮重点关注什么」。"""
+    try:
+        import self_evolution as evo
+    except Exception as exc:                       # noqa: BLE001
+        return {"ok": False, "error": f"自进化模块不可用: {exc}"}
+    n = max(1, min(int(limit or 20), 100))
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute("SELECT focus_date, focus_text, stats_json "
+                        "FROM sa_evo_focus ORDER BY focus_date DESC, id DESC "
+                        "LIMIT %s", (n,))
+            rows = [dict(r) for r in cur.fetchall()]
+        except Exception as exc:                   # noqa: BLE001
+            conn.rollback()
+            rows = []
+            return {"ok": False, "error": str(exc)}
+    return {"ok": True, "focus": rows}
+
+
+# ---------------- 机构信号（institution_signals.py） ----------------
+
+def _inst_conf() -> dict:
+    """机构信号配置。默认全部关闭（注入决策 = 改决策口径）。"""
+    try:
+        import institution_signals as inst
+    except Exception as exc:                          # noqa: BLE001
+        return {"enabled": False, "error": str(exc)}
+    return {**inst.DEFAULTS, **(_conf_section("paper").get("inst_signals") or {})}
+
+
+@app.get("/api/inst/signals/{code}")
+def inst_signals(code: str):
+    """某只票的机构信号块（与注入决策的文本**逐字相同**，便于页面核对）。
+
+    用这条接口可以直接回答「模型到底看到了什么」——注入是不可见的，
+    而这里的每一行都是决策上下文里真实出现的内容。
+    """
+    try:
+        import institution_signals as inst
+    except Exception as exc:                          # noqa: BLE001
+        return {"ok": False, "error": f"机构信号模块不可用: {exc}"}
+    conf = _inst_conf()
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        text = inst.build_injection(cur, code, conf=conf)
+    return {"ok": True, "code": code, "enabled": bool(conf.get("enabled")),
+            "conf": conf, "text": text}
+
+
+@app.get("/api/inst/overview")
+def inst_overview(limit: int = 60):
+    """机构信号库现状 + 最近的成分调入/调出（这个端点让「库里到底有没有数据」可见）。"""
+    try:
+        import institution_signals as inst
+    except Exception as exc:                          # noqa: BLE001
+        return {"ok": False, "error": f"机构信号模块不可用: {exc}"}
+    n = max(1, min(int(limit or 60), 500))
+    out: dict = {"ok": True, "conf": _inst_conf()}
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute("SELECT code, count(*) n, max(report_date) newest, "
+                        "max(report_date) FILTER (WHERE report_date >= "
+                        "  date_trunc('day', now()) - interval '30 days') recent30 "
+                        "FROM sa_analyst_rating GROUP BY code ORDER BY recent30 "
+                        "DESC NULLS LAST, n DESC LIMIT %s", (n,))
+            out["ratings"] = [dict(r) for r in cur.fetchall()]
+            cur.execute("SELECT code, count(*) n, max(period) newest, "
+                        "count(*) FILTER (WHERE htype='社保') shebao "
+                        "FROM sa_holder_inst GROUP BY code ORDER BY newest DESC "
+                        "LIMIT %s", (n,))
+            out["holders"] = [dict(r) for r in cur.fetchall()]
+            cur.execute("SELECT index_code, max(snap_date) newest, count(*) n "
+                        "FROM sa_index_cons GROUP BY index_code ORDER BY index_code")
+            out["indexes"] = [dict(r) for r in cur.fetchall()]
+            cur.execute("SELECT index_code, code, direction, prev_date, new_date, "
+                        "prev_count, new_count FROM sa_index_cons_change "
+                        "ORDER BY new_date DESC, index_code LIMIT 200")
+            out["changes"] = [dict(r) for r in cur.fetchall()]
+        except Exception as exc:                      # noqa: BLE001
+            conn.rollback()
+            out["error"] = str(exc)
+    return out
+
+
+@app.post("/api/inst/refresh")
+def inst_refresh():
+    """手动跑一轮采集。**很慢**（研报 ~1.5s/只 + 指数快照 ~10s/个），页面要转圈。"""
+    try:
+        import institution_signals as inst
+    except Exception as exc:                          # noqa: BLE001
+        raise HTTPException(502, f"机构信号模块不可用: {exc}")
+    conf = _inst_conf()
+    return {"ok": True, **inst.run_once({"get_conn": get_conn}, conf)}
+
+
+# ---------------- 公众号语义检索（mp_retrieval） ----------------
+
+def _mpr_conf() -> dict:
+    """paper.mp_retrieval 段 + 模块默认值。"""
+    try:
+        import mp_retrieval as mpr
+        base = dict(mpr.DEFAULTS)
+    except Exception:                                 # noqa: BLE001
+        base = {"enabled": False, "topk": 6, "days": 14}
+    return {**base, **(_conf_section("paper").get("mp_retrieval") or {})}
+
+
+def _mpr_index_status() -> dict:
+    """索引现状。查不到 Milvus 时**不报错**，只说不可用 ——
+    开关要能显示「为什么没生效」，而不是给用户一个 500。"""
+    try:
+        import mp_retrieval as mpr
+        return mpr.index_status(_mpr_conf(), deps={"get_conn": get_conn})
+    except Exception as exc:                          # noqa: BLE001
+        return {"exists": False, "rows": 0, "error": str(exc)[:200]}
+
+
+@app.get("/api/mp-retrieval/config")
+def mp_retrieval_config_get():
+    """公众号检索的开关与索引现状（页面用来显示「现在到底有没有内容可检索」）。"""
+    return {"ok": True, "conf": _mpr_conf(), "index": _mpr_index_status()}
+
+
+class MprConfIn(BaseModel):
+    enabled: bool | None = None
+    topk: int | None = None
+    days: int | None = None
+
+
+@app.post("/api/mp-retrieval/config")
+def mp_retrieval_config_post(body: MprConfIn):
+    """保存开关。写 paper.mp_retrieval.*（**嵌套**键，不是整段替换）。
+
+    ⚠️ 走 conf_util.set_nested_key 而不是 replace_or_append_section：paper 段里
+    还有几十个别的配置，整段重写会把没在界面上出现的键全抹掉
+    （AGENTS.md 记的「保存调度设置抹掉 mp.auth」那一类事故）。
+    """
+    ops = []
+    if body.enabled is not None:
+        ops.append(("mp_retrieval.enabled", bool(body.enabled)))
+    for key, lo, hi in (("topk", 1, 20), ("days", 1, 180)):
+        val = getattr(body, key)
+        if val is None:
+            continue
+        val = int(val)
+        if not lo <= val <= hi:
+            raise HTTPException(400, f"mp_retrieval.{key} 需在 {lo}~{hi} 之间")
+        ops.append((f"mp_retrieval.{key}", val))
+    if not ops:
+        raise HTTPException(400, "没有要保存的字段")
+    with conf_util.WRITE_LOCK:
+        for dotted, value in ops:
+            conf_util.set_nested_key(CONFIG_FILE, "paper", dotted, value)
+    print(f"[mpret] 页面改了: {', '.join(f'{k}={v}' for k, v in ops)}", flush=True)
+    return {"ok": True, "conf": _mpr_conf(), "written": [k for k, _ in ops]}
+
+
+@app.get("/api/mp-retrieval/query")
+def mp_retrieval_query(q: str = "", code: str = "", name: str = "",
+                       topk: int = 0, days: int = 0):
+    """手工检索一句。**这是判断「开关有没有用」最直接的办法** —— 直接看会喂什么。
+
+    给了 code+name 就走 `build_context`，返回的 `text` 就是**决策上下文里那一段原文**
+    （逐字相同）；只给 q 就返回原始命中列表。
+    """
+    try:
+        import mp_retrieval as mpr
+    except Exception as exc:                          # noqa: BLE001
+        raise HTTPException(502, f"检索模块不可用: {exc}")
+    conf = _mpr_conf()
+    if code and name:
+        with get_conn() as conn:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            text = mpr.build_context(cur, code, name, conf=conf,
+                                      topk=topk or None, days=days or None)
+        return {"ok": True, "mode": "context", "code": code, "name": name,
+                "conf": conf, "text": text}
+    q = (q or "").strip()
+    if not q:
+        raise HTTPException(400, "请给 q，或者给 code+name")
+    rows = mpr.retrieve(q, code=code or None, topk=topk or 8,
+                        days=days or int(conf["days"]), conf=conf)
+    return {"ok": True, "mode": "search", "q": q, "conf": conf,
+            "hits": [{"title": r.get("title"), "mp_name": r.get("mp_name"),
+                      "published_at": str(r.get("published_at") or ""),
+                      "url": r.get("url"), "score": r.get("score"),
+                      "text": (r.get("text") or "")[:600]} for r in rows]}
+
+
+_mpr_reindex_state = {"running": False, "result": None, "started_at": ""}
+
+
+@app.post("/api/mp-retrieval/reindex")
+def mp_retrieval_reindex(drop: bool = False):
+    """后台重建/增量索引。**不能同步跑**：全量 ~9 分钟，会把请求线程占死。"""
+    if _mpr_reindex_state["running"]:
+        return {"ok": False, "running": True, "message": "已有一次在建索引"}
+    try:
+        import mp_retrieval as mpr
+    except Exception as exc:                          # noqa: BLE001
+        raise HTTPException(502, f"检索模块不可用: {exc}")
+    deps = {"get_conn": get_conn}
+    _mpr_reindex_state.update(running=True, result=None,
+                              started_at=datetime.now().strftime("%H:%M:%S"))
+
+    def _run():
+        t0 = time.time()
+        try:
+            res = mpr.index_articles(deps, conf=_mpr_conf(), drop=bool(drop))
+            res["elapsed_s"] = round(time.time() - t0, 1)
+            _mpr_reindex_state.update(running=False, result=res)
+            print(f"[mpret] 页面触发索引完成: {res}", flush=True)
+        except Exception as exc:                      # noqa: BLE001
+            _mpr_reindex_state.update(running=False,
+                                       result={"error": str(exc)[:300]})
+            traceback.print_exc()
+
+    threading.Thread(target=_run, name="mp_reindex", daemon=True).start()
+    return {"ok": True, "started": True, "drop": bool(drop)}
+
+
+@app.get("/api/mp-retrieval/reindex")
+def mp_retrieval_reindex_status():
+    return {"ok": True, **_mpr_reindex_state,
+            "index": _mpr_index_status()}
+
+
+def _inst_loop():
+    """机构信号守护线程：按 interval_minutes 跑一轮采集（默认 0=关）。
+
+    每天只该跑一次的东西不必跑更勤，所以默认 interval_minutes=0（关）；
+    开着时建议 ≥180 分钟 —— 研报评级一天最多变一次，持仓是季报，
+    指数成分虽然 T+1 会变但也不差这一天。
+    """
+    while True:
+        try:
+            conf = _inst_conf()
+            interval = int(conf.get("interval_minutes") or 0)
+            if conf.get("enabled") and interval > 0:
+                import institution_signals as inst
+                inst.run_once({"get_conn": get_conn}, conf)
+                time.sleep(max(interval, 30) * 60)
+            else:
+                time.sleep(600)
+        except Exception as exc:                       # noqa: BLE001
+            print(f"[inst] loop error: {exc}", flush=True)
+            time.sleep(600)
 
 
 @app.get("/api/paper/cycles")
@@ -6705,12 +7329,43 @@ def _paper_run_cycle(conf: dict, slot: str, kind: str = "intraday",
     _paper_state["current_slot"] = slot
     acted = holds = skipped = 0
     err = ""
+    _miss_txt = ""          # 未成交逐条理由；finally 里要用，必须先初始化
     print(f"[paper] {slot} {me} {kind}/{trigger} 开跑", flush=True)
     try:
         deps = _paper_deps(conf)
+        # 🔴 **开跑就先落一行台账**（2026-10-14 用户报「今日各轮记录也没有记录」）。
+        #   原来只在 finally 里写，而 finally 只有**整轮跑完**才执行 ——
+        #   一轮 43 只串行、每只 4~10 分钟（辩论开着）要几小时，
+        #   于是轮次进行中页面永远是空的，看起来像「根本没跑」。
+        #   纯粹是台账/可观测性，**不参与任何决策或成交**。
+        #
+        # ⚠️ 这里只刷 `elapsed_ms`（表示「还活着，已跑多久」），**不动**
+        #   planned/acted/holds/skipped —— 那四个是**整轮跑完后的最终值**，
+        #   拿中途的计数去覆盖它们会让页面上的数字自相矛盾
+        #   （「计划 12 / 成交 0」，其实只是判了 12 只、还没到成交阶段）。
+        #   要显示精确的「已判 X/43」需要加一列 note，那是改 schema，得先问用户。
+        def _tick(seen: int = 0, total: int = 0, last_code: str = "") -> None:
+            nonlocal _tick_seen, _tick_total, _tick_code
+            _tick_seen, _tick_total, _tick_code = seen, total, last_code
+            try:
+                paper_trading.record_cycle(
+                    deps, datetime.now().strftime("%Y-%m-%d"), slot,
+                    kind=kind, trigger=trigger,
+                    planned=acted + holds + skipped, acted=acted,
+                    holds=holds, skipped=skipped,
+                    elapsed_ms=int((time.time() - t0) * 1000), error=err,
+                    note=("已判 %d/%d，最后 %s" % (seen, total, last_code)
+                          if total else "准备中"))
+            except Exception as tick_exc:      # noqa: BLE001
+                print(f"[paper] 台账更新失败（不影响本轮）: {tick_exc}", flush=True)
+
+        _tick_seen = _tick_total = 0
+        _tick_code = ""
+        _tick()
         # 1) 止损：不需要 LLM，先做，保证该跑的止损不会被 LLM 延迟/解析失败拖掉
         sl = paper_trading.check_stop_loss(deps, slot)
         acted += len(sl.get("sold", []))
+        _tick()
         # 2) 重新决策
         targets = only
         if targets is None and conf.get("judge_holdings_only"):
@@ -6721,7 +7376,8 @@ def _paper_run_cycle(conf: dict, slot: str, kind: str = "intraday",
             from paper_trading import _derive_paper_positions
             with deps["get_conn"]() as conn:
                 targets = set(_derive_paper_positions(conn.cursor()).keys()) & wset
-        res = paper_trading.run_decisions(deps, slot=slot, only=targets)
+        res = paper_trading.run_decisions(deps, slot=slot, only=targets,
+                                          progress_fn=_tick)
         decided = res.get("decided", [])
         for d in decided:
             if d.get("executed"):
@@ -6751,8 +7407,14 @@ def _paper_run_cycle(conf: dict, slot: str, kind: str = "intraday",
                 t_res = {"error": str(exc)[:160]}
             _paper_state["last_t"] = t_res
         _paper_state["last_decision"] = res
+        # 🔴 未成交的逐条理由落进台账 note（见 paper_trading.build_miss_note 的
+        #   docstring —— 为什么原来查不到、为什么不插 sa_paper_trades 行）。
+        _miss_txt = paper_trading.build_miss_note(res.get("decided") or [], sl)
+        if _miss_txt:
+            print(f"[paper] {slot} {me} {_miss_txt[:600]}", flush=True)
         print(f"[paper] {slot} {me} {kind}: 判断 {planned} 成交 {acted} 观望 {holds} "
               f"未成交 {skipped} 用时 {time.time()-t0:.0f}s", flush=True)
+        _tick(_tick_total, _tick_total, _tick_code)
     except Exception as exc:
         err = str(exc)
         traceback.print_exc()
@@ -6760,10 +7422,13 @@ def _paper_run_cycle(conf: dict, slot: str, kind: str = "intraday",
     finally:
         elapsed = int((time.time() - t0) * 1000)
         try:
+            # note：运行中是「已判 X/Y」，跑完后换成**未成交的逐条理由**
+            # （见上面那段）。两者不会同时出现，所以一个字段够用。
             paper_trading.record_cycle(
                 _paper_deps(conf), datetime.now().strftime("%Y-%m-%d"), slot,
                 kind=kind, trigger=trigger, planned=acted + holds + skipped,
-                acted=acted, holds=holds, skipped=skipped, elapsed_ms=elapsed, error=err)
+                acted=acted, holds=holds, skipped=skipped, elapsed_ms=elapsed,
+                error=err, note=_miss_txt)
         except Exception:
             pass
         _paper_state["running"] = False
@@ -9168,6 +9833,11 @@ _start_daemon(_mp_loop, "sa_mp")
 # X(Twitter) 指定用户发言监控线程（x_monitor.py；x.interval_minutes=0 或未配账号时跳过）
 _start_daemon(_x_loop, "sa_x")
 _start_daemon(_discover_loop, "sa_discover")
+
+# 机构信号采集线程（institution_signals.py）：
+# 研报评级每天一轮；持仓只在披露季窗口；指数成分快照收盘后 diff。
+# 默认关（paper.inst_signals.enabled=false），关着时线程只空转不干活。
+_start_daemon(_inst_loop, "sa_inst")
 
 # 微信入站长轮询线程（wx_inbound.py + wx_chat.py）。
 # 它同时负责**给 iLink token 保活** —— 没有持续的长轮询，token 几小时内就会失效，

@@ -176,7 +176,8 @@ def parse_with_llm(text: str, *, system_prompt: str, schema_hint: str,
         + ("\n" + temperature_note if temperature_note else "")
     )
     user = "以下是公告正文（已去网页噪音），请抽取：\n\n" + text
-    raw = llm_advisor.ask(sys_p, user, conf=conf, max_tokens=max_tokens, thinking=False)
+    raw = llm_advisor.ask(sys_p, user, conf=conf, max_tokens=max_tokens,
+                         thinking=False, task="standard")
     return extract_json(raw), str((conf or llm_advisor.load_llm_conf()).get("model") or "")
 
 

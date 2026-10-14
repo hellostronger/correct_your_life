@@ -85,6 +85,31 @@ llm:
   # 本机 base_url 指向 101 网关，用这个（2026-10-04 实测 ~1s 响应）。
   # 用 Anthropic 官方端点时请改成 'claude-opus-5'。
   model: 'nvidia/nemotron-3-ultra-550b-a55b'
+  # 客户端超时（秒）。超时是「等多久才放弃」，不是限制输出长度 ——
+  # 网关退化时单次可能要 46~360 秒（原写死 120 秒会让**决策成片失败**，
+  # 而决策失败 ≠ 降级成 hold，是这只票这一轮根本没有决策）。
+  timeout: 420
+  # 任务分级（思路同 Opus/Sonnet/Haiku）：情绪判定/分类/抽取用 fast，
+  # 交易员 JSON 用 standard，分析师报告/多空辩论/复盘用 deep。
+  # ⚠️ 留空 = 沿用上面的 model；某个档位配的模型一旦 404，**不会**静默换弱模型，
+  #    会直接报错 —— 免得「悄悄用弱模型跑决策」而没人发现。
+  #
+  # fast 档实测（2026-10-14，101 网关 36 个候选里只有 7 个还能调通）：
+  #   用**生产真实**的新闻过滤 prompt + 生产同款解析（正则 \[.*?\] → int 下标）：
+  #     nemotron-3-ultra-550b-a55b  55.4s  保留 [0,3,5]
+  #        🔴 留了论坛帖「+300 收一个华纳云」，却丢了**回购公告** —— 分类最差
+  #     nemotron-3-super-120b-a12b   17.7s  保留 [0,1,3,4,6,7]  ← 选它
+  #        偏宽松（会多留两条垃圾），但**该留的都留住了**，且快 3 倍
+  #     nemotron-3.5-lightning-30b   25.2s  ❌ 正则匹配不到 []，fast 档不可用
+  #     gemma-4-31b-it / glm-5.3-flash        ❌ >120s 超时
+  #   ⇒ **大模型不是分类任务的最优解**：550B 推理模型习惯「先想再答」
+  #     （reasoning 312~3784 字符），在「哪几条是真新闻」这种短判别上反而抓不准重点。
+  # ⚠️ 网关的模型在**动态变动**（`nemotron-3-super-120b-a12b` 曾于 10-03 报 410 EOL，
+  #    10-14 又活了）。若哪天 fast 档开始报错，先重新探一遍可用模型，别直接改回默认。
+  tiers:
+    fast: 'nvidia/nemotron-3-super-120b-a12b'
+    standard: ''
+    deep: ''
   # 输出上限，全局唯一：模拟盘报告/交易员/辩论/日报/提款建议都读它。
   # 上限不是消耗 —— 调大不会让短输出变长变贵，只让该写完的长文写完。
   # 调小会把报告腰斩（页面会在正文末尾标「因 max_tokens 被截断」）。
@@ -99,7 +124,23 @@ calendar:
 # 工作日 8:30 后扫一轮，窗口（days 自然日）内的新事件推微信/邮件，同事件只推一次
 alerts:
   enabled: true
-  days: 14
+  # 未来关注窗口（自然日）。留空/删掉 = 用 alerts.DEFAULT_DAYS（183 ≈ 半年）。
+  # ⚠️ 这里写死会让它和代码里的默认值漂移 —— 页面文案说半年、这里写 14，
+  #    谁都不知道该信哪个。留空最安全。
+  # days: 183
+
+# 港股供给冲击：IPO 股东锁定期 + 融资禁售承诺（两条线语义不同，页面分开显示）
+# 为什么要 MinerU：HKEXnews 的中文 PDF 用未嵌入字体子集，PyMuPDF 抽出来是
+# 「交割日期�?0 日止」——丢的正是期限数字，且 U+FFFD 计数为 0，任何缺失检测
+# 都发现不了（2026-10-12 实测）。pypdf 整篇乱码。必须换解析器。
+hk_supply:
+  enabled: true
+  # 每只港股最多解析几份公告（越多越全，也越慢越烧配额）。3 起步够用。
+  max_docs: 3
+  # MinerU token：https://mineru.net/apiManage/token
+  # ⚠️ 含明文密钥，config.yaml 已被 gitignore；这里只写占位说明。
+  # 也支持环境变量 MINERU_API_TOKEN（推荐，不落盘）。
+  mineru_token: ""
 
 # 盘中大盘量能监控（app.py _market_volume_loop：三大指数行情量比 f49）
 # 交易时段按 interval_minutes 采样；放量/缩量状态翻转（连续两次采样确认）推微信
@@ -118,6 +159,20 @@ paper:
   holding_days: 5           # 持有几个交易日后自动平仓结算
   max_position_pct: 25      # 单票市值上限（% of 总资产）
   sleep_seconds: 3          # 逐股决策间 sleep，防 LLM 网关限流
+
+  # 阶段一「逐股决策」的并发度（2026-10-14）。只影响决策这一步，
+  # 阶段二的成交仍然严格串行，且成交顺序按自选股原序还原（同输入必同输出）——
+  # 所以调大它**不改变任何决策内容**，只改变「同一批判断多久做完」。
+  #
+  # 实测（2026-10-14，对真实网关发并发请求，且当时另有一轮并发 6 在跑）：
+  #   并发 6  -> 6/6  成功，均耗时 17.5s
+  #   并发 12 -> 12/12 成功，均耗时 16.1s
+  #   并发 18 -> 18/18 成功，均耗时 16.6s   ← 那一刻网关实际在服务 24 个请求
+  # 结论：**网关不是瓶颈**，延迟几乎不随并发上升。瓶颈是每只票的 prompt 体积。
+  # ⚠️ 代码里硬上限 12。再往上没测过，别直接改代码里的上限。
+  # ⚠️ 本机到云库 RTT 中位 1.9 秒，每只票要开好几次连接 —— 并发只解决
+  #    LLM 那一段，DB 往返是另一块（占比不大，但不是零）。
+  decision_concurrency: 12
 
   # Bull/Bear 多空辩论（debate.py；TradingAgents-astock 对抗机制的本地移植）
   # 决策链：分析师 → 交易员① → [触发] → Bull→Bear→Judge → 交易员②
@@ -142,6 +197,22 @@ paper:
     # —— 辩论当时只是「参考意见」，没有任何约束力。
     enforce_rating: false
 
+  # ---- 自进化（2026-10-12 新增，借鉴 AetherLabsAI/RSIAgent）----
+  # 三段式：Actor(已有) → Verifier(独立验收) → Curriculum(选下一轮练什么)
+  # → 记忆。⚠️ 默认全关：它会改**注入 prompt 的内容**，属决策口径变更。
+  # ⚠️ 2026-10-12 实测：682 条流水只有 3 条经验、12 条超期未结，
+  #    学习回路本来就是断的。开这个开关前建议先跑
+  #    `POST /api/evo/backfill` 把历史经验补齐（默认 dry_run=true 不烧钱）。
+  self_evolution:
+    enabled: false          # 总闸。false 时决策路径与本模块完全无交互
+    backfill: true          # 结算时给「已平仓但没经验」的决策补经验（含止损单）
+    curriculum: false       # Curriculum 要烧 LLM，默认关（用 /api/evo/next-focus 手动触发）
+    max_backfill: 20        # 单次补多少条，避免一次烧爆
+    min_samples_focus: 3    # 有基准 alpha 的样本少于这个数就不出结论（宁缺毋滥）
+    inject_limit: 6         # 最多注入几条有效规则
+    rule_supports_to_keep: 2   # 规则要有几个支持样本才继续注入
+    rule_refutes_to_drop: 2    # 被证伪几次就自动退役（记忆可能记错规则）
+
   # ---- 做 T（2026-10-11）----
   # A 股 T+1 下「做T」唯一可行形态是**持仓不变的份额置换**：
   #   底仓（永不动，拿筹码吃趋势）+ 机动仓（只有这部分允许日内买卖）
@@ -157,6 +228,47 @@ paper:
     refill_max_per_day: 1   # 单日补回次数上限 —— 防「越跌越买」
     max_refill_bearish: 2   # 均线空头时买回门槛 ×2（觉得还会跌就先不补）
     max_codes: 0            # 每轮最多做T标的数，0=不限
+
+  # ---- 机构信号（2026-10-12）----
+  # 用户要求「机构看多看空 / 机构与社保持仓变化 / 被挪出重要指数」参与决策。
+  # 数据可得性都是实测过的（不是查文档）：
+  #   · 券商评级  ak.stock_research_report_em   000858 460 条 / 600519 772 条
+  #   · 机构持仓  ak.stock_main_stock_holder     600036 1342 行（含社保/基金）
+  #   · 指数成分  ak.index_stock_cons_csindex    只有**当前**成分，没有调整历史
+  #            → 「被调出」靠每天存快照自己 diff（sa_index_cons_change）
+  # ⚠️ 三者时效差很多（评级 ~T+1、成分 T+1、持仓**滞后 1~2 个月**），
+  #    注入文本里每条都带数据截止日，别把季报当今天的持仓。
+  inst_signals:
+    enabled: false          # 总闸：false 时决策路径完全不读这些表
+    interval_minutes: 0     # 守护线程轮询，0=线程空转；建议 ≥180
+    rating_days: 90         # 评级分布统计窗口
+    rating_top: 3           # 展示最近 N 篇研报
+    holder_top: 3           # 展示增持/减持各 N 条
+    hold_season: true       # 持仓只在披露季窗口跑（季报平时不会变）
+    indices: ['000300', '000016', '000905', '000852', '000688']
+                           # 沪深300 / 上证50 / 中证500 / 中证1000 / 科创50
+                           # ⚠️ 每个指数快照 ~10 秒，别一次配十几个
+
+  # ---- 公众号语义检索（2026-10-13）----
+  # 为什么不是「再多截 160 字」：实测近 7 天文章正文中位数 630 字，而原来喂给
+  # LLM 的只有「标题 + 正文前 160 字」—— 不是太长，是**只读了 25%**。
+  # 另有 84% 的文章没关联到任何股票（大盘/行业观点），等于不存在。
+  # 方案：Milvus 稠密(bge-m3) + 服务端 BM25 混合检索，块级召回原文段落。
+  # 决策热路径走**确定性** retrieve()（可复现）；agentic_search() 只给开放问题用。
+  mp_retrieval:
+    enabled: false          # 注入决策 = 改决策口径，默认关
+    milvus_uri: 'http://101.43.25.101:19530'
+    collection: sa_mp_chunks
+    embed_model: bge-m3     # 网关 /v1/embeddings 实测可用的只有 bge-m3(1024)
+    topk: 6                 # 决策上下文里放几条
+    days: 14                # 检索时间窗
+    embed_batch: 16         # ⚠️ 别调大：32 条 × 6 并发实测打出 519 次 WinError10065
+    embed_workers: 3        # ⚠️ 别再加，10065 就是加出来的
+  # 建索引（一次性，幂等；改了分块/噪声规则要 --rebuild）：
+  #   python mp_retrieval.py --rebuild     # drop 重建，全量 ~13 分钟
+  #   python mp_retrieval.py --index       # 增量补齐，不 drop
+  #   python mp_retrieval.py --query "招商银行 零售" --limit 5
+  #   python mp_retrieval.py --agentic "今天有什么值得注意"
 
 # 通知配置（微信走腾讯官方 iLink Bot，凭据存云库；邮件走 SMTP）
 # 网页「通知」标签页可改；auth_code 是邮箱授权码，注意保管

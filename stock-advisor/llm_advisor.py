@@ -43,6 +43,17 @@ DEFAULT_LLM_CONF = {
     # 调大不会让短输出（交易员 JSON 只有 250 字）变长变贵，只让本来就该写完的长文
     # 写完。各调用点仍可显式传值覆盖（日报续写就翻倍重试），但不再各写各的常量。
     "max_tokens": 8000,
+    # 客户端超时（2026-10-13 加）。原来**写死 120 秒**，而网关在高峰会退化到
+    # 单次 46~360 秒 —— 实测当日 glm-5.3-flash 46.4s、nemotron-ultra 52.2s、
+    # gpt-oss-20b 148.6s、kimi-k3 361s 直接超时，于是模拟盘决策成片报
+    # `APITimeoutError`（**决策失败 = 这只票这轮没有决策**，不是降级成 hold）。
+    # 超时是「等多久才放弃」，不是「限制模型输出」——放宽它不会让输出变长变贵，
+    # 只让本来能算完的请求别半路被砍。按 AGENTS.md「效果优先」，宁等也不要失败。
+    "timeout": 420,
+    # 模型分级（2026-10-13）。空 = 沿用上面的 model。
+    # 分级的前提是每档模型都**实测可用** —— 网关 99 个模型里多数已 404
+    # （NIM 部署被删），详见 AGENTS.md「模型分级」。
+    "tiers": {"fast": "", "standard": "", "deep": ""},
 }
 
 SYSTEM_PROMPT = """\
@@ -149,12 +160,11 @@ def mask_key(key: str) -> dict:
 
 
 def ask(system: str, user: str, conf: dict | None = None,
-        max_tokens: int = 0, thinking: bool = True) -> str:
-    """调 Claude 拿一段文本。**本项目所有 LLM 调用的统一出口**。
+        max_tokens: int = 0, thinking: bool = True, task: str = "") -> str:
+    """调 LLM 拿一段文本。**本项目所有 LLM 调用的统一出口**。
 
-    只有 ask_advice 时不需要这个函数；抽出它是因为微信对话（wx_chat.py）
-    要用同一套配置和同一套降级链，只是 system prompt 与 max_tokens 不同。
-    复制一份降级逻辑只会让两份代码各自漂移。
+    `task` = 任务档位（`fast`/`standard`/`deep`，见 `model_for`）：给了就按档位换模型，
+    **不给则行为与以前完全一致**（用 `conf["model"]`），所以老调用点零改动。
 
     `max_tokens=0` = 读 config.yaml `llm.max_tokens`（全局唯一，默认 8000）。
     传正数 = 本次调用显式覆盖（日报续写翻倍重试就是这么用的）。
@@ -164,6 +174,11 @@ def ask(system: str, user: str, conf: dict | None = None,
     最简调用，不做无谓的尝试。
     """
     conf = conf or load_llm_conf()
+    if task:
+        picked = model_for(task, conf)
+        if picked and picked != (conf.get("model") or ""):
+            conf = dict(conf)
+            conf["model"] = picked
     if not max_tokens:
         try:
             max_tokens = int(conf.get("max_tokens") or 0)
@@ -181,7 +196,12 @@ def ask(system: str, user: str, conf: dict | None = None,
             + ("当前 base_url 指向自建网关，模型名必须是网关支持的名字，"
                "不是 Anthropic 官方模型名。" if conf.get("base_url")
                else "留空会走到 Anthropic 官方端点，请填官方模型名。"))
-    client_kwargs = {"api_key": conf["api_key"], "timeout": 120.0, "max_retries": 2}
+    try:
+        timeout = float(conf.get("timeout") or 0) or 420.0
+    except (TypeError, ValueError):
+        timeout = 420.0
+    client_kwargs = {"api_key": conf["api_key"], "timeout": timeout,
+                     "max_retries": 2}
     if conf.get("base_url"):
         client_kwargs["base_url"] = conf["base_url"]
     try:
@@ -217,8 +237,60 @@ def ask(system: str, user: str, conf: dict | None = None,
         raise RuntimeError("请求被安全策略拒绝（stop_reason=refusal）")
     text = "".join(b.text for b in msg.content if b.type == "text").strip()
     if not text:
-        raise RuntimeError(f"Claude 返回空内容（stop_reason={msg.stop_reason}）")
+        raise RuntimeError(
+            "Claude 返回空内容（stop_reason=%s）。%s"
+            % (msg.stop_reason,
+               ("⚠ 这是**推理模型把 max_tokens 花在思考上**了，不是内容被截断 —— "
+                "实测 gpt-oss-20b / glm-5.3-flash / nemotron-3.5-lightning 在 "
+                "max_tokens=200 的短任务上全部返回空内容；调大 max_tokens 即可。"
+                if msg.stop_reason == "max_tokens" else ""))
+        )
     return text
+
+
+# ---------------- 模型分级（fast / standard / deep） ----------------
+# 为什么需要（2026-10-13 实测）：网关 99 个模型里大部分已 404，
+# 且**延迟波动极大**（同一模型 1.2s~95s），所以「一个模型打天下」既慢又不稳。
+# 参照 Claude Opus/Sonnet/Haiku 的分级思路，把任务按难度分档、各档绑各档模型。
+#
+# ⚠️ 分级的前提是**每档的模型都实测可用**：网关的 `/v1/models` 里有 ≠ 能用
+# （NIM 部署被删是常态，本次 12 个候选只有 2 个活着）。所以 tier 里留空 =
+# 沿用 `model`；某个档位留空时**不会**自动找替代，避免「静默降级到弱模型」。
+TIERS = ("fast", "standard", "deep")
+
+TASK_HINT = {
+    # 任务 -> 建议档位（调用方传 task= 时按此解析）
+    "sentiment": "fast", "filter": "fast", "classify": "fast",
+    "summarize": "fast", "format": "fast", "title": "fast",
+    "trader": "standard", "advice": "standard", "relevance": "standard",
+    "analyst": "deep", "report": "deep", "daily": "deep", "judge": "deep",
+    "reflect": "deep", "debate": "deep", "curriculum": "deep",
+}
+
+
+def model_for(task: str, conf: dict) -> str:
+    """按任务档位取模型名；档位未配置则回落到 `conf["model"]`。"""
+    tiers = {k: (v or "").strip() for k, v in (conf.get("tiers") or {}).items()
+             if isinstance(v, str)}
+    tier = (tiers.get(task) or "").strip()
+    if tier:
+        return tier
+    hinted = TASK_HINT.get(task)
+    if hinted:
+        tier = (tiers.get(hinted) or "").strip()
+        if tier:
+            return tier
+    return (conf.get("model") or "").strip()
+
+
+def describe_tiers(conf: dict | None = None) -> str:
+    """人可读的档位表（端点/日志用，避免「配置了但看不出走哪档」）。"""
+    c = conf or load_llm_conf()
+    tiers = c.get("tiers") or {}
+    lines = ["默认模型: %s" % (c.get("model") or "(未配置)")]
+    for k in TIERS:
+        lines.append("  %-9s -> %s" % (k, tiers.get(k) or "(沿用默认)"))
+    return "\n".join(lines)
 
 
 def ask_advice(context_text: str, conf: dict | None = None) -> str:

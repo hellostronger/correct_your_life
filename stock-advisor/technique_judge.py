@@ -518,7 +518,7 @@ def run_judge(deps: dict, statuses=("active", "pending"),
             conf = dict(llm_advisor.load_llm_conf())
 
         def llm_fn(system, user, max_tokens=4000):            # noqa: ANN001
-            return llm_advisor.ask(system, user, conf=conf,
+            return llm_advisor.ask(system, user, conf=conf, task="fast",
                                    max_tokens=max_tokens, thinking=True)
 
     if prompt:

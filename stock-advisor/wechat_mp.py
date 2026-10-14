@@ -88,6 +88,23 @@ DEFAULT_MP_CONF = {
     # 把公众号文章写进 sa_news，让它进模拟盘/日报的决策上下文。
     # 关掉 = 只在「📰 公众号」页看，不参与决策。
     "publish_to_news": True,
+    # ---- LLM 相关性过滤（2026-10-12 用户要「公众号必须参与决策」后加）----
+    # 公司名匹配抓不到「题材级」关联：实测 715 篇里 406 篇一篇都没关联上，
+    # 而它们恰恰是券商策略/行业观点这类**决策最有用**的内容。这一层让 LLM 在
+    # 「自选+持仓」范围内做语义判断（同一公司/主营/上下游/该题材主要标的）。
+    # 默认关的理由是**它改决策口径**（§0 的授权边界），**不是省钱** ——
+    # 见 AGENTS.md「别为省 LLM 调用而牺牲效果」：额度要按效果放开。
+    "relevance_llm": {
+        "enabled": False,
+        # 只给「还没被公司名关联上」的文章做；传 false = 每篇都问一遍，
+        # 能捞到「点了 A 公司但主题其实是 B 行业」的额外关联（线上已按效果放开）。
+        "only_unlinked": True,
+        "batch": 6,            # 每次 LLM 调用放几篇
+        "max_per_round": 12,   # 每轮最多处理几篇（防单轮跑太久；线上可放开）
+        "snippet": 300,        # 每篇给模型看的开头字数
+        "max_relations": 4,    # 每篇最多关联几只（宁缺毋滥）
+        "dry_run": False,      # true = 只判不写库
+    },
     # ---- 远程独立部署用（一次配好，网页添加源时自动带入）----
     # WeRSS 服务的地址，如 http://192.168.1.10:8001 或 https://mp.example.com
     "base_url": "",
@@ -136,12 +153,27 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
 # ---------------- 配置 ----------------
 
 def load_mp_conf() -> dict:
-    """读 config.yaml 的 mp 段，补齐默认（每轮现读，改配置即生效）。"""
+    """读 config.yaml 的 mp 段，补齐默认（每轮现读，改配置即生效）。
+
+    ⚠️ 嵌套 dict 必须**深合并**（2026-10-12 加）：`conf.update(section)` 是浅合并，
+    config.yaml 里只要写了 `relevance_llm:` 一个键（哪怕只想改 enabled），
+    整个默认子字典就被顶掉，batch/上限全变 0 —— 与 10-11 那次「保存调度设置抹掉
+    mp.auth」是同一类事故（默认值冒充用户配置）。
+    """
     conf = dict(DEFAULT_MP_CONF)
     try:
         import yaml
         data = yaml.safe_load((BASE_DIR / "config.yaml").read_text(encoding="utf-8")) or {}
-        conf.update({k: v for k, v in (data.get("mp") or {}).items() if v is not None})
+        section = data.get("mp") or {}
+        for k, v in section.items():
+            if v is None:
+                continue
+            base = conf.get(k)
+            if isinstance(base, dict) and isinstance(v, dict):
+                conf[k] = {**base, **{kk: vv for kk, vv in v.items()
+                                      if vv is not None}}
+            else:
+                conf[k] = v
     except Exception:
         pass
     return conf
@@ -1078,6 +1110,11 @@ def run_once(deps) -> dict:
         tstat = {"n": 0, "ok": 0, "fail": 0, "skipped": 0}
         nstat = {"n": 0, "inserted": 0, "skipped_no_time": 0,
                  "skipped_old": 0, "linked": 0, "unlinked": 0}
+        # ---- LLM 相关性过滤（题材级关联；公司名匹配抓不到的那部分）----
+        # 排在 publish_to_news 之后：它只处理「本轮新插入」的文章，且只补关系，
+        # 不重复建 news 行。默认关（要花钱），失败不阻断主流程。
+        rconf = conf.get("relevance_llm") or {}
+        rstat = {"n": 0, "enabled": bool(rconf.get("enabled"))}
         if new_rows and conf.get("resolve_true_time", True):
             try:
                 tstat = fill_true_times(deps, new_rows)
@@ -1088,6 +1125,12 @@ def run_once(deps) -> dict:
                 nstat = publish_to_news(deps, new_rows)
             except Exception as exc:
                 print("[mp] 推入 sa_news 失败：%s" % str(exc)[:150], flush=True)
+        if new_rows and rconf.get("enabled"):
+            try:
+                rstat = llm_relate_to_holdings(deps, new_rows, rconf)
+            except Exception as exc:
+                rstat = {"error": str(exc)[:200]}
+                print("[mp] LLM 相关性过滤失败：%s" % str(exc)[:150], flush=True)
         fresh = [i for it in items for i in it.get("fresh", [])]
         pushed = 0
         # 两道门：本段 notify_new（粗粒度，用户可能整段关掉）与
@@ -1103,6 +1146,7 @@ def run_once(deps) -> dict:
                 print(f"[mp] notify failed: {exc}", flush=True)
         result = {"items": items, "new": sum(i["new"] for i in items),
                   "pushed": pushed, "true_time": tstat, "news": nstat,
+                  "relevance": rstat,
                   "ts": datetime.now().isoformat(timespec="seconds")}
         _state["last_result"] = result
         return result
@@ -1320,6 +1364,60 @@ def fill_true_times(deps, rows: list[dict]) -> dict:
     return stat
 
 
+def _link_index(cur) -> dict:
+    """名册索引 + 自选股名/代码别名 → code。
+
+    为什么不能只用具册（2026-10-12 实测）：`load_name_index` 只读 sa_stock_roster
+    （**A股 5640 只**），而自选/持仓里 **14/43 根本不在名册里** —— 8 只港股
+    （01024 快手-W、00100 MINIMAX-W、02513、06658、01368、01888、00136、001979）
+    和 6 只 ETF（159321、159329、512710、513980、588000、510310）。名册里没有它们的
+    名字，`_find_names` 就不可能命中 —— 也就是说**这类持仓的公众号文章永远
+    关联不到自己**，实测「【MiniMax-W 暴涨…】」这种标题里直接点名（位置 23）都
+    连不上。
+
+    这里补三层，全部**通用规则**，没有任何逐票手写映射：
+      ① 自选股名（港股去掉 -W/-U/-B 等后缀；A 股去掉 股份/有限公司/集团/控股）
+      ② 同上再去掉「贵州/中国/北京…」地域前缀（「中国海洋石油」→「海洋石油」）
+      ③ 股票代码本身（财经标题习惯直接写 6 位/5 位代码，如「【600031…】」）
+    长度门槛沿用 `_find_names` 的 >= 3：2 字短名（茅台、快手）一律不收 ——
+    假阳性比漏报有害。
+
+    ⚠️ `load_name_index` 只吃 **tuple cursor**；传 dict cursor 会静默产出垃圾
+    （dict 迭代出的是列名，我在验证时就被这个坑过一次）。
+    """
+    idx: dict[str, str] = {}
+    try:
+        from stock_roster import load_name_index
+        idx.update(load_name_index(cur) or {})
+    except Exception as exc:
+        print("[mp] 股票名册索引取不到（%s），只按自选股名匹配" % str(exc)[:80],
+              flush=True)
+    try:
+        cur.execute("SELECT code, name FROM sa_watchlist")
+        rows = cur.fetchall()
+    except Exception:
+        rows = []
+    sfx = ("-W", "-U", "-SW", "-B", "股份", "有限公司", "集团", "控股")
+    pre = ("贵州", "江苏", "浙江", "中国", "北京", "上海", "广东")
+    for row in rows:
+        code = (row[0] or "").strip()
+        name = (row[1] or "").strip()
+        if not code:
+            continue
+        cands = {name, code}
+        for s in sfx:
+            if name.endswith(s) and len(name) - len(s) >= 3:
+                cands.add(name[: -len(s)])
+        for p_ in pre:
+            if name.startswith(p_) and len(name) - len(p_) >= 3:
+                cands.add(name[len(p_):])
+        for c in cands:
+            c = c.strip()
+            if len(c) >= 3 and c not in idx:
+                idx[c] = code
+    return idx
+
+
 def publish_to_news(deps, rows: list[dict], max_age_days: int = 7) -> dict:
     """把公众号文章写进 sa_news，让它参与模拟盘/日报的决策上下文。
 
@@ -1339,21 +1437,10 @@ def publish_to_news(deps, rows: list[dict], max_age_days: int = 7) -> dict:
         return stat
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=max_age_days)
-    try:
-        from stock_roster import load_name_index
-    except Exception:
-        load_name_index = None
-
-    payload = []
     conn = deps["get_conn"]()
     try:
         with conn.cursor() as cur:
-            index = {}
-            if load_name_index is not None:
-                try:
-                    index = load_name_index(cur)
-                except Exception:
-                    index = {}
+            index = _link_index(cur)
             for r in rows:
                 cur.execute("SELECT title, published_at, published_at_src, "
                             "COALESCE(content_text,'') "
@@ -1384,7 +1471,14 @@ def publish_to_news(deps, rows: list[dict], max_age_days: int = 7) -> dict:
                 codes = []
                 if index:
                     import stock_discovery as sd
-                    norm = sd._norm((title or "") + " " + (body_txt or "")[:6000])
+                    # ⚠️ 扫**全文**，不截断（2026-10-12 实测修的召回 bug）：
+                    # 原来只扫 body[:6000]，而券商策略/研报类长文正文 8k~20k，
+                    # 实测 8 篇「明明提到了持仓股」的公众号文章里 **7 篇**的持仓股
+                    # 出现在第 7725~20438 字符处 —— 全被切掉了，于是那篇文章
+                    # 关联到了别的股票、唯独没关联到真正提到的那只（招商银行
+                    # naive 命中 7 篇、实际只关联上 2 篇）。这里没有任何成本，
+                    # 只是漏召回。
+                    norm = sd._norm((title or "") + " " + (body_txt or ""))
                     for name in sd._find_names(norm, index):
                         codes.append(index[name])
                 for code in codes:
@@ -1408,4 +1502,223 @@ def publish_to_news(deps, rows: list[dict], max_age_days: int = 7) -> dict:
           "（丢弃 无真值时间 %d / 超%d天 %d）"
           % (stat["inserted"], stat["linked"], stat["skipped_no_time"],
              max_age_days, stat["skipped_old"]), flush=True)
+    return stat
+
+
+# ---------------- LLM 相关性过滤（题材级关联，公司名匹配抓不到的那部分） ----------------
+
+RELEVANCE_SYSTEM = (
+    "你是 A 股 / 港股研究助理。给你若干条财经公众号文章的标题和开头，以及一份"
+    "「关注股票清单」。逐条判断这篇文章**与清单里哪些股票直接相关**。\n"
+    "算相关的口径：\n"
+    "  (1) 文章直接点名该公司；\n"
+    "  (2) 文章讲该公司主营业务/产品本身（业绩、订单、产品发布、产能）；\n"
+    "  (3) 文章讲该公司所处产业链的上游或下游环节，且该环节的变动对它是实质影响；\n"
+    "  (4) 文章讲某个行业或题材，而清单里该股是这个题材/赛道的主要标的。\n"
+    "不算相关的口径：\n"
+    "  · 大盘点评、宏观政策解读、纯资金流/情绪统计，与清单里任何一只都没实质关系；\n"
+    "  · 只因为「都属于科技/消费/医药」这种宽泛行业就算相关（太松，宁可漏）；\n"
+    "  · 提到公司但只是顺带一句、无实质信息。\n"
+    "**宁缺毋滥**：拿不准就不输出。\n"
+    "输出格式（严格照抄，不要 markdown、不要解释、不要写别的字）：\n"
+    "  <文章序号>:<逗号分隔的股票代码>\n"
+    "没有任何相关股票的那篇输出 <文章序号>:NONE\n"
+    "每篇最多 %d 个代码。"
+)
+
+
+def _candidate_universe(cur, limit: int = 80) -> list[tuple[str, str]]:
+    """候选池 = 自选 + 持仓（**只在这份清单里判关联**）。
+
+    为什么不给全市场 5640 只：prompt 会长到没法判，模型也会开始幻觉——
+    而决策只关心自选/持仓。名册里查不到名字的（港股/ETF）就只给代码。
+    """
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    try:
+        cur.execute("SELECT code, name FROM sa_watchlist ORDER BY code")
+        for code, name in cur.fetchall():
+            if code and code not in seen:
+                seen.add(code)
+                out.append((code, (name or "").strip()))
+    except Exception:
+        pass
+    try:
+        cur.execute("SELECT code, sum(CASE WHEN side='buy' THEN shares "
+                    "ELSE -shares END) s FROM sa_paper_trades "
+                    "WHERE status <> 'skipped' GROUP BY code")
+        held = [r[0] for r in cur.fetchall() if r[1] and r[1] > 0]
+    except Exception:
+        held = []
+    missing = [c for c in held if c not in seen]
+    if missing:
+        try:
+            cur.execute("SELECT code, name FROM sa_stock_roster "
+                        "WHERE code = ANY(%s)", (missing,))
+            for code, name in cur.fetchall():
+                seen.add(code)
+                out.append((code, (name or "").strip()))
+        except Exception:
+            pass
+        for c in missing:
+            if c not in seen:
+                seen.add(c)
+                out.append((c, ""))
+    return out[:limit]
+
+
+def _parse_relevance(raw: str, n_items: int, allowed: set[str],
+                     max_relations: int) -> dict[int, list[str]]:
+    """解析 `<序号>:<代码,...>`，**代码必须命中候选白名单**否则丢弃。
+
+    不用 JSON：模型不守格式时（少逗号、多个换行、混进解释文字）行式解析的
+    容错高得多，而白名单兜住了「幻觉出不存在的代码」。
+    """
+    import re
+    out: dict[int, list[str]] = {}
+    for line in (raw or "").splitlines():
+        m = re.match(r"\s*\[?(\d{1,3})\]?\s*[:：、]\s*(.+)$", line)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        if not (0 <= idx < n_items):
+            continue
+        hits = []
+        for code in re.findall(r"\d{5,6}", m.group(2)):
+            if code in allowed and code not in hits:
+                hits.append(code)
+            if len(hits) >= max_relations:
+                break
+        if hits:
+            out.setdefault(idx, []).extend(c for c in hits if c not in out[idx])
+    return out
+
+
+def llm_relate_to_holdings(deps, rows: list[dict], conf: dict | None = None,
+                           max_age_days: int = 7) -> dict:
+    """让 LLM 判断公众号文章与「自选+持仓」的相关性，结果写进 sa_news_related。
+
+    为什么需要它：`_link_index` 只能匹配**公司名/代码**，而公众号大量文章讲的是
+    行业与题材（「存储涨价」「白酒动销」「算力资本开支」）。实测 715 篇里 406 篇
+    一条都没关联上，而这批恰恰是决策价值最高的券商策略/行业观点。
+
+    失败**绝不阻断**主流程（同 publish_to_news）：LLM 挂了只是这批文章没关联上，
+    抓取结果不该作废。写入用 ON CONFLICT DO NOTHING，重复跑幂等。
+    """
+    conf = conf or {}
+    stat = {"n": 0, "calls": 0, "fail": 0, "articles_linked": 0,
+            "relations": 0, "skipped_linked": 0, "dry_run": bool(conf.get("dry_run"))}
+    rows = [r for r in rows if r.get("id") and r.get("url")]
+    if not rows:
+        return stat
+    try:
+        import llm_advisor as llm
+    except Exception as exc:
+        print("[mp] LLM 不可用，跳过相关性过滤：%s" % str(exc)[:120], flush=True)
+        return stat
+    llm_conf = llm.load_llm_conf()
+    if not llm_conf.get("enabled") or not llm_conf.get("api_key"):
+        print("[mp] LLM 未启用/无 key，跳过相关性过滤", flush=True)
+        return stat
+    try:
+        batch = max(1, int(conf.get("batch") or 6))
+        cap = max(1, int(conf.get("max_per_round") or 12))
+        snippet = max(80, int(conf.get("snippet") or 300))
+        max_rel = max(1, int(conf.get("max_relations") or 4))
+        only_unlinked = bool(conf.get("only_unlinked", True))
+    except (TypeError, ValueError):
+        batch, cap, snippet, max_rel, only_unlinked = 6, 12, 300, 4, True
+
+    conn = deps["get_conn"]()
+    inserted: list[tuple[str, str]] = []
+    try:
+        with conn.cursor() as cur:
+            cand = _candidate_universe(cur)
+            if not cand:
+                print("[mp] 候选池为空（自选与持仓都没读到），跳过相关性过滤", flush=True)
+                return stat
+            allowed = {c for c, _ in cand}
+            cur.execute(
+                "SELECT a.id, a.url, a.title, a.mp_name, "
+                "       left(coalesce(nullif(a.content_text,''), a.summary, ''), %s) snip, "
+                "       a.published_at, a.published_at_src, "
+                "       EXISTS (SELECT 1 FROM sa_news_related r "
+                "               WHERE r.url = a.url) AS linked "
+                "  FROM sa_mp_articles a WHERE a.id = ANY(%s)", (snippet, [r["id"] for r in rows]))
+            cols = [d[0] for d in cur.description]
+            arts = [dict(zip(cols, r)) for r in cur.fetchall()]
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        pool = []
+        for a in arts:
+            if a.get("published_at_src") != "wx" or not a.get("published_at"):
+                continue
+            if a["published_at"] < cutoff:
+                continue
+            if only_unlinked and a.get("linked"):
+                stat["skipped_linked"] += 1
+                continue
+            pool.append(a)
+        stat["n"] = len(pool)
+        pool = pool[:cap]
+        stat["n"] = len(pool)
+        if not pool:
+            return stat
+        cand_txt = "、".join(f"{c} {n}" if n else c for c, n in cand)
+        base_msg = RELEVANCE_SYSTEM % max_rel
+        # ⚠️ 按**文章 id** 累积，不能按「批内下标」：批内下标每批都从 0 开始，
+        # 用它做 key 会让后一批的 0 覆盖前一批的 0 —— 实测 batch=1 跑 4 篇时
+        # 只剩最后 1 篇的关联，前 3 篇全丢（离线测试抓到的）。
+        found: dict[int, tuple[str, list[str]]] = {}
+        for start in range(0, len(pool), batch):
+            chunk = pool[start:start + batch]
+            lines = []
+            for i, a in enumerate(chunk):
+                title = (a.get("title") or "").replace("\n", " ").strip()
+                snip = (a.get("snip") or "").replace("\n", " ").strip()[:snippet]
+                lines.append(f"{i}. 标题：{title}\n   开头：{snip}")
+            user = (f"关注股票清单（共 {len(cand)} 只）：\n{cand_txt}\n\n"
+                    f"文章（共 {len(chunk)} 篇，序号从 0 开始）：\n" + "\n".join(lines))
+            stat["calls"] += 1
+            try:
+                raw = llm.ask(base_msg, user, conf=llm_conf, thinking=False,
+                                 task="standard")
+            except Exception as exc:
+                stat["fail"] += 1
+                print("[mp] 相关性判断第 %d 批失败：%s" % (start // batch + 1,
+                                                     str(exc)[:150]), flush=True)
+                continue
+            for idx, codes in _parse_relevance(raw, len(chunk), allowed,
+                                               max_rel).items():
+                row = chunk[idx]
+                prev = found.get(row["id"], (row["url"], []))[1]
+                for c in codes:
+                    if c not in prev:
+                        prev.append(c)
+                found[row["id"]] = (row["url"], prev)
+        for aid in sorted(found):
+            url, codes = found[aid]
+            for code in codes:
+                inserted.append((url, code))
+            stat["articles_linked"] += 1
+        stat["relations"] = len(inserted)
+        if not stat["dry_run"] and inserted:
+            with conn.cursor() as cur:
+                for url, code in inserted:
+                    cur.execute("INSERT INTO sa_news_related (url, code) "
+                                "VALUES (%s,%s) ON CONFLICT (url, code) DO NOTHING",
+                                (url, code))
+            conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+    print("[mp] LLM 相关性：处理 %d 篇（已关联的跳过 %d 篇），调用 %d 次失败 %d 次"
+          " → 关联出 %d 篇 / %d 条关系%s"
+          % (stat["n"], stat["skipped_linked"], stat["calls"], stat["fail"],
+             stat["articles_linked"], stat["relations"],
+             "（dry-run，未写库）" if stat["dry_run"] else ""), flush=True)
     return stat

@@ -29,6 +29,7 @@
 """
 
 import json
+import math
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -45,7 +46,12 @@ HEADERS = {
     "Referer": "https://data.eastmoney.com/",
 }
 
-DEFAULT_DAYS = 14           # 解禁/增发的未来关注窗口（自然日）
+# 解禁/增发的未来关注窗口（自然日）。
+# 2026-10-12 用户要求看**未来半年**（原为 14 天）。半年窗口是安全的：
+# 实测 35 只 A 股持仓的解禁+增发只有 11 条（14 天窗口只有 3 条），
+# 平铺展示完全放得下，且解禁日期是**事前公布**的，看半年才有意义 ——
+# 14 天窗口只能看到「马上要发生」，而决策要的是「什么时候会砸下来」。
+DEFAULT_DAYS = 183          # ≈ 半年
 DEFAULT_REDUCE_LOOKBACK = 5  # 减持公告/明细回看天数
 PAGE_SIZE = 200
 ANN_PAGE_SIZE = 100
@@ -110,17 +116,25 @@ def fetch_lift_events(codes: list[str], end_iso: str) -> list[dict]:
                              "SECURITY_CODE,SECURITY_NAME_ABBR,FREE_DATE,"
                              "CURRENT_FREE_SHARES,LIFT_MARKET_CAP,FREE_SHARES_TYPE",
                              codes, extra, "FREE_DATE"):
-        # 万股 -> 亿元；接口口径：CURRENT_FREE_SHARES 万股、LIFT_MARKET_CAP 万元
-        shares_yi = round((r.get("CURRENT_FREE_SHARES") or 0) / 1e4, 2)
-        cap_yi = round((r.get("LIFT_MARKET_CAP") or 0) / 1e4, 2)
+        # 万股 -> 股；万元 -> 亿元。⚠️ 单位换算对，取数也**不**在这里 round ——
+        #   round 掉的小数会被 aggregate_by_day 逐项累加（见 supply_events），
+        #   且单笔 46.662 万股 round 成 0.0 亿就是「解禁 0.0亿股」。
+        #   显示精度由 fmt_shares / fmt_cap 按量级自适应决定。
+        #   shares_yi/cap_yi 只保留 10 位：位数不够时**会与 shares_txt 自相矛盾**
+        #   （6 位 = 100 股，正好等于展示的最小单位 0.01 万股，于是 77.035 万股
+        #   存成 77.04 万股、显示 77.03 万股 —— 两个字段对不上，AGENTS.md 说的
+        #   「看起来有值、实际是错的」）。
+        shares = float(r.get("CURRENT_FREE_SHARES") or 0) * 1e4      # 万股 -> 股
+        cap_yi = float(r.get("LIFT_MARKET_CAP") or 0) / 1e4          # 万元 -> 亿元
         out.append({
             "type": "lift",
             "code": r["SECURITY_CODE"],
             "name": r.get("SECURITY_NAME_ABBR", ""),
             "event_date": (r.get("FREE_DATE") or "")[:10],
-            "shares_yi": shares_yi,
-            "cap_yi": cap_yi,
-            "shares_txt": f"{shares_yi}亿股",
+            "shares_yi": round(shares / 1e8, 10),
+            "cap_yi": round(cap_yi, 10),
+            "shares_txt": fmt_shares(shares),
+            "cap_txt": ("约" + fmt_cap(cap_yi)) if cap_yi else "",
             "detail": r.get("FREE_SHARES_TYPE", ""),
         })
     return out
@@ -136,17 +150,17 @@ def fetch_placement_events(codes: list[str], end_iso: str) -> list[dict]:
                              "ISSUE_NUM,ISSUE_PRICE,ISSUE_WAY,LOCKIN_PERIOD,SEO_TYPE",
                              codes, extra, "ISSUE_LISTING_DATE"):
         kind = "定向增发" if str(r.get("SEO_TYPE")) == "1" else "公开增发"
-        num = r.get("ISSUE_NUM") or 0
-        shares_yi = round(num / 1e8, 2)
-        cap_yi = round(num * (r.get("ISSUE_PRICE") or 0) / 1e8, 2)
+        num = float(r.get("ISSUE_NUM") or 0)          # 股
+        cap_yi = num * float(r.get("ISSUE_PRICE") or 0) / 1e8
         out.append({
             "type": "placement",
             "code": r["SECURITY_CODE"],
             "name": r.get("SECURITY_NAME_ABBR", ""),
             "event_date": (r.get("ISSUE_LISTING_DATE") or "")[:10],
-            "shares_yi": shares_yi,
-            "cap_yi": cap_yi,
-            "shares_txt": f"{shares_yi}亿股",
+            "shares_yi": round(num / 1e8, 10),
+            "cap_yi": round(cap_yi, 10),
+            "shares_txt": fmt_shares(num),
+            "cap_txt": ("约" + fmt_cap(cap_yi)) if cap_yi else "",
             "detail": f"{kind}·{r.get('ISSUE_WAY', '')}·{r.get('LOCKIN_PERIOD', '')}",
         })
     return out
@@ -255,6 +269,72 @@ def _num(v) -> str:
     return s or "0"
 
 
+def _trim(v: float, dp: int) -> str:
+    """定点到 dp 位再**去尾零**（'46.6600' -> '46.66'、'177.00' -> '177'）。
+
+    ⚠️ 只能在**有小数点时**去尾零。`dp=0` 时 f-string 直接给 '8000'，
+    无脑 `rstrip('0')` 会啃成 '8' —— 8000 股显示成 8 股（第一版就踩了，
+    离线测试当场逮到）。
+    """
+    s = f"{float(v):.{dp}f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s or "0"
+
+
+def _finite(v) -> float | None:
+    """float(v) 且**排除 NaN/Inf**。
+
+    ⚠️ `float('nan')` / `float('inf')` 都是合法 float，不拦的话会一路
+    走完格式化输出成 'nan' / 'inf亿元' —— 与 t_trading.fnum 同一个坑
+    （`"%.2f" % float('nan')` 不抛异常，except 拦不到）。
+    """
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return None
+    return n if math.isfinite(n) else None
+
+
+def fmt_shares(shares) -> str:
+    """股数的人读单位：**按量级自动选** 亿股 / 万股 / 股。
+
+    ⚠️ 别再固定「X.XX亿股」（2026-10-12 用户报）：
+      001309 德明利解禁 46.662 万股 -> 「0.0亿股」（四舍五入成 0，等于没显示）
+      600186 莲花控股 177 万股    -> 「0.02亿股」（真实 0.0177 亿，丢了 12%）
+    单笔解禁/减持本来就在**百万股级**，亿股只适合 IPO 级巨量。
+    源端 CURRENT_FREE_SHARES 单位是万股，本函数收**股**。
+    """
+    n = _finite(shares)
+    if n is None:
+        return ""
+    if n == 0:
+        return "0"
+    a = abs(n)
+    if a >= 1e8:
+        return _trim(n / 1e8, 2) + "亿股"
+    if a >= 1e4:
+        return _trim(n / 1e4, 2) + "万股"
+    return _trim(n, 0) + "股"
+
+
+def fmt_cap(yi) -> str:
+    """金额的人读单位，**入参单位是亿元**。
+
+    「约0.08亿元」不如「约829万元」直观，同一条消息里量级还统一。
+    0/None -> 空串（调用方据此决定要不要显示这一段）。
+    """
+    n = _finite(yi)
+    if n is None or n == 0:
+        return ""
+    a = abs(n)
+    if a >= 1:
+        return _trim(n, 2) + "亿元"
+    if a >= 1e-4:                       # >= 1 万元
+        return _trim(n * 1e4, 2) + "万元"
+    return _trim(n * 1e8, 2) + "元"
+
+
 def fetch_reduce_events(codes: list[str], lookback_days: int = DEFAULT_REDUCE_LOOKBACK
                         ) -> list[dict]:
     """自选股近 lookback_days 的减持：预披露计划公告 + 董监高实际减持明细。
@@ -289,6 +369,7 @@ def fetch_reduce_events(codes: list[str], lookback_days: int = DEFAULT_REDUCE_LO
             "shares_yi": None,
             "cap_yi": None,
             "shares_txt": "",
+            "cap_txt": "",
             "detail": _ann_title(a, name),
             "key": f"{kind}:{code}:{art}",
         })
@@ -324,8 +405,9 @@ def fetch_reduce_events(codes: list[str], lookback_days: int = DEFAULT_REDUCE_LO
             "name": r.get("SECURITY_NAME", ""),
             "event_date": (r.get("CHANGE_DATE") or "")[:10],
             "shares_yi": None,
-            "cap_yi": round(abs(shares) * avg / 1e8, 4) if avg else None,
-            "shares_txt": f"{abs(shares) / 1e4:g}万股",
+            "cap_yi": round(abs(shares) * avg / 1e8, 10) if avg else None,
+            "shares_txt": fmt_shares(abs(shares)),
+            "cap_txt": ("约" + fmt_cap(abs(shares) * avg / 1e8)) if avg else "",
             "detail": f"{r.get('PERSON_NAME', '')}·" + "·".join(bits),
             # GGEID 是这次持股变动的稳定事件号
             "key": f"reduce_done:{r['SECURITY_CODE']}:{ggeid}",
@@ -412,8 +494,14 @@ def event_key(e: dict) -> str:
 
 def _fmt_event(e: dict) -> str:
     icon, label = KIND_META.get(e["type"], ("•", e["type"]))
-    amt = " ".join(x for x in (e.get("shares_txt") or "",
-                               f"约{_num(e['cap_yi'])}亿元" if e.get("cap_yi") else "") if x)
+    # ⚠️ 显示串统一走后端的 cap_txt（自适应 亿/万/元）。前端那个
+    #    `约${cap_yi}亿元` 曾经把 0.0829 亿写成「约0.08亿元」，同一条消息里
+    #    混着 0.19亿 和 0.08亿 很难比较。旧事件（state 文件里存的）没有 cap_txt，
+    #    保留 fallback，别让历史记录渲染成空白。
+    cap_txt = e.get("cap_txt")
+    if cap_txt is None:
+        cap_txt = ("约" + fmt_cap(e["cap_yi"])) if e.get("cap_yi") else ""
+    amt = " ".join(x for x in (e.get("shares_txt") or "", cap_txt or "") if x)
     return (f"{icon}{label} {e['event_date']} {e['name']}（{e['code']}）"
             + (f" {amt} · " if amt else "")
             + f"{e.get('detail') or ''}")

@@ -40,6 +40,12 @@ from datetime import date, datetime, timedelta
 
 import requests
 
+# 复用 alerts 的单位自适应格式化。alerts.py 只依赖标准库 + requests，
+# 不 import app，所以这里 import 不会带起守护线程或 80 秒的 import 开销。
+# ⚠️ 别在这里再写一份 —— 两份格式化逻辑漂移过一次：alerts 的减持分支本来就
+#    用了「X万股」，解禁分支却还在用「X.XX亿股」，同一个模块两种口径。
+from alerts import fmt_cap, fmt_shares
+
 DC_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -480,7 +486,7 @@ def render(snapshot: dict, top_n: int = 6) -> str:
         L.append(f"📤 增发上市：窗口内 {seo['window_n']} 家 / {seo['window_cap_yi']:.1f} 亿")
         for e in sorted(seo["future"], key=lambda x: x["date"])[:top_n]:
             L.append(f"     {e['date']}  {e['name']}({e['code']})  "
-                     f"{e['cap_yi']:.2f}亿  {e['detail']}")
+                     f"{fmt_cap(e['cap_yi']) or '—'}  {e['detail']}")
         if seo["window_n"] <= 3:
             L.append("     （增发天然稀疏，未来 180 天全市场仅个位数，不做分位数评级）")
 
@@ -495,7 +501,8 @@ def render(snapshot: dict, top_n: int = 6) -> str:
             L.append(f"   单日基线（{b['days']} 天有公告）：p50={b['p50']:.1f} "
                      f"p80={b['p80']:.1f} p90={b['p90']:.1f} 亿")
         for e in sorted(red["future"], key=lambda x: -x["cap_yi"])[:top_n]:
-            L.append(f"     {e['date']}  {e['name']}({e['code']})  {e['cap_yi']:.1f}亿")
+            L.append(f"     {e['date']}  {e['name']}({e['code']})  "
+                     f"{fmt_cap(e['cap_yi']) or '—'}")
         L.append("     ⚠ 无法做**前瞻**减持日历：该数据源只收录已过公告日的记录")
         L.append("     （未来窗口四个日期字段实测全 0 行）；家次口径同一股可多次")
 

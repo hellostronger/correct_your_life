@@ -1,0 +1,29 @@
+services:
+  hk-supply:
+    build: .
+    image: hk-supply:1.0.0
+    container_name: hk-supply
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    volumes:
+      # 缓存必须落盘：解析一份公告 = 一次 MinerU 调用 + 一次 LLM 调用，
+      # 不缓存的话每次刷新页面都重烧一遍（且配额 5000 份/天看着宽裕，
+      # 一天几十次刷新就能用掉一大截）。
+      - ./data:/app/data
+    environment:
+      MINERU_API_TOKEN: "${MINERU_API_TOKEN}"
+      # ⚠️ 这里**不能**写 127.0.0.1 —— 那是容器自己的回环，不是宿主机。
+      #    宿主上的 new-api 网关要用宿主可达地址（本机验证过 101:3000 直连 200/401）。
+      #    extra_hosts 里的 host.docker.internal 是给「同宿主」场景的备选。
+      LLM_BASE_URL: "${LLM_BASE_URL:-http://172.17.0.1:3000}"
+      LLM_API_KEY: "${LLM_API_KEY}"
+      LLM_MODEL: "${LLM_MODEL:-z-ai/glm-5.3-flash}"
+      MAX_DOCS: "${MAX_DOCS:-3}"
+      # ⚠️ 刻意**不配** HK_CODES 之类的「持仓清单」。
+      #   谁持有是会变的业务状态，固化进部署配置会让「加一只票」变成
+      #   「改 .env + 重新部署」，而且从配置上看不出服务支持哪些股票，
+      #   容易误以为只支持那几只。持仓由调用方查 sa_watchlist 后传 codes。
+    extra_hosts:
+      # 容器内要调本机的 LLM 网关；host.docker.internal 在 Linux 上需要显式声明
+      - "host.docker.internal:host-gateway"

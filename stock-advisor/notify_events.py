@@ -258,6 +258,16 @@ EVENTS: dict[str, dict[str, Any]] = {
                 "风险敞口仍在）。同一只票同一原因当天只推一次。",
         "source": "paper_trading.check_stop_loss()",
     },
+    "paper_evo_backfill": {
+        "label": "🧬 自进化补经验",
+        "group": "模拟盘",
+        # 默认只推微信：结算每天最多一次，内容是数字摘要。
+        "default": {"wx": True, "email": False},
+        "help": "结算时给「已平仓但从未产生经验」的决策补了经验（含止损单）。"
+                "**这是学习回路是否通畅的直接指标** —— 2026-10-12 实测"
+                "682 条流水只有 3 条经验，补不上说明回路是断的。",
+        "source": "self_evolution.backfill()（经 settle_and_reflect 调用）",
+    },
 }
 
 # 渠道名（与 notify.<渠道> 段一一对应）
