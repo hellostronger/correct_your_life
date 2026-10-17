@@ -11,9 +11,13 @@
 | ETF期权到期 | 每月第四个周三 | 标的（50/300/500ETF 等）临近行权价磁吸/甩离 |
 | LPR 报价 | 每月 20 日（遇周末顺延下一工作日）9:15 | 利率敏感板块（银行/地产）异动 |
 
-FOMC 议息、美国 CPI 这类「不精确到规则」的日期没有可靠推算方式，
+FOMC 议息这类「不精确到规则」的日期没有可靠推算方式，
 走 sa_calendar_events 手动/脚本添加（UI 上有入口，也可让 Claude 定时查好写库），
 同样参与每日提醒。
+
+中/美 CPI 的公布时间**不用手动**：从百度经济日历自动同步（见「CPI 排期自动同步」一节，
+2026-10-17 加）。它带确切日期时间和未来排期（实测 76 天逐日扫描 0 失败），
+缓存到 data/econ_sync.json，只读展示、**不进数据库**。
 
 提醒策略（_calendar_loop，交易日早 8:47 盘前）：
 - 今天/明天发生的事件合并一条推微信
@@ -22,6 +26,9 @@ FOMC 议息、美国 CPI 这类「不精确到规则」的日期没有可靠推�
 """
 
 import json
+import re
+import threading
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -261,6 +268,238 @@ def load_manual(conn, from_iso: str) -> list[dict]:
                  "source": "manual"} for r in cur.fetchall()]
 
 
+# ---------------- CPI 排期自动同步（百度经济日历，2026-10-17 加） ----------------
+# 用户要的：「财经日历里要有中/美 CPI 的公布时间」。
+#
+# 为什么是百度经济日历（实测依据，别换）：
+# - 官方源走不通：BLS schedule 页从本机请求 403（Akamai 拦截），NBS 无稳定日程接口；
+# - 金十 CDN（cdn-rili.jin10.com）本机 DNS 解析不了（getaddrinfo failed）；
+# - 百度经济日历**带未来排期**（实测 76 天逐日扫描 0 失败），中/美 CPI 都带
+#   确切北京时间（中国 09:30、美国 20:30/21:30 随夏令时变）；
+# - akshare 已封装成 news_economic_baidu()，不需要手写私有接口。
+#
+# 缓存到 data/econ_sync.json（与 lianghui.json 同模式），**不进数据库**——
+# 日历只是只读视图，没必要占一张表，也不引入 schema 变更。
+#
+# 诚实标注（页面也会看到同步时间）：
+# - 百度只收录「已排期」的数据，远月（2 个月外）可能还没收录 → 每天滚动重扫，
+#   出现即补上（所以看不到更远的 CPI 不一定是不存在，是源头还没排）。
+# - 只取日期/时间/系列名，**不用**预期/前值数值列（临近发布才会填，且天天变）。
+
+SYNC_FILE = BASE_DIR / "data" / "econ_sync.json"
+SYNC_HORIZON_DAYS = 60            # 默认滚动扫描窗口（天）
+SYNC_REQUEST_DELAY = 0.25         # 逐日请求间隔（秒），对源礼貌
+
+_SYNC_LOCK = threading.Lock()     # 同进程内防并发同步（守护线程 + 手动接口）
+
+# 只认「头条系列」，不抓 CPI 分项（住房/新车/能源/食品/二手车/克里夫兰等）和他国 CPI。
+# 中国香港的「综合CPI年率」也刻意不收（不是内地口径；^中国 后面必须直接跟月份数字）。
+_CN_CPI_RE = re.compile(r"^中国(\d+)月CPI(年率|月率)\(%\)$")
+_US_CPI_RE = re.compile(r"^美国(\d+)月((?:核心)?CPI(?:年率-?未季调|月率-?季调后))\(%\)$")
+
+_SYNC_META = {
+    "cn": {"code": "cpi_cn", "market": "cn", "level": "mid",
+           "title": "中国{mm}月CPI公布",
+           "note": "国家统计局发布：{series}（同比/环比）"},
+    "us": {"code": "cpi_us", "market": "us", "level": "high",
+           "title": "美国{mm}月CPI公布",
+           "note": "美国劳工统计局发布：{series}"},
+}
+
+# 百度日历的「地区」列 → 内部键（两者必须显式映射：早期版本的 bug 是直接
+# 拿中文地区当 bucket 键，而 _SYNC_META 键是 cn/us，必然 KeyError）
+_REGION_KEY = {"中国": "cn", "美国": "us"}
+
+
+def _clean_cell(v) -> str:
+    """把 pandas 的 NaN/None 等脏值统一成空串。"""
+    s = str(v if v is not None else "").strip()
+    return "" if s in ("nan", "NaT", "None") else s
+
+
+def _fetch_day(day: date) -> list[dict]:
+    """取某一天的经济日历行（akshare 封装百度）。[] = 当天无安排。"""
+    import akshare as ak
+    df = ak.news_economic_baidu(date=day.strftime("%Y%m%d"))
+    if df is None or len(df) == 0:
+        return []
+    return [dict(r) for r in df.to_dict("records")]
+
+
+def _cpi_events_for_day(day: date, rows: list[dict]) -> list[dict]:
+    """从一天的行里汇总中/美 CPI 头条系列 → 事件（每国至多 1 条）。"""
+    bucket: dict[str, dict] = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        key = _REGION_KEY.get(_clean_cell(r.get("地区")))
+        if not key:
+            continue
+        name = _clean_cell(r.get("事件"))
+        m = (_CN_CPI_RE if key == "cn" else _US_CPI_RE).match(name)
+        if not m:
+            continue
+        label = f"CPI{m.group(2)}" if key == "cn" else m.group(2)
+        info = bucket.setdefault(key, {"month": m.group(1), "times": set(),
+                                       "series": []})
+        info["series"].append(label)
+        t = _clean_cell(r.get("时间"))
+        if t:
+            info["times"].add(t)
+
+    out = []
+    for key, info in bucket.items():
+        meta = _SYNC_META[key]
+        series = list(dict.fromkeys(info["series"]))       # 去重保序
+        times = sorted(info["times"])
+        out.append({
+            "date": day.isoformat(), "code": meta["code"],
+            "title": meta["title"].format(mm=info["month"]),
+            "time": times[0] if times else "",
+            "market": meta["market"], "level": meta["level"],
+            "note": meta["note"].format(series="、".join(series)),
+            "source": "econ_sync",
+        })
+    return out
+
+
+def _load_sync() -> dict:
+    try:
+        d = json.loads(SYNC_FILE.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_sync(payload: dict) -> None:
+    SYNC_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SYNC_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(SYNC_FILE)
+
+
+def load_synced_events(from_iso: str | None = None) -> list[dict]:
+    """缓存里 from_iso（含）之后的事件（只读，不联网）。"""
+    since = from_iso or date.today().isoformat()
+    return [e for e in (_load_sync().get("events") or [])
+            if isinstance(e, dict) and str(e.get("date") or "") >= since]
+
+
+def sync_meta() -> dict:
+    """同步状态（页面显示用）。"""
+    d = _load_sync()
+    window = d.get("window") or ["", ""]
+    return {"last_synced_at": d.get("synced_at") or "",
+            "event_count": len(d.get("events") or []),
+            "window_end": window[1] if len(window) > 1 else "",
+            "failed_days": len(d.get("failed_days") or []),
+            "warn": d.get("warn") or "",
+            "running": _SYNC_LOCK.locked()}
+
+
+def sync_due(interval_hours: float) -> bool:
+    """距上次成功同步是否已超过 interval_hours（没同步过 = 到期）。"""
+    ts = _load_sync().get("synced_at")
+    if not ts:
+        return True
+    try:
+        last = datetime.fromisoformat(str(ts))
+    except (TypeError, ValueError):
+        return True
+    return (datetime.now() - last).total_seconds() >= float(interval_hours) * 3600
+
+
+def sync_cpi_events(*, days: int | None = None, delay: float | None = None,
+                    fetch_fn=None, today: date | None = None) -> dict:
+    """滚动扫描未来窗口，汇总中/美 CPI 排期写入缓存（拿不到锁就跳过）。
+
+    三条防呆都写在这里（每条对应一种「静默把数据弄丢」的场景）：
+    - 单日失败不中断整轮，**失败的日期沿用旧缓存**（网络抖一下不该抹掉已知排期）；
+    - 全部日期都失败 → 不写缓存、synced_at 不更新，下一轮自动重试；
+    - 扫到 0 条而旧缓存非空 → 保留旧数据并标 warn（源头口径变了也不能
+      让 CPI 从日历里静默消失）。
+    """
+    if not _SYNC_LOCK.acquire(blocking=False):
+        return {"ok": False, "busy": True, "error": "已有同步任务在跑"}
+    try:
+        return _sync_impl(days=days, delay=delay, fetch_fn=fetch_fn, today=today)
+    finally:
+        _SYNC_LOCK.release()
+
+
+def _sync_impl(*, days: int | None = None, delay: float | None = None,
+               fetch_fn=None, today: date | None = None) -> dict:
+    today = today or date.today()
+    days = int(days or SYNC_HORIZON_DAYS)
+    delay = SYNC_REQUEST_DELAY if delay is None else delay
+    fetch = fetch_fn or _fetch_day
+
+    old = _load_sync()
+    old_events = [e for e in (old.get("events") or []) if isinstance(e, dict)]
+    events: list[dict] = []
+    failed: list[str] = []
+    requests = 0
+    for i in range(days + 1):
+        day = today + timedelta(days=i)
+        requests += 1
+        try:
+            rows = fetch(day)
+        except Exception as exc:
+            failed.append(day.isoformat())
+            events += [e for e in old_events if e.get("date") == day.isoformat()]
+            print(f"[calendar] CPI 同步 {day} 失败: "
+                  f"{type(exc).__name__}: {str(exc)[:120]}", flush=True)
+        else:
+            events += _cpi_events_for_day(day, rows or [])
+        if delay:
+            time.sleep(delay)
+
+    if failed and len(failed) >= requests:
+        return {"ok": False, "error": "全部日期抓取失败，缓存未更新",
+                "failed_days": failed}
+
+    warn = ""
+    if not events and old_events:
+        events = old_events
+        warn = "本次未扫到任何 CPI（保留旧缓存）"
+
+    dedup: dict[tuple, dict] = {}
+    for e in events:
+        dedup[(e.get("date"), e.get("code"))] = e
+    events = [dedup[k] for k in sorted(dedup)]
+
+    payload = {"synced_at": datetime.now().isoformat(timespec="seconds"),
+               "window": [today.isoformat(), (today + timedelta(days=days)).isoformat()],
+               "requests": requests, "failed_days": failed, "warn": warn,
+               "events": events}
+    _write_sync(payload)
+    return {"ok": True, "events": len(events), "requests": requests,
+            "failed_days": failed, "warn": warn}
+
+
+def sync_async(**kw) -> dict:
+    """手动触发：后台线程跑（别占住 HTTP 请求线程），立刻返回。
+
+    锁在本函数先拿、由工作线程释放（threading.Lock 允许跨线程 release），
+    这样「两个请求同时点」不会起两个同步；拿不到锁就是 busy。
+    """
+    if not _SYNC_LOCK.acquire(blocking=False):
+        return {"started": False, "busy": True}
+
+    def _run():
+        try:
+            res = _sync_impl(**kw)
+            print(f"[calendar] CPI 手动同步完成: {res}", flush=True)
+        except Exception as exc:
+            print(f"[calendar] CPI 手动同步失败: {type(exc).__name__}: {exc}",
+                  flush=True)
+        finally:
+            _SYNC_LOCK.release()
+
+    threading.Thread(target=_run, daemon=True, name="econ_sync_manual").start()
+    return {"started": True}
+
+
 # ---------------- 每日盘前提醒 ----------------
 
 def _load_state() -> dict:
@@ -279,7 +518,7 @@ def _save_state(state: dict) -> None:
 
 
 def upcoming_events(conn, months: int = 3) -> list[dict]:
-    """规则事件 + 年度政治事件 + 手动事件合并视图（按日期排序）。"""
+    """规则事件 + 年度政治事件 + 手动事件 + 新股排期 + CPI/财报同步 合并视图（按日期排序）。"""
     today = date.today()
     auto = generate_events(months=months)
     end = (today + timedelta(days=months * 31)).isoformat()
@@ -287,7 +526,9 @@ def upcoming_events(conn, months: int = 3) -> list[dict]:
         auto += yearly_events(y)
     manual = [e for e in load_manual(conn, today.isoformat()) if e["date"] <= end]
     ipo = _ipo_events(end)
-    return sorted(auto + manual + ipo,
+    synced = [e for e in load_synced_events(today.isoformat()) if e["date"] <= end]
+    earn = _earn_events(end)
+    return sorted(auto + manual + ipo + synced + earn,
                   key=lambda e: (e["date"], e["source"], e["code"]))
 
 
@@ -302,6 +543,16 @@ def _ipo_events(end_iso: str) -> list[dict]:
                 if e["date"] <= end_iso]
     except Exception as exc:
         print(f"[calendar] 新股排期并入失败（忽略）: {exc}", flush=True)
+        return []
+
+
+def _earn_events(end_iso: str) -> list[dict]:
+    """财报排期（持仓 + 所属板块龙头）并进日历视图。失败静默（同 _ipo_events）。"""
+    try:
+        import earnings_sync
+        return [e for e in earnings_sync.load_events() if e["date"] <= end_iso]
+    except Exception as exc:
+        print(f"[calendar] 财报排期并入失败（忽略）: {exc}", flush=True)
         return []
 
 

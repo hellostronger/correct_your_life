@@ -997,7 +997,7 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
   <!-- 财经日历 -->
   <section id="tab-calendar" class="hide">
     <div class="card">
-      <b style="font-size:13px">手动添加事件（非农/交割/LPR 已自动生成，这里补充 FOMC 议息、美国 CPI 等）</b>
+      <b style="font-size:13px">手动添加事件（非农/交割/LPR 本地推算、中/美 CPI 自动同步；这里补充 FOMC 议息等）</b>
       <div class="row" style="margin-top:8px">
         <input id="c-date" placeholder="日期" style="width:130px"
                onfocus="this.type='date'" onblur="if(!this.value)this.type='text'">
@@ -1011,8 +1011,10 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
         第 4 个周五 ETF 期权到期、每月 20 日 <b>LPR</b>；
         年度政治事件：<b>美国中期选举</b>（偶数年 11 月第一个周一之后的周二）、
         <b>全国两会开幕</b>（从《政府工作报告》抽取，闭幕日不固定）。
+        <b>中/美 CPI 公布时间</b>从百度经济日历自动同步（默认每日一轮、滚动窗口 60 天，
+        可在「设置」里调；远月排期源头可能还没收录，出现即自动补上）。
         交易日早 8 点起盘前自动推微信：今明两日事件一条，
-        ⚡重要事件（非农/四巫/中期选举/两会）另提前 3 天预告一次。
+        ⚡重要事件（非农/四巫/中期选举/两会/美国 CPI）另提前 3 天预告一次。
       </div>
     </div>
 
@@ -1058,12 +1060,15 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
 
     <div class="card">
       <div class="row" style="justify-content:space-between;margin-bottom:6px">
-        <b style="font-size:13px">未来 3 个月（含新股排期）</b>
+        <b style="font-size:13px">未来 3 个月（含新股排期、CPI 与财报同步）</b>
         <div class="row">
+          <button class="btn ghost" id="cal-sync-btn" onclick="syncEcon()"
+                  title="立即同步：中/美 CPI 公布时间 + 持仓及所属板块 A股/美股龙头财报排期（后台跑：CPI 约半分钟，财报几分钟）">同步日历</button>
           <button class="btn ghost" onclick="calendarCheck()" title="按当前日期跑一次盘前提醒逻辑">模拟提醒</button>
           <button class="btn ghost" onclick="loadCalendar()">刷新</button>
         </div>
       </div>
+      <div id="calendar-sync-line" class="muted" style="font-size:12px;margin-bottom:6px"></div>
       <div id="calendar-list"></div>
       <div id="calendar-empty" class="empty hide">加载中…</div>
     </div>
@@ -5710,6 +5715,24 @@ async function loadCalendar() {
   try {
     const d = await api('/api/calendar');
     const evs = d.events || [];
+    const sy = d.sync || {};
+    const es = d.earn_sync || {};
+    const sline = $('calendar-sync-line');
+    const ts16 = v => String(v || '').replace('T', ' ').slice(0, 16);
+    const parts = [];
+    parts.push(sy.last_synced_at
+      ? `CPI 自动同步：${ts16(sy.last_synced_at)} · 排期 ${sy.event_count} 条`
+        + (sy.running ? ' · 同步进行中…' : '')
+        + (sy.warn ? ` · ⚠️ ${esc(sy.warn)}` : '')
+      : 'CPI 尚未同步过（点「同步日历」立即拉取）');
+    const mp = es.mapping || {};
+    parts.push(es.last_synced_at
+      ? `财报自动同步：${ts16(es.last_synced_at)} · 事件 ${es.event_count} 条`
+        + ` · 龙头映射 ${mp.items || 0} 条（A ${mp.leaders_cn || 0} / 美 ${mp.leaders_us || 0}）`
+        + (es.running ? ' · 同步进行中…' : '')
+        + (es.warn ? ` · ⚠️ ${esc(es.warn)}` : '')
+      : '财报尚未同步过（点「同步日历」立即拉取）');
+    sline.innerHTML = parts.join('<br>');
     $('calendar-empty').classList.toggle('hide', evs.length > 0);
     const today = new Date().toISOString().slice(0, 10);
     $('calendar-list').innerHTML = evs.map(e => {
@@ -5724,10 +5747,14 @@ async function loadCalendar() {
              style="font-size:11px;margin-left:4px">原文↗</a>` : '';
       const ipoTag = e.source === 'ipo'
         ? '<span class="muted" style="font-size:11px"> · 新股</span>' : '';
+      const syncTag = e.source === 'econ_sync'
+        ? '<span class="muted" style="font-size:11px"> · 同步</span>'
+        : (e.source === 'earnings_sync'
+           ? '<span class="muted" style="font-size:11px"> · 财报</span>' : '');
       return `<div class="row" style="justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--border);${isPast ? 'opacity:.5' : ''}">
         <span><b>${e.date}</b> <span class="muted">周${wd}</span>
           <span class="badge" style="${lv.s}">${lv.t}</span>
-          <span style="margin-left:6px">${esc(e.title)}</span>${link}${ipoTag}
+          <span style="margin-left:6px">${esc(e.title)}</span>${link}${ipoTag}${syncTag}
           ${e.time ? `<span class="muted"> · ${esc(e.time)}</span>` : ''}
           ${e.market === 'us' ? '<span class="muted"> · 美</span>' : '<span class="muted"> · A/港</span>'}
           ${e.note ? `<div class="muted" style="margin-top:2px">${esc(e.note)}</div>` : ''}</span>
@@ -5757,6 +5784,22 @@ async function calendarCheck() {
     const r = await api('/api/calendar/check', { method: 'POST' });
     toast(r.alerts.length ? `已触发 ${r.alerts.length} 条提醒（推微信/邮件）` : '今明无事件，无提醒');
   } catch (e) { toastErr(e.message); }
+}
+async function syncEcon() {
+  const btn = $('cal-sync-btn');
+  try {
+    btn.disabled = true;
+    const r = await api('/api/calendar/sync', { method: 'POST' });
+    const st = [];
+    if (r.cpi && r.cpi.started) st.push('CPI');
+    else if (r.cpi && r.cpi.busy) st.push('CPI（已在跑）');
+    const er = r.earnings || {};
+    if (er.started) st.push('财报');
+    else if (er.busy) st.push('财报（已在跑）');
+    if (st.length) toast(`已开始同步：${st.join(' + ')}（后台跑，完成后点「刷新」查看）`);
+    else toastErr('未启动：' + (er.error || (r.cpi && r.cpi.error) || '未知原因'));
+  } catch (e) { toastErr('同步失败: ' + e.message); }
+  finally { btn.disabled = false; }
 }
 
 // ---- 报告 ----

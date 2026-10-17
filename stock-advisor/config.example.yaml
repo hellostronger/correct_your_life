@@ -117,9 +117,18 @@ llm:
   max_tokens: 8000
   auto_advice: true
 
-# 财经日历盘前提醒（econ_calendar.py + app.py _calendar_loop）
+# 财经日历盘前提醒（econ_calendar.py + earnings_sync.py + app.py _econ_sync_loop）
+# sync_* 为 CPI 排期自动同步（百度经济日历，只读缓存 data/econ_sync.json）
+# earn_* 为财报排期同步（A股=东财预约披露表；美股=Nasdaq 财报日历；
+#         跟踪对象 = 持仓 + 所属板块 A股/美股龙头，龙头由 LLM 映射缓存
+#         data/earnings_map.json；只读缓存 data/earnings_sync.json）
 calendar:
   enabled: true
+  sync_enabled: true
+  sync_days: 60
+  sync_interval_hours: 24
+  earn_enabled: true
+  earn_days: 60
 
 # 自选股事件告警（alerts.py：限售解禁 + 增发新股上市，东财公开接口）
 # 工作日 8:30 后扫一轮，窗口（days 自然日）内的新事件推微信/邮件，同事件只推一次

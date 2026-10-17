@@ -412,9 +412,22 @@ SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "calendar": {
         "label": "📅 财经日历提醒",
-        "help": "非农/交割/四巫/LPR 本地推算，FOMC/CPI 需手动补录。",
+        "help": "非农/交割/四巫/LPR 本地推算；中/美 CPI 公布时间、持仓及所属板块"
+                "A股/美股龙头财报披露时间自动同步（百度经济日历 / 东财预约披露 / Nasdaq）；"
+                "FOMC 需手动补录。",
         "fields": [
             {"key": "enabled", "t": "bool", "d": True, "label": "启用"},
+            {"key": "sync_enabled", "t": "bool", "d": True, "label": "自动同步 CPI 排期",
+             "help": "每日滚动扫描未来窗口，把中/美 CPI 公布时间并入日历（只读展示，不进数据库）"},
+            {"key": "sync_days", "t": "int", "d": 60, "lo": 7, "hi": 180,
+             "label": "同步窗口(天)", "help": "窗口越大请求越多（每天约等于窗口天数次轻量请求）"},
+            {"key": "sync_interval_hours", "t": "int", "d": 24, "lo": 1, "hi": 168,
+             "label": "同步间隔(小时)", "help": "CPI 与财报排期共用这个间隔"},
+            {"key": "earn_enabled", "t": "bool", "d": True, "label": "自动同步财报排期",
+             "help": "跟踪「持仓 + 所属板块 A股/美股龙头」的财报披露时间。A股=东财预约披露表；"
+                     "美股=Nasdaq 财报日历（约 7~8 周展望）；板块龙头由 LLM 映射并缓存（30 天/持仓变动才重建）"},
+            {"key": "earn_days", "t": "int", "d": 60, "lo": 7, "hi": 180,
+             "label": "财报窗口(天)", "help": "美股财报日历逐日扫描的前瞻天数；A股按最新报告期快照，不受此窗口影响"},
         ],
     },
     "volume": {

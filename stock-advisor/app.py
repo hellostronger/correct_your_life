@@ -3280,6 +3280,7 @@ def llm_update_config(body: LLMConfIn):
 # ---------------- 财经日历（econ_calendar.py：规则事件 + 手动事件 + 盘前提醒） ----------------
 
 import econ_calendar
+import earnings_sync
 
 
 class CalendarEventIn(BaseModel):
@@ -3291,10 +3292,12 @@ class CalendarEventIn(BaseModel):
 
 @app.get("/api/calendar")
 def calendar_upcoming(months: int = 3):
-    """未来 N 个月的财经日历（规则事件自动生成 + 手动事件合并，按日期排序）。"""
+    """未来 N 个月的财经日历（规则事件自动生成 + 手动事件 + CPI 同步，按日期排序）。"""
     months = max(1, min(months, 6))
     with get_conn() as conn:
-        return {"events": econ_calendar.upcoming_events(conn, months=months)}
+        events = econ_calendar.upcoming_events(conn, months=months)
+    return {"events": events, "sync": econ_calendar.sync_meta(),
+            "earn_sync": earnings_sync.sync_meta()}
 
 
 @app.get("/api/macro/rates")
@@ -3605,6 +3608,77 @@ def calendar_check():
         return {"alerts": econ_calendar.check_calendar_once(conn, notify_fn=notifier.notify)}
 
 
+def _earn_positions() -> list[dict]:
+    """财报排期的跟踪对象 = 真实持仓 ∪ 模拟持仓（去重，只含在手的）。
+
+    真实持仓口径复用 `_derive_holdings()`（与持仓页一致）；模拟盘持仓走
+    `paper_trading._derive_paper_positions`（它已过滤掉 shares<=0 的）。
+    任一来源失败不阻断另一个 —— 值不值班到「没有持仓」而不跟踪。
+    """
+    out: dict[str, str] = {}
+    try:
+        for p in _derive_holdings():
+            if int(p.get("net_shares") or 0) > 0:
+                out[p["code"]] = p.get("name") or p["code"]
+    except Exception as exc:
+        print(f"[earnings] 真实持仓读取失败（继续用模拟持仓）: "
+              f"{type(exc).__name__}: {str(exc)[:160]}", flush=True)
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            for code, pos in paper_trading._derive_paper_positions(cur).items():
+                out.setdefault(code, (pos or {}).get("name") or code)
+    except Exception as exc:
+        print(f"[earnings] 模拟持仓读取失败: "
+              f"{type(exc).__name__}: {str(exc)[:160]}", flush=True)
+    return [{"code": c, "name": n} for c, n in sorted(out.items())]
+
+
+def _earn_roster() -> dict:
+    """A股名册（code→name）：只用于校验 LLM 给龙头的「代码-名字」一致性。
+
+    名册不完整（实测缺 000333 美的集团）→ 「不在名册」不算无效；
+    校验失败也只丢那一条龙头，不影响同步本身。
+    """
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT code, name FROM sa_stock_roster")
+            out: dict[str, str] = {}
+            for r in cur.fetchall():
+                code = r["code"] if isinstance(r, dict) else r[0]
+                name = r["name"] if isinstance(r, dict) else r[1]
+                if code:
+                    out[str(code)] = str(name or "")
+            return out
+    except Exception as exc:
+        print(f"[earnings] 名册读取失败（跳过名字校验）: "
+              f"{type(exc).__name__}: {str(exc)[:160]}", flush=True)
+        return {}
+
+
+@app.post("/api/calendar/sync")
+def calendar_sync_all():
+    """手动触发日历数据同步（CPI 排期 + 财报排期），后台跑，完成后页面「刷新」可见。
+
+    - CPI：逐日扫百度经济日历，窗口 calendar.sync_days（默认 60 天），约半分钟。
+    - 财报：A股预约披露（东财）+ 美股财报日历（Nasdaq），窗口 calendar.earn_days
+      （默认 60 天）；板块龙头映射仅在首次/持仓变化时调 LLM（可能几分钟）。
+    两边各自互斥；已有任务在跑时返回 busy，不排队。
+    """
+    conf = _conf_section("calendar") or {}
+    days = max(7, min(int(conf.get("sync_days", 60) or 60), 180))
+    cpi = econ_calendar.sync_async(days=days)
+    if conf.get("earn_enabled", True):
+        edays = max(7, min(int(conf.get("earn_days", 60) or 60), 180))
+        try:
+            earn = earnings_sync.sync_async(positions=_earn_positions(), days=edays,
+                                            roster=_earn_roster())
+        except Exception as exc:
+            earn = {"started": False, "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    else:
+        earn = {"started": False, "error": "财报同步已关闭（calendar.earn_enabled=false）"}
+    return {"cpi": cpi, "earnings": earn}
+
+
 def _calendar_loop():
     """财经日历守护线程：交易日 start_time–end_time 窗口（默认 8:00–12:00，可网页改）
     内每 5 分钟查一次（同键只推一次，实际每天只会推一条今明事件/重要预告），盘前及时推微信。"""
@@ -3622,6 +3696,40 @@ def _calendar_loop():
         except Exception as exc:
             print(f"[calendar] loop error: {exc}", flush=True)
             time.sleep(600)
+
+
+def _econ_sync_loop():
+    """日历数据同步守护线程（CPI + 财报排期）：每 sync_interval_hours（默认 24h，可网页改）
+    滚动同步一轮。
+
+    为什么独立线程：CPI 全窗口扫描约 60 次请求、半分钟左右；财报一轮约 45 次
+    Nasdaq 请求 +（仅首次/持仓变动）一次 LLM 映射，可能几分钟。塞进
+    _calendar_loop 会让盘前提醒晚发；手动触发走 /api/calendar/sync 的临时线程，
+    与这里互斥不排队。
+
+    启动后先等 90 秒：import app 本身要几十秒且一串守护线程在就绪，这不是
+    紧急任务，别和它们抢。之后每 10 分钟看一眼是否到期（到期才真正联网）。
+    """
+    time.sleep(90)
+    while True:
+        try:
+            conf = _conf_section("calendar") or {}
+            interval = max(1, int(conf.get("sync_interval_hours", 24) or 24))
+            if conf.get("sync_enabled", True):
+                if econ_calendar.sync_due(interval):
+                    days = max(7, min(int(conf.get("sync_days", 60) or 60), 180))
+                    res = econ_calendar.sync_cpi_events(days=days)
+                    print(f"[calendar] CPI 同步: {res}", flush=True)
+            if conf.get("earn_enabled", True):
+                if earnings_sync.sync_due(interval):
+                    edays = max(7, min(int(conf.get("earn_days", 60) or 60), 180))
+                    res = earnings_sync.sync_earnings(positions=_earn_positions(),
+                                                      days=edays, roster=_earn_roster())
+                    print(f"[calendar] 财报排期同步: {res}", flush=True)
+            time.sleep(600)
+        except Exception as exc:
+            print(f"[calendar] 同步循环出错: {exc}", flush=True)
+            time.sleep(1800)
 
 
 def _conf_enabled(section: str, default: bool) -> bool:
@@ -9927,6 +10035,9 @@ _start_daemon(_withdrawal_loop, "sa_withdrawal")
 
 # 财经日历盘前提醒线程（交易日早 8–12 点窗口，今明事件/重要预告推微信）
 _start_daemon(_calendar_loop, "sa_calendar")
+
+# CPI 排期同步线程（中/美 CPI 公布时间 → data/econ_sync.json，默认每日一轮）
+_start_daemon(_econ_sync_loop, "sa_econ_sync")
 
 # 节假日/交易日历（真源=国务院放假公告，LLM 抽取）。放最后起：它可能触发一次
 # 抓公告+LLM 的慢操作，不该排在其它守护线程前面拖慢它们就绪。

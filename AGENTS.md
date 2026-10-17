@@ -4,6 +4,92 @@
 
 ---
 
+### 📅 财经日历自动化：CPI + 持仓/板块龙头财报排期（2026-10-17 用户要求）
+
+用户两条诉求：①「中国/美国 CPI 公布日期和时间自动同步」；②「购买股票所属板块的
+A股+美股龙头财报发布时间也要关注」。两条线同一套模式：**JSON 缓存（不进数据库）
+→ 并入 `econ_calendar.upcoming_events()`** → 页面日历与盘前提醒自动生效。
+提醒逻辑一行没改；财报事件 `level=mid`（今明提醒会列出，**不占「提前 3 天」预告
+额度** —— 财报季几十条 mid 逐个提前 3 天推会把提醒淹掉，噪音等于没报警）。
+
+涉及文件：`stock-advisor/earnings_sync.py`（新模块）+
+`stock-advisor/econ_calendar.py`（CPI 同步核心 + 合并入口）+ app.py 接线。
+
+#### 数据源（全部实测，别再找替代）
+
+| 数据 | 源 | 实测 |
+|---|---|---|
+| 中美 CPI | `ak.news_economic_baidu(date='YYYYMMDD')` 逐日扫 | `data/econ_sync.json`；61 天窗口 = 61 请求 ~1.5 分钟；只取 headline CPI；US `level=high` / CN `level=mid` |
+| A股预约披露 | `ak.stock_yysj_em(symbol="沪深A股", date="YYYYMMDD")` | 20260930 期 5225 行 ~4.5s；**20261231（当年年报期）东财未挂 → `TypeError: 'NoneType' object is not subscriptable`** → 按期间容错，两个近期期全败才中止（实测 `cn_failed_periods=1` 属预期） |
+| 美股财报 | **Nasdaq 官方** `api.nasdaq.com/api/calendar/earnings?date=YYYY-MM-DD` | `data/earnings_sync.json`；逐日扫（跳过周末），前瞻窗口实测 ~7~8 周；E2E 扫 43 天 0 失败 |
+
+**已否决（别再试）**：Yahoo quoteSummary（403）、yfinance（未装）、BLS 日历页（403）。
+
+#### 板块 → 龙头映射（唯一语义环节，走 LLM）
+
+持仓 A/H/ETF 混着，数据源无法把「港股/ETF」映射到「A股+美股龙头」→ LLM
+（`task="standard"`，网关 503 退避重试 4 次）→ `data/earnings_map.json`。
+
+- 重建触发：持仓集合变化（**增量：只问缺的代码**）/ 30 天 TTL / 手动 force；
+- 防幻觉校验（宁缺毋滥）：A股必须 6 位数字；**在 `sa_stock_roster` 内则名字必须
+  匹配**否则丢弃（实测模型把 601858 写成「中国燃气」，名册是「中国科传」→ 丢弃）；
+  「不在名册」不算无效（实测名册缺 000333 美的集团）；美股 ticker 过格式闸门
+  + 腾讯行情 `usXXX` 验证（实测拦下 `BF.B` —— 真实存在的双重股权代码被从严
+  拒绝，属已知取舍；要放开需先验证腾讯行情支持点号）；
+- 真闸门在同步期：A股龙头不在东财预约披露表里就不产生事件，计入 `unmatched`；
+- LLM 失败保留旧映射；校验丢弃原因写进 `earn_sync.mapping.warn`（页面可核对）。
+
+#### 事件口径
+
+`code = earn:own:{code}` / `earn:cn:{code}` / `earn:us:{TICKER}`，
+`source="earnings_sync"`，`level="mid"`。A股日期取最新约定
+（实际披露 > 三次变更 > 二次变更 > 一次变更 > 首次预约）；
+**美股保持当地日历日不换算**（与全球财经网站口径一致），note 里注明北京时间
+（盘前→北京当晚；盘后→北京次日凌晨）。
+
+#### 接线与开关（全部默认开）
+
+- `POST /api/calendar/sync` 现返回 `{"cpi":{...},"earnings":{...}}`（各自互斥、
+  busy 不排队）；`GET /api/calendar` 增加 `earn_sync`（含 mapping 摘要）；
+  UI 按钮改「同步日历」；
+- 配置：`calendar.sync_enabled`(true) / `sync_days`(60, 7~180) /
+  `sync_interval_hours`(24, 1~168) / `earn_enabled`(true) / `earn_days`(60, 7~180)；
+- 守护线程 `sa_econ_sync`（CPI + 财报共用间隔；正常睡 600s / 出错 1800s）；
+- 跟踪对象 = 真实持仓（`_derive_holdings()` net>0）∪ 模拟盘持仓
+  （`paper_trading._derive_paper_positions`，已滤 shares>0），**单源失败不阻断
+  另一源**（宁可跟丢几个，不能因为一边挂了就当「没有持仓」）。
+
+#### 验证
+
+- 离线 `test_earn_sync_offline.py` **127/127**（全 Fake，不联网不烧 LLM；含
+  日期优先级、名字错配丢弃、ticker 校验、全败不写缓存（逐字节比对）、单源失败
+  沿用旧事件、0 条不清空旧数据、映射增量只问缺的代码、sync_due/async、
+  econ_calendar 合并与提醒（mid 不进 pre3）、静态接线）；CPI 套件
+  `test_econ_sync_offline.py` **68/68**；
+- 真实 E2E（2026-10-17 11:36~11:42，写的就是生产缓存）：CPI `ok, events=2,
+  requests=61, failed_days=[]` → **2026-11-09 中国10月CPI / 11-10 美国10月CPI**；
+  财报 `ok, events=56`（own 19 + cn 16 + us 21）、`us_days_scanned=43`、
+  `unmatched=0`；映射 31 条（A 龙头 27 / 美龙头 28）；合并视图
+  **81 = auto 17 + ipo 6 + earnings_sync 56 + econ_sync 2**；
+- 重启后生产实例（PID 15624）实测同组数字；`/openapi.json` 里
+  `POST /api/calendar/sync` 已注册；缓存新鲜时守护线程不重复同步（不烧 LLM）。
+
+#### 本次踩到的坑
+
+1. **E2E 脚本又被 temp 目录 `click.py` 遮蔽真 click 包**（uvicorn `import click`
+   → IndexError）——「三个必备动作」里的 `sys.path` 剔脚本目录这条漏了，
+   写 no-boot 探测脚本必须一次带全。
+2. **轮询启动要留足 420 秒**：同一个 launcher 今早启动 **58s**，验证实例这次
+   **236s** —— 启动耗时波动 3~4 倍（原因未深究），我按 202 秒轮询差 35 秒没等到，
+   白排查一轮。`sa_bootstrap_done=True` 的 no-boot 导入只 4.9s，
+   **别拿它估真实启动时间**。
+3. **no-boot 导入仍会起部分守护线程**（含新加的 `sa_econ_sync`）：E2E 进程里它
+   自己检查了一次 sync_due 并打印 busy（无害，但探测脚本不是纯离线）。
+4. E2E 退出码 1 ≠ 失败：PowerShell 把 py_mini_racer 的 stderr 警告报成
+   NativeCommandError；`ALL DONE` 与全部数据完整（老坑）。
+
+---
+
 ### 🧬 自进化层 `stock-advisor/self_evolution.py`（2026-10-12，参考 AetherLabsAI/RSIAgent）
 
 **先说结论：这个项目早就有「自进化」，但学习回路是断的 —— 不是慢，是没数据。**

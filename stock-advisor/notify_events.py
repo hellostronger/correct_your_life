@@ -185,8 +185,9 @@ EVENTS: dict[str, dict[str, Any]] = {
         "label": "📅 财经日历",
         "group": "事件 / 日历",
         "default": {"wx": True, "email": True},
-        "help": "非农 / 交割日 / 四巫 / LPR 本地推算，美国中期选举、两会开幕，"
-                "以及手动补录的 FOMC / CPI。",
+        "help": "非农 / 交割日 / 四巫 / LPR 本地推算，中/美 CPI 公布时间、持仓及所属"
+                "板块 A股/美股龙头财报披露时间自动同步，美国中期选举、两会开幕，"
+                "以及手动补录的 FOMC。",
         "source": "econ_calendar.check_calendar_once()",
     },
     "macro_rate": {
