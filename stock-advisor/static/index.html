@@ -1190,10 +1190,18 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
         <button class="btn ghost" onclick="markAllXhsRead()">全部已读</button>
         <span class="muted" id="xhs-status"></span>
       </div>
+      <div class="row" style="margin-top:8px">
+        <b style="font-size:13px;white-space:nowrap">抓取词</b>
+        <input id="xhs-kw-input" type="text" placeholder="额外抓取词，逗号分隔；留空 = 只用自选股名"
+          style="flex:1;min-width:240px">
+        <label class="muted"><input type="checkbox" id="xhs-use-watchlist"> 含自选股名</label>
+        <button class="btn ghost" onclick="saveXhsKw()">保存</button>
+      </div>
+      <div class="muted" id="xhs-kw-eff" style="margin-top:4px"></div>
       <div class="muted" style="margin-top:4px">
         首次使用请先点「登录小红书」：会弹出浏览器，扫码登录后自动保存登录态。
-        抓取词 = config.yaml <code>xhs.keywords</code> + 自选股票名（<code>use_watchlist</code>），
-        每轮最多 12 个词。小红书风控严，默认每 120 分钟一轮；
+        抓取词 = 上面输入框 + 自选股票名（可关），合并去重后每轮最多 12 个词
+        （自定义词在前，超出部分自选股名按名称排序补足）。小红书风控严，默认每 120 分钟一轮；
         匹配到自选股的笔记会推进新闻流（source=xhs）供模拟盘舆情引用。
       </div>
     </div>
@@ -3693,7 +3701,7 @@ const TAB_LOADERS = {
   news:      () => { loadNews(); loadConfig(); },
   bili:      () => { loadBiliCreators(); loadBiliDynamics(); loadBiliStatus(); },
   wb:        () => { loadWbCreators(); loadWbPosts(); loadWbStatus(); },
-  xhs:       () => { loadXhsNotes(); loadXhsStatus(); },
+  xhs:       () => { loadXhsNotes(); loadXhsStatus(); loadXhsKwCfg(); },
   mp:        () => { loadMpSources(); loadMpArticles(); loadMpStatus(); loadMprConfig(); },
   x:         () => { loadXAccounts(); loadXWatch(); loadXTweets(); loadXStatus(); },
   reports:   loadReports,
@@ -8599,7 +8607,39 @@ async function loadXhsStatus() {
     }
     if (!st.browser_data_ready && st.mediacrawler_exists)
       el.textContent += ' · 首次使用请先「登录小红书」';
+    // 「当前生效」预览：合并自选股名后的最终词表（与后端 resolve_keywords 同一份输出）
+    const eff = $('xhs-kw-eff');
+    if (eff) {
+      const kws = st.keywords || [];
+      eff.textContent = kws.length
+        ? `当前生效 ${kws.length} 个词：${kws.join('、')}`
+        : '当前没有生效抓取词 —— 填「额外抓取词」或勾选「含自选股名」';
+    }
   } catch { /* 忽略 */ }
+}
+/** 读 xhs.keywords / xhs.use_watchlist 原始值（走通用配置接口，写入口只有一个）。 */
+async function loadXhsKwCfg() {
+  try {
+    const d = await api('/api/config/all');
+    const sec = (d.sections || []).find(s => s.section === 'xhs');
+    if (!sec) return;
+    const kw = ((sec.rows || []).find(r => r.key === 'keywords') || {}).value;
+    const uw = ((sec.rows || []).find(r => r.key === 'use_watchlist') || {}).value;
+    $('xhs-kw-input').value = Array.isArray(kw) ? kw.join(', ') : (kw || '');
+    $('xhs-use-watchlist').checked = !!uw;
+  } catch { /* 忽略 */ }
+}
+/** 保存抓取词。走 /api/config/all（coerce 校验 + 行级手术，不整段替换）。 */
+async function saveXhsKw() {
+  // 中文逗号/换行都当分隔符，避免整串被当成一个词
+  const kws = $('xhs-kw-input').value.split(/[,，\n]/).map(s => s.trim()).filter(Boolean);
+  $('xhs-kw-input').value = kws.join(', ');
+  try {
+    await jsonPut('/api/config/all', { values: { xhs: {
+      keywords: kws, use_watchlist: $('xhs-use-watchlist').checked } } });
+    toastOk('已保存，下一轮抓取生效');
+    loadXhsStatus();
+  } catch (e) { toastErr('保存失败: ' + e.message); }
 }
 async function triggerXhsFetch() {
   try {

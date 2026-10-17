@@ -47,6 +47,7 @@ xhs:
   max_comments: 20
   use_watchlist: true
   # 额外搜索词（list 或逗号分隔字符串）；单轮关键词总数上限 12
+  # 网页「📕 小红书」页或「⚙️ 调度 → 🧩 完整配置」可直接改
   keywords: []
 
 # 板块轮动监控（sector.py + sector_intraday）

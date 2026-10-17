@@ -4140,6 +4140,39 @@ Python 明明抛了 traceback，我只看到「Exited with code 1」没有输出
 
 ---
 
+### 📕 小红书抓取词编辑器 + `_fmt_value` 列表往返 bug（2026-10-17）
+
+背景：`xhs.keywords` 原来只能手改 config.yaml。📕 标签页新增内联编辑器：
+**抓取词输入框 + 「含自选股名」checkbox + 保存 + 生效词预览**，
+写入口复用现成端点（不新增写路径）。
+
+#### 🔴 真 bug：`conf_util._fmt_value` 不认 list —— 保存一次配置就烂（实证）
+
+配置编辑器写回 YAML 走 `_fmt_value`，它原来只处理标量，list 落到 `str(value)`：
+
+```
+OLD: _fmt_value(['贵州茅台','工商银行']) = "'[''贵州茅台'', ''工商银行'']'"
+     → YAML reload 得到 str（不是 list）→ resolve_keywords 对字符串按逗号 split
+       → 词变成 "['贵州茅台'" / "'工商银行']" 这种垃圾（搜出去必然 0 结果）
+NEW: [贵州茅台, ',带逗号词', 工商银行]   ← 流式序列；含逗号的字符串项自动补引号
+     → reload 仍是 list
+```
+
+两条边界（都有测试钉）：**流式序列里逗号是项分隔符**，所以「未加引号但含逗号的字符串项」
+必须补引号，否则 `[a,b, c]` 被解析成三项；bool/None/数字的原分支顺序不动。
+
+#### 生效词 = 自定义词在前 + 自选股名补足，**上限 12**
+
+`resolve_keywords()`：自定义词（list 或逗号串）→ 去重 → 再拼自选股名（`use_watchlist`）
+→ 去重 → `out[:12]`。**自定义词在前，超过 12 个会把自选股名全部挤掉** —— 所以 UI 的
+「生效词」预览直接复用 `/api/xhs/status`（它的 `keywords` 字段就是 `resolve_keywords()`
+的最终结果，与爬虫实际用的**同一份输出**，不是前端另算的近似）。
+
+验证：`test_xhs_kw.py` 41/41（含 `_fmt_value` 新旧对照 + 逗号项引号 + 12 词截断）；
+`test_xhs_kw_ui.py` 21/21（HTML/JS 装配、onclick 引用存在、走 `PUT /api/config/all`、
+tab loader 挂上 `loadXhsKwCfg`）；E2E 13/13 —— 真请求保存 → 生效 → **还原 config.yaml
+并 sha256 逐字节核对**；回归 `test_mpr_http` 20/0、`test_paper_ui` 34/0。
+
 ### 测试环境陷阱
 
 - `notifier._db_exec` 内部 `from app import get_conn`，会**重新执行整个 app.py 并再起一套 daemon**，

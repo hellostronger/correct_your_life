@@ -28,11 +28,21 @@ def _path(config_path) -> Path:
 
 
 def _fmt_value(value) -> str:
-    """把 Python 值渲染成 YAML 行内标量（值已由调用方保证是标量）。"""
+    """把 Python 值渲染成 YAML 行内值（标量；list/tuple → 流式序列）。"""
     if isinstance(value, bool):
         return "true" if value else "false"
     if value is None:
         return "null"
+    if isinstance(value, (list, tuple)):
+        parts = []
+        for v in value:
+            s = _fmt_value(v)
+            # 流式序列里逗号是项分隔符：未加引号但含逗号的字符串项必须补引号，
+            # 否则 [a,b, c] 会被解析成三项
+            if isinstance(v, str) and "," in v and not s.startswith("'"):
+                s = "'" + v.replace("'", "''") + "'"
+            parts.append(s)
+        return "[" + ", ".join(parts) + "]"
     if isinstance(value, (int, float)):
         return str(value)
     s = str(value)
