@@ -1431,6 +1431,45 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       <div id="adopted-refs" style="margin-top:10px"></div>
     </div>
 
+    <!-- 策略使用记分卡（只读）：回答「哪些策略真的在影响决策」 -->
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <b style="font-size:13px">📊 策略使用记分卡</b>
+        <button class="btn ghost" style="font-size:12px" onclick="loadStrategyScorecard()">刷新</button>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:4px">
+        只读对照：卖出策略触发 / 影子盈亏 / 信号后组合实际有没有卖 + 聚宽库采纳状态。
+        <b>影子盈亏</b>＝假如按该策略卖出的收益差（未实际成交）；
+        <b>实际卖出</b>＝信号后 7 个自然日内组合真的卖了同一只票。
+      </div>
+      <div class="jq-stats" id="sc-summary" style="margin-top:8px">加载中…</div>
+      <div style="margin-top:10px"><b style="font-size:12px">卖出策略侧（影子模式）</b></div>
+      <div class="table-scroll" style="max-height:280px;margin-top:4px">
+        <table>
+          <thead><tr><th>卖出策略</th><th>绑定</th><th>已触发</th><th>影子盈亏</th>
+            <th>胜率</th><th>最近触发</th></tr></thead>
+          <tbody id="sc-sell"></tbody>
+        </table>
+      </div>
+      <div style="margin-top:12px"><b style="font-size:12px">近期信号 vs 实际卖出</b>
+        <span class="muted" style="font-size:11px">（信号后 7 个自然日内组合是否卖出同一只票）</span></div>
+      <div class="table-scroll" style="max-height:280px;margin-top:4px">
+        <table>
+          <thead><tr><th>日期</th><th>代码</th><th>名称</th><th>策略</th>
+            <th>影子盈亏</th><th>实际卖出</th></tr></thead>
+          <tbody id="sc-recent"></tbody>
+        </table>
+      </div>
+      <div style="margin-top:12px"><b style="font-size:12px">聚宽库侧</b></div>
+      <div class="table-scroll" style="max-height:280px;margin-top:4px">
+        <table>
+          <thead><tr><th>策略</th><th>采纳</th><th>沙箱</th>
+            <th>回测年化</th><th>自选引入</th></tr></thead>
+          <tbody id="sc-jq"></tbody>
+        </table>
+      </div>
+    </div>
+
     <div class="card">
       <div class="row" style="justify-content:space-between;align-items:center">
         <span class="row" style="gap:4px">
@@ -3057,6 +3096,76 @@ function loadAdoptedRefs() {
     </div>`;
 }
 
+// ---- 策略使用记分卡（只读，2026-10-17）----
+// 回答「哪些策略真的在影响决策」：卖出策略触发/影子盈亏 + 信号后组合实际卖出
+// 对照 + 聚宽库采纳/沙箱/回测。全部只读，不改变任何交易行为。
+function scAmt(v) {
+  if (v == null || !isFinite(Number(v))) return '—';
+  const n = Number(v);
+  return (n > 0 ? '+' : '') + '¥' + fmt(Math.round(n));
+}
+
+async function loadStrategyScorecard() {
+  const sum = $('sc-summary');
+  if (!sum) return;
+  try {
+    const d = await api('/api/paper/strategy-scorecard?days=30');
+    const t = d.totals || {};
+    const jq = d.jq || [];
+    sum.innerHTML = [
+      ['近 30 天信号', t.recent_exits || 0],
+      ['信号后实际卖出', t.acted == null ? '—'
+        : t.acted + (t.acted_pct == null ? '' : '（' + t.acted_pct + '%）')],
+      ['信号影子合计', scAmt(t.shadow_pnl_all)],
+      ['卖出策略', (d.sell_strategies || []).length],
+      ['聚宽库采纳', jq.filter(x => x.enabled).length + '/' + jq.length],
+    ].map(([k, v]) => `<div class="jq-stat"><div class="jq-stat-v">${jqEsc(v)}</div>
+        <div class="jq-stat-k">${jqEsc(k)}</div></div>`).join('');
+    $('sc-sell').innerHTML = (d.sell_strategies || []).map(s => `<tr>
+      <td><b>${jqEsc(s.name)}</b>
+        <div class="muted" style="font-size:11px">${jqEsc(s.kind)}</div></td>
+      <td>${fmt(s.bindings)}</td>
+      <td>${fmt(s.triggered)} <span class="muted">/ ${fmt(s.pending)} 待触发</span></td>
+      <td class="${cls(s.shadow_pnl)}"><b>${scAmt(s.shadow_pnl)}</b></td>
+      <td>${s.win_rate == null ? '—' : s.win_rate + '%'}
+        <span class="muted">(${fmt(s.wins)}/${fmt(s.exits)})</span></td>
+      <td>${s.last_exit ? jqEsc(s.last_exit) : '<span class="muted">—</span>'}</td>
+    </tr>`).join('')
+      || '<tr><td colspan="6" class="muted">暂无卖出策略</td></tr>';
+    $('sc-recent').innerHTML = (d.recent_exits || []).map(r => `<tr>
+      <td>${jqEsc(r.exit_date)}</td>
+      <td>${jqEsc(r.code)}</td>
+      <td>${jqEsc(r.name || '')}</td>
+      <td>${jqEsc(r.strategy)}</td>
+      <td class="${cls(r.pnl_pct)}">${r.pnl_pct == null ? '—' : signed(r.pnl_pct) + '%'}</td>
+      <td>${r.acted ? '✅ ' + jqEsc(r.sell_date) : '<span class="muted">未卖</span>'}</td>
+    </tr>`).join('')
+      || '<tr><td colspan="6" class="muted">近 30 天没有策略触发记录</td></tr>';
+    $('sc-jq').innerHTML = jq.map(x => `<tr>
+      <td><b>${jqEsc(x.name)}</b>
+        <div class="muted" style="font-size:11px">${jqEsc(x.runnable || '')}${
+          x.portable_score == null ? '' : ' · 评分 ' + x.portable_score
+        }${x.universe_n ? ' · 池 ' + x.universe_n + ' 只' : ''}</div></td>
+      <td>${x.enabled ? '<span class="badge b-ok">已采纳</span>'
+                      : '<span class="badge">未采纳</span>'}</td>
+      <td>${x.sandbox && x.sandbox.runs
+        ? x.sandbox.ok + '/' + x.sandbox.runs
+          + (x.sandbox.last ? '<div class="muted" style="font-size:11px">'
+             + jqEsc(x.sandbox.last) + '</div>' : '')
+        : '<span class="muted">—</span>'}</td>
+      <td>${x.backtest && x.backtest.annual_return != null
+        ? '<span class="' + cls(x.backtest.annual_return) + '">'
+          + signed(x.backtest.annual_return) + '%</span>'
+        : '<span class="muted">—</span>'}</td>
+      <td>${x.watchlist_added ? x.watchlist_added + ' 只'
+                              : '<span class="muted">0</span>'}</td>
+    </tr>`).join('')
+      || '<tr><td colspan="5" class="muted">库里还没有策略</td></tr>';
+  } catch (e) {
+    sum.textContent = '记分卡加载失败：' + e.message;
+  }
+}
+
 function jqGotoArticle(articleId) {
   if (!articleId) return;
   // ⚠️ 这里原来写的是 `jqFetch && jqFetch()` —— 那是**「抓取文章」按钮**
@@ -3713,7 +3822,7 @@ const TAB_LOADERS = {
   paper:     loadPaper,
   tdesk:     loadTDesk,
   notify:    () => { loadNotifyConf(); loadNotifyMatrix(); refreshWxChat(); },
-  jq:        () => { loadJqLib(); loadJqList(); loadAdopted(); },
+  jq:        () => { loadJqLib(); loadJqList(); loadAdopted(); loadStrategyScorecard(); },
   analysis:  loadTechniques,
   schedule:  () => { loadSchedule(); loadConfigAll(); },
 };

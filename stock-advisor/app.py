@@ -6161,7 +6161,7 @@ def paper_adopted_strategies(include_rejected: bool = False):
             "total_return": _pct_or_none(tr), "annual_return": _pct_or_none(ar),
             "max_drawdown": _pct_or_none(mdd), "sharpe": sh,
             "universe": pool, "universe_n": len(pool),
-            "drives_paper": False,      # 见 docstring：它不参与实际下单
+            "drives_paper": False,      # 仍不直接下单；信号进决策走 paper.strategy_inject
         })
     return {"n": len(items), "items": items,
             "adopted": sum(1 for i in items if i["enabled"]),
@@ -6247,6 +6247,19 @@ def adopted_strategy_to_watchlist(sid: int):
         "hint": "已加进自选 = 模拟盘候选池；买不买仍由 run_decisions 决策，"
                 "不等于该策略在替你下单。",
     }
+
+
+@app.get("/api/paper/strategy-scorecard")
+def paper_strategy_scorecard(days: int = 30):
+    """策略使用记分卡（只读）：回答「哪些策略真的在影响决策」。
+
+    三块：① 卖出策略侧（绑定/触发/影子盈亏/胜率）；② 近期触发 + 信号后
+    7 个自然日内组合实际有没有卖同一只票；③ 聚宽库侧（采纳/沙箱/回测/自选引入）。
+    只读聚合，不改任何交易行为。
+    """
+    with get_conn() as conn, conn.cursor(
+            cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        return paper_strategy.scorecard(cur, days=days)
 
 
 # ---------- 策略库采集（聚宽社区，防重复爬取）----------

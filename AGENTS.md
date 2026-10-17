@@ -90,6 +90,68 @@ A股+美股龙头财报发布时间也要关注」。两条线同一套模式：
 
 ---
 
+### 🔁 策略参与决策：信号注入（默认开）+ 使用记分卡（2026-10-17 用户要求）
+
+用户要求「策略参与决策」。**先查清现状：不是没闭环，是没人用。** 真库只读实测：
+聚宽库 4 条策略全 `runnable='idea'`、采纳 **0** 条；「策略→自选」桥 **0 次使用**；
+`drives_paper` 硬编码 `False`（app.py）；`paper_trading.py` 对 strategy **零引用**
+—— 卖出策略是纯影子（只写 `sa_paper_strategy_exits`，从不产生成交）。
+
+**用户裁决（两档，勿重开）**：①「策略信号进决策上下文」→ **默认开，带开关**；
+②「策略触发即直接卖出」硬执行档 → **先不做**。设计因此保持「LLM 是交易员」：
+策略只提供信息与对照，不下单。
+
+#### 实现（1 个新注入块 + 1 个只读记分卡）
+
+| 组件 | 位置 | 要点 |
+|---|---|---|
+| 注入块 | `paper_strategy.build_injection()` | 两块：①卖出策略对该股的近期触发（`sa_paper_strategy_exits` 按 code + days 窗口）②该股选股来源（`sa_watchlist.note` 里「来自策略『…』股票池」+ 回测结论）|
+| 接线 | `paper_trading._decide_one()` | 照抄 evo/inst/mp 模式：`with get_conn()` 块内查、异常 print 吞掉；append 顺序 **evo → inst → strategy → mp** |
+| 记分卡 | `paper_strategy.scorecard()` + `GET /api/paper/strategy-scorecard?days=` | 纯只读聚合，不改任何交易行为 |
+| 配置 | `paper.strategy_inject.{enabled,days,max_items,max_chars}` | 默认 `true/14/3/1200`；`config_schema` 4 字段 |
+
+**注入块的影子口径必须明写**（本设计最容易被忽略的一条）：卖出策略**没有实际卖出**，
+只写了影子记录。注入文本头尾都写明「影子口径：策略对照只记录、未实际卖出；不是
+交易指令」，否则 LLM 会把「策略已卖出」当已成交事实（同「抓取时间冒充事实时间」
+一类）。**两部分都为空时返回 `""`，决策上下文逐字节不变**（`enabled=false` 时
+同样逐字节还原，有断言钉死）。
+
+- `enabled` 闸门只在调用方（paper_trading）判断，`build_injection` 自身不查 ——
+  与 evo/inst/mp 模式一致；静态测试断言该守卫存在。
+- 截断：`max_chars` 下限 200；超长加 `[策略信号块超长已截断，全文 N 字符]`。
+- 块文本：头 `【策略信号（卖出触发为影子口径：策略对照只记录、未实际卖出；不是交易指令）】`；
+  行 `· {日期} 卖出策略「{名}」触发卖出信号（影子盈亏 {+x.xx%}，整仓/xx% 仓）`。
+- `drives_paper` 语义**保持 False**（仍不直接下单），注释更新为指向 `paper.strategy_inject`。
+
+#### 记分卡口径（「信号后组合卖没卖」是**对照**，不是因果）
+
+- 卖出策略侧：绑定数 / 触发数 / 影子盈亏 / **胜率**（`win_rate` 在 exits=0 时返回
+  **None 而非 0** —— 「没样本」不能显示成「全输」）。
+- 近期触发 × 实际卖出对照：LATERAL join `sa_paper_trades`（`side='sell' AND
+  COALESCE(status,'')<>'skipped'`，`trade_date ∈ [exit_date, exit_date+7]`）取最早卖出日。
+- 聚宽库侧：`sa_sandbox_run` 无 strategy_id 列 → 经 `post_id = sa_strategy_def.article_id`
+  关联；列 = 状态(runnable/采纳)/可移植分/股票池/自选引入/沙箱/回测。
+- UI：📚 策略库/沙箱 tab 内 3 张表 + 汇总条；`TAB_LOADERS.jq` 已注册；
+  裸数字全走 `fmt()`（null→「—」，5 处）。
+
+#### 验证（都可重复跑）
+
+| 脚本 | 结果 |
+|---|---|
+| `test_strategy_inject.py`（离线 56 项） | 全过：空块/影子文本/截断/tuple-dict 双游标逐字节一致/conf 覆盖/scorecard 聚合（含 win_rate=None）/静态接线 |
+| `probe_strategy_realdb.py`（真库只读 7 项） | 全过：`build_injection(003035)` 真实输出 2 条（10-15 移动止盈 -6.50% + 10-11 时间止损 -0.29%）；scorecard 与独立 SQL 对账（jq 4/4、exits 28/28、acted 19/19）|
+| `verify_strategy_in_context.py`（零 token 9 项） | 全过：`"\n"+block` **逐字节**出现在 `_llm_call` 入参；关掉后块消失、上下文严格更短 |
+| `test_sc_render.mjs`（node 真跑 V8，63 项） | 全过：全量/空库/残缺数据/请求失败 4 场景，无 `undefined`/`NaN`/`[object` |
+| 回归 | `test_paper_ui` 34/0、`check_full_js` 两块 OK、`test_anal_ui`/`test_render` 全过 |
+
+真库基线（10-17）：卖出策略 7 条 / 触发 28 / 实际对照 19（67.9%）/ 影子盈亏合计
++191.55；线上重启后 `GET /api/paper/strategy-scorecard` 200 与探测一致。
+
+> 写渲染测试时错了一次断言：`scAmt(1074.73)` 实际渲染 `+¥1,075`（符号在前 +
+> zh-CN 千分位），我写的 `¥+1075` 是**断言错不是代码错**。
+
+---
+
 ### 🧬 自进化层 `stock-advisor/self_evolution.py`（2026-10-12，参考 AetherLabsAI/RSIAgent）
 
 **先说结论：这个项目早就有「自进化」，但学习回路是断的 —— 不是慢，是没数据。**
@@ -3071,7 +3133,12 @@ Qwen/Qwen3-Omni-30B-A3B-Instruct / -Thinking / -Captioner
 ```
 
 - 每轮辩论 **3 次 LLM 调用**（+1 次仅高风险票）；触发辩论的票整轮 **6~7 次**
-- 触发条件：`action ∈ {buy,sell}`（hold 不辩）且 `confidence >= min_confidence`
+- 触发条件：`enabled` + `trigger_codes` 白名单 + 方向开关（buy 看 `trigger_on_buy`、
+  sell 看 `trigger_on_sell`）+ `confidence >= min_confidence`。
+  ⚠️ **`hold` 不被任何开关过滤** —— 只要 enabled 且信心达标，hold 也会跑整轮辩论。
+  实测（2026-10-17 查生产侧车）：348 条决策里 **312 条 hold 有 debate（llm_calls=3）**。
+  本文件旧版写的「（hold 不辩）」是**错的**；行为自最初提交 ca93d5b 起即如此、
+  已跑数周，**不动**（改它=改决策成本口径，须先问）。
 - 辩论失败**不阻断**决策：捕获异常后沿用第一轮结果，记 `debate_error`
 
 ### Risk Critic：补上被漏掉的风险层（2026-10-04）

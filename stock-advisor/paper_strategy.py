@@ -23,7 +23,8 @@
    -> hold_pct = 现价 / 基准成本 - 1，对所有策略同一口径。
 """
 import json
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 
 from psycopg2.extras import execute_values
 
@@ -612,3 +613,255 @@ def _summary(items: list[dict]) -> dict:
                  "（比逐票看可靠，逐票差异多半来自个股而非策略）。"
                  "avg_spread 越大说明几套策略分歧越大，越值得继续观察谁最终胜出。"),
     }
+
+
+# ---------------- 决策注入（2026-10-17，用户要求「策略参与决策」） ----------------
+# 背景：用户问「聚宽库/策略对照有没有实际用起来」→ 实测发现**回路是断的**：
+#   · 卖出策略（sa_strategies/绑定/影子卖出）只在 paper_strategy 内部转，
+#     paper_trading 侧 grep 零引用 —— LLM 根本不知道这只票被哪个卖出策略触发了；
+#   · 聚宽库的选股来源只写在自选备注里（「来自策略「X」股票池」），决策侧同样看不到。
+# 用户 2026-10-17 裁决：信号注入**默认开**（带开关）；「策略触发即直接卖出」的
+# 硬执行档**不做**（LLM 仍是唯一交易员）。
+#
+# 两条纪律：
+#   1) 块里必须写明「影子口径」——触发只记录、未实际卖出。不写清楚，LLM 会把
+#      信号当已成交事实（与 AGENTS.md「抓取时间冒充事实时间」同一类坑）；
+#   2) 两部分都为空时返回 ""，调用方不追加任何内容 → 上下文逐字节与改动前一致。
+INJECT_DEFAULTS = {
+    "enabled": True,     # 2026-10-17 用户定：默认开（带开关，关掉逐字节还原）
+    "days": 14,          # 卖出触发回看窗口（自然日）
+    "max_items": 3,      # 最多列几条触发（按日期倒序取最近）
+    "max_chars": 1200,   # 整块字符上限，超出截断并标注
+}
+
+
+def _rows(cur) -> list:
+    """游标结果 → dict 列表。兼容 tuple / RealDict 两种游标。
+
+    AGENTS.md 记过：institution_signals 第一版假设 tuple 游标，在 dict 游标上
+    抛 KeyError: 0。两个方向都要能跑。
+    """
+    rows = cur.fetchall()
+    if not rows:
+        return []
+    if isinstance(rows[0], dict):
+        return [dict(r) for r in rows]
+    cols = [d[0] for d in (cur.description or [])]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def build_injection(cur, code: str, as_of=None, conf=None) -> str:
+    """「策略信号」注入块：卖出侧近期触发（影子口径）+ 选股来源标注。
+
+    cur 由调用方持有（paper_trading._decide_one 的 with get_conn() 块内）：
+    只读、不写、不开新连接。返回 "" = 没有任何可注入内容（调用方原样跳过）。
+    """
+    c = {**INJECT_DEFAULTS, **(conf or {})}
+    days = max(1, int(c.get("days") or 14))
+    max_items = max(1, int(c.get("max_items") or 3))
+    max_chars = max(200, int(c.get("max_chars") or 1200))
+    as_of_s = str(as_of or datetime.now().date())[:10]
+    since = (datetime.strptime(as_of_s, "%Y-%m-%d")
+             - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    parts = []
+
+    # ① 卖出侧：近 N 天该股被绑定的卖出策略触发过什么
+    cur.execute(
+        "SELECT e.exit_date, e.pnl_pct, e.ratio, COALESCE(s.name, '') AS sname "
+        "FROM sa_paper_strategy_exits e "
+        "LEFT JOIN sa_strategies s ON s.id = e.strategy_id "
+        "WHERE e.code = %s AND e.exit_date >= %s "
+        "ORDER BY e.exit_date DESC, e.id DESC LIMIT %s",
+        (code, since, max_items))
+    for r in _rows(cur):
+        d = str(r.get("exit_date"))[:10]
+        pnl = _float(r.get("pnl_pct"))
+        ratio = _float(r.get("ratio")) or 1.0
+        seg = "整仓" if ratio >= 0.999 else f"{ratio * 100:.0f}% 仓"
+        pnl_txt = f"{pnl:+.2f}%" if pnl is not None else "—"
+        parts.append(f"· {d} 卖出策略「{r.get('sname') or '未知'}」触发卖出信号"
+                     f"（影子盈亏 {pnl_txt}，{seg}）")
+
+    # ② 选股来源：自选备注里由「引用策略股票池」写入的标记
+    cur.execute("SELECT note FROM sa_watchlist WHERE code = %s", (code,))
+    w = _rows(cur)
+    note = (w[0].get("note") if w else "") or ""
+    m = re.search(r"来自策略「(.+?)」", note)
+    if m:
+        sname = m.group(1)
+        cur.execute("SELECT id, runnable, enabled FROM sa_strategy_def "
+                    "WHERE name = %s ORDER BY id LIMIT 1", (sname,))
+        sd = _rows(cur)
+        extra = ""
+        if sd:
+            cur.execute("SELECT annual_return, max_drawdown FROM sa_backtest_run "
+                        "WHERE strategy_id = %s ORDER BY id DESC LIMIT 1",
+                        (sd[0].get("id"),))
+            bt = _rows(cur)
+            if bt:
+                ar = _float(bt[0].get("annual_return"))
+                dd = _float(bt[0].get("max_drawdown"))
+                if ar is not None:
+                    extra += f"；回测年化 {ar:.1f}%"
+                    if dd is not None:
+                        extra += f"、最大回撤 {dd:.1f}%"
+            extra += "；该策略" + ("已采纳（仅供参考）" if sd[0].get("enabled") else "未采纳")
+        parts.append(f"· 选股来源：本股由聚宽策略「{sname}」的股票池引入{extra}")
+
+    if not parts:
+        return ""
+    out = ("【策略信号（卖出触发为影子口径：策略对照只记录、未实际卖出；不是交易指令）】\n"
+           + "\n".join(parts)
+           + "\n（策略信号只作参考；是否买卖仍按本报告分析与交易规则决定。）")
+    if len(out) > max_chars:
+        out = out[:max_chars] + f"\n[策略信号块超长已截断，全文 {len(out)} 字符]"
+    return out
+
+
+def scorecard(cur, days: int = 30) -> dict:
+    """策略使用记分卡（只读聚合）：回答「哪些策略真的在影响决策」。
+
+    三块（全部只读，不改任何交易行为）：
+      ① 卖出策略侧：每条策略的绑定/已触发/影子盈亏/胜率/最近触发；
+      ② 近期触发明细 + 「信号后 7 个自然日内组合实际有没有卖同一只票」对照；
+      ③ 聚宽库侧：采纳状态 / 沙箱验证 / 回测结论 / 自选引入数。
+    """
+    days = max(1, min(int(days), 365))
+    now = datetime.now()
+    since = (now - timedelta(days=days)).strftime("%Y-%m-%d")
+    out = {"days": days, "since": since,
+           "generated_at": now.strftime("%Y-%m-%d %H:%M:%S")}
+
+    # ① 卖出策略侧
+    cur.execute(
+        "SELECT s.id, s.name, s.kind, "
+        "(SELECT count(*) FROM sa_paper_strategy_bindings b "
+        " WHERE b.strategy_id=s.id) AS bindings, "
+        "(SELECT count(*) FROM sa_paper_strategy_bindings b "
+        " WHERE b.strategy_id=s.id AND b.triggered_at IS NOT NULL) AS triggered, "
+        "(SELECT count(*) FROM sa_paper_strategy_bindings b "
+        " WHERE b.strategy_id=s.id AND b.triggered_at IS NULL AND b.enabled) AS pending, "
+        "(SELECT count(*) FROM sa_paper_strategy_exits e "
+        " WHERE e.strategy_id=s.id) AS exits_n, "
+        "(SELECT COALESCE(sum(e.pnl_amount), 0) FROM sa_paper_strategy_exits e "
+        " WHERE e.strategy_id=s.id) AS shadow_pnl, "
+        "(SELECT count(*) FROM sa_paper_strategy_exits e "
+        " WHERE e.strategy_id=s.id AND e.pnl_amount > 0) AS wins, "
+        "(SELECT max(e.exit_date) FROM sa_paper_strategy_exits e "
+        " WHERE e.strategy_id=s.id) AS last_exit "
+        "FROM sa_strategies s ORDER BY s.id")
+    sell = []
+    for r in _rows(cur):
+        n = int(r.get("exits_n") or 0)
+        w = int(r.get("wins") or 0)
+        sell.append({
+            "id": r.get("id"), "name": r.get("name") or "",
+            "kind": r.get("kind") or "",
+            "bindings": int(r.get("bindings") or 0),
+            "triggered": int(r.get("triggered") or 0),
+            "pending": int(r.get("pending") or 0),
+            "exits": n, "wins": w,
+            "win_rate": round(w / n * 100, 1) if n else None,
+            "shadow_pnl": round(float(r.get("shadow_pnl") or 0), 2),
+            "last_exit": str(r.get("last_exit"))[:10] if r.get("last_exit") else None,
+        })
+    out["sell_strategies"] = sell
+
+    # ② 近期触发明细 + 「信号后组合实际有没有卖」对照。
+    # 窗口取 [exit_date, exit_date+7]：信号说「该卖」，看组合 7 个自然日内卖没卖。
+    # 只取最早一笔卖出（同票同窗口多笔卖出不该重复计数）。
+    cur.execute(
+        "SELECT e.id, e.code, e.exit_date, e.pnl_pct, e.pnl_amount, e.ratio, "
+        "COALESCE(s.name, '') AS sname, COALESCE(w.name, '') AS stock_name, "
+        "t.sell_date "
+        "FROM sa_paper_strategy_exits e "
+        "LEFT JOIN sa_strategies s ON s.id = e.strategy_id "
+        "LEFT JOIN sa_watchlist w ON w.code = e.code "
+        "LEFT JOIN LATERAL ("
+        "  SELECT min(tt.trade_date) AS sell_date FROM sa_paper_trades tt "
+        "  WHERE tt.code = e.code AND tt.side = 'sell' "
+        "    AND COALESCE(tt.status, '') <> 'skipped' "
+        "    AND tt.trade_date >= e.exit_date AND tt.trade_date <= e.exit_date + 7"
+        ") t ON true "
+        "WHERE e.exit_date >= %s "
+        "ORDER BY e.exit_date DESC, e.id DESC LIMIT 80",
+        (since,))
+    recent = []
+    for r in _rows(cur):
+        pnl = _float(r.get("pnl_pct"))
+        amt = _float(r.get("pnl_amount"))
+        ratio = _float(r.get("ratio")) or 1.0
+        sell_date = r.get("sell_date")
+        recent.append({
+            "code": r.get("code") or "",
+            "name": r.get("stock_name") or "",
+            "exit_date": str(r.get("exit_date"))[:10],
+            "strategy": r.get("sname") or "",
+            "pnl_pct": round(pnl, 2) if pnl is not None else None,
+            "pnl_amount": round(amt, 2) if amt is not None else None,
+            "ratio": ratio,
+            "sell_date": str(sell_date)[:10] if sell_date else None,
+            "acted": bool(sell_date),
+        })
+    out["recent_exits"] = recent
+    acted = sum(1 for it in recent if it["acted"])
+    out["totals"] = {
+        "recent_exits": len(recent),
+        "acted": acted,
+        "acted_pct": round(acted / len(recent) * 100, 1) if recent else None,
+        "shadow_pnl_all": round(sum((it["pnl_amount"] or 0) for it in recent), 2),
+    }
+
+    # ③ 聚宽库侧
+    cur.execute("SELECT id, name, article_id, runnable, enabled, portable_score, "
+                "universe::text AS universe_txt "
+                "FROM sa_strategy_def ORDER BY id")
+    jq = []
+    for r in _rows(cur):
+        uni_n = 0
+        try:
+            uni = json.loads(r.get("universe_txt") or "[]")
+            uni_n = len(uni) if isinstance(uni, (list, dict)) else 0
+        except Exception:  # noqa: BLE001
+            uni_n = 0
+        cur.execute("SELECT count(*) AS n FROM sa_watchlist WHERE note LIKE %s",
+                    (f"来自策略「{r.get('name')}」%",))
+        wl = _rows(cur)
+        wl_n = int((wl[0].get("n") if wl else 0) or 0)
+        cur.execute("SELECT annual_return, max_drawdown, sharpe, total_return "
+                    "FROM sa_backtest_run WHERE strategy_id = %s "
+                    "ORDER BY id DESC LIMIT 1", (r.get("id"),))
+        bt = _rows(cur)
+        sb_n = sb_ok = 0
+        sb_last = None
+        if r.get("article_id"):
+            # 沙箱记录挂在文章 post_id 上（sa_strategy_def.article_id 同源）
+            cur.execute("SELECT count(*) AS n, count(*) FILTER (WHERE ok) AS ok_n, "
+                        "max(created_at) AS last FROM sa_sandbox_run "
+                        "WHERE post_id = %s", (r.get("article_id"),))
+            sb = _rows(cur)
+            if sb:
+                sb_n = int(sb[0].get("n") or 0)
+                sb_ok = int(sb[0].get("ok_n") or 0)
+                sb_last = str(sb[0].get("last"))[:10] if sb[0].get("last") else None
+        item = {
+            "id": r.get("id"), "name": r.get("name") or "",
+            "runnable": r.get("runnable") or "",
+            "enabled": bool(r.get("enabled")),
+            "portable_score": _float(r.get("portable_score")),
+            "universe_n": uni_n,
+            "watchlist_added": wl_n,
+            "sandbox": {"runs": sb_n, "ok": sb_ok, "last": sb_last},
+            "backtest": None,
+        }
+        if bt:
+            item["backtest"] = {
+                "total_return": _float(bt[0].get("total_return")),
+                "annual_return": _float(bt[0].get("annual_return")),
+                "max_drawdown": _float(bt[0].get("max_drawdown")),
+                "sharpe": _float(bt[0].get("sharpe")),
+            }
+        jq.append(item)
+    out["jq"] = jq
+    return out

@@ -1636,6 +1636,20 @@ def _decide_one(deps, conf, stock, today, slot: str = ""):
                                               conf=_mc)
         except Exception as exc:  # noqa: BLE001
             print(f"[paper] 公众号检索注入跳过: {exc}", flush=True)
+        # 策略信号注入（2026-10-17，用户要求「策略参与决策」，默认开启）：
+        # ① 卖出策略对该股的近期触发（**影子口径**：策略对照只记录、未实际卖出）
+        # ② 该股选股来源（来自哪个聚宽策略 + 回测结论）。
+        # 用户 2026-10-17 裁决：默认开（带开关）；「策略触发即直接卖出」不做。
+        # 同样必须在 with get_conn() 块内查询；异常一律吞掉。
+        strategy_block = ""
+        try:
+            import paper_strategy as _ps
+            _sc = {**_ps.INJECT_DEFAULTS, **(conf.get("strategy_inject") or {})}
+            if _sc.get("enabled"):
+                strategy_block = _ps.build_injection(cur, code, as_of=today,
+                                                     conf=_sc)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[paper] 策略信号注入跳过: {exc}", flush=True)
     ctx = _build_context(stock, quote, bars, news, events, market_note,
                          account, positions, past, conf, social,
                          event_news=event_news)
@@ -1643,6 +1657,8 @@ def _decide_one(deps, conf, stock, today, slot: str = ""):
         ctx += "\n" + evo_block
     if inst_block:
         ctx += "\n" + inst_block
+    if strategy_block:
+        ctx += "\n" + strategy_block
     if mp_block:
         ctx += "\n" + mp_block
     # 3. LLM 调用 1：分析师
