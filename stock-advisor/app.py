@@ -60,6 +60,7 @@ import conf_util
 import config_schema
 import cost_estimate
 import crypto_watch
+import etf_flows
 import futures_watch
 import holiday_calendar
 import ilink_client
@@ -685,6 +686,19 @@ def init_db():
         ddl += _inst_mod.DDL
     except Exception as exc:
         print(f"[init_db] 机构信号 DDL 跳过: {exc}", flush=True)
+    # 核心宽基 ETF 资金流 + 全球利率（2026-10-17 新增）：
+    # sa_etf_flows（15 只宽基 ETF 的份额/净值）+ sa_macro_rates_global
+    # （FRED 6 序列）。同样用 `+=`（理由同上：DDL 里带分号/注释）。
+    # 两个模块自己的 sync 也会惰性建表，这里是让新库一次带全。
+    try:
+        import etf_flows as _ef_mod
+        ddl += _ef_mod.DDL
+    except Exception as exc:
+        print(f"[init_db] ETF 资金流 DDL 跳过: {exc}", flush=True)
+    try:
+        ddl += macro_rates.GLOBAL_DDL
+    except Exception as exc:
+        print(f"[init_db] 全球利率 DDL 跳过: {exc}", flush=True)
     last_exc: Exception | None = None
     # 旧版 sa_strategies 是「按股票建行」的，列结构与现在完全不同，
     # CREATE TABLE IF NOT EXISTS 修不了它，只能重建。只在确实是旧结构时动手。
@@ -3325,6 +3339,57 @@ def macro_rates_sync(days: int = 400):
     try:
         with get_conn() as conn:
             return {"ok": True, **macro_rates.sync(conn, days=days)}
+    except Exception as exc:
+        raise HTTPException(502, f"{type(exc).__name__}: {str(exc)[:200]}")
+
+
+# ---- 全球利率（FRED，2026-10-17 新增）----
+# 为什么单开一组端点而不是并进 /api/macro/rates：数据源不同（FRED vs akshare），
+# 更新节奏不同（日频 US + 月频日德英韩 vs 日频中美），且失败要能分开报 ——
+# 并进一条的话，FRED 挂了会把 akshare 那部分也标成失败。
+
+@app.get("/api/macro/global")
+def macro_global_view():
+    """各国 10Y 国债收益率（含中国 10Y；日/德/英/韩为月频，带数据日与滞后）。
+
+    无表/无数据时回可读 ok:False（不是 500）—— 页面加载时表很可能还没建。
+    """
+    with get_conn() as conn:
+        return macro_rates.global_snapshot(conn)
+
+
+@app.post("/api/macro/global/sync")
+def macro_global_sync(days: int = 400):
+    """手动同步 FRED 6 序列（每天一次足够；页面「同步」用）。"""
+    try:
+        with get_conn() as conn:
+            return macro_rates.sync_global(conn, days=days)
+    except Exception as exc:
+        raise HTTPException(502, f"{type(exc).__name__}: {str(exc)[:200]}")
+
+
+# ---- 核心宽基 ETF 资金流（2026-10-17 新增）----
+
+@app.get("/api/etf/flows")
+def etf_flows_view(days: int = 90):
+    """15 只宽基 ETF 的份额/净值 + 估算净申赎（差额在读取时按相邻记录日算）。
+
+    无表/无数据回可读 ok:False —— 首次使用点「同步」或等守护线程采集。
+    """
+    with get_conn() as conn:
+        return etf_flows.snapshot(conn, days=days)
+
+
+@app.post("/api/etf/flows/sync")
+def etf_flows_sync(days: int = 30):
+    """手动同步：回补沪市份额（按日拉取）+ 深市最新快照 + 缺失净值。
+
+    首次全量回补约 30 个交易日 × 1 请求 + 15 次净值请求（几十秒）；
+    稳态每个交易日只需 1~2 次请求（增量）。
+    """
+    try:
+        with get_conn() as conn:
+            return etf_flows.sync(conn, days=days)
     except Exception as exc:
         raise HTTPException(502, f"{type(exc).__name__}: {str(exc)[:200]}")
 
@@ -9870,6 +9935,15 @@ def _macro_loop():
                                 cooldown_hours=int(mconf.get("alert_cooldown_hours", 12)))
                     except Exception as exc:
                         print(f"[macro] 收益率同步失败: {exc}", flush=True)
+                    # 全球利率（FRED，2026-10-17 加）：与美债同一个「交易日一次」
+                    # 节奏。6 个 CSV 每次 ~1s，不贵；月度序列也能第一时间拿到
+                    # 月中更新。独立 try —— FRED 挂了不能把中美收益率同步标成失败。
+                    if mconf.get("global_enabled", True):
+                        try:
+                            with get_conn() as conn:
+                                macro_rates.sync_global(conn, days=400)
+                        except Exception as exc:
+                            print(f"[macro] 全球利率同步失败: {exc}", flush=True)
 
             # ② 新股排期同步 + 上市提醒 + 打新额度提醒
             if mconf.get("ipo_enabled", True) and last_ipo_day != today:
@@ -9915,6 +9989,50 @@ def _macro_loop():
                     print(f"[holiday] 休市提醒失败: {exc}", flush=True)
         except Exception as exc:
             print(f"[macro] loop error: {exc}", flush=True)
+        time.sleep(1800)
+
+
+def _etf_flows_loop():
+    """核心宽基 ETF 资金流守护线程（2026-10-17 加）。
+
+    节奏（两个窗口，都是幂等回补，不赌「第一次就拿到」）：
+    - **早间 09:00~11:00**：补昨晚没出全的净值 / 把深市 T-1 快照写进它应在的日期；
+    - **盘后 16:15 起每 30 分钟**：沪市当日份额 16:00 后才发布（发布时间不定），
+      当日最多 8 轮（`pm_attempts`）—— 份额当天出不来时没必要一遍遍捶接口。
+
+    周末/假日不跑（`is_trading` 折叠语义，与采集路径一致：宁可用陈旧数据、
+    也不在休市日白刷接口）。反复跑安全：sync 对已存日期不重复请求、
+    写入 ON CONFLICT upsert。
+    """
+    last_seen_day = None
+    pm_attempts = 0
+    while True:
+        try:
+            now = datetime.now()
+            today = now.date()
+            if last_seen_day != today:
+                last_seen_day = today
+                pm_attempts = 0                    # 跨日重置（不是按轮次累计）
+            conf = _conf_section("etf_flows")
+            if conf.get("enabled", True) and holiday_calendar.is_trading(today):
+                hm = now.strftime("%H:%M")
+                morning = "09:00" <= hm <= "11:00"
+                evening = hm >= "16:15" and pm_attempts < 8
+                if morning or evening:
+                    if evening:
+                        pm_attempts += 1
+                    try:
+                        with get_conn() as conn:
+                            r = etf_flows.sync(
+                                conn, days=int(conf.get("backfill_days", 30)))
+                        print(f"[etf] 同步: stat_date={r.get('stat_date')} "
+                              f"当日就绪={r.get('latest_is_today')} "
+                              f"upserted={r.get('upserted')} "
+                              f"errors={len(r.get('errors') or [])}", flush=True)
+                    except Exception as exc:
+                        print(f"[etf] 同步失败: {exc}", flush=True)
+        except Exception as exc:
+            print(f"[etf] loop error: {exc}", flush=True)
         time.sleep(1800)
 
 
@@ -10058,6 +10176,10 @@ _start_daemon(_holiday_loop, "sa_holiday")
 
 # 宏观（美债收益率异动 + 新股排期 + 休市提醒），每半小时一轮
 _start_daemon(_macro_loop, "sa_macro")
+
+# 核心宽基 ETF 资金流（早间 09:00~11:00 补净值 + 盘后 16:15 起每 30 分钟
+# 拉当日份额，当日最多 8 轮；周末/假日跳过）
+_start_daemon(_etf_flows_loop, "sa_etf_flows")
 
 # 自选股事件告警线程（工作日 8:30 后每日一轮：解禁/增发上市新事件推微信）
 _start_daemon(_alerts_loop, "sa_alerts")

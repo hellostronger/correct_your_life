@@ -26,6 +26,7 @@ import json
 import os
 import threading
 import time
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -284,6 +285,240 @@ def digest(conn) -> str:
     lines.append("> 提示：美债利率上行压制成长股估值与黄金；下行则相反。"
                  "这是判断风格切换与外资流向的常用锚，引用时务必带数据日。")
     return "\n".join(lines)
+
+
+# ==========================================================================
+# 全球国债收益率（2026-10-17 加）—— FRED 序列
+# ==========================================================================
+# 为什么走 FRED：akshare 的新浪全球债只覆盖「美国」与「中国」两个国别
+# （bond_gb_us_sina / bond_gb_zh_sina 的 symbol 表 2026-10-17 实测全是单一
+# 国家），日/德/英/韩没有免费可用的 akshare 源。FRED 是圣路易斯联储官方
+# CSV 接口，无 key、直出，实测稳定：
+#   https://fred.stlouisfed.org/graph/fredgraph.csv?id=<SERIES>
+#
+# 实测口径（2026-10-17，别重测）：
+# - DGS10 / DGS2 是日频；IRLTLT01{Jp,De,Gb,Kr}M156N 是 OECD **月频**，
+#   末值都停在 2026-09-01 —— 天然滞后约 1 个月，展示/注入必须带数据日，
+#   不能当「今日值」引用（文件头 pitfall #1 的同一个坑）。
+# - IRLTLT01CNM156N（中国）**不存在（404）**：中国 10Y 走本项目已有的
+#   sa_macro_rates.cn10y（akshare 日频），不重复引入第二个源。
+# - CSV 缺失值写作 "."，必须跳过而不是编 0。
+GLOBAL_SERIES = {
+    "US10Y": ("DGS10", "daily", "美国10年"),
+    "US2Y": ("DGS2", "daily", "美国2年"),
+    "JP10Y": ("IRLTLT01JPM156N", "monthly", "日本10年（月度）"),
+    "DE10Y": ("IRLTLT01DEM156N", "monthly", "德国10年（月度）"),
+    "GB10Y": ("IRLTLT01GBM156N", "monthly", "英国10年（月度）"),
+    "KR10Y": ("IRLTLT01KRM156N", "monthly", "韩国10年（月度）"),
+}
+
+GLOBAL_DDL = """
+CREATE TABLE IF NOT EXISTS sa_macro_rates_global (
+    stat_date   DATE NOT NULL,
+    code        VARCHAR(12) NOT NULL,
+    value       NUMERIC(8,4),
+    src         VARCHAR(12) NOT NULL DEFAULT '',
+    fetched_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (stat_date, code)
+);
+"""
+
+# 决策注入默认值（paper.macro_inject）。默认关 —— 它改的是决策上下文口径，
+# 按 AGENTS.md §0 必须先问；用户点头后打开即可。
+INJECT_DEFAULTS = {"enabled": False, "max_chars": 1500}
+
+
+def _d10(v):
+    """任意日期/字符串 → 'YYYY-MM-DD'；不可解析返回 None。"""
+    if v is None:
+        return None
+    s = str(v).strip()[:10].replace("/", "-")
+    if len(s) != 10 or s[4] != "-" or s[7] != "-":
+        return None
+    try:
+        date.fromisoformat(s)
+        return s
+    except ValueError:
+        return None
+
+
+def _rowvals(row, *keys):
+    """一行 → 值元组；**tuple 游标与 dict 游标都支持**（按 keys 顺序取列）。
+
+    与 institution_signals._row 同一个理由：/api 端点用默认 tuple 游标，
+    `paper_trading._decide_one` 用 RealDictCursor —— 只认一种会在某条路径上
+    静默变成「读取失败」。
+    """
+    if isinstance(row, dict):
+        return tuple(row.get(k) for k in keys)
+    return tuple(row[i] for i in range(len(keys)))
+
+
+def fetch_fred_csv(series_id: str) -> list:
+    """FRED CSV → [(date10, value)]（升序）。缺值（"."）跳过；非 200 抛异常。"""
+    import requests
+    r = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv",
+                     params={"id": series_id}, timeout=40)
+    if r.status_code != 200:
+        raise RuntimeError(f"FRED {series_id} HTTP {r.status_code}")
+    out = []
+    for line in r.text.splitlines()[1:]:
+        parts = line.strip().split(",")
+        if len(parts) < 2:
+            continue
+        d10 = _d10(parts[0])
+        vs = parts[1].strip()
+        if not d10 or vs in ("", "."):
+            continue
+        try:
+            v = float(vs)
+        except ValueError:
+            continue
+        if v != v:                       # NaN
+            continue
+        out.append((d10, v))
+    if not out:
+        raise RuntimeError(f"FRED {series_id} 解析后为空")
+    return out
+
+
+def sync_global(conn, days: int = 400) -> dict:
+    """同步 6 条 FRED 序列到 sa_macro_rates_global（按 (stat_date, code) upsert）。"""
+    with conn.cursor() as cur:
+        for stmt in [s.strip() for s in GLOBAL_DDL.split(";") if s.strip()]:
+            cur.execute(stmt)
+    conn.commit()
+    cutoff = (date.today() - timedelta(days=max(30, days))).isoformat()
+    all_rows, newest, errors = [], {}, {}
+    for code, (sid, _freq, _label) in GLOBAL_SERIES.items():
+        try:
+            pts = fetch_fred_csv(sid)
+        except Exception as exc:
+            errors[code] = str(exc)
+            continue
+        pts = [(d, v) for d, v in pts if d >= cutoff]
+        if not pts:
+            errors[code] = "窗口内无数据"
+            continue
+        newest[code] = f"{pts[-1][0]} {pts[-1][1]}"
+        all_rows.extend((d, code, v, "fred") for d, v in pts)
+    if all_rows:
+        from psycopg2.extras import execute_values
+        with conn.cursor() as cur:
+            execute_values(
+                cur,
+                "INSERT INTO sa_macro_rates_global (stat_date, code, value, src) "
+                "VALUES %s ON CONFLICT (stat_date, code) DO UPDATE SET "
+                "value = EXCLUDED.value, src = EXCLUDED.src, fetched_at = now()",
+                all_rows, page_size=500)
+        conn.commit()
+    return {"ok": not errors, "rows": len(all_rows), "newest": newest,
+            "errors": errors}
+
+
+def global_snapshot(conn) -> dict:
+    """各国 10Y（含中国，从 sa_macro_rates 合并）+ 与上一期的变动 + 滞后天数。"""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT code, stat_date, value FROM ("
+                "  SELECT code, stat_date, value,"
+                "         row_number() OVER (PARTITION BY code "
+                "                            ORDER BY stat_date DESC) AS rn"
+                "  FROM sa_macro_rates_global WHERE stat_date >= %s) t "
+                "WHERE rn <= 2 ORDER BY code, stat_date DESC",
+                (date.today() - timedelta(days=500),))
+            rows = cur.fetchall()
+    except Exception as exc:
+        return {"ok": False, "why": f"读取失败（表可能还没建，先同步一次）: {exc}"}
+    by = {}
+    for r in rows:
+        code, sd, v = _rowvals(r, "code", "stat_date", "value")
+        by.setdefault(code, []).append((sd, _num(v)))
+    items = []
+    for code in ("US10Y", "US2Y", "JP10Y", "DE10Y", "GB10Y", "KR10Y"):
+        hist = by.get(code) or []
+        if not hist:
+            continue
+        sd, v = hist[0]
+        prev = hist[1][1] if len(hist) > 1 else None
+        _sid, freq, label = GLOBAL_SERIES[code]
+        items.append({"code": code, "label": label, "freq": freq,
+                      "value": v, "stat_date": sd.isoformat(),
+                      "lag_days": (date.today() - sd).days,
+                      "chg": _chg(v, prev), "src": "fred"})
+    # 中国 10Y：并入（sa_macro_rates 是 akshare 日频，不重复引入源）
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT stat_date, cn10y FROM sa_macro_rates "
+                        "ORDER BY stat_date DESC LIMIT 2")
+            crows = cur.fetchall()
+        if crows:
+            sd, v = _rowvals(crows[0], "stat_date", "cn10y")
+            v = _num(v)
+            if sd is not None and v is not None:
+                prev = _num(_rowvals(crows[1], "stat_date", "cn10y")[1]) \
+                    if len(crows) > 1 else None
+                items.append({"code": "CN10Y", "label": "中国10年", "freq": "daily",
+                              "value": v, "stat_date": sd.isoformat(),
+                              "lag_days": (date.today() - sd).days,
+                              "chg": _chg(v, prev), "src": "macro_rates"})
+    except Exception:
+        pass
+    if not items:
+        return {"ok": False, "why": "库里还没有全球利率数据，先同步一次"}
+    order = ["US10Y", "US2Y", "CN10Y", "JP10Y", "DE10Y", "GB10Y", "KR10Y"]
+    items.sort(key=lambda x: order.index(x["code"]) if x["code"] in order else 99)
+    return {"ok": True, "items": items}
+
+
+def build_injection(conn, max_chars: int = 1500) -> str:
+    """给模拟盘决策的「全球利率」块。无数据返回 ""（调用方跳过）。
+
+    默认不注入（paper.macro_inject.enabled 控制）。月度序列（日/德/英/韩）
+    在文本里明确标「月频」：它们天然滞后约一个月，与日频值混读等于
+    拿 9 月初的利率当今天的信号。
+    """
+    try:
+        snap = global_snapshot(conn)
+    except Exception:
+        return ""
+    if not snap.get("ok"):
+        return ""
+    items = snap.get("items") or []
+    if not items:
+        return ""
+
+    def fmt(i):
+        chg = i.get("chg")
+        s = f"{i['label']} {i['value']}%（{i['stat_date']}"
+        if chg is not None:
+            s += f"，变动 {chg * 100:+.1f}bp"
+        s += "）"
+        return s
+
+    daily = [i for i in items if i.get("freq") == "daily"]
+    monthly = [i for i in items if i.get("freq") != "daily"]
+    lines = ["【全球利率（各国 10Y 国债；另含美国2Y）】"]
+    if daily:
+        lines.append("· 日频：" + "；".join(fmt(i) for i in daily))
+    if monthly:
+        lines.append("· 月频（官方口径发布晚，只当背景）："
+                     + "；".join(fmt(i) for i in monthly))
+    us10 = next((i for i in items if i.get("code") == "US10Y"), None)
+    us2 = next((i for i in items if i.get("code") == "US2Y"), None)
+    if us10 and us2 and us10.get("value") is not None \
+            and us2.get("value") is not None:
+        lines.append(f"· 美债 10Y-2Y 利差 "
+                     f"{round(us10['value'] - us2['value'], 3)}%")
+    lines.append("⚠️ 利率上行压制成长股估值、下行相反；月度序列（日本/德国/"
+                 "英国/韩国）更新比市场晚约 1 个月，引用必须带数据日。")
+    text = "\n".join(lines)
+    cap = max(200, int(max_chars or 1500))
+    if len(text) > cap:
+        n = len(text)
+        text = text[:cap] + f"\n[利率块超长已截断，全文 {n} 字符]"
+    return text
 
 
 if __name__ == "__main__":        # python macro_rates.py  -> 手动同步 + 打印

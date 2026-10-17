@@ -642,10 +642,9 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
         不只是「名字像」。点徽标看双线图；比价突然偏离会推微信。
       </div>
     </div>
-  </section>
 
-  <!-- 板块轮动 -->
-    <!-- 国际期货盯盘：黄金 / 石油等 -->
+    <!-- 国际期货盯盘：黄金 / 石油等（原卡片被历史编辑误放在 </section> 之外，
+         2026-10-17 移回行情页；顺带修掉表头 7 列 vs 数据 8 列的对不齐） -->
     <div class="card" style="margin-top:14px">
       <div class="row" style="justify-content:space-between">
         <b style="font-size:13px">💰 国际期货（akshare）
@@ -659,14 +658,66 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       <div style="overflow-x:auto" id="futures-wrap">
         <table style="margin-top:6px">
           <thead><tr>
-            <th>品种</th><th>最新价</th><th>涨跌幅</th><th>最高</th><th>最低</th><th>持仓量</th><th>时间</th>
+            <th>品种</th><th>代码</th><th>最新价</th><th>涨跌幅</th><th>最高</th><th>最低</th><th>持仓量</th><th>时间</th>
           </tr></thead>
           <tbody id="futures-body"></tbody>
         </table>
       </div>
     </div>
+
+    <!-- 全球国债收益率（美/中/日/德/英/韩 10Y；日德英韩为 OECD 月频，2026-10-17 加）-->
+    <div class="card" style="margin-top:14px">
+      <div class="row" style="justify-content:space-between">
+        <b style="font-size:13px">🌍 全球国债收益率
+          <span class="muted" style="font-weight:normal">美/中/日/德/英/韩 10Y</span></b>
+        <span class="row">
+          <span class="muted" id="grate-meta" style="font-size:12px"></span>
+          <button class="btn ghost" style="font-size:12px" onclick="syncMacroGlobal(this)">同步</button>
+        </span>
+      </div>
+      <div class="empty" id="grate-empty" style="margin-top:8px">加载中...</div>
+      <div style="overflow-x:auto" id="grate-wrap">
+        <table style="margin-top:6px">
+          <thead><tr>
+            <th>国家 / 期限</th><th>收益率</th><th>变动</th><th>数据日</th><th>频率</th>
+          </tr></thead>
+          <tbody id="grate-body"></tbody>
+        </table>
+      </div>
+      <div class="hint" style="font-size:12px;margin-top:6px">
+        美债 10Y/2Y 为日频（FRED）；日/德/英/韩 10Y 为 <b>OECD 月频</b>
+        —— 天然滞后约 1 个月（行内标滞后天数），只当背景。中国 10Y 为中债口径（日频）。
+        引用时务必带数据日。
+      </div>
+    </div>
+
+    <!-- 核心宽基 ETF 资金流（份额变化×净值 ≈ 净申赎估算，2026-10-17 加）-->
+    <div class="card" style="margin-top:14px">
+      <div class="row" style="justify-content:space-between">
+        <b style="font-size:13px">🏦 核心宽基 ETF 资金流
+          <span class="muted" style="font-weight:normal">净申赎估算 · 15 只宽基</span></b>
+        <span class="row">
+          <span class="muted" id="eflow-meta" style="font-size:12px"></span>
+          <button class="btn ghost" style="font-size:12px" onclick="syncEtfFlows(this)">同步</button>
+        </span>
+      </div>
+      <div class="empty" id="eflow-empty" style="margin-top:8px">加载中...</div>
+      <div style="overflow-x:auto" id="eflow-wrap">
+        <table style="margin-top:6px">
+          <thead><tr>
+            <th>ETF</th><th>数据日</th><th>份额(亿份)</th><th>净申赎(亿元)</th><th>近5日(亿元)</th><th>净值</th>
+          </tr></thead>
+          <tbody id="eflow-body"></tbody>
+        </table>
+      </div>
+      <div class="hint" id="eflow-note" style="font-size:12px;margin-top:6px">
+        净申赎 = 份额变化 × 单位净值（估算口径，含套利/做市行为，<b>≠「国家队净买入」</b>）；
+        沪市份额滞后 T+1，深市只有最新快照（历史从启用日起积累）。
+      </div>
+    </div>
   </section>
 
+  <!-- 板块轮动 -->
   <section id="tab-sector" class="hide">
     <div class="card">
       <div class="row" style="justify-content:space-between">
@@ -3806,7 +3857,7 @@ const TAB_LOADERS = {
   //   所以这里只做**零成本的**状态探测（探 101 的 /health，约 15ms），
   //   把「有 N 只港股可查」显示出来，让人自己点「查我的港股」。
   //   —— 之前我漏了这个注册，页面永远停在初始的「加载中…」。
-  market:    () => { loadWatch(); loadAlerts(); loadCrypto(); loadDiscover(); loadFutures(); loadHKSupplyStatus(); },
+  market:    () => { loadWatch(); loadAlerts(); loadCrypto(); loadDiscover(); loadFutures(); loadMacroGlobal(); loadEtfFlows(); loadHKSupplyStatus(); },
   sector:    () => { loadSector(); loadIntraday(); startIntradayAuto(); },
   holdings:  () => { loadHoldings(); refreshTradeStrategyOptions(); },
   strategies:() => { loadStrategies(); refreshTradeStrategyOptions(); },
@@ -7392,6 +7443,90 @@ async function loadFutures() {
   } catch (e) { $('futures-meta').textContent = '加载失败: ' + e.message; }
 }
 
+// ---- 全球国债收益率（FRED；日/德/英/韩为 OECD 月频，行内标滞后天数）----
+async function loadMacroGlobal() {
+  try {
+    const d = await api('/api/macro/global');
+    const items = d.items || [];
+    const ok = !!d.ok && items.length > 0;
+    $('grate-empty').classList.toggle('hide', ok);
+    if (!ok) $('grate-empty').textContent = d.why || '暂无数据，点「同步」拉取';
+    $('grate-body').innerHTML = items.map(i => {
+      const chg = typeof i.chg === 'number' ? i.chg : null;
+      const lag = (typeof i.lag_days === 'number' && i.lag_days >= 7)
+        ? ` <span class="muted" style="font-size:11px">滞后${i.lag_days}天</span>` : '';
+      return `<tr>
+        <td><b>${esc(i.label || i.code)}</b>${lag}</td>
+        <td class="num">${i.value != null ? Number(i.value).toFixed(2) + '%' : '—'}</td>
+        <td class="${cls(chg)}">${chg == null ? '—' : (chg > 0 ? '+' : '') + (chg * 100).toFixed(1) + 'bp'}</td>
+        <td class="muted">${esc(i.stat_date || '—')}</td>
+        <td class="muted">${i.freq === 'daily' ? '日频' : '月频'}</td>
+      </tr>`;
+    }).join('');
+    if (ok) {
+      const u = items.find(i => i.code === 'US10Y') || items[0];
+      $('grate-meta').textContent = `数据截至 ${u.stat_date}`;
+    }
+  } catch (e) { $('grate-meta').textContent = '加载失败: ' + e.message; }
+}
+
+// ---- 核心宽基 ETF 资金流（净申赎 = 份额变化×净值，估算口径）----
+async function loadEtfFlows() {
+  try {
+    const d = await api('/api/etf/flows');
+    const items = d.items || [];
+    const ok = !!d.ok && items.length > 0;
+    $('eflow-empty').classList.toggle('hide', ok);
+    if (!ok) $('eflow-empty').textContent = d.why || '暂无数据，点「同步」拉取';
+    $('eflow-body').innerHTML = items.map(i => {
+      const dv = typeof i.d_value === 'number' ? i.d_value : null;
+      const d5 = typeof i.d_value5 === 'number' ? i.d_value5 : null;
+      const sv = v => v == null ? '—' : (v > 0 ? '+' : '') + (v / 1e8).toFixed(2);
+      return `<tr>
+        <td><b>${esc(i.name)}</b> <span class="muted" style="font-size:11px">${esc(i.code)}</span></td>
+        <td class="muted">${esc(i.stat_date || '—')}</td>
+        <td class="num">${i.shares != null ? (i.shares / 1e8).toFixed(2) : '—'}</td>
+        <td class="${cls(dv)}">${sv(dv)}</td>
+        <td class="${cls(d5)}">${sv(d5)}</td>
+        <td class="muted num">${fmtPx(i.nav)}</td>
+      </tr>`;
+    }).join('');
+    if (ok) {
+      const t = d.total || {};
+      const tv = typeof t.value === 'number' ? t.value : null;
+      const t5 = typeof t.value5 === 'number' ? t.value5 : null;
+      $('eflow-meta').textContent =
+        `当日合计 ${tv == null ? '—' : (tv > 0 ? '+' : '') + (tv / 1e8).toFixed(2) + ' 亿'}` +
+        `（近5日 ${t5 == null ? '—' : (t5 > 0 ? '+' : '') + (t5 / 1e8).toFixed(2) + ' 亿'}）` +
+        ` · 截至 ${d.stat_date}`;
+      const notes = d.notes || [];
+      if (notes.length) $('eflow-note').innerHTML = notes.map(esc).join('<br>');
+    }
+  } catch (e) { $('eflow-meta').textContent = '加载失败: ' + e.message; }
+}
+
+async function syncMacroGlobal(btn) {
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = '同步中…';
+  try {
+    const r = await jsonPost('/api/macro/global/sync');
+    btn.textContent = (r && r.ok) ? '已同步' : '部分失败';
+    await loadMacroGlobal();
+  } catch (e) { btn.textContent = '失败'; toastErr('全球利率同步失败: ' + e.message); }
+  setTimeout(() => { btn.textContent = old; btn.disabled = false; }, 2500);
+}
+
+async function syncEtfFlows(btn) {
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = '同步中…';
+  try {
+    const r = await jsonPost('/api/etf/flows/sync');
+    btn.textContent = (r && r.ok) ? '已同步' : '部分失败';
+    await loadEtfFlows();
+  } catch (e) { btn.textContent = '失败'; toastErr('ETF 资金流同步失败: ' + e.message); }
+  setTimeout(() => { btn.textContent = old; btn.disabled = false; }, 2500);
+}
+
 async function loadCrypto(force = false) {
   try {
     if (force) await jsonPost('/api/crypto/refresh');
@@ -9161,6 +9296,8 @@ async function loadNewsFilter() {
 loadWatch();
 loadAlerts();
 loadCrypto();
+loadMacroGlobal();
+loadEtfFlows();
 loadHKSupplyStatus();
 loadNewsFilter();
 loadUnreadBadge();

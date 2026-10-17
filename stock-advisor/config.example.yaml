@@ -65,6 +65,29 @@ sector:
   # 然后填 http://127.0.0.1:8080
   data_service_url: ""
 
+# 全球利率（FRED，app.py _macro_loop 内与美国 CPI 同一个「交易日一次」节奏）
+# 美债 DGS10/DGS2 日频；日/德/英/韩 10Y 是 OECD 月频（天然滞后约一个月）。
+# 中国 10Y 复用 paper 上方的中美利差源（sa_macro_rates），不重复引入。
+# ⚠️ 月度序列展示与注入都带数据日 —— 别当「今日值」引用。
+macro:
+  enabled: true
+  global_enabled: true
+  alert_threshold_bp: 5
+  alert_cooldown_hours: 12
+  ipo_enabled: true
+  ipo_alert_lead_days: 1
+  ipo_quota_alert_enabled: true
+  ipo_quota_lookahead_days: 45
+
+# 核心宽基 ETF 资金流（etf_flows.py，2026-10-17）
+# 15 只国家队常买的宽基 ETF 的份额/净值；「份额变化×净值」≈ 净申赎估算
+# （含套利/做市行为，不等于「国家队净买入」）。
+# 沪市按日可取历史（首次回补 backfill_days 个交易日）；
+# 深市**只有最新快照**（数据日用净值匹配推断，常为 T-1，历史从启用日起积累）。
+etf_flows:
+  enabled: true
+  backfill_days: 30   # 首次启用回补窗口（交易日）
+
 # 提款计划（app.py _withdrawal_loop）
 # 交易日 15:10 起每半小时检查一次达标/临期状态，里程碑（可提/剩10·5·1交易日/逾期）推微信
 withdrawal:
@@ -273,6 +296,15 @@ paper:
     days: 14            # 卖出触发回看窗口（自然日）
     max_items: 3        # 最多列几条触发
     max_chars: 1200     # 整块字符上限
+
+  # ---- 宏观背景注入决策（2026-10-17）----
+  # 默认关：它改的是决策上下文口径。两块：① 全球利率（美/中/日/德/英/韩 10Y +
+  # 美债 2Y，含 10Y-2Y 利差；日德英韩是 OECD 月频，天然滞后约一个月，注入文本
+  # 里带数据日与滞后警告）② 核心宽基 ETF 资金流（份额变化×净值 ≈ 净申赎估算，
+  # 含套利/做市行为，非「国家队净买入」）。关掉后决策上下文逐字节还原。
+  macro_inject:
+    enabled: false
+    max_chars: 1500     # 利率段与 ETF 段合并后的字符上限，超出截断并标注
 
   # ---- 公众号语义检索（2026-10-13）----
   # 为什么不是「再多截 160 字」：实测近 7 天文章正文中位数 630 字，而原来喂给

@@ -1650,6 +1650,36 @@ def _decide_one(deps, conf, stock, today, slot: str = ""):
                                                      conf=_sc)
         except Exception as exc:  # noqa: BLE001
             print(f"[paper] 策略信号注入跳过: {exc}", flush=True)
+        # 宏观背景注入（2026-10-17 加，**默认关闭**）：全球利率（FRED 6 序列 +
+        # 中国 10Y 从 sa_macro_rates 合并）+ 核心宽基 ETF 资金流（净申赎估算）。
+        # 两块共用 paper.macro_inject 一个开关；两块都空时上下文逐字节不变；
+        # 超长按 max_chars 截断并留痕（截断必须在，否则单块能顶掉整个上下文预算）。
+        # 同样必须在 with get_conn() 块内查询（出块连接就关了）；异常一律吞掉。
+        macro_block = ""
+        try:
+            import macro_rates as _mr
+            import etf_flows as _ef
+            _mi = {**_mr.INJECT_DEFAULTS, **(conf.get("macro_inject") or {})}
+            if _mi.get("enabled"):
+                _cap = max(200, int(_mi.get("max_chars") or 1500))
+                _parts = []
+                # ⚠️ 传的是 conn 不是 cur：两个模块内部自己调 conn.cursor()
+                #（2026-10-17 真跑逮到 —— 传游标时它们 catch 掉 AttributeError
+                #  后返回 ""，两块静默为空、不打任何日志，比报错更危险）。
+                _rt = _mr.build_injection(conn, max_chars=_cap)
+                if _rt:
+                    _parts.append(_rt)
+                _efb = _ef.build_injection(conn, max_chars=_cap)
+                if _efb:
+                    _parts.append(_efb)
+                if _parts:
+                    macro_block = "\n".join(_parts)
+                    if len(macro_block) > _cap:
+                        _n = len(macro_block)
+                        macro_block = (macro_block[:_cap]
+                                       + f"\n[宏观块超长已截断，全文 {_n} 字符]")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[paper] 宏观注入跳过: {exc}", flush=True)
     ctx = _build_context(stock, quote, bars, news, events, market_note,
                          account, positions, past, conf, social,
                          event_news=event_news)
@@ -1659,6 +1689,8 @@ def _decide_one(deps, conf, stock, today, slot: str = ""):
         ctx += "\n" + inst_block
     if strategy_block:
         ctx += "\n" + strategy_block
+    if macro_block:
+        ctx += "\n" + macro_block
     if mp_block:
         ctx += "\n" + mp_block
     # 3. LLM 调用 1：分析师
