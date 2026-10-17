@@ -74,6 +74,13 @@ _CACHE_WARNED = False
 # 条款抽取结果可以复用更久：公告内容不会变，变的是「什么时候该重查公告列表」。
 CLAUSE_TTL_DAYS = 30
 MINEDOC_TTL_DAYS = 7
+# 文档页数：**同一个 URL 的文件永不改版**，页数不会变，缓存可以留很久。
+# 它决定「要不要走分块」——没有它每次都要先拿整份去撞 200 页上限，白烧一次
+# MinerU 的失败额度（见 mineru_probe_page_count 注释）。
+PAGECOUNT_TTL_DAYS = 365
+# 公告**列表**缓存：盘中基本不变，但一次搜索 8 只票实测 94 秒。
+# 阶段1「只读缓存秒出」若每次都要重搜，这个「秒出」就是假的。
+ANNOUNCE_TTL_DAYS = 0.25      # 6 小时
 
 
 def _cache_path(key: str, suffix: str = ".json") -> Path:
@@ -181,15 +188,38 @@ def search_announcements(stock_id: str, date_from: str, date_to: str,
                          t1code: str = "-2", rows: int = 200) -> list[dict]:
     """按内部 stockId 搜公告。date 格式 YYYYMMDD。
 
-    ⚠️ 两个坑（都是实测踩的）：
+    ⚠️ 三个坑（都是实测踩的，其中第 3 条是这个功能**整体失效**的根因）：
       1. 必须 **GET + querystring**。POST 同路径返回 405。
       2. 返回体是 `{"result": "<JSON 字符串>"}` —— result 要再 json.loads 一次。
+      3. 🔴 日期参数叫 **`fromDate` / `toDate`**，不是 `from` / `to`
+         （2026-10-15 定位）。写成 from/to 时**服务端静默忽略**，不报错、
+         不 400，只是照常返回**最近约 30 天**的公告 —— 于是
+         `date_from = 今天 - 365 天` 是个笑话：
+         | 代码 | 02513 公告数 | 实际覆盖窗口 |
+         |---|---|---|
+         | `from`/`to`（错） | **6** | 09/10~16/09/2026（约 30 天）|
+         | `fromDate`/`toDate`（对） | **57** | 09/10/2025~10/09/2026 |
+         传 `from=20160101` 与 `from=20250101` 返回**逐条相同**的结果，
+         这是判据（不是「碰巧公告少」）。
+         后果不是「慢一点」而是**功能完全无效**：禁售/锁定条款写在几个月前
+         的配售、招股、认购公告里，而这个接口只看得到最近 30 天，
+         于是 8 只港股**全部**显示「未识别到禁售条款」，
+         而页面看起来一切正常（这正是 AGENTS.md 反复警告的假成功）。
+
+    ⚠️ **公告列表本身也缓存**（`ann:` 前缀，6 小时）：8 只票一次搜索实测
+       **94 秒**，而列表在盘中基本不变。阶段1「只读缓存秒出」如果每次
+       都要重搜 94 秒，这个「秒出」就是假的 —— 用户还是会盯着空白等一分半。
     """
+    cache_key = "ann:%s:%s:%s:%s:%d" % (stock_id, date_from, date_to,
+                                         t1code, rows)
+    c = cache_get(cache_key, ANNOUNCE_TTL_DAYS)
+    if c is not None:
+        return c
     q = urllib.parse.urlencode({
         "sortDir": "0", "sortByOptions": "DateTime", "category": "0",
         "market": "SEHK", "searchType": "0", "documentType": "-1",
         "t1code": t1code, "t2Gcode": "-2", "t2code": "-2",
-        "stockId": stock_id, "from": date_from, "to": date_to,
+        "stockId": stock_id, "fromDate": date_from, "toDate": date_to,
         "title": "", "searchText": "", "lang": "zh",
         "page": "1", "rowRange": str(rows),
     })
@@ -203,10 +233,13 @@ def search_announcements(stock_id: str, date_from: str, date_to: str,
         return []
     if isinstance(inner, str):
         try:
-            return json.loads(inner)          # ← 第二层，别漏
+            out = json.loads(inner)        # ← 第二层，别漏
         except json.JSONDecodeError as exc:
             raise HKEXError("result 内层解析失败: %s" % str(inner)[:160]) from exc
-    return inner or []
+    else:
+        out = inner or []
+    cache_put(cache_key, out)
+    return out
 
 
 def pdf_url(file_link: str) -> str:
@@ -237,14 +270,21 @@ def _mineru_headers(token: str) -> dict:
 
 
 def mineru_submit(url: str, token: str, model_version: str = "vlm",
-                  timeout: int = 60) -> str:
+                  timeout: int = 60, page_ranges: str | None = None) -> str:
     """提交解析任务，返回 task_id。
 
     HKEXnews 的 PDF 对第三方抓取是开放的（裸 UA / 无 UA / 浏览器 UA
     实测三种都是 200 + 完整 PDF），所以直接把公网 URL 交给 MinerU 抓，
     不用自己下载再上传 —— 少一次 1MB 传输，也少一处会 403 的地方。
+
+    `page_ranges`（2026-10-15 实测可用）：形如 `"1-30"` / `"201-400"`。
+    免费版**限 200 页**，招股章程动辄 500 页，传这个可以让 MinerU
+    只处理指定页 —— 于是**既不用下载也不用上传**，一个依赖都不用加。
     """
-    body = json.dumps({"url": url, "model_version": model_version}).encode()
+    body_d = {"url": url, "model_version": model_version}
+    if page_ranges:
+        body_d["page_ranges"] = page_ranges
+    body = json.dumps(body_d).encode()
     last = None
     for attempt in range(3):
         try:
@@ -328,7 +368,79 @@ def mineru_fetch_markdown(zip_url: str, timeout: int = 180) -> str:
     return z.read(name).decode("utf-8", "ignore")
 
 
-def parse_pdf(url: str, token: str, model_version: str = "vlm") -> str:
+def locate_pages(url: str, keywords, max_pages: int = 12) -> list:
+    """用 PyMuPDF 定位「含禁售/锁定关键词」的页码（返回 (1-based, 0-based) 列表）。
+
+    ⚠️⚠️ **PyMuPDF 在这里只做定位，绝不取数字** —— 这是本文件头那条
+       「PDF 用未嵌入字体子集，PyMuPDF 会吞字（『交割日期後60日』丢『後6』，
+        且 U+FFFD 计数为 0，任何缺失检测都发现不了）」的正确用法：
+       定位只需要「这一页**含不含**某个关键词」，而子集字体丢字
+       **不会整页丢光关键词**（常用字通常嵌得进）。真值一律来自 MinerU。
+
+    为什么需要它：MinerU 免费版**限 200 页**，而招股章程/年报动辄 300~600 页
+    —— 实测 8 只票 51 份公告里有 **5 份**因此直接失败，且失败的恰好是最有
+    价值的那几份（`ipo_lockup` 的基石锁定期只写在招股章程里）。
+    定位后只把这些页**切片成小 PDF** 再交给 MinerU，就绕开了页数上限。
+
+    定位不到返回空列表 —— 调用方据此**走原来的整份路径**，
+    宁可慢也不能因为「没定位到」就漏查。
+    """
+    try:
+        import fitz                      # PyMuPDF
+    except ImportError:
+        return []
+    try:
+        raw = download_pdf(url)
+    except Exception:                     # noqa: BLE001
+        return []
+    try:
+        doc = fitz.open(stream=raw, filetype="pdf")
+    except Exception:                     # noqa: BLE001
+        return []
+    try:
+        hits = []
+        for i, page in enumerate(doc):
+            if len(hits) >= max_pages:
+                break
+            try:
+                txt = page.get_text() or ""
+            except Exception:             # noqa: BLE001
+                continue
+            if not txt:
+                continue
+            flat = re.sub(r"\s+", "", txt)
+            if any(re.sub(r"\s+", "", k) in flat for k in keywords):
+                hits.append((i + 1, i))
+        return hits
+    finally:
+        try:
+            doc.close()
+        except Exception:                 # noqa: BLE001
+            pass
+
+
+def slice_pdf(url: str, pages, timeout: int = 90) -> bytes:
+    """把指定页导出成一个小 PDF（页码列表为空则原样返回整份）。"""
+    if not pages:
+        return download_pdf(url, timeout)
+    import fitz
+    raw = download_pdf(url, timeout)
+    doc = fitz.open(stream=raw, filetype="pdf")
+    try:
+        out = fitz.open()
+        for _one, idx in pages:
+            if 0 <= idx < doc.page_count:
+                out.insert_pdf(doc, from_page=idx, to_page=idx)
+        return out.tobytes()
+    finally:
+        try:
+            doc.close()
+        except Exception:                 # noqa: BLE001
+            pass
+
+
+def parse_pdf(url: str, token: str, model_version: str = "vlm",
+              page_ranges: str | None = None) -> str:
     """一条龙：提交 -> 轮询 -> 取 markdown。
 
     ⚠️ 曾有个 bug：把 `mineru_poll()` 的返回值（**整个 data dict**）直接当
@@ -336,11 +448,166 @@ def parse_pdf(url: str, token: str, model_version: str = "vlm") -> str:
     `urlopen error unknown url type: {'task_id'}`。
     `mineru_poll` 返回 dict，必须先取 `full_zip_url`。
     """
-    data = mineru_poll(mineru_submit(url, token, model_version), token)
+    data = mineru_poll(mineru_submit(url, token, model_version,
+                                     page_ranges=page_ranges), token)
     zip_url = data.get("full_zip_url") or ""
     if not zip_url:
         raise HKEXError("MinerU 返回里没有 full_zip_url：%s" % sorted(data.keys()))
     return mineru_fetch_markdown(zip_url)
+
+
+# ---------------- 绕过 MinerU 200 页上限（2026-10-15）----------------
+# 症状：8 只票 51 份公告里，**招股章程（全球發售）全部失败**，报
+#   `number of pages exceeds limit (200 pages), please split the file and try again`
+#   —— 而基石投資者/主要股東的锁定期**只写在招股章程里**，恰好是最有价值的那几份。
+#
+# 试过并否决的路（都实测过，别再试）：
+#   1) 本地切片再上传：容器里**没有任何 PDF 库**（fitz/pypdf 全无），
+#      加依赖要先问用户；而且整份上传实测 30MB 要 **90 秒**（uri 传 403，
+#      必须用 requests 且**不能带 Content-Type** —— OSS 预签名把 Content-Type
+#      签进了签名，urllib 会自动加 `application/x-www-form-urlencoded` → 403）。
+#   2) `extract/task` 不接受 `page_ranges`？—— **接受**（实测），所以连
+#      下载+上传那 90 秒都不需要，直接让 MinerU 自己只取这些页。
+MINERU_MAX_PAGES = 200          # 免费版硬上限（报错原文里的数字）
+MINERU_MAX_CHUNKS = 12          # 12×200 = 2400 页封顶，防一夜烧光配额
+# 探测范围（问文档页数用）：**起点远超任何真实公告 + 长度恰好 200 页**。
+# 两个条件缺一不可，理由见 mineru_probe_page_count 的实测表。
+MINERU_PROBE_RANGE = "5000-5199"
+
+_PAGE_LIMIT_MARK = "exceeds limit"
+_DOC_RANGE_RE = re.compile(r"document page range \(1-(\d+)\)")
+
+
+def mineru_probe_page_count(url: str, token: str,
+                            model_version: str = "vlm") -> int:
+    """用一个**必然越界**的请求问出文档真实页数；问不到返回 0。
+
+    实测（2026-10-15 深夜，02513 全球發售 504 页）—— 只有下表的中间形态
+    能问出页数，两个细节都不能省：
+
+    | page_ranges      | 服务端返回 |
+    |------------------|------------|
+    | `1-99999`        | `number of pages exceeds limit (200 pages)` ← ❌ 起点在文档内，先命中**长度**检查 |
+    | `5000-5200`      | `page range 5000-5200 exceeds document page range (1-504)` ✅ |
+    | `999900-1000000` | 同上 ✅ |
+
+    即「起点超出文档页数」时才是越界错误、真实页数回显在里面；起点在文档内
+    时先查「你要的页数 > 200」。所以探测范围必须**起点极大 + 长度 ≤ 200**
+    （两条都满足，将来服务端把检查顺序对调也不会变）。
+
+    ⚠️ 2026-10-15 首版是**假通过**（部署断言把 mineru_submit 换成 fake_submit
+       直接 throw 越界串），真函数里同时埋着两个 bug：
+       ① 用 `1-99999`（命中长度检查）；② 只 catch **提交**阶段的异常 ——
+       而真实链路的越界错误是**轮询阶段**（`state=failed`）才回来的。
+       两条叠加 → 真跑线上时探测恒返回 0（run5 的 5 份招股章程因此失败）。
+       现在提交后**必须轮询**，两个阶段的错误串都要捞。
+    """
+    def _parse_count(exc: Exception) -> int:
+        m = _DOC_RANGE_RE.search(str(exc))
+        return int(m.group(1)) if m else 0
+
+    try:
+        tid = mineru_submit(url, token, model_version,
+                            page_ranges=MINERU_PROBE_RANGE)
+    except HKEXError as exc:
+        return _parse_count(exc)
+    try:
+        mineru_poll(tid, token, poll_sec=5, max_wait=150)
+    except HKEXError as exc:
+        return _parse_count(exc)
+    # 服务端居然接受了这个范围（文档真有 5000+ 页）——不猜页数，返回 0，
+    # 调用方会给出明确报错，而不是编一个数字出来。
+    return 0
+
+
+def _chunk_cache_key(url: str, rng: str) -> str:
+    """分块 markdown 的缓存键。
+
+    ⚠️ 必须**逐块**落盘（不是等全部拼好再落）：MinerU 对同一个文件有
+       「连续失败 5 次就暂时封禁」的滚动限额（报 `retry limit reached
+       (5 attempts), please replace the file`）。整份提交 + 探测 + N 个块，
+       任何一次失败都在消耗这个额度；如果一趟 run 的成果不能复用，
+       几轮就会把额度烧完 —— run4 那 5 份招股章程就是这么被封的
+       （确认过：一小时后同一文件又能提交，是滚动窗口不是永久）。
+    """
+    return "md:" + url + "#" + rng
+
+
+def _parse_pdf_chunks(url: str, token: str, model_version: str, n: int) -> dict:
+    """把 >200 页的文档按页切块解析，逐块缓存，最后拼接 markdown。
+
+    返回 `{"md", "pages", "chunks", "truncated", "chunk_errors"}`；
+    `chunk_errors` 是 {页段: 原因} —— **有洞时调用方不许把结果当完整文档用**
+    （也不许缓存 merged md / 条款缓存），否则「少看了几页」会伪装成
+    「这份公告没有条款」，属于最坏的一类静默失败。
+    """
+    parts, errors, truncated = [], {}, False
+    starts = list(range(1, n + 1, MINERU_MAX_PAGES))
+    for i, start in enumerate(starts):
+        if i >= MINERU_MAX_CHUNKS:
+            truncated = True
+            break
+        end = min(n, start + MINERU_MAX_PAGES - 1)
+        rng = "%d-%d" % (start, end)
+        ck = _chunk_cache_key(url, rng)
+        c = cache_get(ck, MINEDOC_TTL_DAYS)
+        part = c.get("md") if isinstance(c, dict) else None
+        if not part:
+            try:
+                part = parse_pdf(url, token, model_version, page_ranges=rng)
+            except HKEXError as exc:
+                errors[rng] = str(exc)[:160]
+                continue
+            cache_put(ck, {"md": part, "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
+        # 标出页码段：条款引用（quote）要能在拼接后的文本里**逐字**核对上，
+        # 同时便于人工判断「这条出自第几页」。
+        parts.append("\n\n<!-- MinerU 分块 %d-%d / 共 %d 页 -->\n\n"
+                     % (start, end, n) + part)
+    if not parts:
+        raise HKEXError("MinerU 分块解析一份都没成功（n=%d）：%s"
+                        % (n, "；".join("%s %s" % (k, v)
+                                        for k, v in errors.items())[:200]))
+    return {"md": "".join(parts), "pages": n, "chunks": len(parts),
+            "truncated": truncated, "chunk_errors": errors}
+
+
+def parse_pdf_auto(url: str, token: str, model_version: str = "vlm") -> dict:
+    """解析 PDF；超 200 页时**自动按页分块**并拼接 markdown。
+
+    返回 `{"md": str, "pages": int, "chunks": int, "truncated": bool,
+           "chunk_errors": dict}`
+    —— 页数/块数/是否截断/哪几块没成功都要往上报，不能只回一个字符串：
+    调用方与界面需要知道「这份到底是全文、还是只解析了前 N 页 / 中间有洞」。
+
+    ⚠️ `truncated=True` 或有 `chunk_errors` 时调用方**必须在 reason 里说明**。
+       静默少看几页 = 界面看着正常、条款就是少几条，属于最坏的一类失败。
+
+    流程（2026-10-15 深夜修正）：
+      1. 已知页数 > 200（`pages:` 缓存）→ **直接分块**，不再拿整份去撞上限
+         （每次撞 = 消耗一次 MinerU 的失败额度）。
+      2. 否则先试整份；被 200 页上限拒绝才探测页数并缓存。
+      3. 分块逐块解析、逐块落盘（见 _chunk_cache_key 注释）。
+    """
+    cached_n = cache_get("pages:" + url, PAGECOUNT_TTL_DAYS)
+    n = cached_n if isinstance(cached_n, int) else 0
+    if n > MINERU_MAX_PAGES:
+        return _parse_pdf_chunks(url, token, model_version, n)
+    try:
+        md = parse_pdf(url, token, model_version)
+        return {"md": md, "pages": 0, "chunks": 1, "truncated": False,
+                "chunk_errors": {}}
+    except HKEXError as exc:
+        if _PAGE_LIMIT_MARK not in str(exc):
+            raise
+    n = mineru_probe_page_count(url, token, model_version)
+    if n <= MINERU_MAX_PAGES:
+        # 探不到页数（或页数明明没超却被拒）—— 不能假装成功，
+        # 也不能瞎切：如实抛出去，调用方会把它记成 failed + 原因。
+        raise HKEXError(
+            "MinerU 报页数超限，但探测到的页数=%d（解析不了这份公告）" % n)
+    cache_put("pages:" + url, n)
+    return _parse_pdf_chunks(url, token, model_version, n)
+
 
 
 def download_pdf(file_link: str, timeout: int = 90) -> bytes:

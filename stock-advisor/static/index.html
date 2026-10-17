@@ -4009,47 +4009,6 @@ function _plusDays(iso, n) {
 // 天数 -> 人读。⚠️ 不能用 `n % 30 === 0 ? 月 : 日` —— 60 日会被显示成
 // 「2 个月」，而条款原文写的就是「60 日」。这里只在 **>= 90 天**（约 3 个月，
 // 港股 IPO 锁定期的最短量级）时才折成月，否则一律按日显示，保���与原文一致。
-const _hkDays = d => {
-  const n = Number(d);
-  if (!isFinite(n) || n <= 0) return '—';
-  return n >= 90 ? (Math.round(n / 30 * 10) / 10) + ' 个月' : n + ' 日';
-};
-/** 单只港股一行。纯函数，可离线 V8 测。 */
-function _hkRow(it) {
-  // ⚠️ 逐个兜底：`it.code` 缺失时 `${it.code}` 会把 undefined 拼进 HTML。
-  //    渲染层绝不该有能力输出 undefined（AGENTS.md 同类坑）。
-  const code = esc(it && it.code != null ? it.code : '?');
-  const nm = `${code} ${esc((it && it.name) || '')}`.trim();
-  if (!it || it.ok === false) {
-    return `<div style="padding:2px 0"><b>${nm}</b> ` +
-      `<span class="muted">⚠ 未取到：${esc((it && it.error) || '未知原因')}</span></div>`;
-  }
-  const ipo = (it.ipo_lockup || []).map(c =>
-    `🔓 股东锁定期 ${esc(_hkDays(c.days))}` +
-    (c._date ? `<span class="muted">（${esc(c._date)} ${esc((c._title || '').slice(0, 18))}）</span>` : '')
-  );
-  const pledge = (it.issuer_pledge || []).map(c =>
-    `✋ 发行人禁售 ${esc(_hkDays(c.days))}` +
-    (c._date ? `<span class="muted">（${esc(c._date)} ${esc((c._title || '').slice(0, 18))}）</span>` : '')
-  );
-  const lines = [];
-  if (ipo.length) {
-    // ⚠️ nm 在上面已 esc 过，这里**不能**再 esc —— 二次转义会把 &lt; 变成
-    //    &amp;lt;，页面上就显示出字面量 &lt;（XSS 测试曾靠这条抓到过）。
-    lines.push(`<div style="padding:2px 0"><b>${nm}</b> ${ipo.join('；')}</div>`);
-  }
-  if (pledge.length) {
-    lines.push(`<div style="padding:2px 0 0 12px">` +
-      `<span class="muted">↳ 非股份解禁（公司不再发新股）：</span> ${pledge.join('；')}</div>`);
-  }
-  if (!ipo.length && !pledge.length) {
-    // ⚠️ 必须是「没在公告里识别到」而不是空白：空白 = 用户以为查过了没有。
-    const why = it.error || '未在近 12 个月的公告里识别到禁售条款';
-    lines.push(`<div style="padding:2px 0"><b>${esc(nm)}</b> ` +
-      `<span class="muted">${esc(why)}</span></div>`);
-  }
-  return lines.join('');
-}
 /** 只探状态（零成本，约 15ms）。挂在 market tab 的自动加载里。 */
 async function loadHKSupplyStatus() {
   const box = $('hksup-box');
@@ -4160,7 +4119,16 @@ async function loadHKSupply() {
             box.innerHTML = `<span class="muted">⚠ ${esc(p.error || '解析失败')}</span>`;
             return;
           }
-          renderHKSupplyResult(box, p);
+          // ⚠️ 渲染**必须自己兜异常**：定时器上面已经停了，渲染一抛就会被外层
+          //   catch 吞掉 → 页面永远停在进度条骨架，文案还写着「正在重试」，
+          //   而其实再也不会重试了（2026-10-15 离线测试真逮到这一幕）。
+          //   「看起来在重试、实际卡死」正是用户报过三次的那类症状。
+          try {
+            renderHKSupplyResult(box, p);
+          } catch (e) {
+            box.innerHTML = `<span class="muted">⚠ 结果渲染失败：`
+              + esc(e && e.message ? e.message : e) + '</span>';
+          }
         }
       } catch (e) {
         // 单次轮询失败**不要**终止整个进度条（网络抖动很常见）。
@@ -4185,15 +4153,162 @@ async function loadHKSupply() {
   }
 }
 
-/** 进度完成后渲染结果（从 loadHKSupply 里拆出来，轮询回调也用）。 */
-function renderHKSupplyResult(box, d) {
-    const items = d.items || [];
-    const head = `<div class="muted" style="font-size:11px;margin-bottom:3px">` +
-      `⚠ ${esc(d.boundary || '')}</div>`;
-    box.innerHTML = head + (items.length
-      ? items.map(_hkRow).join('')
-      : '<span class="muted">没有可分析的港股</span>');
+/** 港股解禁：表格渲染。
+ *
+ *  ⚠️ 为什么改成表格（2026-10-15 用户：「现在这样显示太乱了」）：
+ *   原来是一行一句话的流水，13 条条款混在一起，看不出
+ *   「哪条是真的股票能卖」「哪天解禁」「多少钱」。
+ *
+ *  ⚠️ 两类**必须分开**且分开命名 —— 实测 13 条里有 11 条是
+ *   `issuer_pledge`（发行人承诺不再发新股），它**不涉及任何股份**，
+ *   没有解禁金额。混在一张表里会让人以为「解禁后有货可卖」——
+ *   而那批新股发行日就可流通。
+ *
+ *  ⚠️ 金额是**按现价估算**：股数 × 今天的价，不是解禁当天的价。
+ *  ⚠️ 没有股数就显示「—」，绝不显示 0：0 元会被读成
+ *   「解禁了但金额为 0」，与「金额未知」完全是两回事。
+ */
+function _hkUnlCell(c) {
+  if (!c.unlock_date) return '<span class="muted">—</span>';
+  const d = c.unlock_date;
+  const today = new Date().toISOString().slice(0, 10);
+  const cls = d >= today ? 'color:var(--up, #d33)' : 'muted';
+  return `<span class="${cls}">${esc(d)}</span>`;
 }
+function _hkAmtCell(c) {
+  if (c.amount == null) return '<span class="muted">—</span>';
+  const sh = c.amount_shares;
+  const s = sh >= 1e8 ? (sh / 1e8).toFixed(2) + ' 亿股'
+          : sh >= 1e4 ? (sh / 1e4).toFixed(1) + ' 万股' : sh + ' 股';
+  const money = (c.amount / 1e8).toFixed(2) + ' 亿 ' + (c.currency || 'HKD');
+  return `<b>${esc(money)}</b><div class="muted" style="font-size:10px">${esc(s)}`
+       + (c.amount_pct ? ` · 占 ${esc(c.amount_pct)}%` : '') + '</div>';
+}
+function _hkTable(title, note, rows, badge, cellNote) {
+  if (!rows.length) return '';
+  const body = rows.map(r => `
+    <tr>
+      <td><b>${esc(r.code)}</b> <span class="muted">${esc(r.name || '')}</span></td>
+      <td>${esc(r.party || '—')}</td>
+      <td>${esc(r.days >= 30 ? (r.days / 30).toFixed(r.days % 30 ? 1 : 0) + ' 个月'
+                            : r.days + ' 日')}</td>
+      <td>${r.unlock_date ? _hkUnlCell(r) : '<span class="muted" title="公告里没有写出起算日期，不能拿公告发布日冒充">缺起算日</span>'}</td>
+      <td>${r.amount_shares ? _hkAmtCell(r) : '<span class="muted">' + esc(cellNote) + '</span>'}</td>
+      <td class="muted" style="font-size:11px">${esc((r._title || '').slice(0, 22))}
+        ${r._date ? `<div>${esc(r._date)}</div>` : ''}</td>
+    </tr>`).join('');
+  return `<div style="margin:6px 0 2px"><b>${badge} ${esc(title)}</b>
+      <span class="muted" style="font-weight:normal;font-size:11px">${esc(note)}</span></div>
+    <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <thead><tr style="text-align:left;color:var(--muted)">
+        <th style="padding:2px 6px 2px 0">股票</th>
+        <th style="padding:2px 6px 2px 0">承诺方</th>
+        <th style="padding:2px 6px 2px 0">期限</th>
+        <th style="padding:2px 6px 2px 0">解禁日</th>
+        <th style="padding:2px 6px 2px 0">解禁金额</th>
+        <th style="padding:2px 0">出处</th>
+      </tr></thead><tbody>${body}</tbody></table>`;
+}
+
+/** 进度完成后渲染结果（从 loadHKSupply 里拆出来，轮询回调也用）。
+ *  ⚠️ `running=true` 时**在结果下面**再挂一条进度条 —— 缓存那批先出，
+ *  后台补齐的过程中页面既有内容又能看出「还在跑」。
+ *  ⚠️ `fromCache=true`（页面加载读落盘结果）时标注「上次解析于…」。 */
+function renderHKSupplyResult(box, d, running, fromCache) {
+    const items = d.items || [];
+    // ⚠️ 覆盖率必须显示出来：只说「未识别到禁售条款」而不说「看过几份
+    //   候选」，用户无法区分「真没有」和「没查够」（这轮 bug 的核心）。
+    const docs = items.reduce((s, it) => s + ((it.announcements || []).length), 0);
+    const cands = items.reduce((s, it) => s + (it.candidates || 0), 0);
+    const failed = items.reduce((s, it) => s + (it.announcements || [])
+      .filter(a => a.status === 'failed').length, 0);
+    // ⚠️ 失败/被截断的**真实原因**要摆出来：只说「N 份解析失败」，用户没法
+    //   判断是自己的票有问题、还是服务端抽风。（原来这里写死「超 200 页」，
+    //   而 200 页上限现在已能自动分块绕开 —— 写死的归因会变成假信息。）
+    const whyN = {};
+    let truncN = 0;
+    let holeN = 0;
+    for (const it of items) for (const a of (it.announcements || [])) {
+      if (a.status === 'failed') {
+        const r = String(a.reason || '未知原因').replace(/^PDF 解析失败：/, '').slice(0, 34);
+        whyN[r] = (whyN[r] || 0) + 1;
+      }
+      if (a.truncated) truncN++;
+      // ⚠️ 「分块解析有缺」与「截断」是两回事：截断是系统性只读了前半，
+      //    有缺是某些页段解析失败（可能被重试补上）。两者都**必须**摆出来，
+      //    否则「这几页没看」会伪装成「这几页没有条款」。
+      if (a.chunk_errors && Object.keys(a.chunk_errors).length) holeN++;
+    }
+    const parts = [`⚠ ${esc(d.boundary || '')}`];
+    if (cands) parts.push(`已解析 ${docs}/${cands} 份候选公告（逐份读原文，不靠关键词猜）`);
+    if (failed) parts.push(`⚠ ${failed} 份解析失败，未覆盖（`
+      + Object.entries(whyN).slice(0, 2).map(([k, v]) => esc(k) + '×' + v).join('；') + `）`);
+    if (truncN) parts.push(`⚠ ${truncN} 份公告超出分块上限，只读了前半部分（可能漏条款）`);
+    if (holeN) parts.push(`⚠ ${holeN} 份公告有页段未解析成功，那几段未查（可能漏条款）`);
+    if (d.saved_at) parts.push(`上次解析于 ${esc(d.saved_at)}`);
+    if (running) parts.push('⏳ 后台正在补齐剩余公告，补完自动更新');
+    const head = `<div class="muted" style="font-size:11px;margin-bottom:3px">`
+      + parts.join('　') + `</div>`;
+
+    // 🔓 真正的股份解禁（锁定期满 → 那批股票可以卖）
+    const real = [];
+    // ✋ 发行人禁售承诺（不再发新股，**不涉及股份**）
+    const pledge = [];
+    for (const it of items) {
+      for (const c of (it.ipo_lockup || []))
+        real.push(Object.assign({ code: it.code, name: it.name }, c));
+      for (const c of (it.issuer_pledge || []))
+        pledge.push(Object.assign({ code: it.code, name: it.name }, c));
+    }
+    const byDate = (a, b) => (a.unlock_date || '9999').localeCompare(b.unlock_date || '9999');
+    real.sort(byDate); pledge.sort(byDate);
+
+    // ⚠️ 抓取失败的票**必须单独一类**：`ok===false` = 这只票连公告都没取到
+    //   （接口/服务失败），与「查过、只是没有条款」是两回事。旧 `_hkRow` 会
+    //   显式渲染 `it.error`；我的第一版表格把两者并进「未识别到」——
+    //   等于把「没查到」说成「没有」，正是这轮在修的那个 bug 的同类。
+    const none = [], errs = [];
+    for (const it of items) {
+      const n = (it.ipo_lockup || []).length + (it.issuer_pledge || []).length;
+      if (it.ok === false) errs.push(it);
+      else if (!n) none.push(it);
+    }
+    let html = head;
+    html += _hkTable('股份解禁（锁定期满，那批股票可以卖）',
+      '金额按现价估算，港元', real, '🔓', '公告未写股数，金额未知');
+    html += _hkTable('发行人禁售承诺（公司不再发新股）',
+      '不涉及股份 —— 这类不是解禁，没有金额', pledge, '✋', '不涉及股份');
+    // ⚠️🔴 无条款的票**必须逐只列出**，哪怕上面两张表已经有内容。
+    //   第一版把它塞在 `if (!real.length && !pledge.length)` 里 ——
+    //   于是「有结果」时这些票**整只从页面上消失**，用户既看不到结论、
+    //   也看不到「查过」，与 AGENTS.md 记的「静默省略比报错更糟」同一类。
+    if (errs.length) {
+      html += `<div style="margin:6px 0 2px"><b>⚠ 未取到</b>
+        <span class="muted" style="font-weight:normal;font-size:11px">`
+        + `这几只没跑完（接口/解析失败），不代表没有条款</span></div>`;
+      html += errs.map(it =>
+        `<div style="padding:2px 0 0 12px"><b>${esc(it.code)} ${esc(it.name || '')}</b> `
+        + `<span class="muted">${esc(it.error || '未知原因')}</span></div>`).join('');
+    }
+    if (none.length) {
+      html += `<div style="margin:6px 0 2px"><b>⚪ 未识别到禁售/锁定条款</b>
+        <span class="muted" style="font-weight:normal;font-size:11px">`
+        + `已逐份读过它们的配售/发行/招股类公告，不是「没查」</span></div>`;
+      html += none.map(it => {
+        const failedN = (it.announcements || []).filter(a => a.status === 'failed').length;
+        const holeN = (it.announcements || []).filter(a => a.chunk_errors
+          && Object.keys(a.chunk_errors).length).length;
+        const why = failedN ? `${failedN} 份公告解析失败，未能确认`
+                  : holeN ? `${holeN} 份公告有页段未解析成功，未能确认`
+                  : `已读 ${it.candidates || 0} 份公告，未识别到`;
+        return `<div style="padding:2px 0 0 12px"><b>${esc(it.code)} `
+             + `${esc(it.name || '')}</b> <span class="muted">${esc(why)}</span></div>`;
+      }).join('');
+    }
+    if (!items.length) html += '<span class="muted">没有可分析的港股</span>';
+    box.innerHTML = html;
+}
+
 async function pushAlerts() {
   toast('检查中…');
   try {
@@ -6785,7 +6900,9 @@ async function loadPaperCycles() {
       const plannedCell = c.planned
         ? String(c.planned)
         : (prog ? `${prog[1]}/${prog[2]}` : '—');
-      const running = !!c.note && !c.planned && !(c.breakdown || []).length;
+      // 「⏭ 跳过」行（2026-10-16 F6）：不是进行中 —— 不进高亮、不触发自动轮询。
+      const skipped = String(c.note || '').startsWith('⏭');
+      const running = !!c.note && !c.planned && !(c.breakdown || []).length && !skipped;
       return `<tr${running ? ' style="background:var(--bg2)"' : ''}>
         <td class="tabular-nums">${esc((c.trade_date || '').slice(5))} ${esc(c.slot)}</td>
         <td>${KIND[c.kind] || esc(c.kind)}</td>
@@ -6821,7 +6938,9 @@ function watchPaperCycles() {
     try {
       const r = await api('/api/paper/cycles?limit=1');
       const top = (r.items || [])[0] || {};
-      const busy = !!top.note && !top.planned;
+      // 「⏭ 跳过」行的 note 非空但不代表有轮次在跑，不能让它把轮询钉住。
+      const busy = !!top.note && !top.planned
+        && !String(top.note).startsWith('⏭');
       await loadPaperCycles();
       if (!busy) {                         // 这一轮跑完了 → 停表
         clearInterval(_paperCyclesTimer);

@@ -13,6 +13,7 @@
 import json
 import os
 import re
+import sys
 import threading
 import tempfile
 import shutil
@@ -31,6 +32,21 @@ from pathlib import Path
 # 行情/东财请求跟着 ProxyError（2026-09-25 实测）。NO_PROXY=* 等效全部直连。
 os.environ.setdefault("NO_PROXY", "*")
 os.environ.setdefault("no_proxy", "*")
+
+# 🔴 stdout/stderr 编码（2026-10-16 F1）。Windows 下 sys.stdout 默认是控制台编码
+# （本机实测 cp936/GBK），含 emoji 的 print（如「📊 盘中量能」标题、通知正文）
+# 会抛 UnicodeEncodeError，而它恰好出现在「notify 成功但日志打 alert pushed 失败」
+# 的 except 里，让日志显示成 notify failed —— 成功被误报成失败。
+# errors="replace" 保证任何字符最多变替换符，绝不再抛。
+def _fix_stdio_encoding() -> None:
+    for stream in (getattr(sys, "stdout", None), getattr(sys, "stderr", None)):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass      # 被重定向成非 TextIOWrapper 时跳过，不影响启动
+
+
+_fix_stdio_encoding()
 
 import psycopg2
 import psycopg2.extras
@@ -1349,6 +1365,35 @@ def volume_intraday():
     return snap
 
 
+def _notify_brief(res) -> str:
+    """把 notifier.notify(...) 的返回值压成单行（2026-10-16 F5）。
+
+    原来日志只打「alert pushed: <标题>」—— notify 明明返回了
+    「没推送（渠道全关）/ 推送了但全失败（附原因）」两种截然不同的结果，
+    日志里一模一样，排查时看不出是哪一种。这条 helper 是唯一渲染点。
+    """
+    if not isinstance(res, dict):
+        return f"non-dict={res!r}"
+    parts = []
+    reason = (res.get("reason") or "").strip()
+    if reason:
+        parts.append(f"reason={reason}")
+    for r in (res.get("results") or []):
+        if not isinstance(r, dict):
+            parts.append(str(r))
+            continue
+        ch = r.get("channel") or "?"
+        if r.get("ok"):
+            uids = [str(x.get("uid")) for x in (r.get("results") or [])
+                    if isinstance(x, dict) and x.get("ok") and x.get("uid")]
+            parts.append(f"{ch}=ok:{r.get('to') or (','.join(uids) or '-')}")
+        else:
+            parts.append(f"{ch}=fail:{(r.get('error') or 'unknown')}")
+    if not parts:
+        parts.append("sent" if res.get("sent") else "no-detail")
+    return " | ".join(parts)
+
+
 def _market_volume_loop():
     """盘中大盘量能守护线程：交易时段按 config volume.interval_minutes 采样，
     放量/缩量状态翻转（双采样确认）推微信/邮件；收盘后补一次全天总结可选。"""
@@ -1362,9 +1407,11 @@ def _market_volume_loop():
                     alert = _market_volume_alert(snap)
                     if alert:
                         try:
-                            notifier.notify(alert["title"], alert["content"],
-                                            event="market_volume")
-                            print(f"[mktvol] alert pushed: {alert['title']}", flush=True)
+                            res = notifier.notify(alert["title"], alert["content"],
+                                                  event="market_volume")
+                            verb = "pushed" if (res or {}).get("sent") else "NOT sent"
+                            print(f"[mktvol] alert {verb}: {alert['title']} "
+                                  f"| {_notify_brief(res)}", flush=True)
                         except Exception as exc:
                             print(f"[mktvol] notify failed: {exc}", flush=True)
                 time.sleep(interval * 60)
@@ -3973,13 +4020,67 @@ def hk_supply_status():
         "service_health": svc,
         "service_error": svc_err,
         "enabled": bool(conf.get("enabled", True)),
-        "max_docs": int(conf.get("max_docs") or 3),
+        # ⚠️ 默认 0 = 每只票**全部**候选都解析（不再截断到 3 份）。
+        #   2026-10-15 实测：修好 HKEXnews 的日期参数（fromDate，见
+        #   hk_supply.search_announcements）后 8 只自选港股真实候选 46 份，
+        #   截断到 3 份等于「每只票一半以上相关公告没看过就下结论」。
+        "max_docs": int(conf.get("max_docs") or 0),
         "retention_days": hk_supply.HS.HKEX_RETENTION_DAYS,
         "hk_codes": codes,                 # 来自 sa_watchlist，不是配置
         "hk_count": len(codes),
         "reason": (svc_err or "") if not (svc and svc.get("ok"))
                   else ((svc or {}).get("reason") or ""),
     }
+
+
+def _hk_attach_market(items: list) -> list:
+    """给港股解禁条款补上**当前价**和**估算解禁金额**。
+
+    ⚠️ 为什么在本机做而不在 101：101 那个服务没有行情源（它只跑
+       MinerU + LLM），而金额 = 股数 × 现价，现价只有本机有
+       （`fetch_quotes` 批量一次）。
+    ⚠️ 金额是**估算**：用的是今天的收盘/最新价，不是解禁当天的价格。
+       所以前端必须标「按现价估算」。宁可标清楚，也不要给一个
+       看起来精确的金额（AGENTS.md：假精确比没有更糟）。
+    ⚠️ 没有股数就**不给金额**，绝不返回 0 —— 0 元会被读成「解禁了但
+       金额为 0」，与「金额未知」完全是两回事。
+    """
+    if not items:
+        return items
+    try:
+        quotes = fetch_quotes([it.get("code") for it in items if it.get("code")])
+    except Exception:                                  # noqa: BLE001
+        quotes = {}
+    by_code = {c: (q or {}) for c, q in (quotes or {}).items()}
+    for it in items:
+        px = (by_code.get(it.get("code")) or {}).get("price")
+        for key in ("ipo_lockup", "issuer_pledge"):
+            for cl in it.get(key) or []:
+                sh = cl.get("amount_shares")
+                cl["price"] = px
+                cl["amount"] = (round(float(px) * sh, 2)
+                                if (sh and px and isinstance(px, (int, float)))
+                                else None)
+    return items
+
+
+@app.get("/api/hk-supply/last")
+def hk_supply_last():
+    """上次解析结果（落盘）。**页面加载就调它** —— 免得每次都得重新点一遍。
+
+    ⚠️ 为什么必须有（2026-10-15）：解析 8 只票实测 38 分钟，而结果原先只
+    存在 101 的**进程内存**里，刷新页面就没了 → 用户看到的是「点按钮 →
+    等半天 → 刷新 → 一切归零」，于是连报「还是没有呀」。
+    """
+    try:
+        r = requests.get(HK_SUPPLY_URL + "/last", timeout=30)
+        d = r.json()
+    except Exception as exc:                            # noqa: BLE001
+        return {"found": False, "items": [],
+                "error": "读上次结果失败：%s" % str(exc)[:160]}
+    d["items"] = _hk_attach_market(d.get("items") or [])
+    d["service_url"] = HK_SUPPLY_URL
+    return d
 
 
 @app.get("/api/hk-supply/scan")
@@ -4006,7 +4107,7 @@ def hk_supply_scan(codes: str = "", max_docs: int = 0):
     if not want:
         return {"job_id": None, "error": "自选股里没有港股（A 股解禁见上面那块）",
                 "service_url": HK_SUPPLY_URL}
-    docs = int(max_docs or conf.get("max_docs") or 3)
+    docs = int(max_docs or conf.get("max_docs") or 0)
     url = "%s/scan?codes=%s&max_docs=%d" % (HK_SUPPLY_URL, ",".join(want), docs)
     try:
         r = requests.post(url, timeout=60)          # 只等「启动」，不等解析
@@ -5031,7 +5132,8 @@ def _paper_event_lines(code: str, days: int = 14) -> list[str]:
 
 
 _paper_state = {"running": False, "settling": False, "current_slot": None,
-                "last_decision": None, "last_settle": None, "last_t": None}
+                "last_decision": None, "last_settle": None, "last_t": None,
+                "last_skip": None}   # F6：最近一次「跳过本轮」的原因（含分类）
 
 
 @app.get("/api/t/advisory")
@@ -7070,7 +7172,8 @@ def paper_status():
             "daemon_threads": sorted(
                 t.name for t in threading.enumerate() if t.name.startswith("sa_")),
             "last_decision": _paper_state["last_decision"],
-            "last_settle": _paper_state["last_settle"]}
+            "last_settle": _paper_state["last_settle"],
+            "last_skip": _paper_state.get("last_skip")}
 
 
 def _paper_strategy_loop():
@@ -7279,6 +7382,9 @@ class _PaperAdvisoryLock:
         self.key = key
         self.conn = None
         self.got = False
+        # F6：区分「锁被别的进程持有」与「取锁本身报错（库不可用）」——
+        # 后者以前只打一行日志，调用方拿不到原因文本。
+        self.error = ""
 
     def __enter__(self):
         try:
@@ -7289,6 +7395,7 @@ class _PaperAdvisoryLock:
             self.conn.commit()
         except Exception as exc:
             print(f"[paper] 取咨询锁失败: {exc}", flush=True)
+            self.error = f"{type(exc).__name__}: {exc}"
             self.got = False
         return self.got
 
@@ -7307,6 +7414,35 @@ class _PaperAdvisoryLock:
         return False
 
 
+def _paper_note_skip(conf: dict, slot: str, kind: str, trigger: str,
+                     reason: str, cls: str) -> None:
+    """把「跳过本轮」的原因落到可观测处（2026-10-16 F6）。
+
+    以前两条早退路径（进程内锁 / 咨询锁）**只在日志留一句话**，页面和
+    `sa_paper_cycles` 里什么都看不到 —— 2026-10-14 用户报「两天没触发」时，
+    「轮次进行中」与「整轮被跳过」在页面上无法区分，就是缺这一步。
+
+    两类必须分开（cls）：
+      busy    —— 上一轮还在跑（正常节奏；一轮 30~50 分钟是已接受的成本）
+      blocked —— 咨询锁被他进程持有 / 取锁报错（库不可用）→ 真正的「整轮被跳过」
+
+    落库用 record_cycle（同一 date+slot 覆盖写）：若之后同 slot 真跑了一轮，
+    会把它覆盖掉，不会留下过期信息。纯可观测性，不参与任何决策/成交。
+    """
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _paper_state["last_skip"] = {"slot": slot, "kind": kind, "trigger": trigger,
+                                 "reason": reason, "class": cls, "ts": stamp}
+    note = (f"⏭ 跳过：上一轮进行中（进程内锁，非故障）｜{stamp}"
+            if cls == "busy" else
+            f"⏭ 跳过：整轮被跳过 —— {reason}｜{stamp}")
+    try:
+        paper_trading.record_cycle(
+            _paper_deps(conf), datetime.now().strftime("%Y-%m-%d"), slot,
+            kind=kind, trigger=trigger, note=note)
+    except Exception as exc:      # noqa: BLE001
+        print(f"[paper] 跳过原因落库失败（不影响本轮跳过）: {exc}", flush=True)
+
+
 def _paper_run_cycle(conf: dict, slot: str, kind: str = "intraday",
                      trigger: str = "", only: set | None = None) -> dict:
     """跑一轮盘中判断：先免 LLM 止损，再（按需）LLM 重新决策，最后记台账。
@@ -7319,12 +7455,17 @@ def _paper_run_cycle(conf: dict, slot: str, kind: str = "intraday",
     me = f"pid={os.getpid()} thread={threading.current_thread().name}"
     if not _paper_cycle_lock.acquire(blocking=False):
         print(f"[paper] {slot} {me} 上一轮还在跑（进程内锁），跳过本轮", flush=True)
+        _paper_note_skip(conf, slot, kind, trigger,
+                         "上一轮进行中（进程内锁）", cls="busy")
         return {"slot": slot, "kind": kind, "skipped_reason": "上一轮进行中"}
     adv = _PaperAdvisoryLock()
     if not adv.__enter__():
         _paper_cycle_lock.release()
-        print(f"[paper] {slot} {me} 别的进程正在跑（咨询锁），跳过本轮", flush=True)
-        return {"slot": slot, "kind": kind, "skipped_reason": "他进程在跑"}
+        reason = (f"取咨询锁失败（库不可用？）: {adv.error}" if adv.error
+                  else "另一进程持有咨询锁")
+        print(f"[paper] {slot} {me} {reason}，跳过本轮", flush=True)
+        _paper_note_skip(conf, slot, kind, trigger, reason, cls="blocked")
+        return {"slot": slot, "kind": kind, "skipped_reason": reason}
     _paper_state["running"] = True
     _paper_state["current_slot"] = slot
     acted = holds = skipped = 0
@@ -7991,6 +8132,9 @@ def notify_test(channel: str = "wx"):
             detail += "\n\n" + json.dumps(
                 [{"uid": r.get("uid"), "ok": r.get("ok"), "error": r.get("error")}
                  for r in res["results"]], ensure_ascii=False)
+        # F7（2026-10-16）：detail 直接抛给 HTTP 的话，日志里什么都没有 ——
+        # 只看日志就能复现失败原因，不必靠前端把响应拷回来。
+        print(f"[notify] test {channel} 失败: {detail}", flush=True)
         raise HTTPException(400, detail)
     return res
 

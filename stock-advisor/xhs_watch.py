@@ -165,11 +165,22 @@ def run_crawl(keywords: list[str], headless: bool, timeout_min: int,
             raise TimeoutError(f"MediaCrawler 超时（{timeout_min} 分钟），已终止")
         if proc.returncode != 0:
             tail = ""
+            text = ""
             try:
-                lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-                tail = "\n".join(lines[-15:])
+                text = log_path.read_text(encoding="utf-8", errors="replace")
+                tail = "\n".join(text.splitlines()[-15:])
             except OSError:
                 pass
+            # ⚠️ 「未登录」是最常见的失败，而它的**原始报错完全指不到真因**：
+            #   用户看到的是「退出码 1 + 一段日志」，不知道要做什么。
+            #   实测（2026-10-15）这条路径的判据是爬虫自己打印的
+            #   `Login state result: False` —— 那是**我们拉的子进程的输出**，
+            #   不是猜测关键词（AGENTS.md 反对的是拿关键词猜新闻语义）。
+            if "Login state result: False" in text or "login_by_qrcode" in text:
+                raise RuntimeError(
+                    "小红书未登录：请先点「登录小红书」扫码（会弹出浏览器窗口）。"
+                    "browser_data 目录存在但**未登录**时，抓取会以 headless 运行 —— "
+                    "扫码窗口不显示，必然失败。\n" + tail)
             raise RuntimeError(f"MediaCrawler 退出码 {proc.returncode}\n{tail}")
     return True
 

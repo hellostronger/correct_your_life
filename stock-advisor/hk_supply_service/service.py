@@ -48,7 +48,29 @@ TOKEN = os.environ.get("MINERU_API_TOKEN", "").strip()
 LLM_BASE = os.environ.get("LLM_BASE_URL", "http://172.17.0.1:3000").rstrip("/")
 LLM_KEY = os.environ.get("LLM_API_KEY", "").strip()
 LLM_MODEL = os.environ.get("LLM_MODEL", "z-ai/glm-5.3-flash")
-MAX_DOCS = int(os.environ.get("MAX_DOCS", "3"))
+# ⚠️ 默认 **0 = 不限份数**（2026-10-15）。原来是 3，理由是「每份约 40 秒」。
+#    那个理由在 `fromDate` 参数修好之前**站不住** —— 当时每只票本来就只有
+#    0~3 份候选（搜索只能看到最近 30 天），上限形同虚设；修好之后 8 只自选
+#    港股真实候选 46 份，上限就变成「每只票一半以上相关公告没看就下结论」。
+#    现在改成全量 + 并发（hk_supply_scan.PARSE_WORKERS=4），冷启动约 6 分钟，
+#    且条款缓存 30 天，**之后每次都是秒开**。
+MAX_DOCS = int(os.environ.get("MAX_DOCS", "0"))
+
+# 兜底模型：**主模型失败（空 content / 429 / 超时）才用**。
+# 换模型 = 换口径，所以只能当补救，不能当首选。
+FALLBACK_MODELS = [m.strip() for m in
+                   (os.environ.get("LLM_FALLBACK_MODELS")
+                    or "z-ai/glm-5.3-flash,openai/gpt-oss-20b").split(",")
+                   if m.strip()]
+
+# 🔴 上一次结果**落盘**（2026-10-15）。
+# 为什么：解析 8 只票要 38 分钟，而结果原先只存在**进程内存**的 JOBS 里 ——
+# 刷新页面就没了、服务重启也没了，用户必须重新点一次按钮再等一遍。
+#   实测这一条直接对应用户连报的第 N 次「还是没有呀」：
+#   他点完之后刷新了页面（或切走再回来），进度条消失、结果消失，
+#   面板回到「点『查我的港股』…」，于是看起来像「功能没反应」。
+# 落盘后：页面加载就自动显示上次结果 + 时间戳，用户不必再点。
+LAST_RESULT = HS.CACHE_DIR / "last_result.json"
 
 app = FastAPI(title="hk-supply", version="1.0.0")
 
@@ -57,41 +79,103 @@ class _NoLLM(RuntimeError):
     pass
 
 
-def ask(system: str, user: str, max_tokens: int = 3000) -> str:
-    """调自建 LLM 网关。
+def ask(system: str, user: str, max_tokens: int = 12000) -> str:
+    """调自建 LLM 网关。**空 content / HTTP 错误会换兜底模型重试**。
 
     ⚠️ 用 requests 直连、**不装 anthropic SDK** —— 基座镜像里没有那个包，
        为一次调用装 SDK 不划算（且 101 磁盘只剩 1.9G/96%）。
-    ⚠️ base_url 指向网关时，走的是 **Anthropic 协议** `/v1/messages`
-       （本机 llm_advisor 就是这么调的，实测 /v1/messages 返回 401 而非 404，
-       说明路径存在、只是缺 key）。
+    ⚠️ base_url 指向网关时走 **Anthropic 协议** `/v1/messages`。
+
+    ⚠️⚠️ `max_tokens` 从 3000 提到 **12000**（2026-10-15 实测：51 份公告里
+       **4 份**报 `LLM 返回空 content: {"type":"thinking","thinking":"Let me
+       analyze..."}`）。根因是本机 AGENTS.md 早就记过的坑：**推理模型把
+       token 花在 thinking 上**，短任务 max_tokens 给小就把正式输出烧光 ——
+       HTTP 200、内容为空，从调用方看等于「这份公告没有条款」，
+       实际是**根本没答完**。典型的「200 但没数据」。
+       顺带覆盖实测另两类：1 份 `HTTP 429`、2 份 `Read timed out (300s)`。
+    ⚠️ 兜底只在**主模型失败后**才用：换模型 = 换口径，能用主模型就不用兜底。
     """
     if not LLM_KEY:
         raise _NoLLM("未配置 LLM_API_KEY")
-    payload = {
-        "model": LLM_MODEL,
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user",
-                      "content": system + "\n\n" + user}],
-    }
-    r = requests.post(LLM_BASE + "/v1/messages", json=payload,
-                      headers={"Content-Type": "application/json",
-                               "x-api-key": LLM_KEY,
-                               "Authorization": "Bearer " + LLM_KEY,
-                               "anthropic-version": "2023-06-01"},
-                      timeout=300)
-    if r.status_code != 200:
-        raise RuntimeError("LLM 网关 HTTP %s: %s" % (r.status_code, r.text[:200]))
-    d = r.json()
-    # Anthropic 协议：content 是 [{type:text, text:...}]
-    parts = []
-    for c in (d.get("content") or []):
-        if isinstance(c, dict) and c.get("type") == "text":
-            parts.append(c.get("text") or "")
-    txt = "".join(parts).strip()
-    if not txt:
-        raise RuntimeError("LLM 返回空 content: %s" % json.dumps(d)[:200])
-    return txt
+    last_err = None
+    for model in (LLM_MODEL,) + tuple(FALLBACK_MODELS):
+        try:
+            payload = {
+                "model": model,
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user",
+                              "content": system + "\n\n" + user}],
+            }
+            r = requests.post(LLM_BASE + "/v1/messages", json=payload,
+                               headers={"Content-Type": "application/json",
+                                        "x-api-key": LLM_KEY,
+                                        "Authorization": "Bearer " + LLM_KEY,
+                                        "anthropic-version": "2023-06-01"},
+                               timeout=300)
+            if r.status_code != 200:
+                last_err = RuntimeError("LLM 网关 HTTP %s: %s"
+                                        % (r.status_code, r.text[:200]))
+                continue
+            d = r.json()
+            parts = []
+            for c in (d.get("content") or []):
+                if isinstance(c, dict) and c.get("type") == "text":
+                    parts.append(c.get("text") or "")
+            txt = "".join(parts).strip()
+            if not txt:
+                last_err = RuntimeError(
+                    "LLM(%s) 返回空 content（推理模型把 token 花在 thinking 上，"
+                    "不是「没有条款」）: %s" % (model, json.dumps(d)[:200]))
+                continue
+            return txt
+        except Exception as exc:                       # noqa: BLE001
+            last_err = exc
+    raise RuntimeError(str(last_err)[:300] if last_err else "LLM 全部模型都失败")
+def save_last(items, summary: str, codes=None, secs=None) -> bool:
+    """把上次结果**落盘**（2026-10-15）。
+
+    🔴 为什么必须落盘：解析 8 只票要 38 分钟，而结果原先只在**进程内存**
+       的 JOBS 里 —— 刷新页面就没了、服务重启也没了，用户必须重新点一次
+       再等一遍。实测这直接对应用户连报的又一次「还是没有呀」：
+       点完之后刷新页面，进度条和结果一起消失，面板退回「点『查我的港股』…」，
+       于是看起来像「功能没反应」。
+    """
+    try:
+        # ⚠️⚠️ **空结果不许覆盖已有结果**（2026-10-15 实测踩到）：
+        #   条款缓存一旦过期/被清，阶段1（只读缓存）会返回**空** items，
+        #   而它照样会调 save_last —— 于是把一份**已有的好结果**冲成空，
+        #   用户刷新页面看到的是「没有可分析的港股」。
+        #   「缓存没命中」是「暂时没有」，不是「没有」，两者不能互相覆盖。
+        if not items:
+            if LAST_RESULT.exists():
+                print("[hk_supply] ℹ 本次结果为空，保留上次落盘结果不动"
+                      "（缓存没命中 ≠ 没有）", flush=True)
+            return False
+        LAST_RESULT.parent.mkdir(parents=True, exist_ok=True)
+        tmp = LAST_RESULT.with_suffix(".tmp")
+        tmp.write_text(json.dumps({
+            "items": items, "summary": summary, "codes": codes or [],
+            "elapsed_sec": secs, "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(LAST_RESULT)
+        return True
+    except OSError as exc:
+        print("[hk_supply] ⚠ 上次结果落盘失败: %s" % exc, flush=True)
+        return False
+
+
+@app.get("/last")
+def last_result():
+    """上次结果。页面加载就调它 —— 免得用户每次都得重新点一遍按钮。"""
+    try:
+        if not LAST_RESULT.exists():
+            return {"items": [], "found": False}
+        d = json.loads(LAST_RESULT.read_text(encoding="utf-8"))
+        d["found"] = True
+        d["boundary"] = _boundary()
+        return d
+    except (OSError, ValueError) as exc:
+        return {"items": [], "found": False, "error": str(exc)[:120]}
 
 
 # ---------------- 后台任务 + 进度（2026-10-13 用户要求进度条）----------------
@@ -120,6 +204,7 @@ def _new_job(codes, max_docs, refresh):
         "stage": "start", "code": "", "name": "", "status": "排队中",
         "items": [], "error": None, "started": time.time(), "finished": None,
         "codes": codes, "max_docs": max_docs, "refresh": refresh,
+        "cache_ready": False, "_stop": False,
     }
     return jid
 
@@ -138,8 +223,33 @@ def _run_job(jid):
                     "code": code or "", "name": name or "",
                     "status": status or ""})
 
+    codes, token = j["codes"], TOKEN
     try:
-        items = SCAN.analyze_many(j["codes"], token=TOKEN, ask_fn=ask,
+        # ---------- 阶段 1：只读缓存，秒级出结果 ----------
+        # ⚠️ 为什么分两阶段（2026-10-15 用户选「先出已有缓存，其余后台补」）：
+        #   冷启动 8 只票 46 份公告约 6 分钟。原先只有 `state=done` 才返回
+        #   items，于是页面在 6 分钟里**什么都看不到** —— 这正是用户
+        #   连报四次「还是没有」的直接原因之一。
+        #   现在阶段 1 **零网络零 LLM**（只读 clauses 缓存），几秒内就有结果，
+        #   页面立刻渲染；阶段 2 在后台把剩下的补齐，补完再刷新一次。
+        #   ⚠️ 阶段 1 一份都没命中时 `error` 保持 None —— 「还没查过」
+        #     不等于「没有禁售」，提前下结论就是假成功。
+        items = SCAN.analyze_many(codes, token=token, ask_fn=ask,
+                                  max_docs=j["max_docs"],
+                                  refresh=bool(j.get("refresh")),
+                                  cache_only=True)
+        j["items"] = items
+        j["summary"] = SCAN.summarize(items)
+        j["cache_ready"] = True
+        # ⚠️ 阶段1 也要落盘：用户等 38 分钟时如果刷新页面，靠这个还能看到
+        #   已缓存的那部分，而不是退回「点『查我的港股』…」。
+        save_last(items, j["summary"], codes, secs=None)
+        _p("parse", 0, j.get("total") or 1, "", "", "已出缓存结果，后台补齐剩余公告…")
+        if j.get("_stop"):
+            return
+
+        # ---------- 阶段 2：全量解析 ----------
+        items = SCAN.analyze_many(codes, token=token, ask_fn=ask,
                                   max_docs=j["max_docs"],
                                   progress_fn=_p,
                                   # ⚠️ refresh 必须**透传**：之前 _new_job 存了它、
@@ -150,6 +260,9 @@ def _run_job(jid):
         j["items"] = items
         j["summary"] = SCAN.summarize(items)
         j["state"] = "done"
+        secs = round((j.get("finished") or time.time()) - j["started"], 1)
+        # ⚠️ 阶段2 结束后**再落一次**（覆盖阶段1 的部分结果），并带耗时。
+        save_last(items, j["summary"], codes, secs)
     except Exception as exc:                       # noqa: BLE001
         j["state"] = "error"
         j["error"] = "分析异常：%s" % str(exc)[:300]
@@ -176,7 +289,12 @@ def scan_start(codes: str = Query(..., description="逗号分隔的港股代码�
 
 @app.get("/job/{jid}")
 def job_status(jid: str):
-    """轮询进度。返回 done/total/stage/current + 最终结果。"""
+    """轮询进度。返回 done/total/stage/current + **任何时刻已算出的**结果。
+
+    ⚠️ `items` / `cache_ready` 必须在 `state != "done"` 时也返回：
+       阶段 1（只读缓存）几秒就跑完了，这时候就把已有结果推给页面，
+       剩下的后台补。原先只有 done 才给 items，等于「6 分钟里一片空白」。
+    """
     j = JOBS.get(jid)
     if not j:
         return {"error": "job %s 不存在（服务可能已重启）" % jid, "state": "gone"}
@@ -185,10 +303,12 @@ def job_status(jid: str):
         "done": j["done"], "total": j["total"], "code": j["code"],
         "name": j["name"], "status": j["status"], "error": j["error"],
         "boundary": _boundary(),
+        "cache_ready": bool(j.get("cache_ready")),
         "elapsed_sec": round((j.get("finished") or time.time()) - j["started"], 1),
     }
-    if j["state"] in ("done", "error"):
-        out["items"] = j.get("items") or []
+    # ⚠️ 只要已经有结果就返回 —— 前端据此在**还在跑**的时候先渲染一份。
+    if j.get("items"):
+        out["items"] = j["items"]
         out["summary"] = j.get("summary") or ""
     return out
 

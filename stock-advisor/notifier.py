@@ -333,15 +333,34 @@ def _db_exec(sql: str, params: tuple = (), fetch: str | None = None):
     return None
 
 
-def ilink_creds() -> dict:
-    """从云库读已登录的 iLink 凭据；库不可用或未登录返回空 dict。"""
+def ilink_creds_ex() -> tuple[dict, str]:
+    """从云库读已登录的 iLink 凭据；返回 ``(creds, err)``（F2，2026-10-16）。
+
+    为什么拆出错误码：原来只返回 dict，把三种情况折叠成同一个 ``{}`` ——
+    「库断连」被 send_wx 报成「尚未登录微信」，用户照着重扫了几次码，而真实
+    原因是数据库连不上。三种组合：
+      ("", {..bot_token..})           → 正常
+      ("库里没有凭据（未绑定或已解绑）", {}) → 真·未登录
+      ("读库失败: ...", {})            → 库不可用（与未绑定必须可区分）
+    """
     try:
         rows = _db_exec(
             "SELECT field, value FROM sa_wx_ilink WHERE field = ANY(%s)",
             (list(ILINK_FIELDS),), fetch="all") or []
-        return {k: v for k, v in rows if v}
-    except Exception:
-        return {}
+    except Exception as exc:
+        return {}, f"读库失败: {type(exc).__name__}: {exc}"
+    creds = {k: v for k, v in rows if v}
+    if not (creds.get("bot_token") or "").strip():
+        return creds, "库里没有凭据（未绑定或已解绑）"
+    return creds, ""
+
+
+def ilink_creds() -> dict:
+    """兼容包装：只要有凭据的 creds（读库失败/未绑定都是 ``{}``）。
+
+    新代码需要区分「库挂了」和「没绑定」时用 ``ilink_creds_ex()``。
+    """
+    return ilink_creds_ex()[0]
 
 
 def ilink_creds_save(creds: dict) -> None:
@@ -498,35 +517,47 @@ def record_inbound_context(user_id: str, context_token: str) -> None:
         pass
 
 
-def send_wx(title: str, content: str, conf: dict | None = None) -> dict:
-    """推送到已绑定的微信（iLink Bot）。content 纯文本（微信不支持 Markdown 渲染）。
+def _wx_log(title: str, out: dict) -> None:
+    """send_wx 的**单一日志出口**：一次调用恰好一条，成功/失败格式统一（F3）。
 
-    收件人优先级：
-      1. `sa_wx_users` 里给 bot 发过消息的用户（有 context_token，出站最稳）
-      2. 绑定者本人的 `ilink_user_id`（**兜底即可**：2026-09-30 实测，
-         没有 context_token 也能送达，前提是 notifystart 已声明过在线）
-
-    全失败时**必须带顶层 `error`**：原来只把错误塞在 results[] 里，
-    而 `/api/notify/test` 只读顶层 error，于是对外只显示「发送失败」，
-    把 `sendmessage ret=-2 errmsg=prepare failed` 整个吞掉 ——
-    2026-09-30 排查这个问题时在这上面白绕了很久。
+    以前 send_wx 无论成败都不打日志（失败路径各打各的 print、又不全）——
+    「微信里没收到消息」时日志里查不到任何痕迹，只能靠前端把响应拷回来。
     """
-    creds = ilink_creds()
+    if out.get("ok"):
+        uids = ",".join(str(r.get("uid")) for r in (out.get("results") or [])
+                        if r.get("ok") and r.get("uid"))
+        print(f"[wx] 推送成功「{(title or '')[:40]}」收件人={uids or '-'}", flush=True)
+    else:
+        print(f"[wx] 推送失败「{(title or '')[:40]}」: "
+              f"{out.get('error') or '未知错误'}", flush=True)
+
+
+def _send_wx_impl(title: str, content: str, conf: dict | None = None) -> dict:
+    """send_wx 的实现体：只算结果，**不打任何日志**（日志统一在 send_wx 出口）。"""
+    creds, cerr = ilink_creds_ex()
     if not creds.get("bot_token"):
+        if cerr.startswith("读库失败"):
+            return {"ok": False, "channel": "wx",
+                    "error": f"读取微信凭据失败（数据库不可用）：{cerr}"}
         return {"ok": False, "channel": "wx",
                 "error": "尚未登录微信，请先在「通知」页扫码登录"}
+    users_err = ""
     try:
         rows = _db_exec(
             "SELECT ilink_user_id FROM sa_wx_users ORDER BY bound_at",
             fetch="all") or []
-    except Exception:
+    except Exception as exc:
         rows = []
+        users_err = f"{type(exc).__name__}: {exc}"
     recips = [r[0] for r in rows if r[0]]
     fallback = False
     if not recips and creds.get("ilink_user_id"):
         recips = [creds["ilink_user_id"]]
         fallback = True
     if not recips:
+        if users_err:
+            return {"ok": False, "channel": "wx",
+                    "error": f"读取微信收件人失败（数据库不可用）：{users_err}"}
         return {"ok": False, "channel": "wx",
                 "error": "没有可推送的收件人：扫码登录返回里没有 ilink_user_id，"
                          "请重新扫码绑定"}
@@ -555,6 +586,27 @@ def send_wx(title: str, content: str, conf: dict | None = None) -> dict:
         elif fallback:
             out["hint"] = ("收件人是绑定者兜底（没收到过入站消息）。"
                            "在微信里给 bot 发一条后会记下 context_token，更稳。")
+    return out
+
+
+def send_wx(title: str, content: str, conf: dict | None = None) -> dict:
+    """推送到已绑定的微信（iLink Bot）。content 纯文本（微信不支持 Markdown 渲染）。
+
+    收件人优先级：
+      1. `sa_wx_users` 里给 bot 发过消息的用户（有 context_token，出站最稳）
+      2. 绑定者本人的 `ilink_user_id`（**兜底即可**：2026-09-30 实测，
+         没有 context_token 也能送达，前提是 notifystart 已声明过在线）
+
+    全失败时**必须带顶层 `error`**：原来只把错误塞在 results[] 里，
+    而 `/api/notify/test` 只读顶层 error，于是对外只显示「发送失败」，
+    把 `sendmessage ret=-2 errmsg=prepare failed` 整个吞掉 ——
+    2026-09-30 排查这个问题时在这上面白绕了很久。
+
+    日志：实现体 `_send_wx_impl` 不打日志，这里经 `_wx_log` **恰好打一条**
+    （成功/失败统一格式，F3）。
+    """
+    out = _send_wx_impl(title, content, conf)
+    _wx_log(title, out)
     return out
 
 

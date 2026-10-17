@@ -47,6 +47,8 @@ BACKOFF_DELAY_S = 30
 RETRY_DELAY_S = 2
 STALE_TOKEN_ERRCODE = -14       # session-guard.ts: bot token 过期/失效
 STALE_TOKEN_PAUSE_S = 3600      # session-guard.ts: 冷却一小时，别硬刚
+COOLDOWN_TICK_S = 60            # F4：冷却期的分片长度 —— 每片重读 token，
+                                # 用户重新扫码后不必等满 1 小时（≤60s 恢复）
 
 # 游标在 sa_wx_ilink 里的 KV 键
 CURSOR_KEY = "get_updates_buf"
@@ -236,6 +238,39 @@ def poll_once(deps: dict, reply_fn=None) -> dict:
     return {"ok": True, "msgs": len(msgs), "handled": handled, "ret": 0}
 
 
+def _wait_token_cooldown(before_token: str, pause_s: int = STALE_TOKEN_PAUSE_S,
+                         sleep_fn=time.sleep, time_fn=time.time) -> bool:
+    """token 失效后的**分片**冷却。返回 True = 检测到 token 已更新、提前结束。
+
+    为什么要分片（F4，2026-10-16）：原来一次性 ``sleep(3600)``，而用户在这期间
+    重新扫码登录、新 token 已写进云库，线程却还要睡满 1 小时才醒 ——
+    现象就是「重新登录了，但入站消息还是没反应」。分片后每 COOLDOWN_TICK_S
+    秒重读一次凭据，发现 token 变更立刻恢复轮询；每片打一条心跳，日志能看出
+    冷却还剩多久。
+
+    before_token 为空（进冷却时没读到凭据，如库抖动）时，任何一次读到非空
+    token 都算「变更」→ 提前退出重试。重试若仍 -14 会再次进冷却，代价可接受，
+    比「库恢复了还要睡满一小时」好得多。
+    """
+    deadline = time_fn() + pause_s
+    while True:
+        left = deadline - time_fn()
+        if left <= 0:
+            return False
+        sleep_fn(min(COOLDOWN_TICK_S, left))
+        try:
+            from notifier import ilink_creds
+            cur = (ilink_creds().get("bot_token") or "").strip()
+        except Exception as exc:                   # noqa: BLE001
+            cur = ""
+            print(f"[wx-in] 冷却期读凭据失败: {exc}", flush=True)
+        if cur and cur != (before_token or "").strip():
+            print("[wx-in] 检测到 token 已更新，提前结束冷却、恢复轮询", flush=True)
+            return True
+        print(f"[wx-in] token 冷却中，剩余约 "
+              f"{max(0, int((deadline - time_fn()) // 60))} 分钟", flush=True)
+
+
 def run_forever(deps: dict, reply_fn=None, tick_fn=None) -> None:
     """常驻轮询线程体。退避/暂停策略抄官方 monitor.ts。
 
@@ -250,11 +285,20 @@ def run_forever(deps: dict, reply_fn=None, tick_fn=None) -> None:
                 # -14 = token 过期。官方直接冷却一小时，别硬刚（每分钟失败一次的
                 # 后果是账号被风控，而重新扫码本来也需要人来操作）。
                 if r.get("errcode") == STALE_TOKEN_ERRCODE or r.get("ret") == STALE_TOKEN_ERRCODE:
+                    try:
+                        from notifier import ilink_creds
+                        before = (ilink_creds().get("bot_token") or "").strip()
+                    except Exception:              # noqa: BLE001
+                        before = ""
                     _set(paused_until=time.time() + STALE_TOKEN_PAUSE_S,
                          last_error=f"token 过期(errcode -14)，冷却 1 小时；"
                                     f"需在「通知」页重新扫码登录")
-                    print(f"[wx-in] token 过期，冷却 {STALE_TOKEN_PAUSE_S // 60} 分钟", flush=True)
-                    time.sleep(STALE_TOKEN_PAUSE_S)
+                    print(f"[wx-in] token 过期，进入冷却（每 {COOLDOWN_TICK_S}s "
+                          f"检查是否有新 token）", flush=True)
+                    changed = _wait_token_cooldown(before)
+                    _set(paused_until=0)
+                    if changed:
+                        _set(last_error=None)
                     fails = 0
                     continue
                 fails += 1
