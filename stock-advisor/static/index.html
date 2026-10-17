@@ -4006,26 +4006,40 @@ function _plusDays(iso, n) {
 //   issuer_pledge 发行人承诺不再发新股 -> 不是股份解禁。
 //   混在一起会让人以为「解禁后有货」，直接误导买卖判断。
 // 渲染铁律：任何字段缺失都要显式说明，**不许显示成「本来就没有」**。
-// 天数 -> 人读。⚠️ 不能用 `n % 30 === 0 ? 月 : 日` —— 60 日会被显示成
-// 「2 个月」，而条款原文写的就是「60 日」。这里只在 **>= 90 天**（约 3 个月，
-// 港股 IPO 锁定期的最短量级）时才折成月，否则一律按日显示，保���与原文一致。
-/** 只探状态（零成本，约 15ms）。挂在 market tab 的自动加载里。 */
+/** 只探状态 + **读上次落盘结果**（零成本，约 15ms + 一次本地读）。
+ *  挂在 market tab 的自动加载里。
+ *
+ *  ⚠️ 为什么必须在这里读 /last（2026-10-17 修，用户第 N 次报「UI 没有显示内容」）：
+ *    后端 /api/hk-supply/last 与 renderHKSupplyResult 的 fromCache 分支
+ *    2026-10-15 就写好了（注释原文「页面加载就调它 —— 免得每次都得重新点一遍」），
+ *    但前端**从来没有调用过它**（git 全历史搜不到）—— 结果明明在 101 落着盘，
+ *    刷新页面后却只剩「点『查我的港股』」一句话。
+ *  ⚠️ 只读缓存、绝不在这里自动发起解析（每份公告约 40 秒，会拖住自选页）。 */
 async function loadHKSupplyStatus() {
   const box = $('hksup-box');
   if (!box) return;
   try {
     const st = await api('/api/hk-supply/status');
     $('hksup-count').textContent = st.hk_count ? `（${st.hk_count} 只）` : '';
+    // 有扫描在跑：进度条/结果归扫描流程管，别用缓存结果把它盖掉
+    if (_hkPoll) return;
     if (!st.hk_count) {
       box.innerHTML = '<span class="muted">自选股里没有港股（A 股解禁见上面那块）</span>';
-    } else if (!st.service_ok) {
-      box.innerHTML = `<span class="muted">⚠ 解析服务不可用：${esc(st.reason || '未知')}</span>`;
-    } else {
-      // ⚠️ 绝不在这里自动发起解析 —— 慢（每份公告约 40 秒），会拖住整个自选页。
-      box.innerHTML = `<span class="muted">自选中 ${st.hk_count} 只港股可查。`
-        + `点「查我的港股」逐份解析港交所公告 PDF（每份约 40 秒，解析结果会缓存；`
-        + `首次较慢，之后很快）</span>`;
+      return;
     }
+    if (!st.service_ok) {
+      box.innerHTML = `<span class="muted">⚠ 解析服务不可用：${esc(st.reason || '未知')}</span>`;
+      return;
+    }
+    let d = null;
+    try { d = await api('/api/hk-supply/last'); } catch (e) { d = null; }
+    if (d && d.found && (d.items || []).length) {
+      try { renderHKSupplyResult(box, d, false, true); return; }
+      catch (e) { /* 渲染失败退回提示文案 */ }
+    }
+    box.innerHTML = `<span class="muted">自选中 ${st.hk_count} 只港股可查。`
+      + `点「查我的港股」逐份解析港交所公告 PDF（每份约 40 秒，解析结果会缓存；`
+      + `首次较慢，之后很快）</span>`;
   } catch (e) {
     box.innerHTML = '<span class="muted">港股服务探测失败: ' + esc(e.message) + '</span>';
   }
@@ -4045,6 +4059,15 @@ function _hkPollStop() {
   if (b) b.disabled = false;
 }
 
+/** 进度条骨架 HTML。**三处共用同一形状**（首屏 / 阶段1出缓存后追加 /
+ *  渲染兜底），各写一份必然漂移（AGENTS.md 记过「副本漂移」）。 */
+function _hkProgHTML(text, marginTop) {
+  return `<div class="hksup-prog"${marginTop ? ' style="margin-top:6px"' : ''}>
+      <div class="hksup-bar"><div class="hksup-fill" style="width:2%"></div></div>
+      <div class="muted hksup-txt" style="font-size:12px">${esc(text || '正在启动…')}</div>
+    </div>`;
+}
+
 async function loadHKSupply() {
   const box = $('hksup-box');
   const t0 = Date.now();
@@ -4054,10 +4077,7 @@ async function loadHKSupply() {
   if (btn) btn.disabled = true;
   // 进度条骨架。⚠️ 先把它 render 出来**再**发请求 —— 否则请求慢的时候
   // 页面连「正在启动」都看不到（用户 2026-10-13 连报三次「一直没结果」）。
-  box.innerHTML = `<div class="hksup-prog">
-      <div class="hksup-bar"><div class="hksup-fill" style="width:2%"></div></div>
-      <div class="muted hksup-txt" style="font-size:12px">正在启动…</div>
-    </div>`;
+  box.innerHTML = _hkProgHTML('正在启动…');
   const fill = () => box.querySelector('.hksup-fill');
   const txt = () => box.querySelector('.hksup-txt');
   const paint = (pct, text) => {
@@ -4090,6 +4110,9 @@ async function loadHKSupply() {
     // 轮询进度。间隔 1.5s：MinerU 一份约 40 秒，1.5s 足够跟得上，
     // 又不至于把 101 打爆。
     let last = null;
+    // 阶段1（只读缓存）的 items 是否已渲染过 —— 只渲染一次，之后进度条
+    // 接着跑，直到 done 出全量结果
+    let cacheShown = false;
     handedOff = true;
     _hkPollBox = box;
     _hkPoll = setInterval(async () => {
@@ -4113,6 +4136,24 @@ async function loadHKSupply() {
           + (p.status ? ` ｜ ${p.status}` : '')
           + ` ｜ 已用 ${secs}s`;
         if (line !== last) { paint(pct, line); last = line; }
+        // ⚠️ 阶段1（只读缓存）几秒就有结果 —— **一拿到就先渲染内容**，
+        //   进度条挪到内容下面继续跑（2026-10-17 修）：后端两阶段
+        //   （service.py 注释「页面立刻渲染」）与 render 的 running 分支
+        //   都是为此设计的，但前端原先只在 state=done 才渲染 —— 冷启动时
+        //   页面要等全量解析完（几分钟~几十分钟）才有内容。
+        //   ⚠️ 只在**缓存里真有条款**时渲染；缓存为空就保持进度条，
+        //     免得把「还没查」渲染成「未识别到」。
+        if (!cacheShown && p.state === 'running' && p.cache_ready
+            && (p.items || []).some(it => (it.ipo_lockup || []).length
+                                       || (it.issuer_pledge || []).length)) {
+          cacheShown = true;
+          try {
+            renderHKSupplyResult(box, p, true);
+            // 内容下面再挂一条进度条：既有内容、又能看出「还在跑」
+            box.insertAdjacentHTML('beforeend',
+                                   _hkProgHTML('后台补齐剩余公告…', true));
+          } catch (e) { /* 渲染失败就保持原进度条；done 时还会再渲染一次 */ }
+        }
         if (p.state === 'done' || p.state === 'error') {
           _hkPollStop();               // 先停表，再渲染（顺序反了会闪一下旧内容）
           if (p.state === 'error') {
@@ -4168,6 +4209,18 @@ async function loadHKSupply() {
  *  ⚠️ 没有股数就显示「—」，绝不显示 0：0 元会被读成
  *   「解禁了但金额为 0」，与「金额未知」完全是两回事。
  */
+// 天数 -> 人读。⚠️ 不能用 `n % 30 === 0 ? 月 : 日` —— 60 日会被显示成
+// 「2 个月」，而条款原文写的就是「60 日」。这里只在 **>= 90 天**（约 3 个月，
+// 港股 IPO 锁定期的最短量级）时才折成月，否则一律按日显示，保持与原文一致。
+// ⚠️ 2026-10-17 修：表格重构（03aa2a1）把本函数内联成了 `days >= 30 ? …` ——
+//   60 日被显示成「2 个月」，且 days 缺失会渲染出「null 日 / undefined 日」。
+//   恢复独立函数（阈值 90 + 非法值破折号），供 _hkTable 调用、离线测试直接断言。
+function _hkDays(d) {
+  const n = Number(d);
+  if (!isFinite(n) || n <= 0) return '—';
+  if (n < 90) return n + ' 日';
+  return (n / 30).toFixed(n % 30 ? 1 : 0) + ' 个月';
+}
 function _hkUnlCell(c) {
   if (!c.unlock_date) return '<span class="muted">—</span>';
   const d = c.unlock_date;
@@ -4190,8 +4243,7 @@ function _hkTable(title, note, rows, badge, cellNote) {
     <tr>
       <td><b>${esc(r.code)}</b> <span class="muted">${esc(r.name || '')}</span></td>
       <td>${esc(r.party || '—')}</td>
-      <td>${esc(r.days >= 30 ? (r.days / 30).toFixed(r.days % 30 ? 1 : 0) + ' 个月'
-                            : r.days + ' 日')}</td>
+      <td>${esc(_hkDays(r.days))}</td>
       <td>${r.unlock_date ? _hkUnlCell(r) : '<span class="muted" title="公告里没有写出起算日期，不能拿公告发布日冒充">缺起算日</span>'}</td>
       <td>${r.amount_shares ? _hkAmtCell(r) : '<span class="muted">' + esc(cellNote) + '</span>'}</td>
       <td class="muted" style="font-size:11px">${esc((r._title || '').slice(0, 22))}
@@ -4218,7 +4270,11 @@ function renderHKSupplyResult(box, d, running, fromCache) {
     const items = d.items || [];
     // ⚠️ 覆盖率必须显示出来：只说「未识别到禁售条款」而不说「看过几份
     //   候选」，用户无法区分「真没有」和「没查够」（这轮 bug 的核心）。
-    const docs = items.reduce((s, it) => s + ((it.announcements || []).length), 0);
+    // ⚠️ 只数**已处理**的公告（status≠pending）：阶段1（只读缓存）的 items
+    //   里每份公告都列着、但多数还是 pending —— 直接数长度会显示
+    //   「已解析 46/46」，而实际只查过缓存里那几份（2026-10-17 修）。
+    const docs = items.reduce((s, it) => s + (it.announcements || [])
+      .filter(a => a.status && a.status !== 'pending').length, 0);
     const cands = items.reduce((s, it) => s + (it.candidates || 0), 0);
     const failed = items.reduce((s, it) => s + (it.announcements || [])
       .filter(a => a.status === 'failed').length, 0);
@@ -4291,15 +4347,27 @@ function renderHKSupplyResult(box, d, running, fromCache) {
         + `<span class="muted">${esc(it.error || '未知原因')}</span></div>`).join('');
     }
     if (none.length) {
-      html += `<div style="margin:6px 0 2px"><b>⚪ 未识别到禁售/锁定条款</b>
+      // ⚠️ running（阶段1先出缓存）时不能说死「未识别到」/「已逐份读过」——
+      //   这些票的公告还有 pending，结论要等后台补齐（2026-10-17 修）。
+      html += `<div style="margin:6px 0 2px"><b>⚪ `
+        + (running ? '暂未发现禁售/锁定条款' : '未识别到禁售/锁定条款') + `</b>
         <span class="muted" style="font-weight:normal;font-size:11px">`
-        + `已逐份读过它们的配售/发行/招股类公告，不是「没查」</span></div>`;
+        + (running ? `缓存里已有的先显示，其余公告后台补齐中，补完自动更新`
+                   : `已逐份读过它们的配售/发行/招股类公告，不是「没查」`)
+        + `</span></div>`;
       html += none.map(it => {
         const failedN = (it.announcements || []).filter(a => a.status === 'failed').length;
         const holeN = (it.announcements || []).filter(a => a.chunk_errors
           && Object.keys(a.chunk_errors).length).length;
+        // ⚠️ 阶段1的公告是 pending（尚未解析），不能算进「已读」——
+        //   否则「还没查」会被渲染成「已读 N 份未识别到」（2026-10-17 修）。
+        const pendN = (it.announcements || []).filter(a => a.status === 'pending').length;
+        const readN = (it.announcements || []).filter(a => a.status
+          && a.status !== 'pending').length;
         const why = failedN ? `${failedN} 份公告解析失败，未能确认`
                   : holeN ? `${holeN} 份公告有页段未解析成功，未能确认`
+                  : pendN ? (readN ? `已读 ${readN} 份，另有 ${pendN} 份待解析（后台补齐中）`
+                                   : `${pendN} 份公告待解析（后台补齐中）`)
                   : `已读 ${it.candidates || 0} 份公告，未识别到`;
         return `<div style="padding:2px 0 0 12px"><b>${esc(it.code)} `
              + `${esc(it.name || '')}</b> <span class="muted">${esc(why)}</span></div>`;
