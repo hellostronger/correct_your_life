@@ -1237,7 +1237,7 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
     </div>
   </section>
 
-  <!-- 小红书关键词舆情（MediaCrawler 搜索模式，见 xhs_watch.py） -->
+  <!-- 小红书关键词舆情（xiaohongshu-mcp 搜索模式，见 xhs_watch_mcp.py） -->
   <section id="tab-xhs" class="hide">
     <div class="card">
       <div class="row">
@@ -9128,14 +9128,44 @@ function pollXhsStatus() {
   }, 4000);
 }
 async function xhsLogin() {
-  if (!await confirmDlg('即将弹出浏览器窗口，请在小红书登录页扫码登录。\n完成后窗口会自动关闭。',
-                        { title: '登录 小红书', okText: '拉起浏览器' })) return;
-  toast('浏览器已拉起，请在窗口中登录小红书（最长等待数分钟）…');
+  let qr;
   try {
-    const r = await api('/api/xhs/login', { method: 'POST' });
-    toast(r.message || (r.ok ? '登录成功' : '登录未完成'));
+    qr = await api('/api/xhs/qr', { method: 'POST' });
+  } catch (e) { toastErr('获取二维码失败: ' + e.message); return; }
+  // 已登录
+  if (qr.already_logged_in) {
+    toast('小红书已登录');
     loadXhsStatus();
-  } catch (e) { toastErr('登录失败: ' + e.message); }
+    return;
+  }
+  let settled = false;
+  const closed = showModal({
+    title: '扫码登录小红书',
+    body: `<div style="text-align:center">
+             <img id="xhs-qr-img" src="${qr.img}" alt="小红书登录二维码" style="width:260px;height:260px;background:#fff">
+             <div id="xhs-qr-tip" class="muted" style="margin-top:8px">请用小红书 App 扫码登录…</div>
+           </div>`,
+    footer: `<button class="btn ghost" data-r="0">关闭</button>`,
+  });
+  // 轮询登录态；弹窗关掉即停（定时器生命周期短于本函数，finally 语义由 await p 保证）
+  const timer = setInterval(async () => {
+    if (!Modal.isOpen()) { clearInterval(timer); return; }
+    try {
+      const st = await api('/api/xhs/login-state');
+      if (st.logged_in && !settled) {
+        settled = true; clearInterval(timer);
+        $('xhs-qr-tip').textContent = '✅ 登录成功';
+        toast('小红书登录成功');
+        setTimeout(() => { if (Modal.isOpen()) Modal.close(1); }, 800);
+        loadXhsStatus();
+      } else if (!st.waiting && !st.logged_in && !settled) {
+        settled = true; clearInterval(timer);
+        $('xhs-qr-tip').textContent = '二维码已过期，请重新点「登录小红书」';
+      }
+    } catch {}
+  }, 3000);
+  await closed;
+  clearInterval(timer);
 }
 
 // ---- 通知（微信 iLink Bot / 邮件 SMTP） ----

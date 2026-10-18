@@ -8987,6 +8987,23 @@ def xhs_fetch():
     return {"ok": True, "message": "抓取已开始，请稍后刷新状态"}
 
 
+@app.post("/api/xhs/qr")
+def xhs_qr():
+    """获取登录二维码（立即返回 base64，后台轮询登录态）。"""
+    result = xhs_watch.request_login_qr()
+    if not result.get("ok"):
+        raise HTTPException(409 if "已有" in (result.get("error") or "") else 500,
+                            result.get("error", "获取二维码失败"))
+    if result.get("already_logged_in"):
+        return {"ok": True, "already_logged_in": True, "message": "已登录"}
+    return {"ok": True, "img": result["img"]}
+
+
+@app.get("/api/xhs/login-state")
+def xhs_login_state():
+    return xhs_watch.login_state()
+
+
 @app.post("/api/xhs/login")
 def xhs_login():
     """弹出浏览器扫码登录小红书（阻塞请求直到流程结束，前端提示用户扫码）。"""
