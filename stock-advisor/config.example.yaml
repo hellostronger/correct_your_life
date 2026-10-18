@@ -35,17 +35,21 @@ wb:
   interval_minutes: 60
   fetch_timeout_minutes: 15
 
-# 小红书关键词舆情监控（调 MediaCrawler 搜索模式，见 xhs_watch.py）
+# 小红书关键词舆情监控（基于 xiaohongshu-mcp REST API，见 xhs_watch_mcp.py）
 # 抓关键词（+ 自选股名，use_watchlist）的笔记与评论，入库 sa_xhs_*，
 # 匹配到自选股的笔记推进 sa_news（source=xhs）供模拟盘舆情引用。
 # 小红书风控严，interval_minutes 建议 ≥120；首次使用先 POST /api/xhs/login 扫码。
+# 需先启动 xiaohongshu-mcp 服务（Docker 或裸金属，默认 127.0.0.1:18060）。
 xhs:
   enabled: true
   interval_minutes: 120
   fetch_timeout_minutes: 12
-  max_notes: 40
-  max_comments: 20
+  max_notes_per_keyword: 40
+  max_comments_per_note: 50
+  load_all_comments: true
   use_watchlist: true
+  # mcp 服务地址（留空则用环境变量 XHS_MCP_URL，默认 http://127.0.0.1:18060）
+  mcp_url: ""
   # 额外搜索词（list 或逗号分隔字符串）；单轮关键词总数上限 12
   # 网页「📕 小红书」页或「⚙️ 调度 → 🧩 完整配置」可直接改
   keywords: []
@@ -265,6 +269,8 @@ paper:
     refill_max_per_day: 1   # 单日补回次数上限 —— 防「越跌越买」
     max_refill_bearish: 2   # 均线空头时买回门槛 ×2（觉得还会跌就先不补）
     max_codes: 0            # 每轮最多做T标的数，0=不限
+    log_enabled: true       # 每轮实盘做T判断（含 hold/不做的）落库 sa_t_advisory_log，
+                            # 页面「判断记录」可回看不做原因与历史（2026-10-18）
 
   # ---- 机构信号（2026-10-12）----
   # 用户要求「机构看多看空 / 机构与社保持仓变化 / 被挪出重要指数」参与决策。

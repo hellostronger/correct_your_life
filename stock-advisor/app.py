@@ -159,9 +159,14 @@ LOCK = threading.Lock()  # 序列化写操作，避免多请求并发写坏数�
 def get_conn():
     """云库建连偶发超时（同实例还跑着 dify，负载波动），重试 2 次兜底。"""
     last_exc: Exception | None = None
+    # 连接超时允许 DB_CONNECT_TIMEOUT 覆盖（DB 掉线时本次启动快速失败给 UI 留活路）
+    try:
+        _cto = int(os.environ.get("DB_CONNECT_TIMEOUT", "45"))
+    except (TypeError, ValueError):
+        _cto = 45
     for attempt in range(3):
         try:
-            return psycopg2.connect(connect_timeout=45, **DB_CONF)
+            return psycopg2.connect(connect_timeout=_cto, **DB_CONF)
         except psycopg2.OperationalError as exc:
             last_exc = exc
             if attempt < 2:
@@ -699,7 +704,15 @@ def init_db():
         ddl += macro_rates.GLOBAL_DDL
     except Exception as exc:
         print(f"[init_db] 全球利率 DDL 跳过: {exc}", flush=True)
+    # 做T判断日志（2026-10-18，用户要求「每次判断落库，方便看为什么其他票不做」）：
+    # sa_t_advisory_log，t_trading.py 自带 DDL（幂等）。
+    try:
+        import t_trading as _tt_mod
+        ddl += _tt_mod.DDL
+    except Exception as exc:
+        print(f"[init_db] 做T判断日志 DDL 跳过: {exc}", flush=True)
     last_exc: Exception | None = None
+    _conn_fail = 0  # 连接级失败计数（跨语句累计；连接级熔断判定见下方循环）
     # 旧版 sa_strategies 是「按股票建行」的，列结构与现在完全不同，
     # CREATE TABLE IF NOT EXISTS 修不了它，只能重建。只在确实是旧结构时动手。
     try:
@@ -721,12 +734,16 @@ def init_db():
         stmt = stmt.strip()
         if not stmt:
             continue
+        # 2026-10-17：云库整机掉线时每条 DDL 3 次 × 45s 超时，几百条 DDL 磨数小时、
+        # 端口永远起不来。连续 8 条都是**连接级**失败断定库不可达，熔断跳过其余
+        # DDL（DDL 幂等，库恢复后下次启动自动补建）。非连接错误不计数、不熔断。
         ok = False
         for attempt in range(3):
             try:
                 with get_conn() as conn, conn.cursor() as cur:
                     cur.execute(stmt)
                 ok = True
+                _conn_fail = 0
                 break
             except psycopg2.errors.DuplicateObject:
                 # 并发启动时才会出现：server 进程和一个临时脚本同时 init_db()，
@@ -737,6 +754,7 @@ def init_db():
                 # 这里整段 ddl 的语义就是幂等建表 —— CREATE/DROP 都带 IF NOT/IF
                 #  EXISTS，「约束已存在」正是想要的结果，直接算成功。
                 ok = True
+                _conn_fail = 0
                 break
             except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
                 last_exc = exc
@@ -744,9 +762,16 @@ def init_db():
                       f"{' '.join(stmt.split())[:60]}...: {exc}", flush=True)
                 if attempt < 2:
                     time.sleep(2 * (attempt + 1))
-        if not ok:
-            print(f"[init_db] giving up on stmt: {' '.join(stmt.split())[:60]}...",
-                  flush=True)
+        if ok:
+            continue
+        print(f"[init_db] giving up on stmt: {' '.join(stmt.split())[:60]}...",
+              flush=True)
+        if "connection" in str(last_exc or "") or "server" in str(last_exc or ""):
+            _conn_fail += 1
+            if _conn_fail >= 8:
+                print(f"[init_db] 连续 {_conn_fail} 条连接级失败，判定云库不可达，"
+                      "跳过余下 DDL（库恢复后重启自动补建）", flush=True)
+                break
     try:
         with get_conn() as conn, conn.cursor() as cur:
             _alter_column_widths(cur)
@@ -5011,6 +5036,12 @@ def _t_advisory_loop():
                 print(f"[t-adv] 判定失败: {res['error']}", flush=True)
                 time.sleep(iv * 60)
                 continue
+            # 全量判断落库（含 hold/不做的）——「为什么其他股票不适合做T」
+            # 也要可回看（2026-10-18 用户要求）。失败在 persist 内部吞掉，
+            # 不影响推送主流程。
+            _nlog = t_trading.persist_advisory(deps, res, "bg", tc)
+            if _nlog:
+                print(f"[t-adv] 判断落库 {_nlog} 条", flush=True)
             acts = [i for i in (res.get("items") or [])
                     if i.get("action") in ("t_sell", "t_buy")]
             sig = {i["code"] for i in acts}
@@ -5331,7 +5362,25 @@ def t_advisory(max_codes: int = 0):
                              "cost": h.get("avg_cost")}
                  for h in (_derive_holdings() or [])
                  if int(h.get("net_shares") or 0) > 0}
-    return t_trading.advisory(deps, tc, positions, max_codes=max_codes)
+    res = t_trading.advisory(deps, tc, positions, max_codes=max_codes)
+    # 全量判断落库（含 hold/不做），用户打开页面看到的与库里存的一致。
+    # 落库失败在 persist 内部吞掉，绝不影响建议返回。
+    t_trading.persist_advisory(deps, res, "api", tc)
+    return res
+
+
+@app.get("/api/t/log")
+def t_log(days: int = 3, code: str = "", limit_runs: int = 40):
+    """做T判断日志回看：为什么「不做」也要能查（2026-10-18 用户要求）。
+
+    - runs    每轮判定摘要（时间/来源 bg|api/数量/可操作数）
+    - codes   每只票窗口内的动作分布 + 最近一次判断与原因（「最近原因」列）
+    - latest  最近一轮的完整判断（含执行单与不做原因）
+    - history ?code= 时返回该票逐条时间线（复盘用：hold 多少天后才触发等）
+    """
+    conf = _conf_section("paper") or {}
+    deps = _paper_deps(conf)
+    return t_trading.read_log(deps, days=days, code=code, limit_runs=limit_runs)
 
 
 class TRecordIn(BaseModel):
@@ -8859,9 +8908,9 @@ def _wb_auto_loop():
             time.sleep(300)  # 配置读取失败等异常，5 分钟后重试
 
 
-# ---------------- 小红书关键词舆情（MediaCrawler 搜索模式，见 xhs_watch.py） ----------------
+# ---------------- 小红书关键词舆情（xiaohongshu-mcp REST API，见 xhs_watch_mcp.py） ----------------
 
-import xhs_watch
+import xhs_watch_mcp as xhs_watch
 
 
 @app.get("/api/xhs/notes")

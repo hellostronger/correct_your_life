@@ -43,9 +43,13 @@ A 股 T+1：**当日买入的份额当日不可卖**。所以日内反复买卖�
 """
 from __future__ import annotations
 
+import json
 import math
 import time
-from datetime import datetime
+import uuid
+from datetime import datetime, timedelta
+
+import psycopg2.extras
 
 import market_data as MD
 import paper_trading as PT
@@ -70,6 +74,10 @@ T_DEFAULTS = {
         "L4_year":     {"days": 60,  "min_gap_hours": 0.0},
     },
     "bearish_ma": "down",        # 均线排列判定：down=空头排列则加深门槛
+    # 判断落库（2026-10-18 用户要求）：每轮 advisory 的全部判断（含 hold/不做）
+    # 写入 sa_t_advisory_log，让「为什么其他股票不适合做T」可回看。
+    # 这是观测不是交易口径，所以默认开 —— 不改任何决策内容。
+    "log_enabled": True,
 }
 
 # T 操作的标记前缀。用来区分「做 T 的成交」和「普通 LLM 决策的成交」，
@@ -1270,3 +1278,288 @@ def status(deps: dict, conf: dict) -> dict:
     return {"enabled": True, "items": out,
             "min_edge_pct": c.get("min_edge_pct"),
             "max_t_per_day": c.get("max_t_per_day")}
+
+
+# ---------------- 判断日志（2026-10-18 用户要求）----------------
+#
+# 用户原话的痛点：「往往只见到一个两个建议」—— 后台线程每 15 分钟把全部持仓
+# 都判了一遍，但只有达到门槛的那一两只被推送，其余 hold/被拦的判断**算完就丢**。
+# 于是「为什么其他股票不适合做T」永远无处可查，做T 的历史判断也没法复盘
+# （哪只票 hold 了很多天后终于触发？高抛的方向对过几次？）。
+#
+# 落库点在**调用方**（app.py 的后台线程 + /api/t/advisory），不在 advisory()
+# 本体 —— advisory 的契约是「纯只读，一个字节都不写」，写失败也绝不能影响
+# 建议本身（persist 内部吞异常）。结构化列（price/edge/threshold/bias）+
+# detail JSONB 双轨：前者给 SQL 聚合和后续与 sa_market_kline / 技术指标
+# （RSI 等）join 复盘用，后者保真当轮完整 item（含执行单）。
+
+DDL = """
+-- 做T判断日志：实盘建议每轮把全部持仓的判断（含 hold/不做）落库。
+-- 幂等建表；结构化列供聚合/复盘 join，detail 存当轮完整 item 快照。
+CREATE TABLE IF NOT EXISTS sa_t_advisory_log (
+    id BIGSERIAL PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    run_type TEXT NOT NULL DEFAULT 'bg',
+    code TEXT NOT NULL,
+    name TEXT,
+    trade_date DATE NOT NULL DEFAULT CURRENT_DATE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    action TEXT NOT NULL,
+    bias TEXT,
+    price NUMERIC,
+    cost NUMERIC,
+    pnl_pct NUMERIC,
+    edge_pct NUMERIC,
+    threshold_pct NUMERIC,
+    anchor_price NUMERIC,
+    trigger_price NUMERIC,
+    net NUMERIC,
+    layer TEXT,
+    movable INTEGER,
+    base_shares INTEGER,
+    pending BOOLEAN DEFAULT FALSE,
+    stabilizing BOOLEAN,
+    why TEXT,
+    invalidate TEXT,
+    detail JSONB
+);
+CREATE INDEX IF NOT EXISTS idx_tadv_code_time
+    ON sa_t_advisory_log (code, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tadv_run ON sa_t_advisory_log (run_id);
+"""
+
+# 落库列（顺序即 _log_rows 行元组顺序，execute_values 按位置填）。
+LOG_COLS = ("run_id", "run_type", "code", "name", "trade_date", "action",
+            "bias", "price", "cost", "pnl_pct", "edge_pct", "threshold_pct",
+            "anchor_price", "trigger_price", "net", "layer", "movable",
+            "base_shares", "pending", "stabilizing", "why", "invalidate",
+            "detail")
+
+# 读侧列（顺序即 read_log 的行元组顺序；dict 游标按名取，tuple 按位取）。
+LOG_ROW_COLS = ("run_id", "run_type", "code", "name", "trade_date", "action",
+                "bias", "price", "cost", "pnl_pct", "edge_pct",
+                "threshold_pct", "anchor_price", "trigger_price", "net",
+                "layer", "movable", "base_shares", "pending", "stabilizing",
+                "why", "invalidate", "created_at", "detail")
+
+
+def _num_log(v):
+    """落库前的数值闸门：None/非数值/NaN/Inf -> None。
+
+    PG 的 numeric 能存 NaN（AGENTS.md 2026-10-13：NaN 进库后读侧
+    Decimal('NaN') 运算直接炸出 InvalidOperation），必须在写侧拒掉。
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _log_rows(run_id: str, run_type: str, items, today: str) -> list[tuple]:
+    """advisory 的 items -> 落库行。**纯函数**，离线可断言。"""
+    rows = []
+    for it in (items or []):
+        if not isinstance(it, dict) or not it.get("code"):
+            continue
+        tk = it.get("ticket") or {}
+        detail = {k: v for k, v in it.items() if k != "detail"}
+        try:
+            mv = int(it.get("movable")) if it.get("movable") is not None else None
+        except (TypeError, ValueError):
+            mv = None
+        try:
+            bs = int(it.get("base_shares")) if it.get("base_shares") is not None else None
+        except (TypeError, ValueError):
+            bs = None
+        rows.append((
+            run_id, run_type, str(it["code"]), it.get("name") or "", today,
+            it.get("action") or "hold", it.get("bias"),
+            _num_log(it.get("price")), _num_log(it.get("cost")),
+            _num_log(it.get("pnl_pct")), _num_log(it.get("edge_pct")),
+            _num_log(it.get("threshold")),
+            _num_log(it.get("anchor_price")),
+            _num_log(tk.get("trigger_price")),
+            _num_log(tk.get("net")),
+            it.get("layer") or "",
+            mv, bs,
+            bool(it.get("pending")), it.get("stabilizing"),
+            it.get("why") or "", it.get("invalidate") or "",
+            json.dumps(detail, ensure_ascii=False, default=str),
+        ))
+    return rows
+
+
+def persist_advisory(deps: dict, res: dict, run_type: str = "bg",
+                     conf: dict | None = None) -> int:
+    """把一轮 advisory 的**全部**判断（含 hold/不做）写入 sa_t_advisory_log。
+
+    - 失败隔离：任何异常都吞掉返回 0，只打一行日志 —— 落库是观测，
+      绝不能把建议线程/接口拖崩。
+    - run_type 区分来源：'bg'=后台建议线程（默认 15 分钟一轮），
+      'api'=用户打开页面/点刷新触发的判定。回看时能分清「系统自动判的」
+      和「用户盯着看的」。
+    - 返回写入行数（关闭/无 items/失败均为 0）。
+    """
+    try:
+        c = _conf(conf)
+        if not c.get("log_enabled", True):
+            return 0
+        items = (res or {}).get("items") or []
+        if not items:
+            return 0
+        now = datetime.now()
+        run_id = "%s-%s-%s" % (run_type, now.strftime("%Y%m%d%H%M%S"),
+                               uuid.uuid4().hex[:6])
+        rows = _log_rows(run_id, run_type, items, now.strftime("%Y-%m-%d"))
+        if not rows:
+            return 0
+        with deps["get_conn"]() as conn, conn.cursor() as cur:
+            psycopg2.extras.execute_values(
+                cur,
+                "INSERT INTO sa_t_advisory_log (%s) VALUES %%s"
+                % ",".join(LOG_COLS),
+                rows)
+        return len(rows)
+    except Exception as exc:                  # noqa: BLE001
+        print(f"[t-log] 判断落库失败（不影响建议本身）: {exc}", flush=True)
+        return 0
+
+
+def _r(row, idx: int, key: str):
+    """tuple / dict 双游标取值（institution_signals._row 同款坑：生产调用方
+    可能传 RealDictCursor，按 tuple 下标取会 KeyError）。"""
+    if isinstance(row, dict):
+        return row.get(key)
+    return row[idx] if idx < len(row) else None
+
+
+def _read_row(row) -> dict:
+    """一行日志 -> 输出 dict：Decimal->float、datetime->isoformat、detail 解包。"""
+    g = lambda i, k: _r(row, i, k)            # noqa: E731
+    d = {
+        "run_id": g(0, "run_id"), "run_type": g(1, "run_type"),
+        "code": g(2, "code"), "name": g(3, "name"),
+        "trade_date": str(g(4, "trade_date") or "")[:10],
+        "action": g(5, "action"), "bias": g(6, "bias"),
+        "price": _num_log(g(7, "price")), "cost": _num_log(g(8, "cost")),
+        "pnl_pct": _num_log(g(9, "pnl_pct")),
+        "edge_pct": _num_log(g(10, "edge_pct")),
+        "threshold_pct": _num_log(g(11, "threshold_pct")),
+        "anchor_price": _num_log(g(12, "anchor_price")),
+        "trigger_price": _num_log(g(13, "trigger_price")),
+        "net": _num_log(g(14, "net")),
+        "layer": g(15, "layer"),
+        "movable": g(16, "movable"), "base_shares": g(17, "base_shares"),
+        "pending": bool(g(18, "pending")),
+        "stabilizing": g(19, "stabilizing"),
+        "why": g(20, "why") or "", "invalidate": g(21, "invalidate") or "",
+    }
+    created = g(22, "created_at")
+    d["created_at"] = (created.isoformat(timespec="seconds")
+                       if hasattr(created, "isoformat") else str(created or ""))
+    raw = g(23, "detail")
+    if raw:
+        try:
+            det = json.loads(raw) if isinstance(raw, (str, bytes)) else dict(raw)
+            if isinstance(det, dict):
+                det.pop("detail", None)
+                d.update(det)          # detail 是当轮完整快照，列只是它的子集
+        except (ValueError, TypeError):
+            pass
+    return d
+
+
+def read_log(deps: dict, days: int = 3, code: str = "",
+             limit_runs: int = 40) -> dict:
+    """读判断日志：每轮摘要 + 每只票的统计与最近原因 + 最近一轮完整判断。
+
+    - runs   每轮一条摘要（时间/来源/数量/可操作数），最多 limit_runs 轮
+    - codes  每只票在窗口内的动作分布 + 最近一次判断与原因
+    - latest 最近一轮的完整 items（detail 解包，含执行单/不做原因）
+    - history 仅 ?code= 时：该票窗口内逐条时间线（同样解包 detail），上限 400 条
+    detail JSONB 不随全窗口返回 —— 30 只 × 26 轮 × 3 天全带 detail 能到几 MB。
+    """
+    try:
+        days = max(1, min(int(days or 3), 30))
+    except (TypeError, ValueError):
+        days = 3
+    try:
+        limit_runs = max(1, min(int(limit_runs or 40), 200))
+    except (TypeError, ValueError):
+        limit_runs = 40
+    code = (code or "").strip()
+    out: dict = {"days": days, "code": code or None, "runs": [], "codes": [],
+                 "latest": None, "history": []}
+    since = (datetime.now() - timedelta(days=days)
+             ).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        where = "created_at >= %s"
+        params: list = [since]
+        if code:
+            where += " AND code = %s"
+            params.append(code)
+        with deps["get_conn"]() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT %s FROM sa_t_advisory_log WHERE %s "
+                "ORDER BY created_at DESC, id DESC"
+                % (",".join(LOG_ROW_COLS), where), params)
+            rows = cur.fetchall()
+    except Exception as exc:                  # noqa: BLE001
+        out["error"] = str(exc)[:160]
+        return out
+    if not rows:
+        return out
+
+    runs: dict = {}
+    codes: dict = {}
+    latest_run_id = None
+    latest_items: list = []
+    for row in rows:
+        d = _read_row(row)
+        rid = d["run_id"]
+        if latest_run_id is None:
+            latest_run_id = rid
+        if rid == latest_run_id and len(latest_items) < 200:
+            latest_items.append(d)
+        r = runs.setdefault(rid, {"run_id": rid, "run_type": d["run_type"],
+                                  "created_at": d["created_at"],
+                                  "n_items": 0, "n_act": 0, "act_codes": []})
+        r["n_items"] += 1
+        if d["action"] in ("t_sell", "t_buy"):
+            r["n_act"] += 1
+            if d["code"] not in r["act_codes"] and len(r["act_codes"]) < 10:
+                r["act_codes"].append(d["code"])
+        cd = codes.setdefault(d["code"], {
+            "code": d["code"], "name": d["name"], "total": 0,
+            "t_sell": 0, "t_buy": 0, "hold": 0,
+            "last_action": None, "last_why": "", "last_created_at": "",
+            "last_price": None, "last_edge_pct": None,
+            "last_threshold_pct": None, "last_bias": None,
+            "first_created_at": d["created_at"]})
+        cd["total"] += 1
+        if d["action"] == "t_sell":
+            cd["t_sell"] += 1
+        elif d["action"] == "t_buy":
+            cd["t_buy"] += 1
+        else:
+            cd["hold"] += 1
+        if not cd["last_created_at"] or d["created_at"] > cd["last_created_at"]:
+            cd.update({"last_action": d["action"], "last_why": d["why"],
+                       "last_created_at": d["created_at"],
+                       "last_price": d["price"], "last_edge_pct": d["edge_pct"],
+                       "last_threshold_pct": d["threshold_pct"],
+                       "last_bias": d["bias"]})
+        cd["first_created_at"] = min(cd["first_created_at"], d["created_at"])
+        if code and len(out["history"]) < 400:
+            out["history"].append(d)
+
+    out["runs"] = list(runs.values())[:limit_runs]
+    out["codes"] = sorted(codes.values(),
+                          key=lambda x: (-x["total"], x["code"]))
+    out["latest"] = ({"run_id": latest_run_id,
+                      "run_type": runs[latest_run_id]["run_type"],
+                      "created_at": runs[latest_run_id]["created_at"],
+                      "items": latest_items} if latest_run_id else None)
+    out["n_rows"] = len(rows)
+    return out

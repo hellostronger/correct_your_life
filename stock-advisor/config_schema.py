@@ -231,7 +231,8 @@ SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "xhs": {
         "label": "📕 小红书舆情",
-        "help": "调 MediaCrawler 搜索关键词（含自选股名）抓笔记+评论，匹配到自选的推进新闻流。"
+        "help": "基于 xiaohongshu-mcp REST API 抓取关键词（含自选股名）的笔记+评论，"
+                "匹配到自选的推进新闻流。需先启动 xiaohongshu-mcp 服务（默认 127.0.0.1:18060）。"
                 "小红书风控严，周期别设太短；首次使用先扫码登录。",
         "fields": [
             {"key": "enabled", "t": "bool", "d": True, "label": "启用"},
@@ -239,13 +240,17 @@ SCHEMAS: dict[str, dict[str, Any]] = {
              "label": "抓取周期(分钟)", "help": "0 = 关闭；风控严，建议 ≥120"},
             {"key": "fetch_timeout_minutes", "t": "int", "d": 12, "lo": 1, "hi": 120,
              "label": "单轮爬取超时(分钟)", "adv": True},
-            {"key": "max_notes", "t": "int", "d": 40, "lo": 20, "hi": 200,
-             "label": "单轮最多笔记数", "adv": True,
-             "help": "MediaCrawler 搜索页 20/页，下限 20"},
-            {"key": "max_comments", "t": "int", "d": 20, "lo": 1, "hi": 100,
+            {"key": "max_notes_per_keyword", "t": "int", "d": 40, "lo": 20, "hi": 200,
+             "label": "单词条最多笔记数", "adv": True},
+            {"key": "max_comments_per_note", "t": "int", "d": 50, "lo": 1, "hi": 200,
              "label": "每篇最多评论数", "adv": True},
+            {"key": "load_all_comments", "t": "bool", "d": True, "label": "尽量加载全部评论",
+             "help": "开启后 mcp 会翻页/展开更多回复，直到达到 max_comments_per_note"},
             {"key": "use_watchlist", "t": "bool", "d": True, "label": "关键词包含自选股名",
              "help": "开启后每轮把自选股名并入搜索词（单轮关键词上限 12 个）"},
+            {"key": "mcp_url", "t": "url", "d": "", "label": "mcp 服务地址",
+             "help": "xiaohongshu-mcp REST API 地址（如 http://127.0.0.1:18060）。"
+                     "留空则用环境变量 XHS_MCP_URL，默认 http://127.0.0.1:18060"},
             {"key": "keywords", "t": "list", "d": [], "label": "额外抓取词",
              "help": "逗号分隔。与自选股名合并去重后取前 12 个（自定义词在前，自选股名按名称排序补足）"},
         ],
@@ -678,6 +683,11 @@ SCHEMAS: dict[str, dict[str, Any]] = {
              "label": "每轮最多做T标的数", "adv": True,
              "help": "0=不限制。持仓多时限制一下，"
                      "每只要打 2 个接口（分钟K+分时），别把行情源打满"},
+            {"key": "t_trading.log_enabled", "t": "bool", "d": True,
+             "label": "做T判断落库", "adv": True,
+             "help": "每轮实盘做T建议把**全部持仓的判断**（含不做/被拦的）写入"
+                     " sa_t_advisory_log。纯观测不改交易；关掉后页面「判断记录」"
+                     "只显示历史存量，不再新增"},
             {"key": "fees.a_commission_rate", "t": "float", "d": 0.00025,
              "lo": 0, "hi": 0.01, "step": 0.00005, "label": "佣金费率", "adv": True,
              "help": "A 股/场内基金佣金费率，万2.5 = 0.00025。双向收取"},

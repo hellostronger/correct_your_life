@@ -1986,6 +1986,67 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       <div id="t-adv-empty" class="empty hide">没有符合条件的标的</div>
     </div>
 
+    <!-- 判断记录：每轮判定（含不做）落库后的回看 —— 「为什么其他票不做」可查 -->
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <span class="row" style="gap:6px;align-items:center">
+          <b style="font-size:13px">🗂 做T判断记录</b>
+          <span class="badge b-mute" id="t-log-src-badge" title="每轮做T建议的全部判断（含不做）都会落库。run 来源：bg=后台定时判定，api=打开页面/手动刷新触发">全量落库</span>
+        </span>
+        <span class="row">
+          <span class="muted" id="t-log-meta" style="font-size:12px"></span>
+          <button class="btn ghost" style="font-size:12px" onclick="loadTLog()">刷新</button>
+        </span>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:4px">
+        每轮判定把<b>全部持仓</b>的判断（含不做的）写入 <span class="mono">sa_t_advisory_log</span>。
+        「为什么这只票不做」看<b>最近原因</b>列；点代码看该票逐轮时间线（hold 多少天后触发、方向变化）。
+        数据积累后可与 K 线/技术指标（RSI 等）联合复盘。
+      </div>
+      <div class="row" style="margin-top:8px;gap:6px;flex-wrap:wrap;align-items:center">
+        <span class="muted" style="font-size:12px">窗口</span>
+        <span class="row" id="t-log-days" style="gap:4px">
+          <button class="btn ghost t-sub active" data-d="1" style="font-size:12px" onclick="tLogDays(1)">今天</button>
+          <button class="btn ghost t-sub" data-d="3" style="font-size:12px" onclick="tLogDays(3)">3 天</button>
+          <button class="btn ghost t-sub" data-d="7" style="font-size:12px" onclick="tLogDays(7)">7 天</button>
+          <button class="btn ghost t-sub" data-d="30" style="font-size:12px" onclick="tLogDays(30)">30 天</button>
+        </span>
+        <span style="width:8px"></span>
+        <span class="muted" id="t-log-out" style="font-size:12px"></span>
+      </div>
+
+      <!-- 视图一：按票汇总（最近原因） -->
+      <div class="table-scroll" style="margin-top:8px" id="t-log-codes-wrap">
+        <table>
+          <thead><tr>
+            <th>代码</th><th>名称</th><th>判定次数</th><th>高抛/接回/不做</th>
+            <th>最近判定</th><th>最近动作</th><th>现价</th><th>最近偏离%</th>
+            <th>门槛%</th><th>最近原因</th><th>时间线</th>
+          </tr></thead>
+          <tbody id="t-log-body"></tbody>
+        </table>
+      </div>
+      <div id="t-log-empty" class="empty hide">窗口内还没有判断记录 —— 开启做T建议调度（⚙️ 调度 → 实盘做T建议）后，每轮判定会自动落库</div>
+
+      <!-- 视图二：单票时间线（点代码展开） -->
+      <div id="t-log-hist-wrap" class="hide" style="margin-top:8px">
+        <div class="row" style="justify-content:space-between;align-items:center">
+          <b style="font-size:13px" id="t-log-hist-title">时间线</b>
+          <button class="btn ghost" style="font-size:12px" onclick="tLogCloseHist()">收起</button>
+        </div>
+        <div class="table-scroll" style="margin-top:6px">
+          <table>
+            <thead><tr>
+              <th>时间</th><th>来源</th><th>动作</th><th>方向</th><th>现价</th>
+              <th>偏离%</th><th>门槛%</th><th>触发位</th><th>原因</th>
+            </tr></thead>
+            <tbody id="t-log-hist-body"></tbody>
+          </table>
+        </div>
+        <div id="t-log-hist-empty" class="empty hide">该票窗口内没有记录</div>
+      </div>
+    </div>
+
     <!-- 模拟盘做T -->
     <div class="card">
       <div class="row" style="justify-content:space-between;align-items:center">
@@ -6604,7 +6665,7 @@ async function paperGoalCheck() {
 // 实盘**只给建议**、绝不自动下单；模拟盘可预演/执行。
 // 渲染层铁律（AGENTS.md 记过一次 90 分钟成果全丢的事故）：
 //   任何可能缺失的字段都走 `tNum(v, spec)` 兜底，绝不 `v.toFixed()` / `${v}%`。
-const _T = { adv: [], filter: 'act', paper: [], paperOn: false };
+const _T = { adv: [], filter: 'act', paper: [], paperOn: false, log: null, logDays: 3, logCode: '' };
 
 /** 数值格式化出口。null/undefined/非数值/NaN -> 破折号。绝不让渲染层因数据缺失崩掉。 */
 const tNum = (v, spec = '2') => {
@@ -6643,7 +6704,7 @@ const T_ACT = {
 
 async function loadTDesk() {
   $('t-paper-body').innerHTML = skeletonBox(2);
-  await Promise.all([loadTAdvisory(), loadTPaper()]);
+  await Promise.all([loadTAdvisory(), loadTPaper(), loadTLog()]);
 }
 
 function tFilter(k) {
@@ -6758,7 +6819,7 @@ function renderTAdv() {
     if (em) {
       em.classList.remove('hide');
       em.textContent = f === 'act'
-        ? (src.length ? '当前没有达到门槛的标的 —— 这通常是对的：做T只在价差足够覆盖成本时才做'
+        ? (src.length ? `当前没有达到门槛的标的 —— 这通常是对的：做T只在价差足够覆盖成本时才做。另有 ${src.length} 只不做的，原因见下方「🗂 做T判断记录」或筛选「全部」`
                       : '实盘没有持仓（持仓来自「我的持仓」流水）')
         : '这个筛选下没有标的';
     }
@@ -6810,6 +6871,115 @@ function renderTAdv() {
       </div>
     </td></tr>`;
   }).join('');
+}
+
+// ---------- 判断记录（全量落库回看，2026-10-18） ----------
+// 每轮做T建议把全部持仓的判断（含不做）落库；这里按票汇总「最近原因」，
+// 点代码下钻该票逐轮时间线。渲染层与实盘建议同一套兜底：坏行剔除、
+// null 一律破折号，一行脏数据不能让整页白屏。
+const _tAttr = s => esc(s).replace(/'/g, '&#39;');
+
+async function loadTLog(code) {
+  const out = $('t-log-out');
+  if (out) out.textContent = '读取中…';
+  const q = code ? `?days=${_T.logDays}&code=${encodeURIComponent(code)}`
+                 : `?days=${_T.logDays}`;
+  try {
+    const r = await api('/api/t/log' + q);
+    _T.log = (r && typeof r === 'object') ? r : {};
+    _T.logCode = code || '';
+    if (out) out.textContent = '';
+    renderTLog();
+  } catch (e) {
+    _T.log = null;
+    _T.logCode = '';
+    renderTLog();
+    if (out) out.textContent = '加载失败：' + e.message;
+  }
+}
+
+function tLogDays(d) {
+  _T.logDays = d;
+  document.querySelectorAll('#t-log-days .t-sub').forEach(b =>
+    b.classList.toggle('active', Number(b.dataset.d || 0) === d));
+  loadTLog(_T.logCode || '');
+}
+
+function renderTLog() {
+  const tb = $('t-log-body'), em = $('t-log-empty'), meta = $('t-log-meta');
+  if (!tb) return;
+  const r = _T.log;
+  const emptyMsg = (r && r.error)
+    ? '读判断日志失败：' + r.error
+    : '窗口内还没有判断记录 —— 开启做T建议调度（⚙️ 调度 → 实盘做T建议）后，每轮判定会自动落库';
+  if (!r || r.error || !(r.codes || []).length) {
+    tb.innerHTML = '';
+    if (em) { em.classList.remove('hide'); em.textContent = emptyMsg; }
+    if (meta) meta.textContent = '';
+    return;
+  }
+  if (em) em.classList.add('hide');
+  if (meta) {
+    meta.textContent = `${tInt(r.n_rows)} 条判断 · ${tInt((r.runs || []).length)} 轮`;
+  }
+  const codes = r.codes.filter(c => c && typeof c === 'object');
+  tb.innerHTML = codes.map(c => {
+    const b = T_BIAS[c.last_bias] || T_BIAS.flat;
+    const a = T_ACT[c.last_action] || T_ACT.hold;
+    return `<tr>
+      <td class="mono"><a href="javascript:void(0)" style="text-decoration:underline"
+        onclick="tLogOpenHist('${_tAttr(c.code || '')}')">${esc(c.code || '')}</a></td>
+      <td>${esc(c.name || '')}</td>
+      <td class="num">${tInt(c.total)}</td>
+      <td class="num">${tInt(c.t_sell)} / ${tInt(c.t_buy)} / ${tInt(c.hold)}</td>
+      <td class="muted" style="font-size:12px">${esc(String(c.last_created_at || '').replace('T', ' ').slice(5, 16))}</td>
+      <td><span class="badge ${a.c}">${a.t}</span> <span class="badge ${b.c}">${b.t}</span></td>
+      <td class="num">${tPx(c.last_price)}</td>
+      <td class="num ${cls(c.last_edge_pct)}">${tPct(c.last_edge_pct)}</td>
+      <td class="num">${tPct4(c.last_threshold_pct)}</td>
+      <td style="font-size:12px;max-width:340px">${esc(c.last_why || '—')}</td>
+      <td><button class="btn ghost" style="font-size:11px;padding:3px 7px"
+        onclick="tLogOpenHist('${_tAttr(c.code || '')}')">📈</button></td>
+    </tr>`;
+  }).join('');
+}
+
+async function tLogOpenHist(code) {
+  if (!code) return;
+  const wrap = $('t-log-hist-wrap');
+  if (wrap) wrap.classList.remove('hide');
+  const title = $('t-log-hist-title');
+  if (title) title.textContent = `📈 ${code} 判断时间线`;
+  const tb = $('t-log-hist-body'), em = $('t-log-hist-empty');
+  if (tb) tb.innerHTML = '';
+  if (em) em.classList.add('hide');
+  await loadTLog(code);
+  const hist = ((_T.log || {}).history || []).filter(h => h && typeof h === 'object');
+  if (!hist.length) {
+    if (em) em.classList.remove('hide');
+    return;
+  }
+  if (tb) tb.innerHTML = hist.map(h => {
+    const b = T_BIAS[h.bias] || T_BIAS.flat;
+    const a = T_ACT[h.action] || T_ACT.hold;
+    return `<tr>
+      <td class="mono" style="font-size:12px">${esc(String(h.created_at || '').replace('T', ' ').slice(5, 19))}</td>
+      <td class="muted">${esc(h.run_type === 'bg' ? '后台' : (h.run_type === 'api' ? '页面' : (h.run_type || '')))}</td>
+      <td><span class="badge ${a.c}">${a.t}</span></td>
+      <td><span class="badge ${b.c}">${b.t}</span></td>
+      <td class="num">${tPx(h.price)}</td>
+      <td class="num ${cls(h.edge_pct)}">${tPct(h.edge_pct)}</td>
+      <td class="num">${tPct4(h.threshold_pct)}</td>
+      <td class="num">${tPx(h.trigger_price)}</td>
+      <td style="font-size:12px;max-width:380px">${esc(h.why || '—')}</td>
+    </tr>`;
+  }).join('');
+}
+
+function tLogCloseHist() {
+  const wrap = $('t-log-hist-wrap');
+  if (wrap) wrap.classList.add('hide');
+  if (_T.logCode) { _T.logCode = ''; loadTLog(''); }
 }
 
 // ---------- 模拟盘做T ----------

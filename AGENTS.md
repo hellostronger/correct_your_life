@@ -4326,6 +4326,58 @@ NEW: [贵州茅台, ',带逗号词', 工商银行]   ← 流式序列；含逗�
 tab loader 挂上 `loadXhsKwCfg`）；E2E 13/13 —— 真请求保存 → 生效 → **还原 config.yaml
 并 sha256 逐字节核对**；回归 `test_mpr_http` 20/0、`test_paper_ui` 34/0。
 
+### 📝 做T判断全量落库（2026-10-18 用户要求）
+
+用户要求：`「💼 实盘做T建议」但是往往只见到一个两个建议，能不能将每次的所判断落库，让用户知道为什么其他股票不适合做t,也方便后续rsi`
+
+#### 设计要点
+
+| 维度 | 实现 |
+|---|---|
+| **落库对象** | 每轮 T 判定的**全量**（所有自选票），不仅仅是生成信号的票 —— `hold/skip` 同样入库 |
+| **表结构** | `sa_t_advisory_log`：23 列（run_id、run_type、code/name、四层面层/方向/阈值、动作/原因、price/cost/edge/threshold/anchor/trigger、layer/movable/base_shares、pnl_pct、pending/stabilizing、ticket JSON、created_at）|
+| **索引** | `(code, created_at DESC)`、`(run_id)`、`(created_at)` |
+| **写入时机** | 后台调度（`_t_advisory_loop` → `run_type='bg'`）、页面手动刷新（`t_advisory` 端点 → `run_type='api'`） |
+| **写入方式** | `execute_values` 批量 upsert、`ON CONFLICT DO NOTHING`；失败**只记日志不抛异常**，不影响建议本身 |
+| **读取接口** | `GET /api/t/log?days=7&code=`（可选） → 聚合两层：`runs[]`（轮次摘要）+ `codes[]`（按票汇总：总次数 / t_sell / t_buy / hold、最近动作/原因/价格/偏离/阈值/方向、首次时间）+ `latest.items`（最新一轮全量）+ `history[]`（指定 code 的逐轮明细）|
+| **开关** | `t_trading.log_enabled`（默认 `true`），`adv=true` 标记高级选项 |
+
+#### 关键实现细节（防坑）
+
+1. **`_num_log(v)`**：写库前把 `None/非数值/NaN/Inf` 全统一成 `None` —— PG `numeric` 列不吃 `NaN`，`psycopg2` 会把 `float('nan')` 存成 `Decimal('NaN')`，后续做减法直接抛 `InvalidOperation`（同机构信号层的 NaN 坑）。
+2. **双游标兼容**：`_log_rows` / `read_log` 同时兼容 `tuple` 游标和 `RealDictCursor` —— `cur.description` 有则按名取，否则按位置取。测试 `FakeCur` 同时实现两套取值路径。
+3. **`run_id` 生成策略**：`{run_type}-{created_at 秒级去标点}-{随机 4 位}`（如 `bg-20261018103000-a7f2`），保证同一轮所有行同 `run_id`、跑两次不撞。
+4. **XSS 防护**：前端渲染统一走 `esc()`，连 `-W/-U` 这种特殊代码也过一遍；`_tAttr` 把单引号再转义为 `'`，放进 `onclick=` 里不破坏 HTML。
+5. **前端 UI**：
+   - 汇总表：每行显示「总次数 / 卖 / 买 / 观望」、最近动作徽标（`hold`=灰、 `t_sell`=红、 `t_buy`=绿）、偏离/阈值百分比、最近原因、📈 按钮钻时间线
+   - 时间线：逐轮展示（最新在前），含动作/方向/价格/偏离/阈值/触发价/原因；`<` 自动转义为 `<`
+   - 窗口切：1/3/7/30 天（`tLogDays` 触发重新 `loadTLog`）
+   - 空态/失败态均有友好文案
+6. **测试**：
+   - 离线 `_t_log_test.py` **83 项全过**（含 `_num_log`、`_log_rows`、`persist_advisory` 批量写/开关/失败隔离、`read_log` 聚合/最近轮/双游标/边界、DDL 幂等、静态接线）
+   - Node V8 `_t_log_ui_test.mjs` **31/31 全过**（8 个场景：加载即显示/窗口切换/点代码开钻/收起回汇总/空态/失败态/XSS/边界特殊代码）
+
+#### 关联文件
+
+| 文件 | 角色 |
+|---|---|
+| `stock-advisor/t_trading.py` | 核心：DDL、LOG_COLS、_num_log、_log_rows、persist_advisory、read_log |
+| `stock-advisor/app.py` | `init_db` 追加 DDL、`_t_advisory_loop` 落库、`t_advisory` 端点落库、`t_log` 端点 |
+| `config.example.yaml` | `t_trading.log_enabled: true` |
+| `stock-advisor/config_schema.py` | `t_trading.log_enabled` schema（bool、default true、adv=true）|
+| `static/index.html` | 判断记录卡片 + `loadTLog`/`renderTLog`/`tLogDays`/`tLogOpenHist`/`tLogCloseHist` |
+| `stock-advisor/_t_log_test.py` | 离线断言（83 项）|
+| `stock-advisor/_t_log_ui_test.mjs` | Node V8 渲染测试（31 项）|
+
+#### 验证记录
+
+- 离线测试：**83/83 通过**
+- Node V8 UI 测试：**31/31 通过**
+- 回归：`test_paper_ui` 34/0、`check_full_js` 两 script 块 OK、`test_anal_ui`/`test_render` 全过
+- 无网络/LLM 依赖，可随时重复跑
+
+---
+
 ### 测试环境陷阱
 
 - `notifier._db_exec` 内部 `from app import get_conn`，会**重新执行整个 app.py 并再起一套 daemon**，
