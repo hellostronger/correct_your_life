@@ -415,6 +415,12 @@ mp:
   keep_days: 120
   base_url: ''                # 远程实例填 http://<服务器IP>:8001；本机留空
   auth: ''                    # 'Bearer <token>'，取法见上；纯本机 8001 留空
+  # 批量导出 MD / 打印成 PDF（2026-10-20）。正文为空的会先回微信原文页重抓，
+  # 重试仍失败则跳过该篇（不中断整次导出），原因写进导出说明。
+  export:
+    recrawl: true             # 导出时补抓空正文
+    retries: 3                # 单篇最多尝试几次（含首次）
+    workers: 4                # 补抓并发；别调高，并发越高越容易被微信风控
 
 # X(Twitter) 指定用户发言监控（x_monitor.py + twscrape）
 # 需先装依赖：pip install "twscrape[curl]"（curl 后端做浏览器级 TLS 指纹伪装，

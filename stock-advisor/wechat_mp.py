@@ -34,12 +34,17 @@ RSS/Atom/JSON 源**，因此它对上游是谁毫不在意：
 """
 
 import concurrent.futures
+import io
 import json
 import re
 import threading
+import time
 import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime, timedelta, timezone
+from html import escape as _html_escape
 from html import unescape as _html_unescape
+from html.parser import HTMLParser
 
 import requests
 
@@ -130,6 +135,13 @@ DEFAULT_MP_CONF = {
     # 连续 N 轮没新文章就把间隔翻倍（退避）；一旦有新文章立刻恢复原频率。
     # 「没更新就别去催」—— 这是省配额的关键，不只是限频。
     'fresh_backoff_rounds': 3,
+    # ---- 导出（2026-10-20 加：批量导出 MD / 打印成 PDF）----
+    # 正文为空的文章先回微信原文重抓；重试仍失败就跳过并列进导出说明。
+    'export': {
+        'recrawl': True,
+        'retries': 3,      # 单篇最多尝试几次（含首次）
+        'workers': 4,      # 并发抓取数；别调高，微信会风控
+    },
 }
 
 # 摘要字段：只取真正的**摘要**类字段。
@@ -1362,6 +1374,927 @@ def fill_true_times(deps, rows: list[dict]) -> dict:
         print("[mp] 真实发布时间：%d 篇取到 var ct，%d 篇没取到（published_at "
               "保持抓取时刻 src='fetched'）" % (stat["ok"], stat["fail"]), flush=True)
     return stat
+
+
+# --------------
+# 导出：Markdown / 打印成 PDF（2026-10-20）
+# --------------
+# 用户诉求：批量导出公众号文章；**正文为空的先回微信原文重抓**，重试仍失败就跳过。
+#
+# 两个关键取舍：
+#   ① **不引 PDF 库**。本机没有 weasyprint/reportlab/fpdf，装一个属于「加新依赖」
+#      （AGENTS.md §0 要先问）。改成生成 A4 打印页，由浏览器「打印 → 另存为 PDF」
+#      出 PDF —— 中文字体、分页、图片都交给浏览器，比手写 PDF 稳得多。
+#   ② 重抓只补「仍为空」的行（`COALESCE(content_html,'')='' AND ...` 兜底），
+#      **绝不用重抓结果覆盖已有正文** —— 这是补漏，不是刷新。
+#
+# 「空」的定义：content_html 与 content_text 都是空白。只有图片没有文字的文章
+# html 非空 → 不算空，照常导出（图片本身就是正文）。
+
+EXPORT_MAX_IDS = 200
+try:
+    from zoneinfo import ZoneInfo
+    _BJ_TZ = ZoneInfo("Asia/Shanghai")
+except Exception:                    # Windows 缺 tzdata 时退回固定 +8
+    _BJ_TZ = timezone(timedelta(hours=8))
+
+
+class _JsContentFinder(HTMLParser):
+    """定位微信文章页 `<div id="js_content">…</div>` 的**原始正文区间**。
+
+    为什么不用正则直接抓：正文里嵌套大量 div，`<div ...>(.*?)</div>` 会在第一个
+    内层闭合处截断。这里用 HTMLParser 的 getpos() 换算绝对偏移，再按 div 深度
+    配平找闭合位置 —— 不用自己写 tokenizer，也不会被嵌套 div 骗到。
+    """
+
+    def __init__(self, text: str):
+        super().__init__(convert_charrefs=False)
+        # HTMLParser 只按 "\n" 计行（updatepos 里数的是 \n），这里必须同口径；
+        # 用 splitlines() 会把单独的 \r 也当换行，偏移会整体错位。
+        self._line_starts = [0]
+        pos = text.find("\n")
+        while pos != -1:
+            self._line_starts.append(pos + 1)
+            pos = text.find("\n", pos + 1)
+        self.start: int | None = None
+        self.end: int | None = None
+        self._depth = 0
+        self._done = False
+
+    def _abs(self) -> int:
+        line, col = self.getpos()
+        return self._line_starts[max(0, min(line - 1, len(self._line_starts) - 1))] + col
+
+    def handle_starttag(self, tag, attrs):
+        if self._done or tag.lower() != "div":
+            return
+        if self.start is None:
+            if any((k or "").lower() == "id" and (v or "").strip() == "js_content"
+                   for k, v in attrs):
+                raw = self.get_starttag_text() or ""
+                self.start = self._abs() + len(raw)
+                self._depth = 1
+        else:
+            self._depth += 1
+
+    def handle_endtag(self, tag):
+        if self._done or tag.lower() != "div" or self.start is None:
+            return
+        self._depth -= 1
+        if self._depth <= 0:
+            self.end = self._abs()
+            self._done = True
+
+    def handle_startendtag(self, tag, attrs):
+        # 自闭合 <div/> 不能让深度 +1；默认实现会 start+end 各调一次，这里显式忽略。
+        pass
+
+
+_JS_CONTENT_RE = re.compile(
+    r"<\s*div\b[^>]*\bid\s*=\s*(['\"])js_content\1[^>]*>", re.I)
+_DIV_TAG_RE = re.compile(r"<\s*(/?)\s*div\b[^>]*>", re.I)
+
+
+def _extract_js_content(page: str) -> str:
+    """从微信文章页取出正文 HTML（js_content 区块内层）。取不到返回 ""。"""
+    if not page:
+        return ""
+    finder = _JsContentFinder(page)
+    try:
+        finder.feed(page)
+        finder.close()
+    except Exception:
+        pass
+    if finder.start is not None and finder.end is not None and finder.end > finder.start:
+        return page[finder.start:finder.end]
+    # 兜底：页面结构不规范、HTMLParser 中途抛异常时按 div 深度配平再扫一次。
+    m = _JS_CONTENT_RE.search(page)
+    if not m:
+        return ""
+    depth = 1
+    for tag in _DIV_TAG_RE.finditer(page, m.end()):
+        raw = tag.group(0)
+        if tag.group(1):
+            depth -= 1
+        elif not raw.rstrip().endswith("/>"):
+            depth += 1
+        if depth <= 0:
+            return page[m.end():tag.start()]
+    return ""
+
+
+_IMG_TAG_RE = re.compile(r"<\s*img\b([^>]*)>", re.I)
+
+
+def _attr_value(attrs: str, name: str) -> str:
+    m = re.search(
+        r"""(?:^|\s)%s\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))""" % re.escape(name),
+        attrs, re.I)
+    if not m:
+        return ""
+    return _html_unescape(m.group(1) or m.group(2) or m.group(3) or "")
+
+
+def _abs_url(url: str) -> str:
+    u = (url or "").strip()
+    if u.startswith("//"):
+        u = "https:" + u
+    return u
+
+
+def _normalize_content_html(html: str) -> str:
+    """微信正文里的图片统一成真实地址。
+
+    正文图片是懒加载：`src` 是占位 SVG，真地址在 `data-src`。不换过来的话
+    导出后图片全是空白占位。顺手丢掉宽度/样式属性 —— 打印页靠 CSS 自适应。
+    """
+    if not html:
+        return ""
+
+    def repl(m):
+        attrs = m.group(1)
+        src = _abs_url(_attr_value(attrs, "data-src")
+                       or _attr_value(attrs, "data-original")
+                       or _attr_value(attrs, "src"))
+        if not src:
+            return ""
+        alt = _attr_value(attrs, "alt")
+        return '<img src="%s" alt="%s">' % (
+            _html_escape(src, quote=True), _html_escape(alt, quote=True))
+
+    return _IMG_TAG_RE.sub(repl, html)
+
+
+_DROP_BLOCK_RE = re.compile(
+    r"<\s*(script|style|iframe|object|embed|form|link|meta|base|svg|"
+    r"video|audio|input|button|textarea|select)\b[^>]*>.*?<\s*/\s*\1\s*>",
+    re.I | re.S)
+_DROP_TAG_RE = re.compile(
+    r"<\s*/?\s*(script|style|iframe|object|embed|form|link|meta|base|svg|"
+    r"video|audio|input|button|textarea|select)\b[^>]*>", re.I)
+_ON_ATTR_RE = re.compile(
+    r"""\s+on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)""", re.I)
+_JS_URL_RE = re.compile(
+    r"""(\s(?:href|src)\s*=\s*)(["']?)\s*javascript:[^"'>\s]*\2""", re.I)
+
+
+def _sanitize_html(html: str) -> str:
+    """导出页要嵌进浏览器，必须挡掉脚本与事件属性（与前端 sanitizeMpHtml 同口径）。"""
+    if not html:
+        return ""
+    s = _DROP_BLOCK_RE.sub("", html)
+    s = _DROP_TAG_RE.sub("", s)
+    s = _ON_ATTR_RE.sub("", s)
+    s = _JS_URL_RE.sub(lambda m: m.group(1) + m.group(2) + "#" + m.group(2), s)
+    return s
+
+
+def _safe_href(url: str) -> str:
+    u = _abs_url(url)
+    low = u.lower()
+    if low.startswith(("http://", "https://", "mailto:", "#")):
+        return u
+    return ""
+
+
+def _safe_img_src(url: str) -> str:
+    u = _abs_url(url)
+    low = u.lower()
+    if low.startswith(("http://", "https://", "data:image/")):
+        return u.replace(" ", "%20").replace("(", "%28").replace(")", "%29")
+    return ""
+
+
+class _HtmlToMarkdown(HTMLParser):
+    """微信正文 HTML → Markdown（只用标准库，不引第三方转换器）。
+
+    覆盖公众号正文实际出现的结构：标题、段落/section、换行、列表、引用、
+    代码块、粗斜体、链接、图片、表格、分隔线。未识别的标签按内联处理。
+    """
+
+    _BLOCK = {"p", "div", "section", "article", "header", "footer", "main",
+              "figure", "figcaption", "aside", "center", "dl", "dt", "dd"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._quote_stack: list[list[str]] = []
+        self._lists: list[dict] = []
+        self._link: list[str] = []
+        self._pre = 0
+        self._cell: list[str] | None = None
+        self._table: list[list[str]] | None = None
+
+    # ---- 输出缓冲 ----
+    def _trim(self):
+        while self.parts:
+            last = self.parts[-1]
+            if not last:
+                self.parts.pop()
+                continue
+            stripped = last.rstrip(" \t")
+            if stripped != last:
+                if stripped:
+                    self.parts[-1] = stripped
+                else:
+                    self.parts.pop()
+                    continue
+            break
+
+    def _newlines(self, n: int = 2):
+        if self._cell is not None:
+            return
+        if self._pre:
+            self.parts.append("\n")
+            return
+        self._trim()
+        have = 0
+        for p in reversed(self.parts):
+            if not p:
+                continue
+            core = p.rstrip("\n")
+            have += len(p) - len(core)
+            if core.strip():
+                break
+        if have < n:
+            self.parts.append("\n" * (n - have))
+
+    def _append(self, text: str):
+        if not text:
+            return
+        if self._cell is not None:
+            self._cell.append(text)
+        else:
+            self.parts.append(text)
+
+    # ---- 事件 ----
+    def handle_data(self, data):
+        if not data:
+            return
+        if self._pre:
+            self._append(data.replace("\r\n", "\n").replace("\r", "\n"))
+            return
+        text = re.sub(r"[ \t\r\n\f\v\u00a0]+", " ", data)
+        if not text:
+            return
+        if self._cell is not None:
+            self._cell.append(text)
+            return
+        if not self.parts or self.parts[-1].endswith("\n"):
+            text = text.lstrip(" ")
+        if text:
+            self.parts.append(text)
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        a = {str(k).lower(): (v or "") for k, v in attrs}
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            self._newlines(2)
+            self._append("#" * int(tag[1]) + " ")
+        elif tag in self._BLOCK:
+            self._newlines(2)
+        elif tag == "br":
+            self._append("  \n")
+        elif tag == "hr":
+            self._newlines(2)
+            self._append("---")
+            self._newlines(2)
+        elif tag == "blockquote":
+            self._quote_stack.append(self.parts)
+            self.parts = []
+        elif tag in ("ul", "ol"):
+            self._newlines(2 if not self._lists else 1)
+            self._lists.append({"ordered": tag == "ol", "n": 0})
+        elif tag == "li":
+            self._newlines(1)
+            depth = max(0, len(self._lists) - 1)
+            marker = "- "
+            if self._lists:
+                lst = self._lists[-1]
+                if lst["ordered"]:
+                    lst["n"] += 1
+                    marker = "%d. " % lst["n"]
+            self._append("  " * depth + marker)
+        elif tag in ("strong", "b"):
+            self._append("**")
+        elif tag in ("em", "i"):
+            self._append("*")
+        elif tag == "code" and not self._pre:
+            self._append("`")
+        elif tag == "pre":
+            self._newlines(2)
+            self._append("```\n")
+            self._pre += 1
+        elif tag == "a":
+            href = _safe_href(a.get("href", ""))
+            self._link.append(href)
+            if href:
+                self._append("[")
+        elif tag == "img":
+            src = _safe_img_src(a.get("data-src") or a.get("data-original")
+                                or a.get("src") or "")
+            if src:
+                alt = (a.get("alt") or "").strip().replace("]", "\\]")
+                self._append("![%s](%s)" % (alt, src))
+        elif tag == "table":
+            self._table = []
+            self._cell = None
+            self._newlines(2)
+        elif tag == "tr":
+            if self._table is not None:
+                self._table.append([])
+        elif tag in ("td", "th"):
+            if self._table is not None:
+                self._cell = []
+        elif tag == "sup":
+            self._append("^")
+        elif tag == "sub":
+            self._append("~")
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            self._newlines(2)
+        elif tag in self._BLOCK:
+            self._newlines(2)
+        elif tag == "blockquote":
+            self._end_quote()
+        elif tag in ("ul", "ol"):
+            if self._lists:
+                self._lists.pop()
+            self._newlines(2)
+        elif tag == "li":
+            self._newlines(1)
+        elif tag in ("strong", "b"):
+            self._append("**")
+        elif tag in ("em", "i"):
+            self._append("*")
+        elif tag == "code" and not self._pre:
+            self._append("`")
+        elif tag == "pre":
+            self._newlines(1)
+            self._append("```")
+            self._pre = max(0, self._pre - 1)
+            self._newlines(2)
+        elif tag == "a":
+            href = self._link.pop() if self._link else ""
+            if href:
+                self._append("](%s)" % href)
+        elif tag in ("td", "th"):
+            if self._table is not None:
+                cell = "".join(self._cell or [])
+                cell = re.sub(r"\s+", " ", cell).strip().replace("|", "\\|")
+                if not self._table:
+                    self._table.append([])
+                self._table[-1].append(cell)
+                self._cell = None
+        elif tag == "table":
+            self._render_table()
+        elif tag == "sup":
+            self._append("^")
+        elif tag == "sub":
+            self._append("~")
+
+    def _end_quote(self):
+        if not self._quote_stack:
+            return
+        inner = "".join(self.parts)
+        self.parts = self._quote_stack.pop()
+        inner = re.sub(r"\n{3,}", "\n\n", inner).strip()
+        if not inner:
+            return
+        quoted = "\n".join(("> " + ln) if ln.strip() else ">"
+                           for ln in inner.split("\n"))
+        self._newlines(2)
+        self.parts.append(quoted)
+        self._newlines(2)
+
+    def _render_table(self):
+        rows = [r for r in (self._table or []) if r]
+        self._table = None
+        if not rows:
+            return
+        width = max(len(r) for r in rows)
+        rows = [r + [""] * (width - len(r)) for r in rows]
+        out = ["| " + " | ".join(rows[0]) + " |",
+               "| " + " | ".join(["---"] * width) + " |"]
+        for r in rows[1:]:
+            out.append("| " + " | ".join(r) + " |")
+        self._newlines(2)
+        self._append("\n".join(out))
+        self._newlines(2)
+
+    def result(self) -> str:
+        while self._quote_stack:          # 容错：未闭合的引用
+            self._end_quote()
+        s = "".join(self.parts)
+        s = re.sub(r"[ \t]+\n(?=\s*\n)", "\n", s)   # 段末空格（保留 <br> 的硬换行）
+        # 不能把「换行后的缩进」一律删掉：嵌套列表就是靠 "  - " 的缩进表达层级。
+        s = re.sub(r"\n{3,}", "\n\n", s)
+        return s.strip()
+
+
+def html_to_markdown(html: str) -> str:
+    """HTML → Markdown；转换器自身出错时退回纯文本（绝不抛给导出流程）。"""
+    if not html:
+        return ""
+    conv = _HtmlToMarkdown()
+    try:
+        conv.feed(html)
+        conv.close()
+        return conv.result()
+    except Exception as exc:
+        print("[mp] HTML→Markdown 失败，退回纯文本：%s" % str(exc)[:120], flush=True)
+        return _html_to_text(html)
+
+
+_RISK_MARKERS = ("环境异常", "访问过于频繁", "去验证", "请在微信客户端打开",
+                 "该内容已被发布者删除", "此内容因违规无法查看", "参数错误",
+                 "该公众号已迁移")
+
+
+def fetch_article_content(url: str, timeout: int = 20, attempts: int = 3) -> dict:
+    """回微信原文抓正文。返回 {"html", "text", "error"}。
+
+    重试 attempts 次（含首次），间隔 1.2s / 2.4s… 递增；**不做无限重试**：
+    对 mp.weixin.qq.com 的密集请求会被风控，失败就交给调用方跳过并说明。
+    """
+    if not url or not url.startswith("http"):
+        return {"html": "", "text": "", "error": "无效的原文链接"}
+    attempts = max(1, min(8, int(attempts or 1)))
+    last_err = ""
+    for i in range(attempts):
+        try:
+            r = requests.get(url, headers={"User-Agent": WX_ARTICLE_UA},
+                             timeout=timeout)
+            if r.status_code != 200:
+                last_err = "HTTP %d" % r.status_code
+            else:
+                page = r.content.decode("utf-8", "replace")
+                inner = _extract_js_content(page)
+                if inner:
+                    html = _normalize_content_html(inner)
+                    text = _html_to_text(html)
+                    if html.strip() or text.strip():
+                        return {"html": html, "text": text, "error": ""}
+                    last_err = "原文正文为空"
+                else:
+                    hit = next((k for k in _RISK_MARKERS if k in page[:6000]), "")
+                    last_err = ("原文页被拦截/失效（%s）" % hit) if hit else \
+                        "原文页里没有正文区块"
+        except Exception as exc:
+            last_err = str(exc)[:160] or exc.__class__.__name__
+        if i + 1 < attempts:
+            time.sleep(1.2 * (i + 1))
+    return {"html": "", "text": "", "error": last_err or "未知错误"}
+
+
+def _is_empty_article(a: dict) -> bool:
+    return not (a.get("content_html") or "").strip() and \
+        not (a.get("content_text") or "").strip()
+
+
+def recrawl_empty_articles(deps, articles: list[dict], conf: dict | None = None) -> dict:
+    """把正文为空的文章回原文重抓；只更新仍为空的行，失败就记进 skipped。
+
+    返回 {"empty", "recovered", "skipped", "skipped_items":[{id,title,url,reason}]}。
+    """
+    conf = conf or load_mp_conf()
+    ec = conf.get("export") or {}
+    enabled = bool(ec.get("recrawl", True))
+    tries = max(1, min(8, int(ec.get("retries") or 3)))
+    workers = max(1, min(8, int(ec.get("workers") or 4)))
+    empty = [a for a in articles if _is_empty_article(a)]
+    stat = {"empty": len(empty), "recovered": 0, "skipped": 0, "skipped_items": []}
+    if not empty:
+        return stat
+    if not enabled:
+        stat["skipped"] = len(empty)
+        stat["skipped_items"] = [
+            {"id": a.get("id"), "title": a.get("title") or "",
+             "url": a.get("url") or "",
+             "reason": "未开启正文补抓（mp.export.recrawl=false）"}
+            for a in empty]
+        return stat
+
+    results: dict = {}
+    with concurrent.futures.ThreadPoolExecutor(workers) as ex:
+        futs = {ex.submit(fetch_article_content, a.get("url") or "", 20, tries): a
+                for a in empty}
+        for fut in concurrent.futures.as_completed(futs):
+            a = futs[fut]
+            try:
+                results[a.get("id")] = fut.result()
+            except Exception as exc:
+                results[a.get("id")] = {"html": "", "text": "",
+                                        "error": str(exc)[:160] or "抓取异常"}
+
+    conn = None
+    try:
+        conn = deps["get_conn"]()
+    except Exception as exc:
+        print("[mp] 导出补抓：拿不到数据库连接，结果只在本次导出内存里生效（%s）"
+              % str(exc)[:120], flush=True)
+
+    updates: list[tuple] = []
+    for a in empty:
+        res = results.get(a.get("id")) or {}
+        html = res.get("html") or ""
+        text = res.get("text") or ""
+        if not html.strip() and not text.strip():
+            stat["skipped"] += 1
+            stat["skipped_items"].append({
+                "id": a.get("id"), "title": a.get("title") or "",
+                "url": a.get("url") or "",
+                "reason": res.get("error") or "原文正文为空"})
+            continue
+        a["content_html"] = html
+        a["content_text"] = text
+        stat["recovered"] += 1
+        updates.append((a.get("id"), html, text))
+    if updates and conn is not None:
+        try:
+            with conn.cursor() as cur:
+                # 单向：只写「读完这篇时仍然为空」的行。抓取期间若别的进程
+                # 已补上正文，这里绝不覆盖。
+                # 一次 UNNEST 批量写：远程 PG 每往返约 300ms（AGENTS.md 记过
+                # 逐行 INSERT 249 行要 81.8 秒），逐篇 UPDATE 会把导出拖成分钟级。
+                cur.execute(
+                    "UPDATE sa_mp_articles a SET content_html=v.html, "
+                    "content_text=v.text "
+                    "FROM (SELECT * FROM UNNEST(%s::bigint[], %s::text[], "
+                    "%s::text[]) AS t(id, html, text)) v "
+                    "WHERE a.id = v.id AND COALESCE(a.content_html,'')='' "
+                    "AND COALESCE(a.content_text,'')=''",
+                    ([u[0] for u in updates], [u[1] for u in updates],
+                     [u[2] for u in updates]))
+            conn.commit()
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            print("[mp] 导出补抓写库失败（%d 篇）：%s（本次导出仍用抓到的新内容）"
+                  % (len(updates), str(exc)[:120]), flush=True)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if stat["empty"]:
+        print("[mp] 导出补抓：空正文 %d 篇，补到 %d 篇，跳过 %d 篇"
+              % (stat["empty"], stat["recovered"], stat["skipped"]), flush=True)
+    return stat
+
+
+def _load_export_articles(deps, ids) -> list[dict]:
+    clean: list[int] = []
+    for v in ids or []:
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            continue
+        if n > 0 and n not in clean:
+            clean.append(n)
+    clean = clean[:EXPORT_MAX_IDS]
+    if not clean:
+        return []
+    conn = deps["get_conn"]()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT a.id, a.title, a.url, a.author, a.mp_name, a.summary, "
+                "a.published_at, a.fetched_at, a.published_at_src, "
+                "COALESCE(a.content_html,'') AS content_html, "
+                "COALESCE(a.content_text,'') AS content_text, "
+                "COALESCE(s.name,'') AS source_name "
+                "FROM sa_mp_articles a "
+                "LEFT JOIN sa_mp_sources s ON s.id = a.source_id "
+                "WHERE a.id = ANY(%s) "
+                "ORDER BY COALESCE(a.published_at, a.fetched_at) DESC NULLS LAST, "
+                "a.id DESC", (clean,))
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description] if cur.description else []
+    finally:
+        conn.close()
+    out = []
+    for r in rows:
+        d = dict(r) if isinstance(r, dict) else dict(zip(cols, r))
+        out.append({
+            "id": d.get("id"),
+            "title": d.get("title") or "（无标题）",
+            "url": d.get("url") or "",
+            "author": d.get("author") or "",
+            "mp_name": d.get("mp_name") or "",
+            "summary": d.get("summary") or "",
+            "published_at": d.get("published_at"),
+            "fetched_at": d.get("fetched_at"),
+            "published_at_src": d.get("published_at_src") or "",
+            "content_html": d.get("content_html") or "",
+            "content_text": d.get("content_text") or "",
+            "source_name": d.get("source_name") or "",
+        })
+    return out
+
+
+def _fmt_dt(dt) -> str:
+    if not dt:
+        return ""
+    try:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(_BJ_TZ).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return str(dt)[:16]
+
+
+def _src_note(src: str) -> str:
+    return "" if (src or "") == "wx" else "（近似：抓取/RSS 时刻）"
+
+
+_BAD_FN = re.compile(r'[\\/:*?"<>|\r\n\t]+')
+
+
+def _safe_filename(name: str, fallback: str = "article", max_len: int = 70) -> str:
+    s = _BAD_FN.sub(" ", (name or "").strip())
+    s = re.sub(r"\s+", " ", s).strip(" .")
+    if not s:
+        s = fallback
+    if len(s) > max_len:
+        s = s[:max_len].rstrip(" .")
+    return s or fallback
+
+
+def _article_body_md(a: dict) -> str:
+    html = a.get("content_html") or ""
+    if html.strip():
+        return html_to_markdown(_normalize_content_html(html))
+    return (a.get("content_text") or "").strip()
+
+
+def _md_doc(a: dict, body: str, index: int | None = None) -> str:
+    title = a.get("title") or "（无标题）"
+    head = ("%d. %s" % (index, title)) if index else title
+    lines = ["# " + head, ""]
+    meta = []
+    mp_name = a.get("mp_name") or a.get("source_name")
+    if mp_name:
+        meta.append("公众号：%s" % mp_name)
+    if a.get("author"):
+        meta.append("作者：%s" % a.get("author"))
+    when = _fmt_dt(a.get("published_at") or a.get("fetched_at"))
+    if when:
+        meta.append("发布时间：%s%s" % (when, _src_note(a.get("published_at_src"))))
+    if a.get("url"):
+        meta.append("原文：%s" % a.get("url"))
+    for m in meta:
+        lines.append("- " + m)
+    lines += ["", "---", "", body.strip() or "_（原文正文为空）_", ""]
+    return "\n".join(lines)
+
+
+def _skip_doc(items: list[dict], total: int, ok: int) -> str:
+    lines = ["# 导出说明", "",
+             "- 共请求：%d 篇" % total,
+             "- 成功导出：%d 篇" % ok,
+             "- 未能导出：%d 篇" % len(items), "",
+             "## 未能导出的文章", "",
+             "以下文章正文为空，已回微信原文重试仍未取到，已跳过：", ""]
+    for it in items:
+        lines.append("- %s（id=%s）" % (it.get("title") or "（无标题）", it.get("id")))
+        lines.append("  - 原因：%s" % (it.get("reason") or "正文为空"))
+        if it.get("url"):
+            lines.append("  - 原文：%s" % it.get("url"))
+    return "\n".join(lines) + "\n"
+
+
+def _skip_note(items: list[dict]) -> str:
+    lines = ["> ⚠️ 另有 %d 篇正文为空、重新抓取失败，**未包含在本次导出中**：" % len(items)]
+    for it in items:
+        lines.append("> - %s（id=%s）：%s"
+                     % (it.get("title") or "（无标题）", it.get("id"),
+                        it.get("reason") or "正文为空"))
+    return "\n".join(lines)
+
+
+def _zip_bytes(files: list[tuple[str, str]]) -> bytes:
+    buf = io.BytesIO()
+    used: set[str] = set()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, text in files:
+            base = name
+            n = 2
+            while name in used:
+                stem, dot, ext = base.rpartition(".")
+                name = (stem or base) + "-%d" % n + (dot + ext if dot else "")
+                n += 1
+            used.add(name)
+            zf.writestr(name, text.encode("utf-8"))
+    return buf.getvalue()
+
+
+def export_markdown(deps, ids, conf: dict | None = None) -> dict:
+    """批量导出 Markdown。单篇返回 .md，多篇返回 .zip（含导出说明）。"""
+    conf = conf or load_mp_conf()
+    arts = _load_export_articles(deps, ids)
+    if not arts:
+        raise ValueError("没有找到可导出的文章（可能已被清理或 id 无效）")
+    rc = recrawl_empty_articles(deps, arts, conf)
+    ok = [a for a in arts if not _is_empty_article(a)]
+    skipped = rc.get("skipped_items") or []
+    if not ok:
+        detail = "；".join("%s（%s）" % (s.get("title") or s.get("id"),
+                                       s.get("reason") or "正文为空")
+                          for s in skipped[:5])
+        raise ValueError("所选文章正文均为空，重新抓取也失败" +
+                         ("：" + detail if detail else ""))
+    stamp = datetime.now(timezone.utc).astimezone(_BJ_TZ).strftime("%Y%m%d-%H%M")
+    if len(ok) == 1:
+        a = ok[0]
+        md = _md_doc(a, _article_body_md(a))
+        if skipped:
+            md = _skip_note(skipped) + "\n\n" + md
+        return {
+            "data": md.encode("utf-8"),
+            "filename": _safe_filename(a.get("title"), "文章%d" % a.get("id")) + ".md",
+            "media_type": "text/markdown; charset=utf-8",
+            "exported": 1, "skipped": len(skipped),
+            "skipped_items": skipped, "mode": "single",
+        }
+    files: list[tuple[str, str]] = []
+    if skipped:
+        files.append(("00_导出说明.md", _skip_doc(skipped, len(arts), len(ok))))
+    for i, a in enumerate(ok, 1):
+        name = "%02d-%s.md" % (i, _safe_filename(a.get("title"),
+                                                "文章%d" % a.get("id"), 50))
+        files.append((name, _md_doc(a, _article_body_md(a))))
+    return {
+        "data": _zip_bytes(files),
+        "filename": "公众号文章_%s_%d篇.zip" % (stamp, len(ok)),
+        "media_type": "application/zip",
+        "exported": len(ok), "skipped": len(skipped),
+        "skipped_items": skipped, "mode": "zip",
+    }
+
+
+_PRINT_CSS = """
+@page { size: A4; margin: 14mm 13mm; }
+* { box-sizing: border-box; }
+body { margin: 0; padding: 22px 26px 40px; color: #222;
+  font: 14px/1.75 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+  "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  background: #fff; }
+.mp-toolbar { position: sticky; top: 0; z-index: 9; display: flex; gap: 10px;
+  align-items: center; flex-wrap: wrap; padding: 10px 14px; margin-bottom: 18px;
+  background: #f5f7fa; border: 1px solid #e3e8ef; border-radius: 10px; }
+.mp-toolbar button { font-size: 14px; padding: 6px 16px; border-radius: 8px;
+  border: 1px solid #1a73e8; background: #1a73e8; color: #fff; cursor: pointer; }
+.mp-toolbar .tip { color: #667085; font-size: 12px; }
+.notice { border: 1px solid #f0c36d; background: #fff8e6; color: #7a5b00;
+  border-radius: 8px; padding: 10px 14px; margin: 14px 0; font-size: 13px; }
+.notice ul { margin: 6px 0 0; padding-left: 20px; }
+.cover { page-break-after: always; }
+.cover h1 { font-size: 25px; margin: 8px 0 4px; }
+.cover .sub { color: #667085; margin-bottom: 18px; }
+.toc { border-top: 1px solid #e3e8ef; padding-top: 12px; }
+.toc h2 { font-size: 17px; }
+.toc li { margin: 4px 0; }
+.mp-art { page-break-after: always; }
+.mp-art:last-of-type { page-break-after: auto; }
+.mp-art h1 { font-size: 22px; line-height: 1.45; margin: 0 0 10px; }
+.mp-meta { color: #667085; font-size: 12px; border-bottom: 1px solid #e3e8ef;
+  padding-bottom: 10px; margin-bottom: 18px; word-break: break-all; }
+.mp-meta a { color: #1a73e8; text-decoration: none; }
+.mp-body img { max-width: 100% !important; height: auto !important; }
+.mp-body table { border-collapse: collapse; max-width: 100%; }
+.mp-body td, .mp-body th { border: 1px solid #d0d5dd; padding: 4px 8px; }
+.mp-body pre { white-space: pre-wrap; word-break: break-word; background: #f8fafc;
+  border: 1px solid #e3e8ef; border-radius: 6px; padding: 10px; }
+.mp-body a { color: #1a73e8; }
+.mp-text { white-space: pre-wrap; word-break: break-word; }
+@media print {
+  body { padding: 0; }
+  .mp-toolbar { display: none !important; }
+}
+"""
+
+_PRINT_JS = """
+(function () {
+  var printed = false;
+  function go() {
+    if (printed) return;
+    printed = true;
+    setTimeout(function () { window.print(); }, 150);
+  }
+  var imgs = Array.prototype.slice.call(document.images || []);
+  var left = imgs.filter(function (i) { return !i.complete; }).length;
+  if (!left) { go(); return; }
+  var timer = setTimeout(go, 6000);
+  imgs.forEach(function (img) {
+    if (img.complete) return;
+    function done() {
+      img.removeEventListener('load', done);
+      img.removeEventListener('error', done);
+      if (--left <= 0) { clearTimeout(timer); go(); }
+    }
+    img.addEventListener('load', done);
+    img.addEventListener('error', done);
+  });
+})();
+"""
+
+
+def _print_body_html(a: dict) -> str:
+    html = a.get("content_html") or ""
+    if html.strip():
+        return _sanitize_html(_normalize_content_html(html))
+    text = a.get("content_text") or ""
+    if not text.strip():
+        return ""
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    return "\n".join("<p>%s</p>" % _html_escape(p).replace("\n", "<br>")
+                     for p in paras)
+
+
+def export_print_html(deps, ids, conf: dict | None = None) -> dict:
+    """生成可打印的 A4 页面（浏览器「打印 → 另存为 PDF」即得 PDF）。"""
+    conf = conf or load_mp_conf()
+    arts = _load_export_articles(deps, ids)
+    if not arts:
+        raise ValueError("没有找到可导出的文章（可能已被清理或 id 无效）")
+    rc = recrawl_empty_articles(deps, arts, conf)
+    ok = [a for a in arts if not _is_empty_article(a)]
+    skipped = rc.get("skipped_items") or []
+    if not ok:
+        detail = "；".join("%s（%s）" % (s.get("title") or s.get("id"),
+                                       s.get("reason") or "正文为空")
+                          for s in skipped[:5])
+        raise ValueError("所选文章正文均为空，重新抓取也失败" +
+                         ("：" + detail if detail else ""))
+
+    now = datetime.now(timezone.utc).astimezone(_BJ_TZ).strftime("%Y-%m-%d %H:%M")
+    file_title = "公众号文章导出 %s（%d 篇）" % (now, len(ok))
+    h = []
+    h.append("<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">")
+    h.append("<meta name=\"referrer\" content=\"no-referrer\">")
+    h.append("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">")
+    h.append("<title>%s</title><style>%s</style></head><body>"
+             % (_html_escape(file_title), _PRINT_CSS))
+    h.append("<div class=\"mp-toolbar\"><button onclick=\"window.print()\">"
+             "🖨 打印 / 保存为 PDF</button>"
+             "<span class=\"tip\">在弹出的打印对话框里选择「另存为 PDF」；"
+             "勾选「背景图形」可保留文章底色。图片加载完成后会自动弹出打印框。</span>"
+             "</div>")
+    h.append("<section class=\"cover\"><h1>%s</h1>"
+             "<div class=\"sub\">导出时间：%s · 共 %d 篇</div>"
+             % (_html_escape("公众号文章导出"), _html_escape(now), len(ok)))
+    if skipped:
+        h.append("<div class=\"notice\">⚠️ 有 %d 篇正文为空，回原文重试仍未取到，"
+                 "已跳过：<ul>" % len(skipped))
+        for s in skipped:
+            label = _html_escape(s.get("title") or "（无标题）")
+            if s.get("url"):
+                label = "<a href=\"%s\">%s</a>" % (
+                    _html_escape(s.get("url"), quote=True), label)
+            h.append("<li>%s —— %s</li>"
+                     % (label, _html_escape(s.get("reason") or "正文为空")))
+        h.append("</ul></div>")
+    h.append("<div class=\"toc\"><h2>目录</h2><ol>")
+    for a in ok:
+        h.append("<li>%s</li>" % _html_escape(a.get("title") or "（无标题）"))
+    h.append("</ol></div></section>")
+
+    for i, a in enumerate(ok, 1):
+        meta = []
+        mp_name = a.get("mp_name") or a.get("source_name")
+        if mp_name:
+            meta.append("公众号：%s" % _html_escape(mp_name))
+        if a.get("author"):
+            meta.append("作者：%s" % _html_escape(a.get("author")))
+        when = _fmt_dt(a.get("published_at") or a.get("fetched_at"))
+        if when:
+            meta.append("发布时间：%s%s"
+                        % (_html_escape(when), _html_escape(_src_note(a.get("published_at_src")))))
+        if a.get("url"):
+            meta.append("原文：<a href=\"%s\">%s</a>" % (
+                _html_escape(a.get("url"), quote=True),
+                _html_escape(a.get("url"))))
+        body = _print_body_html(a)
+        h.append("<section class=\"mp-art\" id=\"art-%s\">" % _html_escape(str(a.get("id"))))
+        h.append("<h1>%d. %s</h1>" % (i, _html_escape(a.get("title") or "（无标题）")))
+        h.append("<div class=\"mp-meta\">%s</div>" % " · ".join(meta))
+        h.append("<div class=\"mp-body\">%s</div></section>"
+                 % (body or "<p>（原文正文为空）</p>"))
+    h.append("<script>%s</script></body></html>" % _PRINT_JS)
+    return {
+        "html": "".join(h),
+        "exported": len(ok), "skipped": len(skipped),
+        "skipped_items": skipped,
+        "filename": _safe_filename(file_title, "公众号文章导出") + ".html",
+    }
 
 
 def _link_index(cur) -> dict:

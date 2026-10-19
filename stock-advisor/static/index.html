@@ -1317,6 +1317,12 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       <div class="card-head">
         <b>📄 最新文章</b>
         <div class="row tight">
+          <label class="muted" title="勾选后批量导出"><input type="checkbox" id="mp-sel-all" onchange="mpToggleAll(this.checked)"> 全选</label>
+          <span class="muted" id="mp-sel-info" style="font-size:12px">未选</span>
+          <button class="btn ghost sm" id="mp-export-md-btn" onclick="mpExportMd()"
+                  title="导出为 Markdown（多篇打包 zip）。正文为空的会先回原文重抓，仍取不到则跳过">⬇ 导出 MD</button>
+          <button class="btn ghost sm" id="mp-export-pdf-btn" onclick="mpExportPdf()"
+                  title="打开可打印页面，在浏览器里选「另存为 PDF」。正文为空的会先回原文重抓">🖨 导出 PDF</button>
           <label class="muted"><input type="checkbox" id="mp-unread-only" onchange="loadMpArticles()"> 只看未读</label>
           <button class="btn ghost sm" onclick="markAllMpRead()">全部已读</button>
           <button class="btn ghost sm" onclick="loadMpArticles()">刷新</button>
@@ -8086,11 +8092,19 @@ async function delMpSource(id, name) {
   try { await api('/api/mp/sources/' + id, { method: 'DELETE' }); toastOk('已删除'); loadMpSources(); }
   catch (e) { toastErr(e.message); }
 }
+// 批量导出的选中态：_mpItems 是当前列出的文章（只存 id/title），
+// _mpSel 是勾选的 id。刷新列表时按现存 id 剪掉失效项 —— 否则
+// 「勾了 3 篇 → 刷新后列表变了 → 导出」会带上已不在列表里的 id。
+let _mpItems = [];
+const _mpSel = new Set();
 async function loadMpArticles() {
   try {
     const unread = $('mp-unread-only').checked ? '&unread_only=true' : '';
     const d = await api('/api/mp/articles?limit=60' + unread);
     const items = d.items || [];
+    _mpItems = items.map(a => ({ id: a.id, title: a.title || '' }));
+    const alive = new Set(_mpItems.map(x => x.id));
+    Array.from(_mpSel).forEach(id => { if (!alive.has(id)) _mpSel.delete(id); });
     $('mp-empty').classList.toggle('hide', items.length > 0);
     $('mp-list').innerHTML = items.map(a => {
       const ts = a.published_at || a.fetched_at || '';
@@ -8117,6 +8131,11 @@ async function loadMpArticles() {
       if (!pv) pv = (a.content_text || '').trim();
       return `<div class="dyn-item ${a.is_read ? '' : 'unread'}">
         <div class="dyn-head">
+          <label class="mp-sel" title="选择这篇导出" style="margin-right:2px">
+            <input type="checkbox" class="mp-sel-cb" data-id="${a.id}"
+                   ${_mpSel.has(a.id) ? 'checked' : ''}
+                   onchange="mpSelOne(${a.id}, this.checked)">
+          </label>
           ${a.is_read ? '' : '<span class="unread-dot" title="未读"></span>'}
           <span class="dyn-author">${esc(a.mp_name || a.source_name)}</span>
           <a href="${esc(a.url)}" target="_blank" rel="noopener"
@@ -8131,6 +8150,7 @@ async function loadMpArticles() {
         <div class="mp-body hide"></div>
       </div>`;
     }).join('');
+    mpUpdateSelInfo();
     const badge = $('mp-tab-badge');
     badge.textContent = d.unread || 0;
     badge.classList.toggle('hide', !d.unread);
@@ -8185,6 +8205,123 @@ async function toggleMpBody(id, el) {
 async function markAllMpRead() {
   try { const r = await jsonPost('/api/mp/read', { all: true }); toastOk(`已标记 ${r.updated} 条已读`); loadMpArticles(); }
   catch (e) { toastErr(e.message); }
+}
+
+// ---- 公众号批量导出（MD / 打印成 PDF） ----
+// 正文为空的不在前端补：交给后端统一「回原文重抓 → 仍失败则跳过」，
+// 这样单篇和批量的口径一致，跳过原因也能写进导出说明里。
+function mpSelOne(id, on) {
+  const v = Number(id);
+  if (on) _mpSel.add(v); else _mpSel.delete(v);
+  mpUpdateSelInfo();
+}
+function mpToggleAll(on) {
+  _mpSel.clear();
+  if (on) _mpItems.forEach(x => _mpSel.add(x.id));
+  document.querySelectorAll('#mp-list .mp-sel-cb').forEach(cb => { cb.checked = !!on; });
+  mpUpdateSelInfo();
+}
+function mpUpdateSelInfo() {
+  const n = _mpSel.size, total = _mpItems.length;
+  const info = $('mp-sel-info');
+  if (info) info.textContent = n ? `已选 ${n} 篇` : (total ? '未选' : '');
+  const all = $('mp-sel-all');
+  if (all) { all.checked = total > 0 && n === total; all.indeterminate = n > 0 && n < total; }
+  ['mp-export-md-btn', 'mp-export-pdf-btn'].forEach(id => {
+    const b = $(id); if (b) b.disabled = n === 0;
+  });
+}
+function _mpFilename(res, fallback) {
+  const cd = res.headers.get('Content-Disposition') || '';
+  const star = /filename\*=UTF-8''([^;]+)/i.exec(cd);
+  if (star) { try { return decodeURIComponent(star[1]); } catch (e) { /* 落兜底 */ } }
+  const plain = /filename="?([^";]+)"?/i.exec(cd);
+  return (plain && plain[1]) || fallback;
+}
+function saveBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename || 'download';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+async function mpExportMd() {
+  const ids = Array.from(_mpSel);
+  if (!ids.length) { toast('请先勾选要导出的文章'); return; }
+  const btn = $('mp-export-md-btn');
+  const old = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '导出中…'; }
+  try {
+    const res = await fetch('/api/mp/export/md', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids }),
+    });
+    if (!res.ok) {
+      let msg = 'HTTP ' + res.status;
+      try { const j = await res.json(); msg = j.detail || msg; } catch (e) { /* 非 JSON */ }
+      throw new Error(msg);
+    }
+    const blob = await res.blob();
+    const exported = Number(res.headers.get('X-MP-Exported') || 0);
+    const skipped = Number(res.headers.get('X-MP-Skipped') || 0);
+    saveBlob(blob, _mpFilename(res, ids.length > 1 ? '公众号文章.zip' : '公众号文章.md'));
+    if (skipped) {
+      let info = '';
+      try { info = decodeURIComponent(res.headers.get('X-MP-Skipped-Info') || ''); } catch (e) { info = ''; }
+      if (info.length > 160) info = info.slice(0, 160) + '…';
+      toastErr(`已导出 ${exported} 篇，跳过 ${skipped} 篇（正文为空且重抓失败）` + (info ? '：' + info : ''));
+    } else {
+      toastOk(`已导出 ${exported} 篇`);
+    }
+  } catch (e) {
+    toastErr('导出失败: ' + e.message);
+  } finally {
+    if (btn) btn.textContent = old;
+    mpUpdateSelInfo();
+  }
+}
+async function mpExportPdf() {
+  const ids = Array.from(_mpSel);
+  if (!ids.length) { toast('请先勾选要导出的文章'); return; }
+  // 必须同步 window.open：等 fetch 回来再开会立刻被弹窗拦截。
+  const win = window.open('', '_blank');
+  if (!win) { toastErr('浏览器拦截了新窗口，请允许本站弹窗后重试'); return; }
+  win.document.write('<!DOCTYPE html><html><head><meta charset="utf-8"><title>公众号导出</title></head>'
+    + '<body style="font:14px/1.8 -apple-system,\'Microsoft YaHei\',sans-serif;padding:40px;color:#444">'
+    + '<p>⏳ 正在准备导出页面…</p>'
+    + '<p style="color:#888;font-size:13px">正文为空的文章会先回原文重抓，可能需要几十秒；'
+    + '准备好后会自动弹出打印框。</p></body></html>');
+  win.document.close();
+  const btn = $('mp-export-pdf-btn');
+  const old = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '准备中…'; }
+  try {
+    const res = await fetch('/api/mp/export/print?ids=' + ids.join(','));
+    if (!res.ok) {
+      let msg = 'HTTP ' + res.status;
+      try { const j = await res.json(); msg = j.detail || msg; } catch (e) { /* 非 JSON */ }
+      throw new Error(msg);
+    }
+    const html = await res.text();
+    const skipped = Number(res.headers.get('X-MP-Skipped') || 0);
+    if (win.closed) { toastErr('打印窗口已被关闭，请重新导出'); return; }
+    win.document.open();
+    win.document.write(html);
+    win.document.close();
+    if (skipped) toast(`有 ${skipped} 篇正文为空已跳过（打印页顶部有清单）`);
+  } catch (e) {
+    if (!win.closed) {
+      try { win.document.body.textContent = '导出失败：' + e.message; }
+      catch (err) { win.close(); }
+    }
+    toastErr('导出失败: ' + e.message);
+  } finally {
+    if (btn) btn.textContent = old;
+    mpUpdateSelInfo();
+  }
 }
 async function triggerMpFetch() {
   const btn = $('mp-fetch-btn');

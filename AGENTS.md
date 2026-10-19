@@ -4405,3 +4405,39 @@ tab loader 挂上 `loadXhsKwCfg`）；E2E 13/13 —— 真请求保存 → 生�
 
 工作区里混有用户自己的 WIP（`jq_sandbox.py`、`sandbox_runner.py`、`valuation_data.py`、
 `scripts/*.py`、`_dirty_backup_*.json`、`clade`）——**不要碰、不要提交**。
+
+---
+
+### 📤 公众号批量导出（MD / 打印成 PDF）+ 空正文回原文补抓（2026-10-20）
+
+用户要求：给公众号文章加导出 PDF 或 MD、支持批量；**正文为空的回原文重抓并重试，
+仍失败就跳过该篇**（不能因一篇空的让整次导出失败）。
+
+| 组件 | 位置 |
+|---|---|
+| 抓正文 | `wechat_mp.fetch_article_content(url, timeout=20, attempts=3)` —— iPhone 微信 UA，取 `#js_content`；懒加载图 `data-src/data-original` |
+| 回补 | `wechat_mp.recrawl_empty_articles(deps, articles)` —— `ThreadPoolExecutor(workers≤8)` + 退避重试；**只写库里两列都为空的行**（`COALESCE(...)=''` 双条件），一次 `UNNEST` 批量 UPDATE |
+| MD | `export_markdown` —— 单篇 `.md`，多篇 `.zip`（多一篇 `00_导出说明.md` 列跳过原因）|
+| PDF | `export_print_html` —— 可打印 A4 HTML，前端 `window.print()` 手动「另存为 PDF」。**不引第三方 PDF 库**（AGENTS §0 加依赖要先问）|
+| 端点 | `POST /api/mp/export/md`（JSON `{ids:[...]}`，≤200）、`GET /api/mp/export/print?ids=1,2` |
+| 配置 | `mp.export.{recrawl,retries,workers}` → `true / 3 / 4`（后两个 adv） |
+| 前端 | 公众号卡片全选框 + 每行勾选 + 「导出 MD / 导出 PDF」按钮；`TAB_LOADERS` 之外无新注册（在 mp tab 内）|
+
+**口径（别改错）**：
+- 「空正文」= `content_html` 与 `content_text` **都**为空/空白；**只有图片的 HTML 不算空**。
+- 回补**绝不覆盖已有内容**（与 `sync_source` 同规则）。抓不到就不写库，只在本次导出里跳过。
+- 全部为空且重抓失败 → HTTP **422**（`正文均为空`）；id 非法/空 → 400/422。
+- 跳过清单走响应头 `X-MP-Skipped` + `X-MP-Skipped-Info`（`quote` 百分号编码，
+  保证 latin-1 header 安全），前端 `decodeURIComponent` 后截 160 字提示。
+- `Content-Disposition` 必须同时给 ASCII `filename` 与 `filename*=UTF-8''`（中文名）。
+- PDF 弹窗**必须同步 `window.open`**（等 `await fetch` 后再开会被拦截）。
+
+**验证（可重复跑）**：离线 `test_mp_export.py` **179/0**（全 Fake，不联网不碰库；
+含回补 SQL 单次执行/单向守卫/写库失败仍在内存生效/zip 重名/截断/头部编码）；
+node V8 `test_mp_export_ui.mjs` **80/0**（勾选态/全选/文件名解析/blob 下载/
+成功与跳过与失败三种 toast/弹窗拦截/窗口提前关闭）；真实 E2E `mp_export_e2e.py`：
+真库取 2 篇 → `POST /api/mp/export/md` 200 + zip 8037B、`GET /print` 200 + 53516B、
+`ids=abc`→400、空 ids→422。`check_mp_js.py` 两个 script 块 `node --check` OK。
+
+**遗留**：单次导出上限 200 篇（前端列表只列 60 篇）；PDF 走浏览器「打印 → 另存为 PDF」，
+没有服务端渲染 PDF（要装依赖，须先问）。

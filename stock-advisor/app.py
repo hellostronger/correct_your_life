@@ -53,8 +53,9 @@ import psycopg2.extras
 import requests
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field
+from urllib.parse import quote
 
 import conf_util
 import config_schema
@@ -9693,6 +9694,81 @@ def mp_status():
 def mp_digest(hours: int = 36):
     lines = wechat_mp.digest_lines(_mp_deps(), hours)
     return {"hours": hours, "lines": lines, "markdown": "\n".join(lines)}
+
+
+class MpExportIn(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=200)
+
+
+def _mp_export_headers(r: dict) -> dict:
+    filename = r.get("filename") or "export"
+    fallback = re.sub(r"[^A-Za-z0-9._-]+", "_", filename).strip("_") or "export"
+    headers = {
+        # ASCII 兜底给老浏览器；filename*= 才是中文真名（RFC 5987）
+        "Content-Disposition": "attachment; filename=\"%s\"; filename*=UTF-8''%s"
+                               % (fallback, quote(filename, safe="")),
+        "X-MP-Exported": str(r.get("exported") or 0),
+        "X-MP-Skipped": str(r.get("skipped") or 0),
+        "Cache-Control": "no-store",
+    }
+    skipped = r.get("skipped_items") or []
+    if skipped:
+        info = "；".join("%s：%s" % (s.get("title") or s.get("id"),
+                                    s.get("reason") or "正文为空")
+                         for s in skipped)
+        # HTTP 头只能是 latin-1，中文必须百分号编码，前端 decodeURIComponent 还原
+        headers["X-MP-Skipped-Info"] = quote(info[:1500], safe="")
+    return headers
+
+
+@app.post("/api/mp/export/md")
+def mp_export_md(body: MpExportIn):
+    """批量导出 Markdown（多篇打 zip）。正文为空的会先回原文重抓，仍失败则跳过。"""
+    try:
+        r = wechat_mp.export_markdown(_mp_deps(), body.ids)
+    except ValueError as exc:
+        msg = str(exc)
+        raise HTTPException(422 if "正文均为空" in msg else 400, msg)
+    return Response(content=r["data"], media_type=r["media_type"],
+                    headers=_mp_export_headers(r))
+
+
+def _parse_mp_export_ids(raw: str) -> list[int]:
+    out: list[int] = []
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            v = int(part)
+        except ValueError:
+            raise HTTPException(400, "ids 里含非数字：%s" % part[:20])
+        if v not in out:
+            out.append(v)
+    if not out:
+        raise HTTPException(400, "请先选择要导出的文章（ids 为空）")
+    if len(out) > wechat_mp.EXPORT_MAX_IDS:
+        raise HTTPException(400, "一次最多导出 %d 篇" % wechat_mp.EXPORT_MAX_IDS)
+    return out
+
+
+@app.get("/api/mp/export/print")
+def mp_export_print(ids: str = ""):
+    """可打印的 A4 HTML，浏览器「打印 → 另存为 PDF」。
+
+    不自建 PDF 引擎：weasyprint/reportlab 等依赖都不在 requirements 里，
+    而浏览器的中文字体与图片渲染质量最好（AGENTS.md §0：加依赖要先问）。
+    """
+    try:
+        r = wechat_mp.export_print_html(_mp_deps(), _parse_mp_export_ids(ids))
+    except ValueError as exc:
+        msg = str(exc)
+        raise HTTPException(422 if "正文均为空" in msg else 400, msg)
+    return HTMLResponse(content=r["html"], headers={
+        "Cache-Control": "no-store",
+        "X-MP-Exported": str(r.get("exported") or 0),
+        "X-MP-Skipped": str(r.get("skipped") or 0),
+    })
 
 
 def _mp_loop():

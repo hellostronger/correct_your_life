@@ -300,6 +300,17 @@ SCHEMAS: dict[str, dict[str, Any]] = {
              "label": "文章保留天数", "adv": True},
             {"key": "timeout", "t": "int", "d": 25, "lo": 3, "hi": 300,
              "label": "HTTP 超时(秒)", "adv": True},
+            {"key": "export.recrawl", "t": "bool", "d": True,
+             "label": "导出时补抓空正文",
+             "help": "勾选的文章若库里没正文，导出前回微信原文页重抓并补存。"
+                     "关掉则空正文一律跳过（不跳过整次导出）"},
+            {"key": "export.retries", "t": "int", "d": 3, "lo": 1, "hi": 8,
+             "label": "单篇最多尝试次数", "adv": True,
+             "help": "含首次。失败会退避重试；仍取不到就跳过该篇并在导出说明里列出原因"},
+            {"key": "export.workers", "t": "int", "d": 4, "lo": 1, "hi": 8,
+             "label": "补抓并发数", "adv": True,
+             "help": "别调高：并发越高越容易被微信风控（403/验证页）。"
+                     "4 是实测稳定值"},
         ],
     },
     # ---------------- X ----------------
