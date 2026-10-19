@@ -1520,6 +1520,10 @@ NoneType.__format__`，成果**全部丢失**。真因是 `f"{r.get('price'):.2f
 
 - **本机有代理干扰**，必须设 `NO_PROXY=*` / `no_proxy=*`（`app.py:31` 就是为此）。
   不设的话 pip 和部分数据源会报 `ProxyError` / `Cannot connect to proxy`。
+- ⚠️ **Git/GitHub 是例外**（2026-10-20 实测）：`git config https.proxy` =
+  `http://127.0.0.1:6478`，**直接 push/fetch 必须走它**；加 `NO_PROXY=*` 反而
+  **直连 443 超时**（21s `Couldn't connect`）。代理走 `curl -x http://127.0.0.1:6478
+  https://github.com` 实测 200/1.3s。**别再照抄「git fetch 要设 NO_PROXY=*」那条**。
 - 本机直连出口：**`59.34.155.130`**（2026-10-03 实测更正；AGENTS.md 原记的
   `121.32.254.148` 已失效，疑似运营商动态分配）。**每次做「换 IP 是否影响限流」
   这类实验前先实测出口**，别用文档里的旧值。无系统代理、无 VPN
@@ -2548,8 +2552,9 @@ compose 改标签**必须用通配**并 `grep` 复核（写死版本号会静默
    **判据必须查 `FETCH_HEAD` 的实际 sha，不能看返回码**。
    症状：build 成功、镜像 digest 与上一次**完全相同**（`b699c265`）、
    `git log` 还停在旧 commit → 源码根本没更新，却看起来「部署成功了」。
-   同理本机 `git fetch` 也要重试（github 抽风：`early EOF` / `Connection was reset`），
-   且**必须设 `NO_PROXY=*`**，否则走代理直接 reset
+   同理本机 `git fetch` 也要重试（github 抽风：`early EOF` / `Connection was reset`）。
+   ⚠️ 但**不要设 `NO_PROXY=*`**（2026-10-20 更正）：git 必须走 `127.0.0.1:6478`
+   代理，直连 GitHub 443 会超时；详见「网络环境」那节。
 3. **`sed` 替换 compose 镜像标签要写通配**：我按上一版标签
    （`126993c`）写死 `sed 's|...fork-scratch-126993c|...|'`，但 compose 早被改成
    `0d498c5` → **sed 空操作、静默无效**，容器还在跑旧镜像。
