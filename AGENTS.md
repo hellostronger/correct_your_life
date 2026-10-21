@@ -4446,3 +4446,51 @@ node V8 `test_mp_export_ui.mjs` **80/0**（勾选态/全选/文件名解析/blob
 
 **遗留**：单次导出上限 200 篇（前端列表只列 60 篇）；PDF 走浏览器「打印 → 另存为 PDF」，
 没有服务端渲染 PDF（要装依赖，须先问）。
+
+---
+
+### 🧮 加仓摊薄成本试算一直失败：裸 `api()` 没带 `Content-Type`（2026-10-21 修）
+
+**症状**：持仓页「🧮 加仓摊薄成本」点试算 → **「试算失败 [object Object]」**；
+`app.log` 里有 4 次 `POST /api/cost-estimate HTTP/1.1" 422 Unprocessable Entity`。
+
+**真因两层，都在前端，后端算法一行没错**：
+
+1. `ccCalc` / `ccPlan` 用 `api('/api/cost-estimate', { method:'POST', body: JSON.stringify(body) })`
+   —— 裸 `api()` **不补请求头**，而 `fetch` 对字符串 body 默认
+   `Content-Type: text/plain;charset=UTF-8`。FastAPI 因此把 body 当**纯文本**，
+   Pydantic 报 `model_attributes_type`（`loc=["body"]`，
+   `msg=Input should be a valid dictionary or object to extract fields from`）→ 422。
+   > 用 curl **带** `-H "Content-Type: application/json"` 打同样 body 全部 200 ——
+   > 这一步是必须做的对照，否则很容易误改后端。`_cost_e2e.py` 自己显式带了 header，
+   > 所以它从头到尾**没有覆盖前端这一层**。
+2. `api()` 把 `detail`（422 时是**数组**）直接丢给 `new Error(array)` →
+   页面显示 `"[object Object]"`，用户在界面上完全看不到真实原因。
+
+**修法**（`static/index.html`，3 处，无后端改动）：
+
+| 位置 | 改法 |
+|---|---|
+| `ccCalc` | `api('/api/cost-estimate', {method:'POST', body:…})` → `jsonPost('/api/cost-estimate', body)` |
+| `ccPlan` | 同上 → `jsonPost('/api/cost-plan', body)` |
+| `api()` | `detail` 是数组时 `.map(x => x.msg \|\| x.type).filter(Boolean).join('；')` |
+
+`jsonPost` 本来就补 `Content-Type: application/json`，是项目里发 JSON 的正确出口。
+静态页面走 `FileResponse` **每请求读盘** → 改完刷新即可，无需重启服务。
+
+**验证（都可重复跑）**：
+
+| 方式 | 结果 |
+|---|---|
+| 浏览器真跑 + monkeypatch `window.fetch` 捕获 | `/api/cost-estimate`、`/api/cost-plan` 均 **status 200 + ctype=application/json** |
+| 页面渲染 | 单笔：`22.651 → 18.3906（-18.81%）`、真实回本价 18.3962、费用 13.95、回本涨幅 +45.42%；分批 3 行（2000/8000/30000 → 100/600/2500 股）|
+| `check_full_js.py` | 2 个 script 块 `node --check` 全过 |
+| `_cost_estimate_test.py` | **112 项全过**，新增第 20 节静态接线断言：两个试算必须 `jsonPost`、不得再用裸 `api()`、`api()` 必须处理数组 detail |
+
+**顺带发现（未改，等口径）**：`shares` / `old_shares` 传小数会 422（Pydantic `int`）；
+UI 提示「A 股须 100 股整数倍」但**既不取整也不拦截**。是否自动向下取整成整手，
+属交互口径，要用户定。
+
+> 教训与「HTTP 200 但 data 为空」同源：**curl 能通 ≠ 页面能用**。curl 默认补的
+> header 恰好掩盖了前端缺 header。写前端请求的回归断言时，要断言**用哪个助手**，
+> 不是断言「请求发出去了」。

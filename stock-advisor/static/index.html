@@ -2495,7 +2495,14 @@ function skeletonBox(lines = 3) {
 async function api(url, opts) {
   const resp = await fetch(url, opts);
   const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(data.detail || resp.statusText);
+  if (!resp.ok) {
+    // FastAPI 的校验错误是 detail 数组，直接丢给 Error 会显示成 "[object Object]"
+    let msg = data.detail;
+    if (Array.isArray(msg)) {
+      msg = msg.map(x => x && (x.msg || x.type)).filter(Boolean).join('；');
+    }
+    throw new Error(msg || resp.statusText);
+  }
   return data;
 }
 const jsonPost = (url, body) => api(url, {
@@ -5126,8 +5133,9 @@ async function ccCalc() {
   const code = $('cc-pos').value;
   if (code) body.code = code;
   try {
-    const d = await api('/api/cost-estimate', {
-      method: 'POST', body: JSON.stringify(body) });
+    // 必须走 jsonPost：裸 api() 不带 Content-Type，FastAPI 会把 JSON 字符串
+    // 当纯文本 body，Pydantic 直接 422（页面表现为「试算失败 [object Object]」）
+    const d = await jsonPost('/api/cost-estimate', body);
     const delta = ccNum(d.cost_delta_pct);
     const be = ccNum(d.break_even_from_now);
     const cur = ccNum(d.current_price);
@@ -5176,8 +5184,7 @@ async function ccPlan() {
   const code = $('cc-pos').value;
   if (code) body.code = code;
   try {
-    const d = await api('/api/cost-plan', {
-      method: 'POST', body: JSON.stringify(body) });
+    const d = await jsonPost('/api/cost-plan', body);
     const rows = d.rows || [];
     // 找出「买得最多」的那档做高亮 —— 预算是递增的，最后一档买入最多、成本摊得最低
     let best = -1;

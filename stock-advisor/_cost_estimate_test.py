@@ -328,4 +328,39 @@ for k in ("total_cash_paid", "total_fees_paid", "cash_needed",
 ok(isinstance(d["fee"], dict) and "commission_rate" in d["fee"],
    "to_dict 含 fee 子结构")
 
+print("\n=== 20) 前端接线：两个试算必须走 jsonPost（2026-10-21 422 回归）===")
+# 真因：ccCalc/ccPlan 用裸 api() 发 POST，不带 Content-Type → FastAPI 把
+# JSON 字符串当纯文本 body → Pydantic 422。裸 api() 本身是合法助手（不改），
+# 但发 JSON 必须走 jsonPost。静态断言钉住，避免再次改回去。
+_html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "static", "index.html")
+with open(_html_path, encoding="utf-8") as fh:
+    _html = fh.read()
+
+
+def _between(start, end):
+    i = _html.find(start)
+    j = _html.find(end, i + len(start)) if i >= 0 else -1
+    return _html[i:j] if 0 <= i < j else ""
+
+
+_cc = _between("async function ccCalc(", "async function ccPlan(")
+_cp = _between("async function ccPlan(", "async function addTrade(")
+_api = _between("async function api(url, opts)", "const jsonPost")
+_post = _between("const jsonPost", "const jsonPut")
+ok(bool(_cc) and bool(_cp) and bool(_api) and bool(_post),
+   "能定位 ccCalc / ccPlan / api / jsonPost 四处源码")
+ok("jsonPost('/api/cost-estimate'" in _cc,
+   "ccCalc 走 jsonPost('/api/cost-estimate')")
+ok("jsonPost('/api/cost-plan'" in _cp,
+   "ccPlan 走 jsonPost('/api/cost-plan')")
+ok("api('/api/cost-estimate'" not in _cc,
+   "ccCalc 不得再用裸 api() 发 POST（缺 Content-Type → 422）")
+ok("api('/api/cost-plan'" not in _cp,
+   "ccPlan 不得再用裸 api() 发 POST")
+ok("Array.isArray(msg)" in _api,
+   "api() 把 FastAPI 的 detail 数组转成可读文本（不再 [object Object]）")
+ok("'Content-Type': 'application/json'" in _post,
+   "jsonPost 带 Content-Type: application/json")
+
 print(f"\n=== 共 {N} 条 ===")
