@@ -111,6 +111,11 @@ DEFAULT_INTERVALS = {
     # 复选框 + 间隔输入框都由 SCH_INTERVALS 通用生成，不用写任何专用 UI。
     # ⚠️ 只读、只推建议、**绝不下单**（实盘操作始终由本人手动执行）。
     "t_adv": {"enabled": False, "interval_minutes": 15},
+    # 聚宽策略每日结论（2026-10-23）。读写的就是 config.yaml 顶层 strategy_daily 段，
+    # 与 strategy_daily.load_daily_conf() 同一份 —— 不复制真源。
+    # 默认开（用户要求「每天运行」）；enabled 只是「本线程要不要自己跑」
+    # 的总闸，手动点「试运行」不受它限制。
+    "strategy_daily": {"enabled": True, "interval_minutes": 1440},
 }
 # ⚠️ news 的周期真身是 `news.fetch_interval_minutes`（_auto_fetch_loop 和
 # news_fetcher 都读它），而 `news.interval_minutes` 是历史遗留的**幽灵键**：
@@ -4947,6 +4952,99 @@ def _t_advisory_loop():
             time.sleep(120)
 
 
+def _strategy_daily_loop():
+    """聚宽策略每日结论守护线程：**只出结论、绝不下单**。
+
+    与「复现策略收益」是两件事：这里只回答「按这套策略，最后一个交易日实际
+    怎么调仓、折到你的账户是多少」。三条纪律：
+
+    1. **不成交**。`strategy_daily` 全模块没有任何下单代码路径；LLM 仍是
+       交易员，本线程的产出只进页面与通知。
+    2. **只在有建议时推**。每天一条「今日无调仓」是噪音，噪音等于没报警。
+    3. **交易日闸门用 `calendar_gate(..., allow_when_unknown=False)`**：日历
+       不可用时按「非交易日」处理 —— 休市日跑出来的是陈旧价上的结论。
+    """
+    while True:
+        try:
+            # 走 load_daily_conf() 而不是裸 _conf_section：后者在 config.yaml 少写
+            # 几个键时给出半截 dict（阈值全是 None），而 load_daily_conf 会与
+            # DEFAULT_DAILY_CONF 合并 —— 默认值只有这一份真源。
+            conf = strategy_daily.load_daily_conf()
+            if not conf.get("enabled"):
+                time.sleep(600)
+                continue
+            now = datetime.now()
+            _td = holiday_calendar.is_trading_day(now.date())
+            if not paper_trading.calendar_gate(_td, allow_when_unknown=False):
+                time.sleep(600)
+                continue
+            deps = {"get_conn": get_conn}
+            # 「到点了吗 + 今天跑过没有」都在 should_run 里（按 started_at 去重，
+            # 不能按 trade_date —— 行情可能停在几天前）。
+            due = strategy_daily.should_run(deps, conf)
+            if not due.get("due"):
+                time.sleep(300)
+                continue
+            res = strategy_daily.run_all(deps, conf)
+            if res.get("skipped"):
+                print(f"[strategy_daily] 跳过：{res.get('reason')}", flush=True)
+                time.sleep(1800)
+                continue
+            if not res.get("ok"):
+                print(f"[strategy_daily] 未跑成：{res.get('reason')}", flush=True)
+                time.sleep(1800)
+                continue
+            print(f"[strategy_daily] {res['run_id']} 策略={res['n_total']} "
+                  f"出结论={res['n_ok']} 有建议={res['n_actionable']} "
+                  f"耗时={res['elapsed_s']}s", flush=True)
+            acts = [r for r in (res.get("rows") or []) if r.get("suggestions")]
+            if acts:
+                lines, n_show, rejected = [], 0, set()
+                for r in acts:
+                    if n_show >= 16:
+                        break
+                    _t = str(r.get("title") or r.get("article_id") or "")[:18]
+                    for s in (r.get("suggestions") or []):
+                        if n_show >= 16:
+                            break
+                        _side = "买" if s.get("side") == "buy" else "卖"
+                        try:
+                            _w = "%+.2f%%" % (float(s.get("w_change") or 0) * 100)
+                        except (TypeError, ValueError):
+                            _w = ""
+                        _sh = s.get("suggest_shares")
+                        if _sh:
+                            _amt = "%s 股" % _sh
+                        elif s.get("suggest_value") is not None:
+                            _amt = "约 %.0f 元（无整手，只给金额）" % float(
+                                s["suggest_value"])
+                        else:
+                            _amt = "股数不确定"
+                        lines.append(f"· 「{_t}」{_side} {s.get('code')} "
+                                     f"{s.get('name') or ''} {_amt}（{_w}）")
+                        n_show += 1
+                    g = r.get("gate") or {}
+                    if g.get("verdict") == "reject":
+                        rejected.add(str(r.get("title") or "")[:18])
+                extra = ""
+                if len(acts) > 8 or n_show >= 16:
+                    extra = "\n（还有更多，见页面「策略库 / 每日结论」）"
+                gate_txt = ""
+                if rejected:
+                    gate_txt = ("\n⚠ 数据质量闸门未通过（%s）：结论仅供参考，"
+                                "不代表可直接照做" % "、".join(sorted(rejected)[:3]))
+                _notifier_notify_safe(
+                    "📤 策略每日结论 %s" % (res.get("trade_date") or ""),
+                    "%d 条策略给出调仓建议：\n%s%s%s"
+                    % (len(acts), "\n".join(lines), extra, gate_txt),
+                    event="strategy_daily")
+            iv = max(10, int(conf.get("interval_minutes") or 1440))
+            time.sleep(iv * 60)
+        except Exception as exc:      # noqa: BLE001
+            print(f"[strategy_daily] loop error: {exc}", flush=True)
+            time.sleep(600)
+
+
 def _supply_market_loop():
     """每日推送：全市场供给冲击日历 + 海外市场资金抽离视角。
 
@@ -5015,6 +5113,8 @@ import strategy_crawler
 import strategy_extract as SX
 import jq_sandbox as JS
 import strategy_gate as SG
+import strategy_contract
+import strategy_daily
 import stock_discovery
 import stock_roster
 import paper_memory
@@ -5982,6 +6082,17 @@ class JqFetchIn(BaseModel):
                     "失效场景实测、作者补的参数），关掉只省请求不建议")
 
 
+class StrategyDailyRunIn(BaseModel):
+    """手动触发一次策略试运行（受咨询锁保护，与守护线程互斥）。"""
+    only: list[str] | None = Field(
+        default=None, description="只跑这些 article_id；不给则跑所有候选")
+    force: bool = Field(
+        default=False,
+        description="忽略「今天跑过 / 没到点」的去重。不会绕过咨询锁")
+    min_score: int | None = Field(
+        default=None, ge=0, le=100, description="覆盖 portable_score 门槛")
+
+
 # ---- 本地行情 / 回测 ----
 class KlineSyncIn(BaseModel):
     codes: list[str] = Field(min_length=1, max_length=200)
@@ -6252,6 +6363,108 @@ def paper_strategy_scorecard(days: int = 30):
     with get_conn() as conn, conn.cursor(
             cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         return paper_strategy.scorecard(cur, days=days)
+
+
+# ---------- 聚宽策略每日结论（只出结论、绝不下单）----------
+# 与「复现策略收益」是两件事：这里只回答「按这套策略，最后一个交易日实际
+# 怎么调仓、折到你的账户是多少」。全模块没有任何下单路径。
+
+_SD_STATE_LOCK = threading.RLock()
+_SD_STATE = {"running": False, "run_id": "", "started_at": "",
+             "finished_at": "", "result": None, "error": ""}
+
+
+def _sd_state(**kw) -> dict:
+    with _SD_STATE_LOCK:
+        if kw:
+            _SD_STATE.update(kw)
+        return dict(_SD_STATE)
+
+
+def _sd_deps() -> dict:
+    return {"get_conn": get_conn}
+
+
+def _sd_run_bg(conf, only, force):
+    """后台跑一轮。**不在外层持锁跑** —— 互斥由 `run_all` 的 PG 咨询锁
+    （918273647）保证，这里只做「本进程不叠两个」的簿记。
+
+    `rows` 不留在状态里：它和 `GET /api/strategy/daily` 的 latest 是同一份
+    数据，留在内存里只会让轮询响应翻倍。
+    """
+    try:
+        if not force:
+            due = strategy_daily.should_run(_sd_deps(), conf)
+            if not due.get("due"):
+                _sd_state(running=False,
+                          finished_at=datetime.now().isoformat(timespec="seconds"),
+                          result={"ok": False, "skipped": True,
+                                  "reason": due.get("reason") or "未到运行时间"})
+                return
+        res = strategy_daily.run_all(_sd_deps(), conf, only or None)
+        res = res if isinstance(res, dict) else {"ok": False, "reason": "返回值异常"}
+        slim = {k: v for k, v in res.items() if k != "rows"}
+        slim["n_rows"] = len(res.get("rows") or [])
+        _sd_state(running=False,
+                  finished_at=datetime.now().isoformat(timespec="seconds"),
+                  run_id=str(res.get("run_id") or ""), result=slim)
+    except Exception as exc:                     # noqa: BLE001
+        print(f"[strategy_daily] 手动运行失败: {exc}", flush=True)
+        _sd_state(running=False,
+                  finished_at=datetime.now().isoformat(timespec="seconds"),
+                  error=str(exc)[:300],
+                  result={"ok": False, "reason": "运行异常：%s" % str(exc)[:300]})
+
+
+@app.get("/api/strategy/daily")
+def strategy_daily_get(runs: int = 20, limit: int = 200):
+    """策略每日结论（只读）：轮次台账 + 逐策略最新结论 + 手动运行状态。"""
+    conf = _conf_section("strategy_daily") or {}
+    min_score = conf.get("min_score")
+    if min_score is None:
+        min_score = strategy_daily.DEFAULT_DAILY_CONF["min_score"]
+    with get_conn() as conn, conn.cursor(
+            cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        run_rows = strategy_daily.load_runs(cur, max(1, min(runs, 90)))
+        latest = strategy_daily.load_latest(cur, max(1, min(limit, 500)))
+        universe = strategy_daily.load_universe(cur, min_score)
+    return {"ok": True,
+            "runs": run_rows,
+            "latest": latest,
+            "universe": universe,
+            "conf": conf,
+            "status_label": strategy_daily.STATUS_LABEL,
+            "fail_status": list(strategy_daily.FAIL_STATUS),
+            "state": _sd_state()}
+
+
+@app.post("/api/strategy/daily/run")
+def strategy_daily_run(body: StrategyDailyRunIn):
+    """手动试运行一轮（后台跑，轮询 GET /api/strategy/daily 看结果）。
+
+    为什么放后台：真跑一轮实测 383 秒（建切片 CSV 15MB + 上传 44MB +
+    容器回测），同步请求必然超时。
+    """
+    with _SD_STATE_LOCK:
+        if _SD_STATE.get("running"):
+            return {"ok": False, "running": True,
+                    "reason": "上一轮还在跑（%s）" % (_SD_STATE.get("run_id") or "未知")}
+        _SD_STATE.update({
+            "running": True, "run_id": "",
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at": "", "result": None, "error": ""})
+    conf = dict(strategy_daily.DEFAULT_DAILY_CONF)
+    conf.update({k: v for k, v in (_conf_section("strategy_daily") or {}).items()
+                 if v is not None})
+    # 手动点「试运行」是本人明确意图，不该被「每日自动调度是否开启」挡住
+    # —— `enabled` 管的是守护线程要不要自己跑，不是禁止手动。
+    conf["enabled"] = True
+    if body.min_score is not None:
+        conf["min_score"] = int(body.min_score)
+    threading.Thread(target=_sd_run_bg, args=(conf, body.only, body.force),
+                     daemon=True, name="sd-manual").start()
+    return {"ok": True, "running": True,
+            "hint": "已开始；轮询 GET /api/strategy/daily 看结果"}
 
 
 # ---------- 策略库采集（聚宽社区，防重复爬取）----------
@@ -10270,6 +10483,11 @@ if _BOOTSTRAP:
         fx_watch._ensure_tables(_fx_deps())
     except Exception as exc:
         print(f"[fx] init tables failed: {exc}", flush=True)
+    # 聚宽策略每日结论：sa_strategy_daily（逐策略结论）+ sa_strategy_daily_run（轮次台账）
+    try:
+        strategy_daily._ensure_tables({"get_conn": get_conn})
+    except Exception as exc:
+        print(f"[strategy_daily] init tables failed: {exc}", flush=True)
 
 # 声明微信客户端在线（iLink notifystart）。
 # **必须在每次服务启动时做**：iLink 侧的「会话」不是持久状态，重启后不重新
@@ -10350,6 +10568,11 @@ _start_daemon(_paper_strategy_loop, "sa_paper_strategy")
 # 你没看页面就错过了，而做T本来就是抓瞬时波动。
 # 只在「有可执行单」且「与上次通知的集合不同」时推，否则噪音等于没报警。
 _start_daemon(_t_advisory_loop, "sa_t_advisory")
+
+# 聚宽策略每日结论线程（2026-10-23）。**只出结论、绝不下单**：按每套策略
+# 的前置条件跑最后一个交易日，给出「买/卖哪只、多少股」，汇总后推通知。
+# 与前一个线程一样只在有建议时推（每天一条「今日无调仓」= 噪音）。
+_start_daemon(_strategy_daily_loop, "sa_strategy_daily")
 
 # 每日报告线程（盘前简报 / 盘后复盘；时间点见 config.yaml schedule 段，网页可改）
 _start_daemon(_daily_reports_loop, "sa_daily_reports")

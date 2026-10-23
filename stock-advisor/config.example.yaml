@@ -587,3 +587,25 @@ analysis_learn:
   auto_loop: true             # 守护线程定期从新文章萃取
   loop_interval_minutes: 720  # 默认 12h 一轮，每轮最多 3 篇
 
+# 聚宽策略每日结论（2026-10-23）。**只出结论、绝不下单** —— 下单决策仍由 LLM 交易员做。
+# 每天 run_time 之后跑一轮：把契约合规的聚宽策略各跑一遍，给出「最后一个交易日实际
+# 怎么调仓、折到你的账户是多少股」。结果落 sa_strategy_daily（逐策略结论）+
+# sa_strategy_daily_run（轮次台账），页面「🧩 策略库」可看；当天有建议才推通知。
+# ⚠️ 这是**顶层**段（不是 paper.*）：调度页（DEFAULT_INTERVALS / /api/schedule）
+# 读写的就是顶层 `strategy_daily`。
+# ⚠️ enabled 只是「守护线程要不要自己跑」，手动点「试运行」不受它限制。
+# 实测一个 486 天窗口的策略跑完约 384 秒（建切片 CSV 15MB + 上传 44MB + 容器回测）。
+strategy_daily:
+  enabled: true
+  min_score: 4               # portable_score 低于此值不进沙箱
+  max_strategies: 20         # 每轮最多跑几个（每个约 6 分钟）
+  max_codes: 1200            # 切片最多几只股票
+  universe_top_n: 600        # 策略要「全市场」时沙箱里只有这个池子（会记 universe_truncated）
+  universe_sample_days: 12   # 按最近 N 个交易日成交额中位数排序
+  lookback_days: 730         # 回放窗口（自然日），取最后一个交易日的调仓作结论
+  min_bars: 250              # 日K不足直接判 insufficient_data
+  cash: 1000000.0            # 只影响回放仓位规模，不影响最终折算
+  timeout: 600               # 单策略沙箱超时(秒)
+  max_stale_days: 45         # 行情滞后超过这个天数判 data_stale，不跑
+  run_time: "15:30"          # 每天几点跑（当天已跑过自动跳过；周末不跑）
+  interval_minutes: 1440     # 线程检查周期，不是运行周期

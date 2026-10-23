@@ -1588,6 +1588,44 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       </div>
     </div>
 
+    <!-- 📤 聚宽策略每日结论：只出结论、绝不下单 -->
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <b style="font-size:13px">📤 策略每日结论</b>
+        <span class="row" style="gap:6px">
+          <button class="btn ghost" id="sd-run-btn" style="font-size:12px"
+                  onclick="sdRun(this)">试运行一轮</button>
+          <button class="btn ghost" style="font-size:12px"
+                  onclick="loadStrategyDaily()">刷新</button>
+        </span>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:4px">
+        每天收盘后把聚宽策略<b>隔离在沙箱里真跑一遍</b>，只回答「按这套策略，最后一个交易日
+        实际怎么调仓、折到你的账户是多少」。<b>只出结论、绝不下单</b> —— 买不买仍由交易员决定。
+        真跑一轮约 6 分钟（建切片 CSV + 上传 + 容器回测）。
+      </div>
+      <div id="sd-state" class="muted" style="font-size:12px;margin-top:6px"></div>
+      <div class="jq-stats" id="sd-summary" style="margin-top:8px">加载中…</div>
+      <div style="margin-top:10px"><b style="font-size:12px">逐策略最新结论</b>
+        <span class="muted" style="font-size:11px">（同一策略只显示最近一次）</span></div>
+      <div class="table-scroll" style="max-height:320px;margin-top:4px">
+        <table>
+          <thead><tr><th>策略</th><th>状态</th><th>结论</th><th>建议</th>
+            <th>数据质量</th><th>数据截至</th></tr></thead>
+          <tbody id="sd-body"></tbody>
+        </table>
+      </div>
+      <div id="sd-detail" style="margin-top:10px"></div>
+      <div style="margin-top:12px"><b style="font-size:12px">运行轮次台账</b></div>
+      <div class="table-scroll" style="max-height:240px;margin-top:4px">
+        <table>
+          <thead><tr><th>轮次</th><th>开始</th><th>交易日</th><th>策略</th>
+            <th>成功 / 失败</th><th>有建议</th><th>耗时</th><th>备注</th></tr></thead>
+          <tbody id="sd-runs"></tbody>
+        </table>
+      </div>
+    </div>
+
     <div class="card">
       <div class="row" style="justify-content:space-between;align-items:center">
         <span class="row" style="gap:4px">
@@ -3353,6 +3391,403 @@ async function loadStrategyScorecard() {
   }
 }
 
+// ---- 📤 聚宽策略每日结论（只出结论、绝不下单，2026-10-23）----
+// 与上面的「策略使用记分卡」不同：记分卡看的是卖出策略的影子效果，
+// 这里看的是聚宽选股策略**本身**在沙箱里真跑的最后一个交易日结论。
+// 全模块零下单路径 —— 后端 strategy_daily.py 不含任何成交代码。
+let _SD_LATEST = [];
+let _SD_STATE = {};
+let _SD_LABELS = {}, _SD_FAIL = [];
+let _SD_POLL = null, _SD_POLL_N = 0;
+const _SD_POLL_MS = 10000, _SD_POLL_MAX = 720;   // 真跑一轮实测 ~6 分钟，2 小时兜底
+
+function _sdStopPoll() {
+  if (_SD_POLL) { clearInterval(_SD_POLL); _SD_POLL = null; }
+  _SD_POLL_N = 0;
+}
+
+// ⚠️ 成功路径绝不能 clearInterval（AGENTS.md：`finally` 里清定时器会误杀
+//    比函数活得久的轮询 —— 进度条只轮询一次就冻住，且不报错）。
+function _sdStartPoll() {
+  if (_SD_POLL) return;                       // 防重复点击叠两个轮询
+  _SD_POLL_N = 0;
+  _SD_POLL = setInterval(async () => {
+    _SD_POLL_N += 1;
+    if (_SD_POLL_N > _SD_POLL_MAX) {
+      _sdStopPoll();
+      const el = $('sd-state');
+      if (el) el.textContent = '轮询超时（约 2 小时），请手动刷新查看结果。';
+      return;
+    }
+    if (document.hidden) return;              // 页面不可见时跳过请求但保留定时器
+    const body = $('sd-body');
+    if (!body || !body.isConnected) { _sdStopPoll(); return; }
+    await loadStrategyDaily(true);
+    const st = _SD_STATE || {};
+    if (!st.running) {
+      _sdStopPoll();
+      const res = st.result || {};
+      if (res.ok === false && res.skipped) toastErr('本轮已跳过：' + (res.reason || ''));
+      else if (res.ok === false) toastErr('策略运行失败：' + (res.reason || st.error || '未知原因'));
+      else if (res.ok === true) toastOk('策略运行完成：' + (res.n_ok || 0) + ' 条出结论');
+    }
+  }, _SD_POLL_MS);
+}
+
+async function sdRun(btn) {
+  if (btn) { btn.disabled = true; btn.textContent = '启动中…'; }
+  try {
+    const d = await jsonPost('/api/strategy/daily/run', { force: true });
+    if (!d.ok) {
+      toastErr(d.reason || '启动失败');
+      if (d.running) {                        // 上一轮还在跑：接管它的进度
+        if (btn) btn.textContent = '运行中…';
+        await loadStrategyDaily(true);
+        _sdStartPoll();
+        return;
+      }
+      if (btn) { btn.disabled = false; btn.textContent = '试运行一轮'; }
+      return;
+    }
+    if (btn) btn.textContent = '运行中…';
+    toastOk('已开始；真跑一轮约 6 分钟，页面每 10 秒自动刷新');
+    await loadStrategyDaily(true);
+    _sdStartPoll();
+  } catch (e) {
+    toastErr('启动失败：' + e.message);
+    if (btn) { btn.disabled = false; btn.textContent = '试运行一轮'; }
+  }
+}
+
+function _sdBadge(status) {
+  const s = String(status || '');
+  const txt = _SD_LABELS[s] || s || '—';
+  const k = s === 'ok' ? 'b-ok' : (_SD_FAIL.indexOf(s) >= 0 ? 'b-bad' : 'b-warn');
+  return `<span class="badge ${k}">${jqEsc(txt)}</span>`;
+}
+
+// gate 在 data_quality.gate 里（_LATEST_COLS 没有顶层 gate 列）。
+function _sdGate(dq) {
+  const g = (dq && dq.gate) || null;
+  if (!g) return '<span class="muted">—</span>';
+  const v = String(g.verdict || '');
+  const k = v === 'pass' ? 'b-ok' : (v === 'reject' ? 'b-bad' : 'b-warn');
+  const lab = v === 'pass' ? '通过' : v === 'reject' ? '未通过'
+    : v === 'partial' ? '部分' : (v || '—');
+  let out = `<span class="badge ${k}">${jqEsc(lab)}</span>`;
+  if (g.score != null) out += ` <span class="muted" style="font-size:11px">${fmt(g.score)} 分</span>`;
+  const bl = (g.blockers || []).filter(Boolean);
+  const pn = (g.penalties || []).filter(Boolean);
+  if (bl.length) {
+    out += `<div class="muted" style="font-size:11px">阻断 ${bl.length}：${
+      jqEsc(bl.join('；').slice(0, 120))}</div>`;
+  } else if (pn.length) {
+    out += `<div class="muted" style="font-size:11px">扣分 ${pn.length}：${
+      jqEsc(pn.join('；').slice(0, 100))}</div>`;
+  }
+  return out;
+}
+
+// 策略里的收益率/回撤/权重都是**小数**（1.3375 = +133.75%），不是百分数。
+function _sdPct(v, digits) {
+  const n = Number(v);
+  if (v == null || v === '' || !isFinite(n)) return '—';
+  const x = n * 100;
+  return (x > 0 ? '+' : '') + x.toFixed(digits == null ? 2 : digits) + '%';
+}
+
+function _sdAmt(v, side) {
+  const n = Number(v);
+  if (v == null || v === '' || !isFinite(n)) return '—';
+  const sign = side === 'sell' ? '-' : (side === 'buy' ? '+' : (n > 0 ? '+' : n < 0 ? '-' : ''));
+  return sign + '¥' + fmt(Math.round(Math.abs(n)));
+}
+
+function _sdNum2(v) {
+  const n = Number(v);
+  return v == null || v === '' || !isFinite(n) ? '—' : n.toFixed(2);
+}
+
+function _sdUnique(rows) {
+  const seen = new Set(), out = [];
+  (rows || []).forEach(r => {
+    const k = String(r.article_id || '');
+    if (!k || seen.has(k)) return;
+    seen.add(k); out.push(r);
+  });
+  return out;
+}
+
+function _sdPaintState(st) {
+  st = st || {};
+  const el = $('sd-state'), btn = $('sd-run-btn');
+  if (btn) {
+    btn.disabled = !!st.running;
+    btn.textContent = st.running ? '运行中…' : '试运行一轮';
+  }
+  if (!el) return;
+  if (st.running) {
+    el.innerHTML = `⏳ 正在跑（开始于 ${jqEsc(fmtLocalTs(st.started_at))}）`
+      + ' —— 真跑一轮约 6 分钟，页面每 10 秒自动刷新。';
+    return;
+  }
+  const parts = [];
+  if (st.finished_at) parts.push('上次结束 ' + fmtLocalTs(st.finished_at));
+  const res = st.result || null;
+  if (res && res.skipped) parts.push('跳过：' + (res.reason || ''));
+  else if (res && res.ok === false) parts.push('失败：' + (res.reason || st.error || ''));
+  else if (res && res.ok === true) {
+    parts.push(`成功：${fmt(res.n_ok)}/${fmt(res.n_total)} 出结论`
+      + `，${fmt(res.n_actionable)} 条建议`
+      + (res.elapsed_s == null ? '' : `，耗时 ${Math.round(res.elapsed_s)}s`));
+    if (res.run_id) parts.push('轮次 ' + res.run_id);
+  }
+  if (st.error && !(res && res.reason)) parts.push('错误：' + st.error);
+  el.textContent = parts.length ? parts.join(' · ')
+    : '还没有手动运行记录（守护线程每天到点也会自动跑一轮）。';
+}
+
+async function loadStrategyDaily(silent) {
+  const sum = $('sd-summary');
+  if (!sum) return;
+  if (!silent) sum.textContent = '加载中…';
+  try {
+    const d = await api('/api/strategy/daily?runs=20&limit=500');
+    _SD_LABELS = d.status_label || {};
+    _SD_FAIL = d.fail_status || [];
+    _SD_STATE = d.state || {};
+    _SD_LATEST = _sdUnique(d.latest);
+
+    _sdPaintState(_SD_STATE);
+    if (_SD_STATE.running) _sdStartPoll();
+
+    const runs = d.runs || [];
+    const last = runs[0] || null;
+    const rows = _SD_LATEST;
+    const uni = d.universe || {};
+    let nOk = 0, nSug = 0, nGateBad = 0;
+    rows.forEach(r => {
+      if (r.status === 'ok') nOk += 1;
+      if ((r.suggestions || []).length) nSug += 1;
+      const g = (r.data_quality || {}).gate || {};
+      if (g.verdict === 'reject') nGateBad += 1;
+    });
+    // 只列达门槛的候选，别让「9」被读成「库里只有 9 条策略」
+    const uniLabel = uni.min_score == null ? '本轮候选策略'
+      : '候选策略（可移植分 ≥ ' + uni.min_score + '）';
+    const uniValue = uni.total == null ? fmt(rows.length)
+      : fmt(rows.length) + ' / ' + fmt(uni.total);
+    sum.innerHTML = [
+      [uniLabel, uniValue],
+      ['出结论', fmt(nOk)],
+      ['未出结论', fmt(rows.length - nOk)],
+      ['有建议', fmt(nSug)],
+      ['闸门未通过', fmt(nGateBad)],
+      ['最新轮次', last ? (last.run_id || '—') : '—'],
+      ['本轮交易日', last && last.trade_date ? last.trade_date : '—'],
+      ['本轮成功/失败', last ? fmt(last.n_ok) + '/' + fmt(last.n_failed) : '—'],
+    ].map(([k, v]) => `<div class="jq-stat"><div class="jq-stat-v">${jqEsc(v)}</div>
+        <div class="jq-stat-k">${jqEsc(k)}</div></div>`).join('');
+
+    $('sd-body').innerHTML = rows.map(r => {
+      const dq = r.data_quality || {};
+      const st = String(r.status || '');
+      const sug = r.suggestions || [];
+      const nBuy = sug.filter(x => x.side === 'buy').length;
+      const nSell = sug.filter(x => x.side === 'sell').length;
+      const concl = st === 'ok' ? (r.summary || '') : (r.reason || '');
+      const aid = String(r.article_id || '');
+      return `<tr>
+        <td><b>${jqEsc((r.title || '').slice(0, 60) || '(未命名策略)')}</b>
+          <div class="muted" style="font-size:11px">${jqEsc(aid)}${
+            r.portable_score == null ? '' : ' · 可移植分 ' + fmt(r.portable_score)}</div></td>
+        <td>${_sdBadge(st)}</td>
+        <td style="max-width:420px">${jqEsc(concl || '—')}</td>
+        <td>${sug.length
+          ? `${fmt(sug.length)} 条 <span class="muted" style="font-size:11px">买 ${
+              fmt(nBuy)} / 卖 ${fmt(nSell)}</span><br>`
+            + `<button class="link-btn" style="font-size:11px" `
+            + `onclick="sdShow('${_tAttr(aid)}')">明细</button>`
+          : '<span class="muted">—</span>'}</td>
+        <td>${_sdGate(dq)}</td>
+        <td>${dq.as_of ? jqEsc(dq.as_of) : '<span class="muted">—</span>'}${
+          dq.stale_days == null ? ''
+            : `<div class="muted" style="font-size:11px">滞后 ${fmt(dq.stale_days)} 天</div>`}</td>
+      </tr>`;
+    }).join('')
+      || '<tr><td colspan="6" class="muted">还没有结论。点「试运行一轮」，或等收盘后守护线程自动跑。</td></tr>';
+
+    $('sd-runs').innerHTML = runs.map(r => `<tr>
+      <td class="jq-code" style="background:none;border:none;padding:0;max-height:none">${
+        jqEsc(r.run_id || '—')}</td>
+      <td>${r.started_at ? jqEsc(fmtLocalTs(r.started_at)) : '<span class="muted">—</span>'}</td>
+      <td>${r.trade_date ? jqEsc(r.trade_date) : '<span class="muted">—</span>'}</td>
+      <td>${fmt(r.n_total)}</td>
+      <td><span class="badge b-ok">${fmt(r.n_ok)}</span> /
+        <span class="badge ${r.n_failed ? 'b-bad' : 'b-mute'}">${fmt(r.n_failed)}</span></td>
+      <td>${fmt(r.n_actionable)}</td>
+      <td>${r.elapsed_s == null ? '—' : Math.round(r.elapsed_s) + 's'}</td>
+      <td style="max-width:320px">${jqEsc(r.error || r.note || '')}</td>
+    </tr>`).join('')
+      || '<tr><td colspan="8" class="muted">还没有运行记录</td></tr>';
+  } catch (e) {
+    if (!silent) sum.textContent = '策略每日结论加载失败：' + e.message;
+    else {
+      const el = $('sd-state');
+      if (el) el.textContent = '刷新失败：' + e.message + '（会自动重试）';
+    }
+  }
+}
+
+function sdShow(articleId) {
+  const box = $('sd-detail');
+  if (!box) return;
+  const key = String(articleId || '');
+  if (box.dataset.sd === key) { box.innerHTML = ''; box.dataset.sd = ''; return; }
+  const row = _SD_LATEST.find(x => String(x.article_id || '') === key);
+  if (!row) { toastErr('没找到这条结论（可能已被新一轮覆盖）'); return; }
+  box.dataset.sd = key;
+
+  const st = String(row.status || '');
+  const sug = row.suggestions || [];
+  const pos = row.positions || [];
+  const rej = row.rejected || [];
+  const dq = row.data_quality || {};
+  const gate = dq.gate || {};
+  const pre = row.precond || {};
+  const met = row.metrics || {};
+  const rm = dq.run_meta || {};
+  const slice = dq.slice || {};
+
+  const sugRows = sug.slice(0, 100).map(x => {
+    const isBuy = x.side === 'buy';
+    return `<tr>
+      <td>${jqEsc(x.code || '')}</td>
+      <td>${jqEsc(x.name || '')}</td>
+      <td><span class="badge ${isBuy ? 'b-ok' : 'b-bad'}">${
+        isBuy ? '买入' : '卖出'}</span></td>
+      <td><span class="${cls(x.w_change)}">${_sdPct(x.w_change)}</span></td>
+      <td>${_sdAmt(x.suggest_value, x.side)}</td>
+      <td>${fmt(x.suggest_shares)}</td>
+      <td>${fmtPx(x.price)}</td>
+      <td class="muted" style="font-size:11px">${jqEsc(x.reason || '')}</td>
+    </tr>`;
+  }).join('')
+    || '<tr><td colspan="8" class="muted">这一轮没有任何调仓建议</td></tr>';
+
+  const posRows = pos.slice(0, 60).map(p => `<tr>
+      <td>${jqEsc(p.code || '')}</td><td>${jqEsc(p.name || '')}</td>
+      <td>${fmt(p.shares)}</td><td>${fmtPx(p.close)}</td>
+      <td>${_sdPct(p.weight)}</td></tr>`).join('')
+    || '<tr><td colspan="5" class="muted">无持仓</td></tr>';
+
+  const rejRows = rej.slice(0, 30).map(r =>
+    `<li>${jqEsc(r.code || '')} ${r.side === 'buy' ? '买入' : '卖出'} — ${
+      jqEsc(r.reason || '')}</li>`).join('');
+
+  const preRows = (pre.items || []).map(it => {
+    const s = String(it.state || '');
+    const k = s === 'pass' ? 'b-ok' : (s === 'fail' ? 'b-bad' : 'b-warn');
+    const lab = s === 'pass' ? '满足' : (s === 'fail' ? '不满足' : '未知');
+    let line = `<span class="badge ${k}">${lab}</span> ${
+      jqEsc(it.desc || it.type || '')}`;
+    if (it.code) line += ' · ' + jqEsc(it.code);
+    if (it.close != null) line += ' · 收盘 ' + fmtPx(it.close);
+    if (it.ma != null) line += ' · MA' + fmt(it.n) + ' ' + fmtPx(it.ma);
+    if (it.note) line += `<div class="muted" style="font-size:11px">${jqEsc(it.note)}</div>`;
+    return `<li>${line}</li>`;
+  }).join('') || '<li class="muted">无条件记录</li>';
+
+  const metCells = [];
+  const addMet = (k, v) => metCells.push(`<div class="jq-metric">
+      <div class="jq-metric-v">${jqEsc(v)}</div>
+      <div class="jq-metric-k">${jqEsc(k)}</div></div>`);
+  if (met.total_return != null) addMet('累计收益', _sdPct(met.total_return));
+  if (met.annual_return != null) addMet('年化', _sdPct(met.annual_return));
+  if (met.max_drawdown != null) addMet('最大回撤', _sdPct(met.max_drawdown));
+  if (met.sharpe != null) addMet('Sharpe', _sdNum2(met.sharpe));
+  if (met.sortino != null) addMet('Sortino', _sdNum2(met.sortino));
+  if (met.n_trades != null) addMet('成交笔数', fmt(met.n_trades));
+  const ts = met.trade_stats || {};
+  if (ts.win_rate != null) addMet('胜率', _sdPct(ts.win_rate, 1));
+  if (rm.days != null) addMet('沙箱天数', fmt(rm.days));
+  if (rm.equity != null) addMet('期末权益', '¥' + fmt(Math.round(rm.equity)));
+  if (rm.n_positions != null) addMet('持仓只数', fmt(rm.n_positions));
+  if (slice.codes != null) addMet('切片标的', fmt(slice.codes) + ' 只');
+  if (dq.kline_max != null) addMet('K线最长', fmt(dq.kline_max) + ' 根');
+
+  const bl = (gate.blockers || []).filter(Boolean);
+  const pn = (gate.penalties || []).filter(Boolean);
+  const dqLine = [
+    dq.as_of ? '数据截至 ' + dq.as_of : '',
+    dq.stale_days != null ? '滞后 ' + dq.stale_days + ' 天' : '',
+    dq.universe_mode ? '切片模式 ' + dq.universe_mode : '',
+    dq.universe_size != null ? '候选池 ' + dq.universe_size + ' 只' : '',
+    dq.valuation_days != null ? '估值 ' + dq.valuation_days + ' 天' : '',
+  ].filter(Boolean).join(' · ');
+
+  box.innerHTML = `<div style="border:1px solid var(--border);border-radius:8px;
+      padding:10px 12px;background:var(--bg-2)">
+    <div class="row" style="justify-content:space-between;align-items:center">
+      <span><b>${jqEsc(row.title || '(未命名策略)')}</b> ${_sdBadge(st)}
+        <span class="muted" style="font-size:11px">${jqEsc(key)}</span></span>
+      <button class="link-btn" style="font-size:11px"
+              onclick="sdShow('${_tAttr(key)}')">收起</button>
+    </div>
+    <div class="muted" style="font-size:12px;margin-top:6px">
+      ${jqEsc(st === 'ok' ? (row.summary || '') : (row.reason || '—'))}
+    </div>
+    ${metCells.length ? `<div class="jq-metrics" style="margin-top:8px">${
+      metCells.join('')}</div>` : ''}
+
+    <div style="margin-top:10px"><b style="font-size:12px">📌 调仓建议（${
+      sug.length} 条${sug.length > 100 ? '，只显示前 100 条' : ''}）</b>
+      <span class="muted" style="font-size:11px">只建议、不下单；
+        股数按你的模拟盘权益折算，港股只给金额</span></div>
+    <div class="table-scroll" style="max-height:320px;margin-top:4px">
+      <table>
+        <thead><tr><th>代码</th><th>名称</th><th>方向</th><th>目标权重变化</th>
+          <th>参考金额</th><th>股数</th><th>价格</th><th>依据</th></tr></thead>
+        <tbody>${sugRows}</tbody>
+      </table>
+    </div>
+
+    <div style="margin-top:10px"><b style="font-size:12px">🚦 数据质量闸门</b></div>
+    <div class="muted" style="font-size:12px;margin-top:2px">${
+      _sdGate(dq)}${dqLine ? ' · ' + jqEsc(dqLine) : ''}</div>
+    ${bl.length ? `<div class="jq-err" style="margin-top:4px">阻断：${jqEsc(bl.join('\n'))}</div>` : ''}
+    ${pn.length ? `<div class="muted" style="font-size:11px;margin-top:4px">扣分：${
+      jqEsc(pn.join('；'))}</div>` : ''}
+    ${dq.universe_reason ? `<div class="muted" style="font-size:11px;margin-top:4px">切片说明：${
+      jqEsc(dq.universe_reason)}</div>` : ''}
+    ${(dq.warnings || []).length ? `<div class="muted" style="font-size:11px;margin-top:4px">告警：${
+      jqEsc((dq.warnings || []).join('；'))}</div>` : ''}
+
+    <div style="margin-top:10px"><b style="font-size:12px">🔎 前置条件</b>
+      <span class="muted" style="font-size:11px">${jqEsc(pre.state || '')}${
+        pre.as_of ? ' · 数据截至 ' + jqEsc(pre.as_of) : ''}</span></div>
+    <ul style="margin:4px 0 0 18px;padding:0;font-size:12px">${preRows}</ul>
+    ${pre.note ? `<div class="muted" style="font-size:11px;margin-top:4px">${
+      jqEsc(pre.note)}</div>` : ''}
+
+    ${rejRows ? `<div style="margin-top:10px"><b style="font-size:12px">🚫 被拒订单（${
+      rej.length} 条${rej.length > 30 ? '，只显示前 30 条' : ''}）</b>
+      <ul style="margin:4px 0 0 18px;padding:0;font-size:12px">${rejRows}</ul></div>` : ''}
+
+    <details style="margin-top:10px">
+      <summary style="cursor:pointer;font-size:12px"><b>📦 目标持仓（${
+        pos.length} 只${pos.length > 60 ? '，只显示前 60 只' : ''}）</b></summary>
+      <div class="table-scroll" style="max-height:280px;margin-top:4px">
+        <table>
+          <thead><tr><th>代码</th><th>名称</th><th>股数</th><th>收盘</th>
+            <th>权重</th></tr></thead>
+          <tbody>${posRows}</tbody>
+        </table>
+      </div>
+    </details>
+  </div>`;
+}
+
 function jqGotoArticle(articleId) {
   if (!articleId) return;
   // ⚠️ 这里原来写的是 `jqFetch && jqFetch()` —— 那是**「抓取文章」按钮**
@@ -4009,7 +4444,7 @@ const TAB_LOADERS = {
   paper:     loadPaper,
   tdesk:     loadTDesk,
   notify:    () => { loadNotifyConf(); loadNotifyMatrix(); refreshWxChat(); },
-  jq:        () => { loadJqLib(); loadJqList(); loadAdopted(); loadStrategyScorecard(); },
+  jq:        () => { loadJqLib(); loadJqList(); loadAdopted(); loadStrategyScorecard(); loadStrategyDaily(); },
   analysis:  loadTechniques,
   schedule:  () => { loadSchedule(); loadConfigAll(); },
 };

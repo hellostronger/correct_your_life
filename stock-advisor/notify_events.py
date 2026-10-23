@@ -125,6 +125,15 @@ EVENTS: dict[str, dict[str, Any]] = {
                 "只在可执行信号集合（代码+动作）变化时推一次，不会每 N 分钟重发。",
         "source": "app._t_advisory_loop()",
     },
+    "strategy_daily": {
+        "label": "📤 策略每日结论",
+        "group": "交易提醒",
+        "default": {"wx": True, "email": True},
+        "help": "聚宽策略库的每日试运行结论：每套策略在最后一个交易日实际怎么"
+                "调仓、折到你的账户是多少股/多少元。**只给结论、绝不下单**，"
+                "LLM 仍是交易员；当天没有任何策略给出调仓时不推送。",
+        "source": "app._strategy_daily_loop()",
+    },
 
     # ---------------- 行情异动 ----------------
     "market_volume": {
