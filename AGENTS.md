@@ -1711,6 +1711,16 @@ NoneType.__format__`，成果**全部丢失**。真因是 `f"{r.get('price'):.2f
   原记的「`git config https.proxy` = …」不成立。**按次传**：
   `git -c http.proxy=http://127.0.0.1:6478 -c https.proxy=http://127.0.0.1:6478 push origin main`
   （实测 `52bffbd..48b733b` 推送成功；`-c` 不落盘，也不会改用户 git 配置）。
+  ⚠️ **代理到 github 也会坏（2026-10-23 晚实测）**：同一个代理对
+  `cloudflare / gitee / raw.githubusercontent` 全 200，**唯独 github.com 报
+  `schannel: failed to receive handshake`**（`--ssl-no-revoke`、
+  `http.schannelCheckRevoke=false` 都无效，不是吊销检查）；直连 443 时通时断
+  （一次 17.5s 成功，紧接着 `Could not connect`）。**可靠绕行是 SSH**：
+  `~/.ssh/id_ed25519` 已授权（`ssh -T git@github.com` → `Hi hellostronger!`），
+  `git push git@github.com:hellostronger/correct_your_life.git main` 一次成功
+  （22 与 `ssh.github.com:443` 两个端口都能连）。用完 `origin` 仍是 HTTPS，
+  **按 URL 推送不会更新 `refs/remotes/origin/main`**，可用
+  `git update-ref refs/remotes/origin/main <sha>` 校正跟踪引用（别为此改 remote 配置）。
 - 本机直连出口：**`59.34.155.130`**（2026-10-03 实测更正；AGENTS.md 原记的
   `121.32.254.148` 已失效，疑似运营商动态分配）。**每次做「换 IP 是否影响限流」
   这类实验前先实测出口**，别用文档里的旧值。无系统代理、无 VPN
