@@ -1244,7 +1244,15 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
         <button class="btn" id="xhs-fetch-btn" onclick="triggerXhsFetch()">立即抓取</button>
         <button class="btn ghost" onclick="xhsLogin()">登录小红书</button>
         <button class="btn ghost" onclick="markAllXhsRead()">全部已读</button>
+        <!-- 暂停时才显示：风控和登录失效的下一步动作不同，按钮文案也不同 -->
+        <button class="btn ghost hide" id="xhs-resume-btn" onclick="resumeXhsFetch()"></button>
         <span class="muted" id="xhs-status"></span>
+      </div>
+      <!-- 风控/登录失效的醒目横幅。两类的处置动作完全不同，所以分别给样式+文案 -->
+      <div id="xhs-pause-banner" class="hide" style="margin-top:8px;padding:8px 10px;border-radius:6px;
+           font-size:12px;line-height:1.6;display:flex;gap:8px;align-items:flex-start">
+        <span id="xhs-pause-icon" style="flex-shrink:0"></span>
+        <span id="xhs-pause-text"></span>
       </div>
       <div class="row" style="margin-top:8px">
         <b style="font-size:13px;white-space:nowrap">抓取词</b>
@@ -1257,8 +1265,17 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       <div class="muted" style="margin-top:4px">
         首次使用请先点「登录小红书」：会弹出浏览器，扫码登录后自动保存登录态。
         抓取词 = 上面输入框 + 自选股票名（可关），合并去重后每轮最多 12 个词
-        （自定义词在前，超出部分自选股名按名称排序补足）。小红书风控严，默认每 120 分钟一轮；
-        匹配到自选股的笔记会推进新闻流（source=xhs）供模拟盘舆情引用。
+        （自定义词在前，超出部分自选股名按名称排序补足）。
+        默认每 120 分钟一轮，并随机多等 0~30 分钟再抓 —— 固定准点抓取是风控识别的
+        脚本特征，抖动能显著降险。匹配到自选股的笔记会推进新闻流（source=xhs）
+        供模拟盘舆情引用。
+      </div>
+      <div class="muted" style="margin-top:6px;padding:6px 8px;background:#2a2118;border-radius:4px">
+        ⚠️ <b>触发风控会自动暂停抓取</b>：连续搜索无结果、或服务端返回限流/验证码时，
+        系统会立刻停止本轮及后续所有定时抓取，并在上方红色横幅提示。
+        <br>· <b>登录态失效</b>（🔑 黄色）：点「登录小红书」重新扫码，登录成功会自动恢复抓取。
+        <br>· <b>疑似风控</b>（⛔ 红色）：等待 30 分钟以上、<b>期间不要手动重试</b>
+        （再抓一次会把临时限流打成封号），恢复后点横幅上的「解除暂停」。
       </div>
     </div>
     <div class="card">
@@ -9206,6 +9223,7 @@ async function loadXhsStatus() {
       else if (r && r.warning) el.textContent += ' · ' + r.warning.slice(0, 60);
       $('xhs-fetch-btn').disabled = false;
     }
+    renderXhsPause(st);
     if (!st.browser_data_ready && st.mediacrawler_exists)
       el.textContent += ' · 首次使用请先「登录小红书」';
     // 「当前生效」预览：合并自选股名后的最终词表（与后端 resolve_keywords 同一份输出）
@@ -9217,6 +9235,54 @@ async function loadXhsStatus() {
         : '当前没有生效抓取词 —— 填「额外抓取词」或勾选「含自选股名」';
     }
   } catch { /* 忽略 */ }
+}
+/**
+ * 风控 / 登录失效两类暂停的 UI 分流。
+ * 两者都停抓，但用户下一步该干的事完全相反，所以横幅颜色、图标、
+ * 按钮文案都分开写 —— 用同一句「抓取已暂停」用户不知道该扫码还是该等。
+ */
+function renderXhsPause(st) {
+  const banner = $('xhs-pause-banner'), btn = $('xhs-resume-btn');
+  const icon = $('xhs-pause-icon'), text = $('xhs-pause-text');
+  if (!st.paused) {
+    banner.classList.add('hide');
+    btn.classList.add('hide');
+    $('xhs-fetch-btn').classList.remove('hide');
+    return;
+  }
+  const isRisk = st.pause_kind === 'risk';
+  banner.classList.remove('hide');
+  banner.style.background = isRisk ? '#3a1d1d' : '#3a3320';
+  banner.style.border = '1px solid ' + (isRisk ? '#8a3a3a' : '#8a7a3a');
+  banner.style.color = isRisk ? '#ffb4b4' : '#ffe9a8';
+  icon.textContent = isRisk ? '⛔' : '🔑';
+  const since = st.pause_since ? st.pause_since.replace('T', ' ') : '';
+  if (isRisk) {
+    text.innerHTML = `<b>已触发小红书风控，抓取已自动暂停</b>（${since && '自 ' + since + ' 起'}）`
+      + `<br>${st.pause_reason || ''}`
+      + `<br>处置：<b>等待 30 分钟以上</b>，期间请勿手动重试（再抓会把临时限流打成封号）。`
+      + `冷却后点右下「解除暂停」恢复定时抓取。`;
+    btn.textContent = '解除暂停（确认已冷却）';
+  } else {
+    text.innerHTML = `<b>小红书登录态已失效，抓取已自动暂停</b>（${since && '自 ' + since + ' 起'}）`
+      + `<br>${st.pause_reason || ''}`
+      + `<br>处置：点上方「登录小红书」重新扫码，<b>登录成功后抓取会自动恢复</b>；`
+      + `若已扫码可点右下按钮强制解除。`;
+    btn.textContent = '解除暂停';
+  }
+  btn.classList.remove('hide');
+}
+async function resumeXhsFetch() {
+  const btn = $('xhs-resume-btn');
+  btn.disabled = true;
+  try {
+    await api('/api/xhs/resume', { method: 'POST' });
+    toastOk('已解除暂停，下一轮定时抓取将照常进行');
+    loadXhsStatus();
+  } catch (e) {
+    // 409 = 登录态还没恢复：让用户先去扫码，而不是反复点同一个按钮
+    toastErr(e.message + '（登录态未恢复，请先完成扫码登录）');
+  } finally { btn.disabled = false; }
 }
 /** 读 xhs.keywords / xhs.use_watchlist 原始值（走通用配置接口，写入口只有一个）。 */
 async function loadXhsKwCfg() {

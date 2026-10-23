@@ -12,6 +12,7 @@
 
 import json
 import os
+import random              # xhs 抓取间隔抖动用（固定周期是风控的脚本特征）
 import re
 import sys
 import threading
@@ -8973,9 +8974,14 @@ def xhs_mark_read(body: XhsReadIn):
 
 @app.post("/api/xhs/fetch")
 def xhs_fetch():
-    """线程触发一次完整抓取（关键词 → MediaCrawler 搜索 → 入库 → 推 sa_news）。"""
+    """线程触发一次完整抓取（关键词 → mcp 搜索 → 入库 → 推 sa_news）。"""
     if _xhs_state_flag():
         raise HTTPException(409, "已有抓取任务在运行")
+    # 风控/登录失效暂停期间，手动抓取也挡住：用户多半没看到提示就点了重试，
+    # 而风控时再抓一次等于亲手把限流夯成封号
+    paused = xhs_watch.get_pause()
+    if paused["active"]:
+        raise HTTPException(409, xhs_watch._pause_message(paused))
 
     def _run():
         try:
@@ -9007,20 +9013,39 @@ def xhs_login_state():
 
 @app.post("/api/xhs/login")
 def xhs_login():
-    """弹出浏览器扫码登录小红书（阻塞请求直到流程结束，前端提示用户扫码）。"""
-    if _xhs_state_flag():
-        raise HTTPException(409, "已有抓取/登录任务在运行")
-    try:
-        result = xhs_watch.login_xhs()
-        return {"ok": result.get("ok", False),
-                "message": "登录成功" if result.get("ok") else "未检测到登录态，请重试并完成扫码"}
-    except Exception as exc:
-        raise HTTPException(500, f"登录失败：{exc}")
+    """弹出浏览器扫码登录小红书（阻塞请求直到流程结束，前端提示用户扫码）。
+
+    不再因「已有抓取/登录任务在运行」拒绝：登录是登录态失效时唯一的恢复通道，
+    焊死它 = 用户彻底卡死。内部 request_login_qr 会回收残留轮询。
+    """
+    result = xhs_watch.login_xhs()
+    if result.get("already_logged_in"):
+        return {"ok": True, "message": "已处于登录状态"}
+    if not result.get("ok"):
+        raise HTTPException(409, result.get("error", "登录失败，请重试"))
+    return {"ok": True, "message": "登录成功"}
 
 
 @app.get("/api/xhs/status")
 def xhs_status():
     return xhs_watch.get_status()
+
+
+@app.post("/api/xhs/resume")
+def xhs_resume():
+    """解除暂停（风控冷却够了 / 扫码重新登录后调用）。
+
+    默认会先探一次登录态：不把用户当成年人，不在登录态没恢复时放行。
+    force=true 跳过该检查，仅供确认过登录态正常的场景使用。
+    """
+    paused = xhs_watch.get_pause()
+    if not paused["active"]:
+        return {"ok": True, "message": "当前未处于暂停状态"}
+    result = xhs_watch.resume_fetch(verify_login=True)
+    if not result.get("ok"):
+        # 登录态还没恢复 —— 409 + 明确原因，前端据此提示"先去扫码"
+        raise HTTPException(409, result.get("error", "无法解除暂停"))
+    return {"ok": True, "message": "已解除暂停，下一轮定时抓取将照常进行"}
 
 
 @app.get("/api/xhs/digest")
@@ -9035,18 +9060,38 @@ def _xhs_state_flag() -> bool:
 
 
 def _xhs_auto_loop():
-    """按 config.yaml xhs.interval_minutes 周期搜小红书笔记+评论；0 = 关闭。"""
+    """按 config.yaml xhs.interval_minutes + 随机抖动周期搜小红书笔记+评论；0 = 关闭。
+
+    ⚠️ 必须加抖动：固定 120 分钟准点抓，在服务端看就是「脚本」特征，
+    风控模型对这种规律性请求特别敏感。实际间隔 = interval + U(0, jitter)。
+    jitter 默认 25% 间隔（120 分钟 → 多等 0~30 分钟），可由配置调。
+    """
     while True:
         try:
             conf = xhs_watch.load_xhs_conf()
             interval = int(conf.get("interval_minutes", 120)) if conf.get("enabled", True) else 0
-            if interval and not xhs_watch.get_status()["fetching"]:
+            paused = xhs_watch.get_pause()
+            if paused["active"]:
+                # 暂停期间整轮跳过：风控时继续抓会把临时限流夯成封号，
+                # 登录失效时也只会拿空结果白跑 12 个词、还拖慢别的采集
+                print(f"[xhs_auto] 暂停中（{paused['kind']}），本轮跳过：{paused['reason']}", flush=True)
+            elif interval and not xhs_watch.get_status()["fetching"]:
                 try:
                     result = xhs_watch.fetch_xhs()
                     xhs_watch._state["last_result"] = result
                 except Exception as exc:
                     xhs_watch._state["last_result"] = {"error": str(exc)}
-            time.sleep(max(interval or 60, 1) * 60)
+            if interval:
+                # 抖动只加正偏移不减：减偏移会让两轮贴太近，反而像高频重试
+                jitter_ratio = float(conf.get("interval_jitter_ratio", 0.25))
+                jitter_ratio = min(max(jitter_ratio, 0.0), 1.0)
+                jitter_sec = random.uniform(0, interval * 60 * jitter_ratio)
+                wait_sec = interval * 60 + jitter_sec
+                print(f"[xhs_auto] 下一轮 {wait_sec / 60:.0f} 分钟后"
+                      f"（间隔 {interval} 分钟 + 抖动 {jitter_sec / 60:.0f} 分钟）", flush=True)
+                time.sleep(wait_sec)
+            else:
+                time.sleep(60)
         except Exception:
             time.sleep(300)  # 配置读取失败等异常，5 分钟后重试
 
