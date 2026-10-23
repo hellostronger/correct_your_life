@@ -1702,10 +1702,15 @@ NoneType.__format__`，成果**全部丢失**。真因是 `f"{r.get('price'):.2f
 
 - **本机有代理干扰**，必须设 `NO_PROXY=*` / `no_proxy=*`（`app.py:31` 就是为此）。
   不设的话 pip 和部分数据源会报 `ProxyError` / `Cannot connect to proxy`。
-- ⚠️ **Git/GitHub 是例外**（2026-10-20 实测）：`git config https.proxy` =
-  `http://127.0.0.1:6478`，**直接 push/fetch 必须走它**；加 `NO_PROXY=*` 反而
-  **直连 443 超时**（21s `Couldn't connect`）。代理走 `curl -x http://127.0.0.1:6478
+- ⚠️ **Git/GitHub 是例外**（2026-10-20 实测）：**直接 push/fetch 必须走
+  `http://127.0.0.1:6478`**；加 `NO_PROXY=*` 反而**直连 443 超时**（21s
+  `Couldn't connect`）。代理走 `curl -x http://127.0.0.1:6478
   https://github.com` 实测 200/1.3s。**别再照抄「git fetch 要设 NO_PROXY=*」那条**。
+  ⚠️ **更正（2026-10-23）**：代理**并不在 git 配置里** ——
+  `git config --show-origin --get-regexp proxy` 为空（repo/global/system 都没有），
+  原记的「`git config https.proxy` = …」不成立。**按次传**：
+  `git -c http.proxy=http://127.0.0.1:6478 -c https.proxy=http://127.0.0.1:6478 push origin main`
+  （实测 `52bffbd..48b733b` 推送成功；`-c` 不落盘，也不会改用户 git 配置）。
 - 本机直连出口：**`59.34.155.130`**（2026-10-03 实测更正；AGENTS.md 原记的
   `121.32.254.148` 已失效，疑似运营商动态分配）。**每次做「换 IP 是否影响限流」
   这类实验前先实测出口**，别用文档里的旧值。无系统代理、无 VPN
