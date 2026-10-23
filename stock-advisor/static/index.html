@@ -665,6 +665,32 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       </div>
     </div>
 
+    <!-- 汇率盯盘（新浪外汇，2026-10-22 加）-->
+    <div class="card" style="margin-top:14px">
+      <div class="row" style="justify-content:space-between">
+        <b style="font-size:13px">💱 汇率（新浪外汇）
+          <span class="muted" style="font-weight:normal">在岸/离岸人民币、日元、欧元、港币、英镑</span></b>
+        <span class="row">
+          <span class="muted" id="fx-meta" style="font-size:12px"></span>
+          <button class="btn ghost" style="font-size:12px" onclick="jsonPost('/api/fx/refresh').then(loadFx)">强制刷新</button>
+        </span>
+      </div>
+      <div class="empty" id="fx-empty" style="margin-top:8px">加载中...</div>
+      <div style="overflow-x:auto" id="fx-wrap">
+        <table style="margin-top:6px">
+          <thead><tr>
+            <th>货币对</th><th>名称</th><th>最新价</th><th>涨跌幅</th><th>买价</th><th>卖价</th><th>昨收</th><th>报价时间</th>
+          </tr></thead>
+          <tbody id="fx-body"></tbody>
+        </table>
+      </div>
+      <div class="hint" style="font-size:12px;margin-top:6px">
+        汇率用新浪 <b>hq.sinajs.cn</b> 批量报价，<b>时间列是真实报价时间</b>（不是抓取时间）。
+        只作宏观背景：汇率影响进出口成本、外币负债与资金流，不是个股买卖的直接触发条件。
+        期货与汇率都会注入模拟盘决策上下文（开关见「⚙️ 调度 → 模拟交易」）。
+      </div>
+    </div>
+
     <!-- 全球国债收益率（美/中/日/德/英/韩 10Y；日德英韩为 OECD 月频，2026-10-17 加）-->
     <div class="card" style="margin-top:14px">
       <div class="row" style="justify-content:space-between">
@@ -1292,6 +1318,24 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
   <section id="tab-mp" class="hide">
     <div class="card">
       <div class="card-head">
+        <b>📤 文章导出</b>
+        <div class="row tight">
+          <label class="muted" title="勾选后批量导出"><input type="checkbox" class="mp-sel-all" onchange="mpToggleAll(this.checked)"> 全选</label>
+          <span class="muted mp-sel-info" style="font-size:12px">未选 · 勾选后可导出</span>
+          <button class="btn sm" data-mp-export="md" onclick="mpExportMd()"
+                  title="导出为 Markdown（多篇打包 zip）。正文为空的会先回原文重抓，仍取不到则跳过">⬇ 导出 MD</button>
+          <button class="btn ghost sm" data-mp-export="pdf" onclick="mpExportPdf()"
+                  title="打开可打印页面，在浏览器里选「另存为 PDF」。正文为空的会先回原文重抓">🖨 导出 PDF</button>
+        </div>
+      </div>
+      <div class="hint">
+        <b>全选</b>选中「📄 最新文章」当前列表的全部文章，也可以滚到下方逐篇勾选。
+        MD 多篇打包成 zip；PDF 打开可打印页面，用浏览器「另存为 PDF」。
+        正文为空的会先回原文重抓，仍取不到则跳过该篇，不影响其余导出。
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head">
         <b>📰 订阅源</b>
         <div class="row tight">
           <span class="muted" id="mp-status"></span>
@@ -1334,11 +1378,11 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       <div class="card-head">
         <b>📄 最新文章</b>
         <div class="row tight">
-          <label class="muted" title="勾选后批量导出"><input type="checkbox" id="mp-sel-all" onchange="mpToggleAll(this.checked)"> 全选</label>
-          <span class="muted" id="mp-sel-info" style="font-size:12px">未选</span>
-          <button class="btn ghost sm" id="mp-export-md-btn" onclick="mpExportMd()"
+          <label class="muted" title="勾选后批量导出"><input type="checkbox" class="mp-sel-all" onchange="mpToggleAll(this.checked)"> 全选</label>
+          <span class="muted mp-sel-info" style="font-size:12px">未选 · 勾选后可导出</span>
+          <button class="btn sm" data-mp-export="md" onclick="mpExportMd()"
                   title="导出为 Markdown（多篇打包 zip）。正文为空的会先回原文重抓，仍取不到则跳过">⬇ 导出 MD</button>
-          <button class="btn ghost sm" id="mp-export-pdf-btn" onclick="mpExportPdf()"
+          <button class="btn ghost sm" data-mp-export="pdf" onclick="mpExportPdf()"
                   title="打开可打印页面，在浏览器里选「另存为 PDF」。正文为空的会先回原文重抓">🖨 导出 PDF</button>
           <label class="muted"><input type="checkbox" id="mp-unread-only" onchange="loadMpArticles()"> 只看未读</label>
           <button class="btn ghost sm" onclick="markAllMpRead()">全部已读</button>
@@ -2042,7 +2086,8 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       <div class="table-scroll" style="margin-top:8px" id="t-log-codes-wrap">
         <table>
           <thead><tr>
-            <th>代码</th><th>名称</th><th>判定次数</th><th>高抛/接回/不做</th>
+            <th>代码</th><th>名称</th><th>判定次数</th>
+            <th title="前两段＝高抛/接回；后四段＝趋势减仓/止损/深亏提示/不做">高抛/接回 · 趋势减/止损/提示/不做</th>
             <th>最近判定</th><th>最近动作</th><th>现价</th><th>最近偏离%</th>
             <th>门槛%</th><th>最近原因</th><th>时间线</th>
           </tr></thead>
@@ -3948,7 +3993,7 @@ const TAB_LOADERS = {
   //   所以这里只做**零成本的**状态探测（探 101 的 /health，约 15ms），
   //   把「有 N 只港股可查」显示出来，让人自己点「查我的港股」。
   //   —— 之前我漏了这个注册，页面永远停在初始的「加载中…」。
-  market:    () => { loadWatch(); loadAlerts(); loadCrypto(); loadDiscover(); loadFutures(); loadMacroGlobal(); loadEtfFlows(); loadHKSupplyStatus(); },
+  market:    () => { loadWatch(); loadAlerts(); loadCrypto(); loadDiscover(); loadFutures(); loadFx(); loadMacroGlobal(); loadEtfFlows(); loadHKSupplyStatus(); },
   sector:    () => { loadSector(); loadIntraday(); startIntradayAuto(); },
   holdings:  () => { loadHoldings(); refreshTradeStrategyOptions(); },
   strategies:() => { loadStrategies(); refreshTradeStrategyOptions(); },
@@ -6727,10 +6772,17 @@ const T_BIAS = {
   flat:  { t: '❔ 不明', c: 'b-warn', d: '方向判不出 → 什么都不做' },
 };
 const T_ACT = {
-  t_sell: { t: '⬆ 高抛（先卖）', c: 'b-warn' },
-  t_buy:  { t: '⬇ 低吸（买回）', c: 'b-info' },
-  hold:   { t: '— 不做',        c: 'b-mute' },
+  t_sell:       { t: '⬆ 高抛（先卖）', c: 'b-warn' },
+  t_buy:        { t: '⬇ 低吸（买回）', c: 'b-info' },
+  hard_stop:    { t: '🛑 止损（卖可卖）', c: 'b-bad' },
+  trend_reduce: { t: '📉 趋势减仓',     c: 'b-warn' },
+  trend_wait:   { t: '⏳ 深亏提示',     c: 'b-mute' },
+  hold:         { t: '— 不做',          c: 'b-mute' },
 };
+// 「有操作」的判定必须与后端 `t_trading.ACT_ACTIONS` 同集合 —— 少了
+// hard_stop/trend_reduce 会让趋势建议被判成「没有操作」，而它恰恰是**要你
+// 手动卖出**的建议；trend_wait 只是提示，不算操作。
+const T_ACT_KEYS = ['t_sell', 't_buy', 'hard_stop', 'trend_reduce'];
 
 async function loadTDesk() {
   $('t-paper-body').innerHTML = skeletonBox(2);
@@ -6751,9 +6803,9 @@ function _tTicketHtml(tk, it) {
   if (!tk) return '';
   const nb = tk.status === 'blocked'
     ? `<div class="t-ticket-blocked">
-         <div><b>不做</b> · ${esc(tk.blocked_reason || '不满足做T条件')}</div>
+         <div><b>不做</b> · ${esc(tk.blocked_reason || tk.warn || '不满足做T条件')}</div>
          ${tk.blocked_hint ? `<div class="muted">${esc(tk.blocked_hint)}</div>` : ''}
-         ${tk.trigger_price != null
+         ${tk.trigger_price != null && tk.threshold_pct != null
             ? `<div>触发价 <b>${tPx(tk.trigger_price)}</b>
                  <span class="muted">（需 ${tPct4(tk.threshold_pct)} ＝ 往返成本
                  ${tPct4(tk.cost_pct)} × ${tk.safety_mult}）</span></div>` : ''}
@@ -6772,6 +6824,22 @@ function _tTicketHtml(tk, it) {
       </div>
       <div class="muted"><b>接回后</b>：机动仓恢复满仓，此后按同一套门槛判断下一次高抛。
         若此时均线空头且未止跌，接回会被拦下</div>
+    </div>`;
+  }
+  // 趋势减仓/止损是**单向卖出单**（`legs='sell_only'`，没有 buy_back）。
+  // 必须排在 ready 双腿模板之前：那条模板会写「第2腿 · 买回」，
+  // 照着做等于把刚减的仓位接回来 —— 与「趋势走坏先降仓位」完全相反。
+  if (tk.legs === 'sell_only' && tk.status === 'ready') {
+    const s = tk.sell || {};
+    const isStop = tk.action === 'hard_stop';
+    return `<div class="t-ticket">
+      <div class="t-leg">
+        <div class="t-leg-t">${isStop ? '止损 · 卖出' : '减仓 · 卖出'}<span class="muted">（单向，不买回）</span></div>
+        <div class="t-leg-p">${tPx(s.price)} <span class="muted">×</span> ${tInt(s.shares)} 股</div>
+        <div class="muted">到手约 ${tInt(s.net_cash)} 元（已扣卖出费 ${tNum(s.fee)}）</div>
+      </div>
+      <div class="muted"><b>这不是做T</b>：降的是<b>总仓位</b>，卖完不接回。</div>
+      ${tk.warn ? `<div class="t-warn">⚠️ ${esc(tk.warn)}</div>` : ''}
     </div>`;
   }
   if (tk.status === 'ready') {
@@ -6809,7 +6877,8 @@ async function loadTAdvisory() {
   try {
     const r = await api('/api/t/advisory');
     _T.adv = r.items || [];
-    const n = _T.adv.filter(i => i.action === 't_sell' || i.action === 't_buy').length;
+    const n = _T.adv.filter(i => i && T_ACT_KEYS.includes(i.action)
+                                && Number(i.shares_suggest) > 0).length;
     const m = $('t-adv-meta');
     if (m) m.textContent = `${_T.adv.length} 只持仓 · ${n} 只有操作`;
     const badge = $('t-tab-badge');
@@ -6832,6 +6901,25 @@ async function loadTAdvisory() {
   }
 }
 
+/** 趋势规则一句话摘要（回放结果的只读展示）。字段全走兜底，缺一个不影响整行。 */
+function _tTrendLine(tr) {
+  if (!tr) return '';
+  if (!tr.enabled) return '未启用';
+  const out = [];
+  if (tr.close != null) out.push(`收盘 ${tPx(tr.close)}`);
+  if (tr.ma20 != null) out.push(`MA20 ${tPx(tr.ma20)}`);
+  if (tr.ma60 != null) out.push(`MA60 ${tPx(tr.ma60)}`);
+  if (tr.streak != null) out.push(`跌破连续 ${tInt(tr.streak)} 日（需 ${tInt(tr.confirm_days)}）`);
+  if (tr.fires != null) out.push(`已触发 ${tInt(tr.fires)}/${tInt(tr.max_reductions)} 次`);
+  if (tr.last_fire_date) out.push(`上次信号 ${esc(tr.last_fire_date)}`);
+  if (tr.hard_stop_price != null) out.push(`止损线 ${tPx(tr.hard_stop_price)}`);
+  if (tr.synthetic_today) out.push('含盘中实时价');
+  return out.join(' · ') || '—';
+}
+
+/** 趋势动作是**单向减仓**，不是一次做T往返 —— 不能弹「记一次做T」。 */
+const tIsTrend = a => a === 'hard_stop' || a === 'trend_reduce' || a === 'trend_wait';
+
 function renderTAdv() {
   const tb = $('t-adv-body'), em = $('t-adv-empty');
   if (!tb) return;
@@ -6842,14 +6930,15 @@ function renderTAdv() {
   const src = _T.adv.filter(i => i && typeof i === 'object');
   const rows = src.filter(i =>
     f === 'all' ? true :
-    f === 'act' ? (i.action === 't_sell' || i.action === 't_buy') :
+    f === 'act' ? (T_ACT_KEYS.includes(i.action)
+                   && Number(i.shares_suggest) > 0) :
     f === 'pending' ? !!i.pending : i.bias === f);
   if (!rows.length) {
     tb.innerHTML = '';
     if (em) {
       em.classList.remove('hide');
       em.textContent = f === 'act'
-        ? (src.length ? `当前没有达到门槛的标的 —— 这通常是对的：做T只在价差足够覆盖成本时才做。另有 ${src.length} 只不做的，原因见下方「🗂 做T判断记录」或筛选「全部」`
+        ? (src.length ? `当前没有达到门槛的标的 —— 这通常是对的：做T只在价差足够覆盖成本时才做，趋势减仓也只在跌破 MA20、且 MA20<MA60 并经确认后才提示。另有 ${src.length} 只不做的，原因见下方「🗂 做T判断记录」或筛选「全部」`
                       : '实盘没有持仓（持仓来自「我的持仓」流水）')
         : '这个筛选下没有标的';
     }
@@ -6862,9 +6951,13 @@ function renderTAdv() {
     // ⚠️ 这张表里凡是**价格**（现价/成本/锚价/触发位/VWAP）一律 tPx（4 位）。
     //    曾用 tNum() 默认 2 位 -> 1.515 显示成 1.52，用户照着挂单挂在错位置。
     //    百分比（门槛/浮盈）另走 tPct/tPct4，别混用 —— 价格和百分比的精度要求不同。
+    // 趋势行的「触发位」是**信号那一根 K 线的收盘价**（回放出来的），
+    // 不是当前价 —— 显示当前价会让人以为「现在就该按这个价挂单」。
     const trig = i.trigger_price != null ? tPx(i.trigger_price)
-               : (i.action === 't_buy' && i.anchor_price
-                  ? tPx(i.anchor_price * (1 - Number(i.threshold || 0) / 100)) : '—');
+               : (i.trend && i.trend.last_fire_price != null
+                  ? tPx(i.trend.last_fire_price)
+                  : (i.action === 't_buy' && i.anchor_price
+                     ? tPx(i.anchor_price * (1 - Number(i.threshold || 0) / 100)) : '—'));
     return `<tr data-trow="${esc(i.code || '')}">
       <td class="mono">${esc(i.code || '')}</td>
       <td>${esc(i.name || '')}</td>
@@ -6884,6 +6977,8 @@ function renderTAdv() {
     </tr>
     <tr data-tdetail="${esc(i.code || '')}"><td colspan="13" style="padding:0 8px 8px">
       <div style="font-size:12px;line-height:1.65">
+        ${i.trend ? `<div><b>趋势规则</b> ${_tTrendLine(i.trend)}</div>` : ''}
+        ${i.override_note ? `<div class="t-warn">⚠️ ${esc(i.override_note)}</div>` : ''}
         <div><b>依据</b> ${esc(i.why || '—')}</div>
         <div><b>方向</b> ${esc(i.bias_why || '—')}</div>
         <div style="color:var(--text-2)"><b>失效条件</b>（出现即说明这个方向错了，应重新评估）${esc(i.invalidate || '—')}</div>
@@ -6895,10 +6990,10 @@ function renderTAdv() {
         <span class="muted">${esc(i.direction_check.note || '')}</span>` : ''}</div>
       </div>
       ${_tTicketHtml(i.ticket, i)}
-      <div style="margin-top:3px">
+      ${tIsTrend(i.action) ? '' : `<div style="margin-top:3px">
         <button class="btn ghost" style="font-size:11px;padding:3px 7px"
           onclick="openTRecord('${esc(i.code || '')}','${i.action === 't_buy' ? 'buy' : 'sell'}')">✍️ 记一次做T</button>
-      </div>
+      </div>`}
     </td></tr>`;
   }).join('');
 }
@@ -6961,7 +7056,8 @@ function renderTLog() {
         onclick="tLogOpenHist('${_tAttr(c.code || '')}')">${esc(c.code || '')}</a></td>
       <td>${esc(c.name || '')}</td>
       <td class="num">${tInt(c.total)}</td>
-      <td class="num">${tInt(c.t_sell)} / ${tInt(c.t_buy)} / ${tInt(c.hold)}</td>
+      <td class="num" title="高抛/${tInt(c.t_sell)} 接回/${tInt(c.t_buy)} · 趋势减仓/${tInt(c.trend_reduce)} 止损/${tInt(c.hard_stop)} 深亏提示/${tInt(c.trend_wait)} 不做/${tInt(c.hold)}"
+        >${tInt(c.t_sell)}/${tInt(c.t_buy)} · ${tInt(c.trend_reduce)}/${tInt(c.hard_stop)}/${tInt(c.trend_wait)}/${tInt(c.hold)}</td>
       <td class="muted" style="font-size:12px">${esc(String(c.last_created_at || '').replace('T', ' ').slice(5, 16))}</td>
       <td><span class="badge ${a.c}">${a.t}</span> <span class="badge ${b.c}">${b.t}</span></td>
       <td class="num">${tPx(c.last_price)}</td>
@@ -7624,6 +7720,16 @@ async function genReport(kind) {
 // ---- 币圈 24h 趋势参考（gate.io 股票永续）+ 币↔股 关联统计 ----
 let _cryptoLinks = {};   // contract -> {stock_code,label,quote,stats}
 
+// ISO 时间串 → 本地时区 'YYYY-MM-DD HH:mm'。⚠️ 直接 slice(0,16) 拿的是 UTC 墙钟，
+// 对 UTC+8 会整整偏早 8 小时（公众号/模拟盘流水都踩过这个坑）。
+function fmtLocalTs(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  if (isNaN(d)) return String(ts);
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 async function loadFutures() {
   try {
     const d = await api('/api/futures/quotes');
@@ -7637,10 +7743,31 @@ async function loadFutures() {
       <td class="muted num">${fmtPx(i.high)}</td>
       <td class="muted num">${fmtPx(i.low)}</td>
       <td class="muted num">${i.vol != null ? Number(i.vol).toFixed(0) : '—'}</td>
-      <td class="muted">${i.ts ? i.ts.replace('T',' ').slice(0,16) : ''}</td>
+      <td class="muted">${esc(fmtLocalTs(i.ts))}</td>
     </tr>`).join('');
-    $('futures-meta').textContent = d.updated_at ? '更新于 ' + d.updated_at.replace('T', ' ') : '';
+    $('futures-meta').textContent = d.updated_at ? '更新于 ' + fmtLocalTs(d.updated_at) : '';
   } catch (e) { $('futures-meta').textContent = '加载失败: ' + e.message; }
+}
+
+// ---- 汇率（新浪外汇，2026-10-22 加）----
+async function loadFx() {
+  try {
+    const d = await api('/api/fx/quotes');
+    const items = d.items || [];
+    $('fx-empty').classList.toggle('hide', items.length > 0);
+    if (!items.length) $('fx-empty').textContent = '暂无汇率数据，点「强制刷新」拉取';
+    $('fx-body').innerHTML = items.map(i => `<tr>
+      <td><b>${esc(i.pair)}</b></td>
+      <td class="muted">${esc(i.name)}</td>
+      <td class="num">${fmtPx(i.last)}</td>
+      <td class="${cls(i.change_pct)}">${i.change_pct != null ? (i.change_pct>0?'+':'')+Number(i.change_pct).toFixed(3)+'%' : '—'}</td>
+      <td class="muted num">${fmtPx(i.bid)}</td>
+      <td class="muted num">${fmtPx(i.ask)}</td>
+      <td class="muted num">${fmtPx(i.prev_close)}</td>
+      <td class="muted">${esc(fmtLocalTs(i.ts))}</td>
+    </tr>`).join('');
+    $('fx-meta').textContent = d.updated_at ? '更新于 ' + fmtLocalTs(d.updated_at) : '';
+  } catch (e) { $('fx-meta').textContent = '加载失败: ' + e.message; }
 }
 
 // ---- 全球国债收益率（FRED；日/德/英/韩为 OECD 月频，行内标滞后天数）----
@@ -8247,13 +8374,18 @@ function mpToggleAll(on) {
 }
 function mpUpdateSelInfo() {
   const n = _mpSel.size, total = _mpItems.length;
-  const info = $('mp-sel-info');
-  if (info) info.textContent = n ? `已选 ${n} 篇` : (total ? '未选' : '');
-  const all = $('mp-sel-all');
-  if (all) { all.checked = total > 0 && n === total; all.indeterminate = n > 0 && n < total; }
-  ['mp-export-md-btn', 'mp-export-pdf-btn'].forEach(id => {
-    const b = $(id); if (b) b.disabled = n === 0;
+  const text = n ? `已选 ${n} 篇` : (total ? '未选 · 勾选后可导出' : '');
+  // 顶部和列表里各有一组导出控件，同步到所有副本。
+  // 按钮不随「未选」置灰：置灰后透明度 50%，用户会以为页面上根本没这两个按钮。
+  // 未勾选时点击由 mpExportMd/mpExportPdf 里的 toast 提示。
+  document.querySelectorAll('#tab-mp .mp-sel-info').forEach(el => { el.textContent = text; });
+  document.querySelectorAll('#tab-mp .mp-sel-all').forEach(cb => {
+    cb.checked = total > 0 && n === total;
+    cb.indeterminate = n > 0 && n < total;
   });
+}
+function _mpExportBtns(kind) {
+  return Array.from(document.querySelectorAll(`#tab-mp [data-mp-export="${kind}"]`));
 }
 function _mpFilename(res, fallback) {
   const cd = res.headers.get('Content-Disposition') || '';
@@ -8274,10 +8406,9 @@ function saveBlob(blob, filename) {
 }
 async function mpExportMd() {
   const ids = Array.from(_mpSel);
-  if (!ids.length) { toast('请先勾选要导出的文章'); return; }
-  const btn = $('mp-export-md-btn');
-  const old = btn ? btn.textContent : '';
-  if (btn) { btn.disabled = true; btn.textContent = '导出中…'; }
+  if (!ids.length) { toast('请先勾选要导出的文章（文章左侧的复选框，或顶部「全选」）'); return; }
+  const btns = _mpExportBtns('md').map(b => ({ b, text: b.textContent }));
+  btns.forEach(({ b }) => { b.disabled = true; b.textContent = '导出中…'; });
   try {
     const res = await fetch('/api/mp/export/md', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -8303,13 +8434,13 @@ async function mpExportMd() {
   } catch (e) {
     toastErr('导出失败: ' + e.message);
   } finally {
-    if (btn) btn.textContent = old;
+    btns.forEach(({ b, text }) => { b.textContent = text; b.disabled = false; });
     mpUpdateSelInfo();
   }
 }
 async function mpExportPdf() {
   const ids = Array.from(_mpSel);
-  if (!ids.length) { toast('请先勾选要导出的文章'); return; }
+  if (!ids.length) { toast('请先勾选要导出的文章（文章左侧的复选框，或顶部「全选」）'); return; }
   // 必须同步 window.open：等 fetch 回来再开会立刻被弹窗拦截。
   const win = window.open('', '_blank');
   if (!win) { toastErr('浏览器拦截了新窗口，请允许本站弹窗后重试'); return; }
@@ -8319,9 +8450,8 @@ async function mpExportPdf() {
     + '<p style="color:#888;font-size:13px">正文为空的文章会先回原文重抓，可能需要几十秒；'
     + '准备好后会自动弹出打印框。</p></body></html>');
   win.document.close();
-  const btn = $('mp-export-pdf-btn');
-  const old = btn ? btn.textContent : '';
-  if (btn) { btn.disabled = true; btn.textContent = '准备中…'; }
+  const btns = _mpExportBtns('pdf').map(b => ({ b, text: b.textContent }));
+  btns.forEach(({ b }) => { b.disabled = true; b.textContent = '准备中…'; });
   try {
     const res = await fetch('/api/mp/export/print?ids=' + ids.join(','));
     if (!res.ok) {
@@ -8343,7 +8473,7 @@ async function mpExportPdf() {
     }
     toastErr('导出失败: ' + e.message);
   } finally {
-    if (btn) btn.textContent = old;
+    btns.forEach(({ b, text }) => { b.textContent = text; b.disabled = false; });
     mpUpdateSelInfo();
   }
 }

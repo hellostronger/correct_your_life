@@ -64,6 +64,7 @@ import cost_estimate
 import crypto_watch
 import etf_flows
 import futures_watch
+import fx_watch
 import holiday_calendar
 import ilink_client
 import ipo_calendar
@@ -879,10 +880,12 @@ def _migrate_json_if_any():
 
 app = FastAPI(title="Stock Advisor", version="0.2.0")
 
-# ---------------- 免费行情接口（无需 key，零成本） ----------------
-# 腾讯行情接口（qt.gtimg.cn）：稳定、无鉴权，字段顺序固定
-TENCENT_QUOTE_URL = "https://qt.gtimg.cn/q="
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+# ---------------- 行情（全部经 101 data_service，本机不直连任何行情源） ----------------
+# 2026-10-22 用户裁决：本机对东财 push2his 的 HTTPS 被重置、腾讯旧 fqkline 全 501，
+# 而 101 直连同样的源正常。所以行情 / 日K / 分时 / 汇率 / 美股统一由 101 的
+# /quote /kline /intraday 代理，本机只做 HTTP 客户端。
+# ⚠️ 刻意**不保留任何本地兜底** —— 有兜底就会在 101 故障时悄悄走另一条路，
+# 两条路的字段口径不同，反而更难发现问题。
 
 
 def _market_of(code: str) -> str:
@@ -899,171 +902,40 @@ def _tx_symbol(code: str) -> str:
     return f"sz{code}"                      # A股深市
 
 
-def _fmt_quote_time(raw: str):
-    """行情快照时间归一化：支持 YYYYMMDDHHMMSS（A股）与 YYYY/MM/DD HH:MM:SS（港股）。"""
-    if not raw:
-        return None
-    if re.fullmatch(r"\d{14}", raw):
-        return f"{raw[:4]}-{raw[4:6]}-{raw[6:8]} {raw[8:10]}:{raw[10:12]}:{raw[12:14]}"
-    if "/" in raw and ":" in raw:  # 港股格式 2026/09/04 16:08:05
-        date_part, _, time_part = raw.partition(" ")
-        y, m, d = date_part.split("/")
-        return f"{y}-{m}-{d} {time_part}"
-    return None
+def _svc_get(path: str, params: dict, timeout: int = 60) -> dict:
+    """101 data_service 的唯一出口（地址解析与 trust_env=False 都在 market_data）。"""
+    import market_data
+    return market_data.service_get(path, params, timeout)
 
 
 def fetch_quotes(codes: list[str]) -> dict[str, dict]:
-    """批量抓取实时行情快照。失败时返回的条目带 error 字段。
+    """批量抓取实时行情快照（经 101 `/quote`）。失败条目带 error 字段。
 
-    A股走腾讯 qt.gtimg.cn（实测 0 延迟）；港股走新浪 rt_hk 接口 —— 腾讯对港股
-    是 15 分钟延迟数据（2026-09-08 实测 quote_time 恒落后本机 ~900s，而 A股同
-    接口 0 延迟），新浪 rt_hk 实测 0 延迟。两个市场分开请求后合并。
-
-    腾讯响应形如 v_sh600519="1~贵州茅台~600519~1330.00~1298.88~...~"；
-    新浪 rt_hk 响应形如 var hq_str_rt_hk00700="TENCENT,腾讯控股,437.0,438.4,..."。
+    市场分流在 101 侧完成（A股腾讯 / 港股新浪 / 港股市值补腾讯），本机不再
+    区分市场、不缓存市值。返回条目字段与旧实现逐一对应。
     """
     result: dict[str, dict] = {}
     if not codes:
         return result
-    hk_codes = [c for c in codes if _market_of(c) == "hk"]
-    a_codes = [c for c in codes if _market_of(c) != "hk"]
-    if a_codes:
-        result.update(_fetch_quotes_tencent(a_codes))
-    if hk_codes:
-        result.update(_fetch_quotes_sina_hk(hk_codes))
-        _fill_hk_market_cap(result)
-    # 保证顺序与请求一致，未返回的补占位
+    syms = {c: _tx_symbol(c) for c in codes}
+    try:
+        payload = _svc_get(
+            "/quote", {"symbols": ",".join(dict.fromkeys(syms.values()))},
+            timeout=30)
+        got = payload.get("quotes") or {}
+    except Exception as exc:            # 行情失败不影响 CRUD
+        print(f"[quote] 101 行情失败: {exc}", flush=True)
+        got = {}
     for c in codes:
-        result.setdefault(c, {"code": c, "error": "行情未返回"})
-    return result
-
-
-def _fetch_quotes_tencent(codes: list[str]) -> dict[str, dict]:
-    """腾讯接口抓 A股行情（~ 分隔，索引依据其固定字段顺序）。"""
-    result: dict[str, dict] = {}
-    symbols = {c: _tx_symbol(c) for c in codes}
-    try:
-        resp = requests.get(TENCENT_QUOTE_URL + ",".join(symbols.values()),
-                            headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        text = resp.text
-        for code, sym in symbols.items():
-            m = re.search(rf'{sym}="([^"]*)"', text)
-            if not m or not m.group(1):
-                result[code] = {"code": code, "error": "行情未返回"}
-                continue
-            f = m.group(1).split("~")
-            if len(f) < 50 or not f[3]:
-                result[code] = {"code": code, "error": "行情数据异常"}
-                continue
-            result[code] = {
-                "code": code,
-                "name": f[1],
-                "market": _market_of(code),
-                "currency": "CNY",
-                "price": _to_float(f[3]),        # 现价
-                "prev_close": _to_float(f[4]),   # 昨收
-                "open": _to_float(f[5]),         # 今开
-                "volume": _to_float(f[6]),       # 成交量(手)
-                "change": _to_float(f[31]),      # 涨跌额
-                "change_pct": _to_float(f[32]),  # 涨跌幅 %
-                "high": _to_float(f[33]),        # 最高
-                "low": _to_float(f[34]),         # 最低
-                "amount": _quote_amount(f[37], "a"),  # 成交额（统一为元）
-                "market_cap": _to_float(f[45]),   # 总市值（亿元；f44 是流通市值）
-                "updated_at": _fmt_quote_time(f[30]),  # 行情快照时间（交易所侧）
-            }
-    except Exception as exc:  # 行情抓取失败不影响 CRUD
-        for c in codes:
-            result.setdefault(c, {"code": c, "error": str(exc)})
-    return result
-
-
-SINA_HK_URL = "https://hq.sinajs.cn/list="
-SINA_HK_HEADERS = {"Referer": "https://finance.sina.com.cn", **HEADERS}
-
-
-def _fetch_quotes_sina_hk(codes: list[str]) -> dict[str, dict]:
-    """新浪 rt_hk 接口抓港股行情（逗号分隔，字段序：英文名,中文名,今开,昨收,
-    最高,最低,现价,涨跌额,涨跌%,买一,卖一,成交额,成交量,...,日期,时间）。
-
-    港股成交量单位是股；成交额是绝对港元。无效代码返回空串 -> error 条目。
-    """
-    result: dict[str, dict] = {}
-    try:
-        url = SINA_HK_URL + ",".join(f"rt_hk{c}" for c in codes)
-        resp = requests.get(url, headers=SINA_HK_HEADERS, timeout=20)
-        resp.raise_for_status()
-        resp.encoding = "gbk"
-        text = resp.text
-        for code in codes:
-            m = re.search(rf'rt_hk{code}="([^"]*)"', text)
-            if not m or not m.group(1):
-                result[code] = {"code": code, "error": "行情未返回"}
-                continue
-            f = m.group(1).split(",")
-            if len(f) < 19 or not f[6]:
-                result[code] = {"code": code, "error": "行情数据异常"}
-                continue
-            result[code] = {
-                "code": code,
-                "name": f[1],
-                "market": "hk",
-                "currency": "HKD",
-                "price": _to_float(f[6]),         # 现价
-                "prev_close": _to_float(f[3]),    # 昨收
-                "open": _to_float(f[2]),          # 今开
-                "volume": _to_float(f[12]),       # 成交量(股)
-                "change": _to_float(f[7]),        # 涨跌额
-                "change_pct": _to_float(f[8]),    # 涨跌幅 %
-                "high": _to_float(f[4]),          # 最高
-                "low": _to_float(f[5]),           # 最低
-                "amount": _to_float(f[11]),       # 成交额（绝对港元）
-                "updated_at": _fmt_quote_time(f"{f[17]} {f[18]}"),  # 快照时间
-            }
-    except Exception as exc:
-        for c in codes:
-            result.setdefault(c, {"code": c, "error": str(exc)})
-    return result
-
-
-# 总市值（market_cap，单位亿元）：A股直接来自腾讯行情 f45（f44 是流通市值）；
-# 港股行情走新浪 rt_hk（无市值字段），借腾讯 hk 行情补——腾讯对港股价格有
-# 15 分钟延迟（所以行情换了新浪），但市值不时效敏感，可接受。港股市值按
-# 代码缓存 1 小时（批量拉一次），避免 30s 一轮的行情刷新打爆接口。
-_HK_CAP_TTL = 3600
-_hk_cap_cache: dict[str, tuple[float | None, float]] = {}
-
-
-def _fill_hk_market_cap(result: dict) -> None:
-    """给行情结果里的港股条目补 market_cap 字段（缺失且缓存过期的才发请求）。"""
-    hk = [c for c, q in result.items()
-          if q.get("market") == "hk" and q.get("name") and "market_cap" not in q]
-    now = time.time()
-    fresh = {c: _hk_cap_cache[c][0] for c in hk
-             if c in _hk_cap_cache and now - _hk_cap_cache[c][1] < _HK_CAP_TTL}
-    for c, v in fresh.items():
-        result[c]["market_cap"] = v
-    stale = [c for c in hk if c not in fresh]
-    if not stale:
-        return
-    caps: dict[str, float | None] = {}
-    try:
-        resp = requests.get(TENCENT_QUOTE_URL + ",".join(f"hk{c}" for c in stale),
-                            headers=HEADERS, timeout=10)
-        text = resp.content.decode("gbk", "ignore")
-        for c in stale:
-            m = re.search(rf'hk{c}="([^"]*)"', text)
-            f = m.group(1).split("~") if m else []
-            caps[c] = _to_float(f[45]) if len(f) > 45 else None
-    except Exception as exc:
-        print(f"[quote] 港股市值抓取失败: {exc}", flush=True)
-    for c in stale:
-        if c in caps:  # 请求成功才更新缓存；失败沿用旧值，下一轮重试
-            _hk_cap_cache[c] = (caps[c], now)
-            result[c]["market_cap"] = caps[c]
+        q = got.get(syms[c]) or {}
+        if q and not q.get("error"):
+            item = {k: v for k, v in q.items() if k != "symbol"}
+            item["code"] = c
+            result[c] = item
         else:
-            result[c]["market_cap"] = _hk_cap_cache[c][0] if c in _hk_cap_cache else None
+            result[c] = {"code": c,
+                         "error": q.get("error") or "行情未返回"}
+    return result
 
 
 def _to_float(v: str):
@@ -1071,18 +943,6 @@ def _to_float(v: str):
         return float(v)
     except (TypeError, ValueError):
         return None
-
-
-def _quote_amount(raw: str, market: str):
-    """腾讯 f[37] 成交额统一成绝对金额（元）。
-
-    A股该字段单位是万元（600519 返回 602259 = 60.2 亿元），必须换算；
-    港股已改走新浪接口（成交额本身就是绝对港元），此处只剩 A股路径。
-    """
-    v = _to_float(raw)
-    if v is None:
-        return None
-    return v * 1e4 if market == "a" else v
 
 
 # ---------------- 量能分析（放量/缩量判断） ----------------
@@ -1117,93 +977,62 @@ def _em_secid(symbol: str) -> str | None:
 
 
 def _em_kline_fields(symbol: str, days: int, fields: str) -> list[str]:
-    """东财日K（push2his）：腾讯 fqkline 被 WAF 拦时兜底（2026-09-16 实测可用）。
-    fields 如 "f51,f56"（日期+成交量）/ "f51,f57"（日期+成交额元）。失败返回 []。"""
+    """日K（经 101 `/kline`，主源东财、101 侧兜底腾讯 newfqkline）。
+
+    fields 如 "f51,f56"（日期+成交量）/ "f51,f57"（日期+成交额元）。
+    失败返回 []**并打印原因** —— 旧的 `except: return []` 让「源坏了」和
+    「今天没数据」长得一模一样，生产上因此静默了整片 trend=flat。
+    """
     secid = _em_secid(symbol)
     if not secid:
+        print(f"[kline] 无法识别 secid: {symbol}", flush=True)
         return []
     try:
-        resp = requests.get(
-            "https://push2his.eastmoney.com/api/qt/stock/kline/get",
-            params={"secid": secid, "klt": 101, "fqt": 1, "lmt": days,
-                    "fields1": "f1,f2,f3", "fields2": fields, "end": "20500101"},
-            headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        return (resp.json().get("data") or {}).get("klines") or []
-    except Exception:
+        payload = _svc_get("/kline", {
+            "secid": secid, "days": max(1, min(int(days), 2000)),
+            "fields": fields, "source": "auto"}, timeout=40)
+        return payload.get("klines") or []
+    except Exception as exc:
+        print(f"[kline] {symbol} 取日K失败: {exc}", flush=True)
         return []
 
 
 def fetch_kline_volumes(symbol: str, days: int = VOL_MA_DAYS + 2) -> list[float]:
     """取某证券近 N 个交易日成交量列表（升序，最后一个元素=最近交易日）。
-    symbol 用腾讯符号（sh600519 / hkHSI / hk00700 / usAAPL.OQ）。主源腾讯日K；
-    腾讯 web.ifzq 域名被 WAF 拦（501，2026-09-16 起频发）时依次换镜像、再兜底
-    东财 push2his（成交量单位与腾讯一致，比值口径不受影响）。都失败返回 []。
 
-    ⚠️ 2026-09-26 实测：`web.ifzq.gtimg.cn` 是 501，但**去掉 web. 前缀**的
-    `ifzq.gtimg.cn` 和 `proxy.finance.qq.com/ifzqgtimg` 都正常（A股/港股/美股全通）。
-    原来的域名在东财整域不可达时会让本函数完全失效——量能列整片显示「—」。
+    symbol 用腾讯符号（sh600519 / hkHSI / hk00700）。全走 101 `/kline`：
+    成交量单位与旧腾讯/东财路径一致（A股手、港股股），比值口径不受影响。
     """
-    for host in ("https://ifzq.gtimg.cn/appstock/app/fqkline/get",
-                 "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get",
-                 "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"):
-        try:
-            resp = requests.get(host, params={"param": f"{symbol},day,,,{days},qfq"},
-                                headers=HEADERS, timeout=15)
-            resp.raise_for_status()
-            data = resp.json().get("data", {}).get(symbol, {})
-            bars = data.get("qfqday") or data.get("day") or []
-            out = [_to_float(bar[5]) for bar in bars if len(bar) > 5]
-            out = [v for v in out if v]
-            if out:
-                return out
-        except Exception:
-            continue
     ks = _em_kline_fields(symbol, days, "f51,f56")
-    return [v for v in (_to_float(k.split(",")[1]) for k in ks if len(k.split(",")) > 1) if v]
+    return [v for v in (_to_float(k.split(",")[1]) for k in ks
+                        if len(k.split(",")) > 1) if v]
 
 
 def fetch_spot_turnover(symbols: list[str]) -> dict[str, dict]:
-    """腾讯实时行情里取**成交额（元）**等字段。
+    """实时行情里取**成交额（元）**等字段（经 101 `/quote`）。
 
-    为什么必须用行情而不是日K（2026-10-07 实测）：
-    - 腾讯日K只有 6 个字段 `[日期,开,收,高,低,成交量]`，**没有成交额**；
-    - 原 `fetch_kline_amounts()` 只走东财 `push2his` 的 f57，而 **push2 系全封**
-      （实测 4/4 RemoteDisconnected），所以它是个「已定义、零调用、永远返回空」
-      的函数 —— 那种不报错但永远没数据的坑。
+    为什么必须用行情而不是日K：日K的 f57 盘中有滞后，而指数的当日成交额
+    是量能判断的主依据。成交额在 101 侧已统一成绝对元（f[35] 的第三段，
+    退化时用 f[37] 万元 ×1e4）。
 
-    成交额在行情的 `f[35]`，格式是 `收盘价/成交量/成交额`（实测与 `f[37]*1e4`
-    一致到 0.000%，f37 单位是万元）。
-
-    ⚠️ **`成交量` 字段跨市场单位不一致**，别拿来直接显示：
-    A股指数是「手」，恒生是「股」（实测同为万级数值但差 100 倍量级）。
-    所以这里只取成交额（单位统一是元），成交量仍走日K只用于算量比。
+    ⚠️ **`成交量` 字段跨市场单位不一致**（A股指数手、恒生股），所以这里只取
+    成交额（单位统一是元），成交量仍走日K只用于算量比。
     """
     if not symbols:
         return {}
-    out: dict[str, dict] = {}
     try:
-        resp = requests.get(TENCENT_QUOTE_URL + ",".join(symbols),
-                            headers=HEADERS, timeout=15)
-        text = resp.content.decode("gbk", "ignore")
-        for sym in symbols:
-            m = re.search(rf'{sym}="([^"]*)"', text)
-            if not m:
-                continue
-            f = m.group(1).split("~")
-            amount = None
-            if len(f) > 35 and f[35] and "/" in f[35]:
-                parts = f[35].split("/")
-                if len(parts) >= 3:
-                    amount = _to_float(parts[2])      # 已是绝对元
-            if amount is None and len(f) > 37:
-                amount = _quote_amount(f[37], "a")   # 兜底：万元 → 元
-            close = _to_float(f[3]) if len(f) > 3 else None
-            prev = _to_float(f[4]) if len(f) > 4 else None
-            out[sym] = {"amount": amount, "close": close, "prev_close": prev,
-                        "pct": _to_float(f[32]) if len(f) > 32 else None}
+        payload = _svc_get("/quote", {"symbols": ",".join(symbols)}, timeout=20)
+        got = payload.get("quotes") or {}
     except Exception as exc:
         print(f"[mktvol] fetch_spot_turnover failed: {exc}", flush=True)
+        return {}
+    out: dict[str, dict] = {}
+    for sym in symbols:
+        q = got.get(sym) or {}
+        if not q or q.get("error"):
+            continue
+        out[sym] = {"amount": q.get("amount"), "close": q.get("price"),
+                    "prev_close": q.get("prev_close"), "pct": q.get("change_pct")}
     return out
 
 
@@ -1317,21 +1146,18 @@ def _a_share_session(now: datetime) -> bool:
 
 
 def sample_market_volume_now() -> dict:
-    """实时采一次三大指数量比（行情 f49）+ 成交额，写入 _intraday_vol 并返回快照。"""
+    """实时采一次三大指数量比 + 成交额（经 101 `/quote`），写入 _intraday_vol 并返回快照。"""
     a_indices = [(s, n) for s, n in INDEX_POOL if n != "恒生指数"]
     items = []
     try:
-        resp = requests.get(TENCENT_QUOTE_URL + ",".join(s for s, _ in a_indices),
-                            headers=HEADERS, timeout=15)
-        text = resp.content.decode("gbk", "ignore")
+        payload = _svc_get("/quote",
+                           {"symbols": ",".join(s for s, _ in a_indices)}, timeout=20)
+        got = payload.get("quotes") or {}
         for sym, name in a_indices:
-            m = re.search(rf'{sym}="([^"]*)"', text)
-            if not m:
-                continue
-            f = m.group(1).split("~")
+            q = got.get(sym) or {}
             items.append({"name": name,
-                          "ratio": _to_float(f[49]) if len(f) > 49 else None,
-                          "amount": _quote_amount(f[37], "a") if len(f) > 37 else None})
+                          "ratio": q.get("ratio"),
+                          "amount": q.get("amount")})
     except Exception as exc:
         print(f"[mktvol] sample failed: {exc}", flush=True)
     ratios = [i["ratio"] for i in items if isinstance(i["ratio"], (int, float))]
@@ -1744,10 +1570,9 @@ def _hkd_cny_rate() -> float | None:
     if _FX_CACHE["rate"] and now - _FX_CACHE["ts"] < 600:
         return _FX_CACHE["rate"]
     try:
-        resp = requests.get("https://qt.gtimg.cn/q=whHKDCNY", headers=HEADERS, timeout=10)
-        m = re.search(r'="([^"]*)"', resp.text)
-        f = m.group(1).split("~") if m else []
-        rate = _to_float(f[3]) if len(f) > 3 else None
+        payload = _svc_get("/quote", {"symbols": "whHKDCNY"}, timeout=15)
+        q = (payload.get("quotes") or {}).get("whHKDCNY") or {}
+        rate = _to_float(q.get("price"))
         if rate and 0.5 < rate < 1.5:  # 合理性护栏，脏数据宁可不折
             _FX_CACHE["rate"], _FX_CACHE["ts"] = rate, now
             return rate
@@ -5003,9 +4828,20 @@ def _t_advisory_loop():
             tc = conf.get("t_trading") or {}
             # 开关/间隔走**通用的** `intervals` 表（DEFAULT_INTERVALS / SCH_INTERVALS
             # 那一套），所以「⚙️ 调度」页里是自动出现的复选框，不用专用 UI。
-            # 但做T引擎本身也要开 —— 只开调度不开启引擎就像「让车跑但没驾照」。
-            iv_conf = (conf.get("intervals") or {}).get("t_adv") or {}
-            if not (tc.get("enabled") and iv_conf.get("enabled")):
+            # ⚠️ 调度页读写的都是**顶层** `t_adv:` 段（_load_schedule_conf 对每个
+            # DEFAULT_INTERVALS 键取 `_conf_section(键名)`，schedule_update 写
+            # `set_section_key(CONFIG_FILE, 键名, ...)`）。原来这里读的是
+            # `paper.intervals.t_adv` —— 那个键没有任何写入口，于是「在调度页勾选
+            # 实盘做T建议」永远不会启动本线程（2026-10-22 修）。
+            #
+            # ⚠️ 也**不再要求 `paper.t_trading.enabled`**：那个开关管的是
+            # **模拟盘**做 T 成交（`_paper_run_cycle` → `t_trading.scan_once`），
+            # 与实盘建议无关。实盘建议本线程只读、绝不下单（见 docstring），
+            # 用它当闸门会让「为了开实盘建议而顺带开启模拟盘做T成交」——
+            # 那是另一件事，不该被这条链路连带改变。
+            # 趋势减仓 / 硬止损建议仍由 `paper.t_trading.trend_reduce.enabled` 管。
+            iv_conf = _conf_section("t_adv")
+            if not iv_conf.get("enabled"):
                 time.sleep(300)
                 continue
             now = datetime.now()
@@ -5024,9 +4860,12 @@ def _t_advisory_loop():
                 continue
             iv = max(5, int(iv_conf.get("interval_minutes") or 15))
             deps = _paper_deps(conf)
+            # `first_date` 必须一起传：趋势减仓要从**建仓日**开始回放，
+            # 缺了它会把建仓前的下跌也算成「我该减仓」。
             positions = {h["code"]: {"name": h.get("name", ""),
                                      "shares": int(h.get("net_shares") or 0),
-                                     "cost": h.get("avg_cost")}
+                                     "cost": h.get("avg_cost"),
+                                     "first_date": h.get("first_date")}
                          for h in (_derive_holdings() or [])
                          if int(h.get("net_shares") or 0) > 0}
             if not positions:
@@ -5044,15 +4883,44 @@ def _t_advisory_loop():
             _nlog = t_trading.persist_advisory(deps, res, "bg", tc)
             if _nlog:
                 print(f"[t-adv] 判断落库 {_nlog} 条", flush=True)
-            acts = [i for i in (res.get("items") or [])
-                    if i.get("action") in ("t_sell", "t_buy")]
-            sig = {i["code"] for i in acts}
+            # 趋势动作（hard_stop / trend_reduce）也是**要你手动下单**的建议，
+            # 所以一起推。判据必须带 `shares_suggest > 0` —— 趋势状态可以在
+            # 「深亏提示（trend_wait）」或「机动仓不足一手」时给不出股数，
+            # 那种行推出去只会造成「看到提醒却不知道卖多少」。
+            acts = []
+            for i in (res.get("items") or []):
+                if i.get("action") not in t_trading.ACT_ACTIONS:
+                    continue
+                try:
+                    _n = int(i.get("shares_suggest") or 0)
+                except (TypeError, ValueError):
+                    _n = 0
+                if _n > 0:
+                    acts.append(i)
+            # 信号集合要带上**动作**：同一只票从「高抛」变成「趋势减仓」也得推
+            # 一次 —— 两者操作完全不同（一个要接回，一个不接回），只看代码
+            # 会把它当成「没变化」静默掉。
+            sig = {(i["code"], i.get("action")) for i in acts}
             if sig and sig != last_sig:
                 lines = []
                 for i in acts[:8]:
                     tk = i.get("ticket") or {}
+                    act = i.get("action")
+                    if act in t_trading.TREND_ACTIONS:
+                        sl = tk.get("sell") or {}
+                        pnl_txt = ""
+                        try:
+                            pnl_txt = "｜浮盈亏 %+.2f%%" % float(i.get("pnl_pct"))
+                        except (TypeError, ValueError):
+                            pnl_txt = ""
+                        mark = "🛑 止损" if act == "hard_stop" else "📉 趋势减仓"
+                        lines.append(
+                            f"{mark} {i['code']} {i.get('name','')} "
+                            f"{sl.get('price')} 卖 {sl.get('shares')} 股"
+                            f"{pnl_txt}｜只卖不买回，仓位永久降低")
+                        continue
                     b = tk.get("buy_back") or {}
-                    if i["action"] == "t_sell":
+                    if act == "t_sell":
                         lines.append(
                             f"⬆ 高抛 {i['code']} {i.get('name','')} "
                             f"{tk.get('sell',{}).get('price')} 卖 "
@@ -5064,8 +4932,13 @@ def _t_advisory_loop():
                             f"⬇ 接回 {i['code']} {i.get('name','')} "
                             f"{b.get('price')} 买 {tk.get('shares')} 股"
                             f"（{i.get('bias_label')}）")
+                _trend = [i for i in acts
+                          if i.get("action") in t_trading.TREND_ACTIONS]
+                _title = ("🔁 实盘做T/趋势建议" if _trend
+                          else "🔁 实盘做T建议")
+                _n_codes = len({i["code"] for i in acts})
                 _notifier_notify_safe(
-                    "🔁 实盘做T建议", f"{len(sig)} 只达到门槛：\n" + "\n".join(lines),
+                    _title, f"{_n_codes} 只达到门槛：\n" + "\n".join(lines),
                     event="t_advisory")
             last_sig = sig
             time.sleep(iv * 60)
@@ -5359,9 +5232,12 @@ def t_advisory(max_codes: int = 0):
     # ⚠️ `_derive_holdings()` 返回的是 **list[dict]**，不是 dict ——
     #    按 dict 写会 `AttributeError: 'list' object has no attribute 'items'`
     #    直接 500（2026-10-11 真请求验证逮到，路由表注册成功≠能返回）。
+    # `first_date` 必须一起传：趋势减仓从**建仓日**开始回放，缺了它会把
+    # 建仓前的下跌也算成「我该减仓」。
     positions = {h["code"]: {"name": h.get("name", ""),
                              "shares": int(h.get("net_shares") or 0),
-                             "cost": h.get("avg_cost")}
+                             "cost": h.get("avg_cost"),
+                             "first_date": h.get("first_date")}
                  for h in (_derive_holdings() or [])
                  if int(h.get("net_shares") or 0) > 0}
     res = t_trading.advisory(deps, tc, positions, max_codes=max_codes)
@@ -9375,6 +9251,78 @@ def futures_refresh():
     return {"ok": True, **futures_watch.run_once(_futures_deps())}
 
 
+def _futures_loop():
+    """期货定时抓取：futures.enabled=false 或 interval_minutes<=0 时轮内跳过。
+
+    24h 连续交易，不限 A 股时段；改配置下一轮生效（每轮现读 config.yaml）。
+    """
+    while True:
+        try:
+            conf = futures_watch.load_futures_conf()
+            interval = int(conf.get("interval_minutes") or 0)
+            if conf.get("enabled", True) and interval > 0:
+                result = futures_watch.run_once(_futures_deps())
+                print(f"[futures] {result.get('total', 0)} 个品种已更新"
+                      f"（{','.join(result.get('symbols') or [])}）", flush=True)
+                time.sleep(max(interval, 1) * 60)
+            else:
+                time.sleep(300)
+        except Exception as exc:
+            print(f"[futures] loop error: {exc}", flush=True)
+            time.sleep(300)
+
+
+# ---------------- 汇率盯盘（fx_watch.py，新浪 hq.sinajs.cn）----------------
+
+def _fx_deps() -> dict:
+    return {"get_conn": get_conn, "notify_fn": notifier.notify}
+
+
+@app.get("/api/fx/quotes")
+def fx_quotes():
+    deps = _fx_deps()
+    try:
+        items = fx_watch.quotes_summary(deps)
+    except Exception:
+        fx_watch._ensure_tables(deps)
+        items = fx_watch.quotes_summary(deps)
+    if not items or any(
+        (not i.get("ts"))
+        or (datetime.now(timezone.utc) - datetime.fromisoformat(i["ts"])).total_seconds() >= 300
+        for i in items
+    ):
+        try:
+            fx_watch.run_once(deps)
+            items = fx_watch.quotes_summary(deps)
+        except Exception as exc:
+            print(f"[fx] refresh failed: {exc}", flush=True)
+    return {"source": "新浪外汇", "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "items": items}
+
+
+@app.post("/api/fx/refresh")
+def fx_refresh():
+    return {"ok": True, **fx_watch.run_once(_fx_deps())}
+
+
+def _fx_loop():
+    """汇率定时抓取：fx.enabled=false 或 interval_minutes<=0 时轮内跳过。"""
+    while True:
+        try:
+            conf = fx_watch.load_fx_conf()
+            interval = int(conf.get("interval_minutes") or 0)
+            if conf.get("enabled", True) and interval > 0:
+                result = fx_watch.run_once(_fx_deps())
+                print(f"[fx] {result.get('total', 0)} 组汇率已更新"
+                      f"（{','.join(result.get('pairs') or [])}）", flush=True)
+                time.sleep(max(interval, 1) * 60)
+            else:
+                time.sleep(300)
+        except Exception as exc:
+            print(f"[fx] loop error: {exc}", flush=True)
+            time.sleep(300)
+
+
 class CryptoWatchIn(BaseModel):
     contract: str = Field(min_length=3, max_length=32, description="合约名，如 TSLA_USDT")
     name: str = Field(default="", max_length=64)
@@ -9489,26 +9437,24 @@ class CryptoLinkIn(BaseModel):
 
 
 def _us_quote(ticker: str) -> dict:
-    """美股实时快照（腾讯 qt.gtimg.cn）。关联标的可能是美股，而 fetch_quotes
+    """美股实时快照（经 101 `/quote`）。关联标的可能是美股，而 fetch_quotes
     只认 A股/港股（6位/4-5位数字），所以这里单独取一份，只给页面显示用。"""
     t = (ticker or "").strip().upper()
     if not re.fullmatch(r"[A-Z][A-Z.\-]{0,5}", t):
         return {}
+    sym = "us" + t.replace(".", "-")
     try:
-        resp = requests.get(f"https://qt.gtimg.cn/q=us{t.replace('.', '-')}",
-                            headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        text = resp.content.decode("gbk", "ignore")
-    except Exception:
+        payload = _svc_get("/quote", {"symbols": sym}, timeout=20)
+        q = (payload.get("quotes") or {}).get(sym) or {}
+    except Exception as exc:
+        print(f"[us] {t} 行情失败: {exc}", flush=True)
         return {}
-    m = re.search(r'="([^"]*)"', text)
-    if not m or not m.group(1):
+    price = _to_float(q.get("price"))
+    if q.get("error") or price is None:
         return {}
-    f = m.group(1).split("~")
-    if len(f) < 33 or not f[3]:
-        return {}
-    return {"code": t, "name": f[1], "market": "us", "currency": "USD",
-            "price": _to_float(f[3]), "change_pct": _to_float(f[32])}
+    return {"code": t, "name": q.get("name") or t, "market": "us",
+            "currency": "USD", "price": price,
+            "change_pct": _to_float(q.get("change_pct"))}
 
 
 def _linked_stock_quote(code: str) -> dict:
@@ -10315,6 +10261,16 @@ if _BOOTSTRAP:
     except Exception as exc:
         print(f"[wx_chat] init tables failed: {exc}", flush=True)
 
+    # 国际期货 / 汇率表（幂等 DDL；期货还会补种 OIL/白银/天然气/铜）
+    try:
+        futures_watch._ensure_tables(_futures_deps())
+    except Exception as exc:
+        print(f"[futures] init tables failed: {exc}", flush=True)
+    try:
+        fx_watch._ensure_tables(_fx_deps())
+    except Exception as exc:
+        print(f"[fx] init tables failed: {exc}", flush=True)
+
 # 声明微信客户端在线（iLink notifystart）。
 # **必须在每次服务启动时做**：iLink 侧的「会话」不是持久状态，重启后不重新
 # 声明的话，所有出站推送都会 ret=-2 prepare failed —— 表现为「微信通知突然
@@ -10397,6 +10353,12 @@ _start_daemon(_t_advisory_loop, "sa_t_advisory")
 
 # 每日报告线程（盘前简报 / 盘后复盘；时间点见 config.yaml schedule 段，网页可改）
 _start_daemon(_daily_reports_loop, "sa_daily_reports")
+
+# 国际期货抓取线程（akshare 国际商品；futures.interval_minutes=0 轮内跳过）
+_start_daemon(_futures_loop, "sa_futures")
+
+# 汇率抓取线程（新浪外汇；fx.interval_minutes=0 轮内跳过）
+_start_daemon(_fx_loop, "sa_fx")
 
 # 币圈 24h 监控线程（gate.io 股票永续；crypto.interval_minutes=0 轮内跳过）
 _start_daemon(_crypto_loop, "sa_crypto")

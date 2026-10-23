@@ -198,6 +198,48 @@ SCHEMAS: dict[str, dict[str, Any]] = {
              "lo": 0, "hi": 60, "label": "DDG 请求间隔(秒)"},
             {"key": "channels.duckduckgo.timeout", "t": "int", "d": 8, "lo": 5, "hi": 120,
              "label": "DDG 超时(秒)", "help": "原为 30s，死源每只票白等满超时"},
+            # 雪球：唯一能拿到「自愿锁仓/解禁」这类只存在于论坛的信息的渠道。
+            # 两条路：① 真浏览器桥（拿真实发帖时间）② SearXNG site: 兜底。
+            {"key": "channels.xueqiu.enabled", "t": "bool", "d": True,
+             "label": "雪球 启用",
+             "help": "解禁/锁仓讨论只在雪球上（实测东财/百度/新浪/SearXNG 搜「MiniMax+解禁」全 0 命中）"},
+            {"key": "channels.xueqiu.min_interval", "t": "float", "d": 3.0,
+             "lo": 0, "hi": 60, "label": "雪球 请求间隔(秒)"},
+            {"key": "channels.xueqiu.timeout", "t": "int", "d": 40, "lo": 5, "hi": 120,
+             "label": "雪球 超时(秒)", "help": "只作用于 SearXNG 兜底那条路；桥的超时在 bridge.timeout"},
+            {"key": "channels.xueqiu.url", "t": "str", "d": "",
+             "label": "雪球兜底用的 SearXNG 地址",
+             "help": "留空 = 复用 channels.searxng.url；两个都空则该渠道不工作"},
+            {"key": "channels.xueqiu.keywords", "t": "str", "d": "解禁 禁售 锁定 锁仓",
+             "label": "雪球事件词(空格分隔)",
+             "help": "每只票按这些词各问一次；这类帖子描述的是**当前仍生效的约束**，"
+                     "所以入库窗口放宽到 180 天（仍必须有真实发布时间，绝不用抓取时间兜底）"},
+            {"key": "channels.xueqiu.max_keywords", "t": "int", "d": 2, "lo": 1, "hi": 6,
+             "label": "雪球 每票最多问几个词",
+             "help": "直接决定请求量 = 风控预算（43 只 × 2 词 = 86 组/轮）"},
+            {"key": "channels.xueqiu.time_range", "t": "str", "d": "month",
+             "label": "雪球兜底路的 SearXNG 时间窗", "adv": True,
+             "help": "⚠️ 不能删：yandex 只有在按时间过滤时才回填 publishedDate，"
+                     "留空实测 0/6 有日期，而无发布时间的条目会被入库层全部丢弃（渠道静默 0 产出）"},
+            {"key": "channels.xueqiu.bridge.enabled", "t": "bool", "d": True,
+             "label": "雪球·浏览器桥 启用", "adv": True,
+             "help": "桥 = 真 Chromium 执行 JS，能过雪球的阿里云 WAF（普通 HTTP 只拿到挑战页）。"
+                     "关掉则只剩 SearXNG 兜底 = 只有被索引过的帖子"},
+            {"key": "channels.xueqiu.bridge.base_url", "t": "str",
+             "d": "http://127.0.0.1:10086",
+             "label": "雪球桥地址", "adv": True,
+             "help": "⚠️ 顺序是**实测**出来的：本机（住宅 IP）实测拿到 6 条真数据含当天帖子；"
+                     "101（机房 IP）密集请求后被弹 check.xueqiu.com/captcha，需人工过一次验证页才能恢复。"
+                     "本项目**没有也不实现**任何绕过验证码/反检测的逻辑"},
+            {"key": "channels.xueqiu.bridge.fallback_url", "t": "str", "d": "",
+             "label": "雪球桥备用地址", "adv": True,
+             "help": "留空 = 不用备用端点。填 101 的地址要预期它更容易吃风控"},
+            {"key": "channels.xueqiu.bridge.pace_ms", "t": "int", "d": 800,
+             "lo": 0, "hi": 5000, "label": "雪球桥 每次请求间隔(毫秒)", "adv": True,
+             "help": "🔴 这是**风控预算**不是性能参数。250ms 实测当天下午就被弹验证码"},
+            {"key": "channels.xueqiu.bridge.cache_ttl", "t": "int", "d": 10800,
+             "lo": 300, "hi": 86400, "label": "雪球桥 结果缓存(秒)", "adv": True,
+             "help": "同一 (股票, 词) 在 TTL 内只问一次。30 分钟 TTL 实测一天 ~4000 组请求 → 打爆风控"},
             {"key": "health_fail_threshold", "t": "int", "d": 3, "lo": 1, "hi": 20,
              "label": "渠道冷却阈值(次)",
              "help": "连续失败几次后跳过该渠道；0 条结果不算失败"},
@@ -362,6 +404,32 @@ SCHEMAS: dict[str, dict[str, Any]] = {
              "label": "比价偏离告警(%)", "help": "0 = 关闭。偏离中位比价超此值推微信"},
             {"key": "link_alert_cooldown_hours", "t": "int", "d": 12, "lo": 1, "hi": 720,
              "label": "比价告警冷却(小时)", "adv": True},
+        ],
+    },
+    # ---------------- 国际期货 / 汇率 ----------------
+    "futures": {
+        "label": "🛢 国际期货（金/银/油/气/铜）",
+        "help": "akshare 国际商品实时报价（黄金/白银/WTI/布伦特/天然气/铜）。"
+                "日盘夜盘连续交易，按固定周期抓取；报价同时注入模拟盘决策上下文。",
+        "fields": [
+            {"key": "enabled", "t": "bool", "d": True, "label": "启用"},
+            {"key": "interval_minutes", "t": "int", "d": 15, "lo": 0, "hi": 1440,
+             "label": "抓取周期(分钟)", "help": "0 = 关闭抓取（页面「强制刷新」仍可用）"},
+            {"key": "alert_threshold_pct", "t": "float", "d": 3, "lo": 0, "hi": 100,
+             "label": "异动阈值(%)", "adv": True,
+             "help": "预留项：当前只入库与注入，不推异动告警"},
+            {"key": "alert_cooldown_hours", "t": "int", "d": 6, "lo": 1, "hi": 720,
+             "label": "同向推送冷却(小时)", "adv": True, "help": "同上，预留"},
+        ],
+    },
+    "fx": {
+        "label": "💱 汇率（新浪外汇）",
+        "help": "新浪 hq.sinajs.cn 批量报价：在岸/离岸人民币、日元、欧元、港币、英镑。"
+                "时间列是真实报价时间；报价同时注入模拟盘决策上下文。",
+        "fields": [
+            {"key": "enabled", "t": "bool", "d": True, "label": "启用"},
+            {"key": "interval_minutes", "t": "int", "d": 15, "lo": 0, "hi": 1440,
+             "label": "抓取周期(分钟)", "help": "0 = 关闭抓取（页面「强制刷新」仍可用）"},
         ],
     },
     # ---------------- 板块 ----------------
@@ -626,6 +694,20 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             {"key": "macro_inject.max_chars", "t": "int", "d": 1500, "lo": 300,
              "hi": 4000, "label": "宏观块字数上限", "adv": True,
              "help": "利率段与 ETF 段合并后的字符上限，超出截断并标注"},
+            # ---- 国际期货 / 汇率进决策（2026-10-22 用户要求）----
+            {"key": "futures_fx_inject.enabled", "t": "bool", "d": True,
+             "label": "期货/汇率进决策",
+             "help": "把「国际期货（金/银/WTI/布伦特/天然气/铜）」与「汇率"
+                     "（在岸/离岸人民币、日元、欧元、港币、英镑）」两块背景注入"
+                     "LLM 决策上下文。两块都只作宏观背景（成本/收入/资金面的间接"
+                     "传导），不是个股买卖的直接触发条件。关掉后上下文逐字节不变。"},
+            {"key": "futures_fx_inject.max_chars", "t": "int", "d": 1200, "lo": 300,
+             "hi": 4000, "label": "期货/汇率块字数上限", "adv": True,
+             "help": "期货段与汇率段合并后的字符上限，超出截断并标注"},
+            {"key": "futures_fx_inject.stale_minutes", "t": "int", "d": 45, "lo": 5,
+             "hi": 1440, "label": "期货/汇率滞后告警(分钟)", "adv": True,
+             "help": "报价时间比现在旧超过这个分钟数，注入文本里会带「数据已滞后」"
+                     "警告，防止模型把陈旧价格当现价"},
             {"key": "judge_holdings_only", "t": "bool", "d": False,
              "label": "每轮只判已持仓",
              "help": "开启后每轮只重新判断持仓股（最省，止损+止盈照常）；"
@@ -643,9 +725,12 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                      "否则模拟盘会系统性高估可实现收益 —— 越高频做越乐观"},
             # ---- 做 T（2026-10-11）----
             {"key": "t_trading.enabled", "t": "bool", "d": False,
-             "label": "做T引擎", "adv": True,
-             "help": "机动仓高抛低吸。默认关 —— 它改的是交易口径，不该默认生效。"
-                     "开启前建议先 POST /api/paper/t-scan（只看不做）看几天判据"},
+             "label": "做T引擎（模拟盘成交）", "adv": True,
+             "help": "**只管模拟盘做T成交**（在模拟盘轮次里真的下单）。默认关 —— 它改的是"
+                     "交易口径，不该默认生效。开启前建议先 POST /api/paper/t-scan"
+                     "（只看不做）看几天判据。"
+                     "⚠️ 实盘做T/趋势建议是另一个开关：`⚙️ 调度` 页的「实盘做T建议」"
+                     "（顶层 t_adv.enabled），那条链路只读、绝不下单，与本项无关"},
             {"key": "t_trading.t_ratio", "t": "int", "d": 30, "lo": 5, "hi": 80,
              "label": "机动仓占比%", "adv": True,
              "help": "只有这部分仓位允许日内买卖，其余是底仓（永不动）。"
@@ -699,6 +784,50 @@ SCHEMAS: dict[str, dict[str, Any]] = {
              "help": "每轮实盘做T建议把**全部持仓的判断**（含不做/被拦的）写入"
                      " sa_t_advisory_log。纯观测不改交易；关掉后页面「判断记录」"
                      "只显示历史存量，不再新增"},
+            # ---- 趋势减仓 / 提前抛（2026-10-22）----
+            {"key": "t_trading.trend_reduce.enabled", "t": "bool", "d": False,
+             "label": "趋势减仓/提前抛", "adv": True,
+             "help": "做T是「持仓不变的份额置换」，趋势一路走坏时它帮不上忙 —— "
+                     "这条补的是「先减一部分仓位」。**只给建议，绝不自动下单**，"
+                     "实际卖出仍由你手动执行。默认关（它会建议真实减仓）。"
+                     "开启后每轮会额外拉 180 天日K回放，判据见下几项"},
+            {"key": "t_trading.trend_reduce.confirm_days", "t": "int", "d": 2,
+             "lo": 1, "hi": 20, "label": "趋势减仓·确认天数", "adv": True,
+             "help": "连续多少个交易日满足「收盘 < MA20 且 MA20 < MA60」才出信号。"
+                     "1 = 单日破位就提示（震荡市噪音大）；2 = 多一层趋势确认"},
+            {"key": "t_trading.trend_reduce.reduce_pct", "t": "int", "d": 33,
+             "lo": 1, "hi": 100, "label": "趋势减仓·每次减%", "adv": True,
+             "help": "建议减掉**当前持仓**的百分比，按申报单位向下取整"
+                     "（A股 100 股、科创板 1 股），且至少保留 1 个申报单位"},
+            {"key": "t_trading.trend_reduce.cooldown_days", "t": "int", "d": 10,
+             "lo": 0, "hi": 250, "label": "趋势减仓·冷却(交易日)", "adv": True,
+             "help": "两次减仓建议之间至少隔多少个交易日。防「一路下跌每天催你卖」"},
+            {"key": "t_trading.trend_reduce.rearm_days", "t": "int", "d": 5,
+             "lo": 1, "hi": 60, "label": "趋势减仓·重新武装天数", "adv": True,
+             "help": "触发过一次后，要连续收盘站回 MA20 多少天才重新具备触发资格。"
+                     "一段下跌只提示一次，不会每轮重复"},
+            {"key": "t_trading.trend_reduce.max_reductions", "t": "int", "d": 2,
+             "lo": 0, "hi": 20, "label": "趋势减仓·最多几次", "adv": True,
+             "help": "同一段下跌最多建议减几次（0 = 永不触发）。默认 2 次 ≈ 减仓"
+                     "到原来的 45%，不会一次把人清空"},
+            {"key": "t_trading.trend_reduce.fresh_days", "t": "int", "d": 2,
+             "lo": 1, "hi": 30, "label": "趋势减仓·信号有效期(交易日)",
+             "adv": True,
+             "help": "信号只在触发当天及之后这么多个交易日内有效。过期就不再提示"
+                     "（避免「上周的信号今天才看到就照着卖」）"},
+            {"key": "t_trading.trend_reduce.hard_stop_pct", "t": "float", "d": 10,
+             "lo": 1, "hi": 90, "label": "硬止损·距成本%", "adv": True,
+             "help": "**新近**跌破成本 × (1-x%) 时给止损建议（一路在水下不算）。"
+                     "优先级高于趋势减仓与做T。这是建议不是自动卖出，"
+                     "且仍受 T+1 可卖数限制"},
+            {"key": "t_trading.trend_reduce.deep_dd_pct", "t": "float", "d": 25,
+             "lo": 0, "hi": 100, "label": "深亏只提示%", "adv": True,
+             "help": "浮亏超过这个幅度时，趋势信号只作提示（trend_wait），"
+                     "不催你卖 —— 一路阴跌 40% 后再叫人割肉，多半割在阶段低点"},
+            {"key": "t_trading.trend_reduce.lookback_days", "t": "int", "d": 180,
+             "lo": 80, "hi": 800, "label": "趋势回放窗口(交易日)", "adv": True,
+             "help": "从**建仓日**起逐日回放用的日K根数（至少需要 60 根才能算 MA60）。"
+                     "调大更准但每轮多拉数据"},
             {"key": "fees.a_commission_rate", "t": "float", "d": 0.00025,
              "lo": 0, "hi": 0.01, "step": 0.00005, "label": "佣金费率", "adv": True,
              "help": "A 股/场内基金佣金费率，万2.5 = 0.00025。双向收取"},

@@ -16,6 +16,27 @@ news:
     # 详情与实测数据见 AGENTS.md「新闻时效」一节。
     bing: {enabled: false, min_interval: 3.0}
     duckduckgo: {enabled: false, min_interval: 5.0, timeout: 30}
+    # 雪球讨论（详见 AGENTS.md「雪球渠道」一节）。它专治常规新闻源覆盖不到的
+    # 解禁/自愿锁仓类信息 —— 实测 eastmoney/baidu/searxng/ak_em 搜
+    # 「MiniMax + 解禁」全部 0 命中，只有雪球上有。
+    xueqiu:
+      enabled: true
+      url: ''                 # 留空 = 复用 channels.searxng.url（同一个实例，少维护一份配置）
+      time_range: month       # 🔴 不能删：不带它 yandex 不回填 publishedDate，
+                              #    而无发布时间的条目会被 save_to_db 全丢 = 静默 0 条
+      keywords: '解禁 禁售 锁定 锁仓'
+      max_keywords: 2         # 0/留空 = 默认 2；负数会被夹到 1
+      # 主路径：Kimi WebBridge（真 Chromium 执行 JS，能过雪球 WAF）。
+      # 桥坏了自动退回 SearXNG 的 site:xueqiu.com，且**不会冷却整条渠道**。
+      # ⚠️ 出口 IP 决定成败（实测）：住宅 IP 正常出数据；机房 IP（如云服务器）
+      #    密集请求会被弹到 check.xueqiu.com/captcha，只能人工过一次验证。
+      #    所以优先本机守护进程，云服务器只当备胎。
+      bridge:
+        enabled: true
+        base_url: 'http://127.0.0.1:10086'
+        fallback_url: ''       # 有自建常驻服务时填，如 'http://<host>/xq-bridge'
+        pace_ms: 800           # 批间隔；调小 = 加速被弹验证码
+        cache_ttl: 10800       # 同一 (symbol, 关键词) 3 小时内只问一次
   fetch_interval_minutes: 30
   items_per_query: 10
   keywords_extra: []
@@ -64,10 +85,11 @@ sector:
 
   # 板块数据服务（多厂商聚合，替代已被 WAF 掐断的东财直连）
   # 部署见 stock-advisor/data_service/README.md
-  # 留空 = 不启用，sector 仍走原东财实现（保持原行为）
+  # ⚠️ 2026-10-22 用户裁决：本机不直连任何行情源，行情 / 日K / 分时 / 汇率 /
+  # 美股全部经这里的 /quote /kline /intraday 代理（本机只做 HTTP 客户端）。
+  # 留空 = 行情功能全部不可用（**刻意不保留本地兜底**）。
   # docker compose -f data_service/docker-compose.yml up -d
-  # 然后填 http://127.0.0.1:8080
-  data_service_url: ""
+  data_service_url: "http://101.43.25.101:8080"
 
 # 全球利率（FRED，app.py _macro_loop 内与美国 CPI 同一个「交易日一次」节奏）
 # 美债 DGS10/DGS2 日频；日/德/英/韩 10Y 是 OECD 月频（天然滞后约一个月）。
@@ -261,7 +283,8 @@ paper:
   # 港股 T+0 没有这个限制，但费用高得多（实测同额往返 A股 0.252% /
   # 港股 0.857%），引擎会**按真实成本自动抬高门槛**，不要手改 min_edge_pct。
   t_trading:
-    enabled: false          # 默认关。开之前先 POST /api/paper/t-scan 看几天判据
+    enabled: false          # 模拟盘做T的**成交通道**（只影响模拟盘）。
+                            # 实盘建议开关是顶层 `t_adv.enabled`，与这里无关。
     t_ratio: 30             # 机动仓占持仓 %，其余是底仓
     min_edge_pct: 0.45      # 单次最小幅度 = 3 倍往返成本 + 滑点
     slippage_bps: 5         # 单边滑点 5bp（双边 0.1%）。做T不做滑点建模 = 自我欺骗
@@ -271,6 +294,26 @@ paper:
     max_codes: 0            # 每轮最多做T标的数，0=不限
     log_enabled: true       # 每轮实盘做T判断（含 hold/不做的）落库 sa_t_advisory_log，
                             # 页面「判断记录」可回看不做原因与历史（2026-10-18）
+
+    # ---- 趋势减仓 / 提前抛（2026-10-22 用户授权新增）----
+    # 为什么要有：做 T 是「持仓不变的份额置换」，智谱 / MINIMAX 那种一路下行
+    # 的票要的是**先减一部分仓位**，而不是等反弹做 T。
+    # **只给建议、绝不自动下单**：scan_once / decide 一个字节都没动，卖出仍由
+    # 本人手动执行。判据 = 收盘 < MA20 且 MA20 < MA60（确认 2 天），
+    # 另有一条独立的「新近跌破成本 x%」硬止损；信号从**建仓日**起逐日回放，
+    # 一段下跌只发一次，站回 MA20 连续 5 天才重新武装。
+    # 默认关：它会建议真实减仓，属交易口径变更。
+    trend_reduce:
+      enabled: false        # 总开关
+      confirm_days: 2       # 连续几个交易日满足「收盘<MA20 且 MA20<MA60」
+      reduce_pct: 33        # 每次建议减掉当前持仓的 %
+      cooldown_days: 10     # 两次建议之间至少间隔的交易日
+      rearm_days: 5         # 连续站回 MA20 多少天后重新武装
+      max_reductions: 2     # 同一段下跌最多建议减几次
+      fresh_days: 2         # 信号有效窗口（交易日）
+      hard_stop_pct: 10     # 新近跌破成本 x% -> 硬止损建议
+      deep_dd_pct: 25       # 浮亏超过 x% 只提示不催卖（避免卖在坑里）
+      lookback_days: 180    # 回放窗口（交易日，需 ≥60 才能算 MA60）
 
   # ---- 机构信号（2026-10-12）----
   # 用户要求「机构看多看空 / 机构与社保持仓变化 / 被挪出重要指数」参与决策。
@@ -311,6 +354,16 @@ paper:
   macro_inject:
     enabled: false
     max_chars: 1500     # 利率段与 ETF 段合并后的字符上限，超出截断并标注
+
+  # ---- 国际期货 / 汇率进决策（2026-10-22 用户要求）----
+  # 两块都只作宏观背景（成本/收入/资金面的间接传导），不是个股买卖的直接触发条件。
+  # 期货：黄金/白银/WTI/布伦特/天然气/铜（akshare 国际商品）
+  # 汇率：在岸/离岸人民币、日元、欧元、港币、英镑（新浪外汇，时间列是真实报价时间）
+  # 关掉后决策上下文逐字节还原。
+  futures_fx_inject:
+    enabled: true
+    max_chars: 1200     # 期货段 + 汇率段合并后的字符上限，超出截断并标注
+    stale_minutes: 45   # 报价时间旧于此值 → 注入文本带「数据已滞后」警告
 
   # ---- 公众号语义检索（2026-10-13）----
   # 为什么不是「再多截 160 字」：实测近 7 天文章正文中位数 630 字，而原来喂给
@@ -369,6 +422,30 @@ schedule:
   calendar:
     start_time: '08:00'
     end_time: '12:00'
+
+# 实盘做T/趋势建议守护线程（2026-10-11）。**只给建议、绝不下单** ——
+# 实盘操作始终由本人手动执行；扫描只读行情/日K/持仓，不做任何成交。
+# ⚠️ 这是**顶层**段（不是 paper.intervals.t_adv）：调度页
+# （DEFAULT_INTERVALS / SCH_INTERVALS / /api/schedule）读写的就是顶层 `t_adv`。
+# 本段 enabled 就是「实盘建议」的总开关（页面「⚙️ 调度」里同一个复选框）。
+# ⚠️ 与 `paper.t_trading.enabled` **无关**：那个开关管的是**模拟盘**做 T 成交，
+# 实盘建议不需要它、也不会因为它开启而成交。趋势减仓/硬止损建议另由
+# `paper.t_trading.trend_reduce.enabled` 控制。
+t_adv:
+  enabled: false
+  interval_minutes: 15
+
+# 国际期货盯盘（黄金/白银/WTI/布伦特/天然气/铜，akshare 国际商品实时报价）
+# interval_minutes: 抓取周期，0 = 关闭（页面「强制刷新」仍可用）
+futures:
+  enabled: true
+  interval_minutes: 15
+
+# 汇率盯盘（新浪 hq.sinajs.cn 批量报价）
+# 在岸/离岸人民币、日元、欧元、港币、英镑；时间列是真实报价时间，不是抓取时间
+fx:
+  enabled: true
+  interval_minutes: 15
 
 # 币圈 24h 趋势参考（gate.io 股票永续；欧易 OKX 本机直连不通，此为平替源）
 # 白名单在「自选行情」页的币圈卡片里加删；interval_minutes: 抓价周期，0=关闭

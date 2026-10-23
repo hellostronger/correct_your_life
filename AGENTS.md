@@ -1076,9 +1076,168 @@ LLM 过滤后**加回来**（prompt 里也加了同一条例外，双保险）�
 带时分秒（01:52 / 23:57），索引时间不会这么随机。交叉验证：标题自称 `2026.10.05`
 的一篇引擎给 2026-10-08（聚合页会晚几天）。⚠️ 仍不是 100% 发帖时间。
 
-验证：`test_xueqiu.py` **23 项**（含「别名带 `-W` 后缀」「关掉就返回 []」）
+验证：`test_xueqiu.py` **26 项**（含「别名带 `-W` 后缀」「关掉就返回 []」）
 + `test_event_rescue.py` **13 项**（LLM 全丢时只救回事件类条目、没丢时不重复救）
 + 两个 E2E：入库 1 条真行、决策上下文出现该块。
+
+---
+
+### 🌉 雪球走「真浏览器桥」：Kimi WebBridge + 两条路的健康度归属（2026-10-20）
+
+上面那条 SearXNG `site:` 路**只能看到被索引的帖子**。实测证据（同一天）：
+Searx 查询 `site:xueqiu.com $MINIMAX-W$ 解禁` 带 `time_range=month` 只回 **2 条、
+且全是 `/hashtag/` 话题页**（被 URL 闸门全挡 → 0 条）；同一条代码走桥拿回 **6 条**，
+最新一条发布时间 **2026-10-20 17:07**（当天）。**用户要的那类信息（自愿锁仓/解禁出货节奏）
+是冷帖，搜索引擎根本不收。**
+
+#### 架构（三条链，缺一不可）
+
+```
+news_fetcher._xq_via_bridge → xq_bridge.search()
+   → POST {base}/command {"action":"evaluate","args":{"code":…,"session":"xq"}}
+   → kimi-webbridge 守护进程 → Chrome MV3 扩展 → 页面内 fetch 雪球内部 JSON API
+```
+
+- 雪球内部接口**只有同源带 cookie 才认**：
+  `GET /query/v1/symbol/search/status?u=1&page=1&count=10&symbol=<SYM>&source=all&sort=time&type=11&q=<kw>`
+  必须在 xueqiu.com 页面里用 `credentials:'include'` 发。
+- 返回条目**没有 per-item `symbol` 字段**；`title` 是 HTML 高亮片段不是标题；
+  `created_at` 是**毫秒**；帖子 URL = `https://xueqiu.com/{user.id}/{id}`；
+  `total` 不可信（按列表长度判）。
+- WebBridge 协议细节：`evaluate` 的参数键是 **`code`**，结果在 **`data.value`**；
+  async IIFE 会被 await；`navigate` 不给 `newTab` 会复用标签页；
+  扩展重连 ≈16s、守护进程排队 ≈22s ⇒ **重试一次**就够。
+
+#### 部署（101）与「本机优先」的实测结论
+
+| 项 | 值 |
+|---|---|
+| 二进制 | `/opt/xq-bridge/bin/kimi-webbridge`，扩展 `/opt/xq-bridge/ext`，profile `/opt/xq-bridge/profile` |
+| systemd | `xq-chrome.service`（无头 Chrome）+ `xq-webbridge.service`（`kimi-webbridge run --addr 0.0.0.0:10086`，已 enable 开机自启）|
+| nginx | `location /xq-bridge/ { proxy_pass http://127.0.0.1:10086/; proxy_read_timeout 600s; }`，**无鉴权**（用户 2026-10-20 明确「不需要考虑这么安全的事」）|
+| 公网入口 | `http://101.43.25.101/xq-bridge/command`（安全组只放 80，**10086 不对外**）|
+
+🔴 **但 101 这条路当前不可用，原因不是部署而是出口 IP**：101 机房 IP 密集请求后被弹
+`check.xueqiu.com/captcha`，**只能人工在 `https://www.xueqiu.com/service/captcha` 过一次验证**。
+本机（住宅 IP）同一个接口同一批参数**立刻出 6 条真数据**。
+⇒ `config.yaml` 的 `bridge.base_url` 指本机 `127.0.0.1:10086`、`fallback_url` 指 101，
+**顺序不能调换**。⚠️ **没有实现任何绕过验证码/反检测的逻辑，也明确不做** ——
+唯一的解法是少问（见下）或人工过一次验证。
+
+#### 🔴 请求量就是风控预算（这不是性能参数）
+
+43 只 × 2 词 = 86 组/轮，抓取间隔 30 分钟 ⇒ 一天 **~4000 组**。按最初的
+`pace_ms=250 / cache_ttl=1800` 跑，当天下午就被弹验证码。
+改成 **`pace_ms=800`、`cache_ttl=10800`（3 小时）**：理由是这个渠道的信息
+变化单位是「天」不是「分钟」，**去重不是省时间，是保命**。
+两条离线断言钉住别再被后人调回去（`test_xq_wire.py` H 段）。
+
+#### symbol 格式（实测，错了是**静默 0 条**不是报错）
+
+| 市场 | 写法 | 实测 |
+|---|---|---|
+| A股/ETF | **必须带前缀** `SZ000158` / `SH600519` / `SZ159321` / `SH510310` / `SH588000` / `BJ830799` | 带前缀 10 条；不带 **0 条** |
+| 港股 | **裸 5 位码** `00100` / `02513` / `00700` | 裸码 10 条；`HK00100`/`HK00700` **0 条** |
+| 空代码 | 直接不发（`symbol=''` 会静默 0 条） | `_xq_via_bridge` 返回 `alive=None`（没资格跑） |
+
+`xq_bridge.symbol_of()` 是**唯一**的拼法来源（含 `hk` 前缀输入会归一成裸码）。
+
+#### 🔴 健康度归属：路径函数**一个都不写**，只有 `fetch_xueqiu` 写一次
+
+这是这次重构的真问题，不是风格问题。渠道健康度是**按渠道名一个键**：
+`_mark_fail("xueqiu", …, threshold=3, cooldown=30min)`。而一只票一轮要发
+**1 次桥调用 + `len(kws)×len(forms)` = 4 次 SearXNG 查询** —— 每次查询失败各记一次的话，
+**同一只票自己就能烧穿阈值 3**，于是：桥还能用却被整条渠道冷却 30 分钟，
+下一只票开头 `_channel_ready` 直接返回 `[]`，页面表现成「雪球两天没产出」。
+
+改法：`_xq_via_bridge` / `_xq_via_searxng` 都返回 **`(items, note, alive)` 三元组**，
+`alive` 是三态且语义写死在 docstring 里：
+
+| `alive` | 含义 |
+|---|---|
+| `None` | **没资格被判断**（桥未启用、没配 SearXNG 地址、本次没有代码）→ 不配写健康度 |
+| `True` | 应答了 —— **哪怕 0 命中**（这只票这个话题确实没人讨论）|
+| `False` | 源坏了（桥 captcha / 连接被拒 / 全部查询失败）|
+
+`fetch_xueqiu` 据此**只写一次**：有条目 `_mark_ok`；两条都 `None` **什么都不写**；
+任一 `False` 才 `_mark_fail`；两条都活着但空 → `_mark_ok` + **打印原因**。
+
+> 「0 条」和「坏了」必须分开，且**空返要打印**。否则静默空转和渠道故障在页面上
+> 长得一模一样 —— 与本文件「静默降级比报错危险」同源。
+
+顺带修的假结论：SearXNG 每次查询的异常原来被 `except` 吞进 `_mark_fail` 就丢掉，
+返回 note 恒写「索引里就没有」→ **连不上** 被说成 **没有**，是**完全相反**的结论。
+现在攒 `errs` 并按 `SearXNG 4/4 次查询失败：ConnectionError: …（另有 3 次同类失败）`
+冒到聚合层的 note 里。
+
+#### 相关性闸门为什么两条路都必须留
+
+`symbol=` **只缩范围、不严格过滤**。实测 6 组 × 10 条 = 59 条，真提到该股的只有
+**45/59 = 76%**，最糟的一组 `SH600519` + `业绩` 是 **0/10 全无关**。
+撤掉闸门等于把别家公司的帖子灌进 `sa_news` 直接参与决策，**比没有这个渠道更糟**。
+所以 `_xq_relevant()` 是唯一一份、桥和 SearXNG 共用（AST 断言 `fetch_xueqiu`
+里不许再出现 `_xq_relevant(`，防止出现第二份实现）。
+
+#### 分批预热
+
+`_xq_prefetch(stocks, conf)` 在 `fetch_watchlist` 的**逐票循环之前**跑一轮，
+把 43 只 × 2 词压成**一次** `search()`（内部按 `batch_size` 分批），
+结果进 3 小时 TTL 的进程内缓存；整段包 try/except，**预热失败绝不掀轮**
+（逐票时自动退回 SearXNG）。
+`fetch_topics` 的排除元组加了 `xueqiu`：话题轮没有代码，
+`symbol_of('')` 会拼成 `SZ` 前缀的假代码。
+
+#### 配置项与「网页保存会不会抹掉 bridge」
+
+`config.yaml`（gitignore，不提交）与 `config.example.yaml`（可提交）都加了
+`news.channels.xueqiu.bridge`：`enabled` / `base_url` / `fallback_url` /
+`pace_ms: 800` / `cache_ttl: 10800`。**顺序不能调换** —— `base_url` 是本机守护
+进程（住宅 IP，实测出真数据），`fallback_url` 是 101（机房 IP，实测吃验证码）。
+
+两个写入口都验过（`test_xq_wire.py` I 段）：
+
+| 入口 | 行为 | 结论 |
+|---|---|---|
+| `PUT /api/config`（`app.py:8038`）| `conf["channels"][name].update({k: v … if k in conf["channels"][name]})` | **合并**进现有 dict，前端少传键不会删、多传脏键进不去 → `bridge` 安全 |
+| `PUT /api/config/all`（`app.py:8137`）| 只写 `config_schema` 里**声明过**的键，走 `set_nested_key` 行级手术 | 未声明的键根本不碰 |
+
+因此给 `config_schema.py` 的 news 段补了 13 个字段（`channels.xueqiu.{enabled,
+min_interval,timeout,url,keywords,max_keywords,time_range}` +
+`bridge.{enabled,base_url,fallback_url,pace_ms,cache_ttl}`）。这既让页面能改这个
+渠道（否则它整段落在 `_unknown_keys()` 的「未知配置项」里改不动），也顺手把
+**两处默认值漂移**钉住：schema 的 `pace_ms/cache_ttl` 必须等于
+`xq_bridge.DEFAULTS`（本文件记过 N 次「副本漂移」）。
+
+> ⚠️ 排查这类问题时别被 PowerShell 骗了：`print` 出来的中文是乱码（GBK 控制台），
+> 但 YAML 本身是好的。判据写进文件再看（`len=5 words=2` = `解禁 禁售`）。
+
+#### 验证（都可重复跑）
+
+| 脚本 | 结果 |
+|---|---|
+| `test_xq_wire.py`（离线 112 项，全 Fake：桩掉 `XB.search` + `NF.requests.get`）| 全过。含「桥坏了不写健康度（兜底必须还活着）」「桥填满名额就**根本不该查** SearXNG（是成本不是运气）」「一轮只记**一条**失败」「两条都没资格 → 不写健康度」「空返打印原因但不记失败」「AST：两个路径函数 `_mark_fail`/`_mark_ok` **调用节点数 = 0**、聚合层恰好 1 条 fail」「prefetch 在循环之前」「symbol_of 13 个市场格式」「`PUT /api/config` 是 update 合并」「config.yaml 的 xueqiu 段每个键都在 schema 里（`unknown=[]`）」「schema 默认值 == `xq_bridge.DEFAULTS`」|
+| `test_xueqiu.py`（真网络 26 项）| 全过。B/C/D 测 SearXNG 那条路的过滤；H 测桥的**契约**（出货 → 标签/时间/URL/相关性；被封 → `alive=False` 且原因点名是桥）|
+| 回归 | `test_event_rescue` 13 / `test_pub_extract` 26 / `test_time_parse` `NO_GAP` 全过；`news_fetcher.py` `ast.parse` OK |
+| 真实 E2E | 本机桥：00100 + 解禁/禁售 → 6 条，最新 2026-10-20T17:07，全带真实发布时间与文章页 URL；101 桥：`桥captcha：雪球风控` → 退回 SearXNG、渠道未被冷却 |
+
+#### 这次踩的坑
+
+1. **用子串数 AST 接线会测到文档字符串**：`src_of(f).count("_mark_fail") == 1`
+   在 docstring 里写着「不写 `_mark_fail`」时恒假。改成走 `ast.walk` 数
+   `ast.Call` 且 `func.id == 目标名` —— **判「有没有调用」必须用调用节点**。
+2. **夹具自己错了会让断言永远测不到目标**：D 段「全被闸门挡住」那条用的
+   `https://xueqiu.com/1/2` 根本过不了文章页正则（`continue` 在计数之前），
+   于是 note 说「索引里就没有」而测试期望「全被闸门挡」。换成真形态 URL。
+3. **`int(x or 2)` 把显式 0 当未配置**：`max_keywords: 0` 会被吞成默认 2。
+   改成 `cap = 2 if raw in (None, "") else max(1, int(raw))`（真 bug，测试逮的）。
+4. **真网络测试的断言必须分清「谁的错」**：SearXNG 索引当天没有文章页、
+   桥被风控，都不是代码故障。把它们写成硬断言 = 测试变成「今天有没有被封」探针；
+   改成**契约断言**（有货 → 形态对；没货 → 必须有可读原因且不记故障）。
+5. **配置写入口有两个，只验一个会漏**：`PUT /api/config`（新闻页专用，
+   `dict.update` 合并）和 `PUT /api/config/all`（通用，只写 schema 声明过的键）。
+   「保存会不会抹掉嵌套的 `bridge`」必须两边都查源码，
+   因为当年 `mp.auth` 那次事故出在**另一个**合并函数上（`{**defaults, **body}`
+   把请求里没出现的键回写成默认值）。这里两条路都恰好安全，已各加一条断言。
 
 ### 🔴 港股解禁（hk_supply）三次验证方法全错，最后一次才对
 
@@ -1502,6 +1661,29 @@ NoneType.__format__`，成果**全部丢失**。真因是 `f"{r.get('price'):.2f
 - 说错了就明确说「我之前说错了」并给出更正，不要含糊带过。
 
 ---
+
+## 2.5 本机磁盘拓扑与清理记录（2026-10-19 实测）
+
+| 盘 | 物理介质 | 容量 | 说明 |
+|---|---|---|---|
+| C: | NVMe SSD (disk #0) | 117.4 GB | 系统盘；**pagefile.sys 26 GB 在这里（系统管理）** |
+| D: | SATA (disk #1) | 447 GB | 数据盘；`correct_your_life` 仓库在这 |
+
+- **pagefile 不要挪到 D**：C 是 NVMe、D 是 SATA，挪过去是性能倒退。要腾空间靠清缓存，不靠换盘。
+- 缓存默认位置已永久改到 D（2026-10-19，用户要求「以后不要再放 C 盘」）：
+  `PIP_CACHE_DIR=D:\dev-cache\pip` / `UV_CACHE_DIR=D:\dev-cache\uv-cache` /
+  `npm config set cache D:\dev-cache\npm-cache` / `GOCACHE=D:\dev-cache\go-build`
+  （都是用户级，无管理员权限，新进程生效）。
+- 本次清理（C 盘 0.21 → 8.42 GB 可用）：Temp 旧文件 3.14 GB、企业微信
+  `upgrade\` 旧安装包 1.98 GB、微信 XPlugin 0.98 GB、汽水音乐缓存 2.10 GB、
+  JetBrains 旧版 IDE + 杂项 0.66 GB、pip/npm/go 缓存 ~0.6 GB。
+- 删除了 `D:\FastGPT-base`（4.04 GB，用户 10-19 指定；esbuild 服务占用，
+  杀进程后 `cmd rd /s /q` 巨型 node_modules 比 PS 递归快一个量级）。
+- 未清（需条件）：汽水音乐 LunaCacheV2 剩 0.94 GB 被运行中的进程锁住
+  （关应用后可清）；`xwechat\radium\cache` 被 `host1.mmap` 锁（关微信后
+  可清）；`kingsoft\wps\addons` 1.66 GB 是 WPS 插件池（删了会重新下载，
+  没自动清）；Windows Temp / DISM WinSxS 要管理员权限。
+- 已知：微信聊天文件在 `D:\xwechat_files`（本来就在 D，无需动）。
 
 ## 3. 项目事实（省得每次重查）
 
@@ -4331,6 +4513,118 @@ NEW: [贵州茅台, ',带逗号词', 工商银行]   ← 流式序列；含逗�
 tab loader 挂上 `loadXhsKwCfg`）；E2E 13/13 —— 真请求保存 → 生效 → **还原 config.yaml
 并 sha256 逐字节核对**；回归 `test_mpr_http` 20/0、`test_paper_ui` 34/0。
 
+### 🔥 小红书抓取 0 结果的三层根因 + 101 服务换新版二进制（2026-10-19）
+
+**症状**：用户报「小红书爬取的好像没结果返回」。实测 `sa_xhs_notes` / `sa_xhs_comments`
+**0 行** —— 这条链路从上线起就没落过一次库。三层根因叠加，全部修掉：
+
+#### 根因 ①：`get_mcp_client` 单例缓存住错误地址（客户端，已修）
+
+起跑顺序坑：app 09:29 启动时 config.yaml 还没有 `mcp_url`（10:07 才写入）→ client
+第一次使用时用默认 `127.0.0.1:18060` 建出来 → **模块级单例永久缓存**。之后每轮
+`load_xhs_conf()` 虽然每轮现读（读到正确的 101 URL），但 client 不重建 → 11:31 那
+轮 12 个词全部 `WinError 10061` 秒败。`/api/xhs/status` 显示 101 URL 是**因为它
+自建新 client** —— 两条路径分化就是烟枪。
+修法：`get_mcp_client` 在 `base_url` 与 conf 解析结果不一致时重建（尾部 `/` 归一）。
+
+#### 根因 ②：101 上的服务端是「3 月旧版」，search 会**无限挂死**（服务端，已换）
+
+部署的二进制（`/opt/xhs-mcp`，构建于 2026-03-09）没有超时保护：search 页等
+`__INITIAL_STATE__` 的 `MustWait` 无界（rod 的 `page.Context(ctx)` **替换**掉
+deadline，Go 里注释明写这个坑）。实测挂死形态：GIN 里 `4m0s` 的 search，**只有
+客户端断开才结束**（ctx cancel → rod `Must*` panic → gin Recovery → 500）。
+采证方法：500 = panic = journal 里有完整栈，**不需要 SIGQUIT**：
+`search.go:175` / `login.go:21` / `service.go:381` 三帧全部对上运行中二进制的
+本地 clone（`D:\xiaohongshu-mcp`）。客户端取消也会造出这种 500 —— 我自己的
+8s login/status 超时 + 60s search 均在服务端日志留下 `1m0s | 500` 轨迹，
+排错时**先分清「客户端断开触发的 500」和「服务端真故障 500」**。
+
+**换法（= 直接部署 fork main 新版）**：上游 `hellostronger` fork 的 main **已经
+修好同款 bug**（`search.go` 有注释：`Context(ctx)` 会替换 deadline，必须其后重新
+`Timeout(60s)`；`login.go` 加了 30s；`feed_detail.go:101` 整单 10min + 评论循环
+全是 `Timeout(2s)` 优雅取值）—— **无需自写补丁，构建 fork main 即可**。
+部署要点（全踩过）：
+
+| 坑 | 事实 |
+|---|---|
+| 101 连 GitHub 极慢 | `git clone` 13min 没拉完、codeload 两次断流（13.6MB/3.3MB 截断）。**gh 镜像一击必中**：`https://ghfast.top/https://github.com/.../archive/refs/heads/main.tar.gz`（80MB 完整）|
+| fork 移除了 `-bin` flag | 旧 unit 里的 `-bin /usr/bin/google-chrome` 会让新二进制起不来（`flag provided but not defined`）。**unit 必须去掉** |
+| 内置浏览器 | fork 用 `browser.EnsureBrowser()` 从 `cdn.one-world.ai/browsers/<ver>/linux-x64.tar.xz`（~148MB）下载到 `$HOME/.cache/...`。101 实测可达（~385KB/s）。**systemd 里没有 `$HOME`** → 首启 fatal `neither $XDG_CACHE_HOME nor $HOME are defined` → unit 加 `Environment=HOME=/root` |
+| 预下载浏览器 | 用 curl 预下到 `/root/.cache/xiaohongshu-mcp/browser/148.0.7778.215/` + tar 解压（对齐 EnsureBrowser 的缓存布局，SHA256 手动校验过）。**解压脚本 `${WANT,,}` 是 bash 语法，被 dash 跑会 Bad substitution** → 用 `tr 'A-Z' 'a-z'` |
+| 构建 | 101 上 `GOTOOLCHAIN=auto GOPROXY=https://goproxy.cn,direct go build` **62 秒**出二进制（22.5MB），无需本地交叉编译 |
+| cookie 路径兼容 | fork 的 `GetCookiesFilePath()` 优先 cwd 的 `cookies.json` = `/opt/xhs-mcp/cookies.json` ✓；空 token = 不鉴权 ✓（`authMiddleware` token=="" 直接放行）|
+
+**上线后验证（12:54 起）**：`/health` 200；login/status 7.6s 登录有效；真实搜索
+9.1s 出 20 条；GIN 里**所有请求有界**（唯一 500 是 1m0s = 60s 内置超时到顶的
+降级路径，其余全 200）。
+
+#### 根因 ③：hot_query 杂项漏进详情队列（客户端，已修）
+
+搜索返回里有 `modelType=hot_query` 的**无 noteCard** 条目（热搜表/专题），旧过滤
+`mtype in (...) or ctype in (...)` 放行 → 取详情必失败且白占 `max_notes` 名额。
+修法：`if not card: continue` 先行（`test_xhs_client_fix.py` 钉死：杂项 50 条 +
+正常 2 条 → `quota_not_wasted`）。其余客户端加固：search 独立 `search_timeout=60`
+（env `XHS_SEARCH_TIMEOUT`）、失败退避重试（`SEARCH_RETRIES=2` + 45s 冷却）、
+词条间隔（`KEYWORD_PACE_SECONDS=8` + 0~4s 抖动，`finally` 里保证 `continue` 也停）、
+`get_status` 超时 8s→20s（忙时 login/status >8s，8s 会把好的检查变超时）、
+超时报错消息用 per_call 而非 self.timeout（否则搜索 60s 超时误报 180s）。
+
+#### 「是不是频率太高了，被封了」—— 证据链：不是
+
+| 证据 | 判定 |
+|---|---|
+| 页面 200、内容完整（htmlLen ~206k）、无验证码、登录有效 | 没有封号/风控拦截形态 |
+| 同一关键词 `基金定投` 连发 **11 次全部成功**（7.3~9.1s） | 频率限制不存在 |
+| 挂死按**时段**出现（10:26–11:08 密集，11:10+ 连续成功 27 次），与「新词/重复词」无关 | 不是频率/账号问题，是**同一 v0.116.2 rod 会话里 CDP 调用不返回**（会话失步）—— 新版二进制有界后不再发生 |
+| 部署新版后的整轮抓取无一次 4 分钟级悬挂 | 封号症状不存在，是旧版缺陷 |
+
+#### 遗留（如实记录，未动）
+
+- **整轮设计**：`sync_notes_to_db` 在**全部关键词跑完后**才落库，一轮 12 词 ×
+  ~40 detail ≈ 2~3.5 小时，中途崩溃/重启 = 全轮报废（12:00 轮被部署打断时，
+  在途 detail 全失败但轮次自身继续、末尾照常落库，属最小损失）。改成「逐词增量
+  落库/跳过已存 note 的 detail」能大幅提效 —— 改的是用户设计，**先问再动**。
+- detail 客户端超时 180s < 服务端 10min 上限：客户端放弃后服务端最多再跑 ~7min
+  白烧浏览器（有界，非挂死）。观察若干轮后再定。
+- 客户端修复（get_status 20s / 报错消息 per_call）在**重启本地 app 后**生效，
+  当轮跑完即重启。
+
+验证：`test_xhs_client_fix.py` **18/18**（不联网）；离线过滤/单例/超时钉死。
+
+### ⛔ 小红书风控/登录失效自动暂停（2026-10-19 后续，`xhs_watch_mcp.py`）
+
+**为什么要有这个**：风控和登录失效都会让抓取彻底拿不到内容，策略却完全不同 ——
+`risk` 继续抓会把临时限流打成封号，`login` 只需扫码重登。原来两种情况都表现为
+「关键词全空、每轮照跑」，等于边被限流边加码。
+
+#### 判定（`classify_failure` 三分类）
+
+| 输入 | 结果 | 依据 |
+|---|---|---|
+| 报错文案命中 `_RISK_PATTERNS`（风控/验证码/429/rate limit…）| `risk` | 文案即证据 |
+| 报错文案命中 `_LOGIN_PATTERNS`（未登录/unauthorized/跳转登录…）| `login` | 同上 |
+| **连续 2 个关键词 0 条** | 问一次登录态：未登录 → `login`，否则 `risk` | 空结果只有这两种真相 |
+| 其它异常（超时/网络） | `None`，**不暂停** | 退避重试本来就能兜住，暂停会让本可完成的抓取白停 |
+
+`_login_state_is_bad()` 在**连不上 mcp 时返回 False** —— 服务端抖动不等于登录失效，
+不能顺手把抓取停掉。
+
+#### 状态与恢复
+
+- `_pause = {active, kind, reason, since}`，`_pause_lock` 保护（抓取线程写、UI 线程读）；
+  同 kind 重复触发**不刷新 `since`**，否则「已暂停多久」永远显示刚开始。
+- 暂停后：定时轮询跳过（`_xhs_auto_loop`）、手动 `POST /api/xhs/fetch` 返回
+  **409 + 可读理由**（不是静默空跑）；**`POST /api/xhs/login` 不被抓取锁阻塞**
+  —— 先重登再恢复是这个功能的主要用法。
+- `POST /api/xhs/resume`：默认先验一次登录态，未恢复则拒绝（风控无法从服务端查询，
+  只能由用户确认冷却够了再放行）。
+- 页面：`#xhs-pause-banner` 双色横幅（risk 红 / login 黄）+ 「解除暂停」按钮。
+- 关键词间隔 `KEYWORD_PACE_SECONDS` 加 **0~4s 抖动**（`random.uniform`），降低连续
+  高频搜索触发风控的概率。
+
+> 两类分开的理由：给用户看的下一步动作完全不同 —— risk 要等，login 要扫码。
+> 混成一种「抓取已暂停」等于把处置说明也一起丢了。
+
 ### 📝 做T判断全量落库（2026-10-18 用户要求）
 
 用户要求：`「💼 实盘做T建议」但是往往只见到一个两个建议，能不能将每次的所判断落库，让用户知道为什么其他股票不适合做t,也方便后续rsi`
@@ -4380,6 +4674,112 @@ tab loader 挂上 `loadXhsKwCfg`）；E2E 13/13 —— 真请求保存 → 生�
 - Node V8 UI 测试：**31/31 通过**
 - 回归：`test_paper_ui` 34/0、`check_full_js` 两 script 块 OK、`test_anal_ui`/`test_render` 全过
 - 无网络/LLM 依赖，可随时重复跑
+
+---
+
+### 📉 趋势减仓 / 提前抛（2026-10-22，**只给建议、绝不下单**）
+
+**为什么加这条**：用户问「最近都是趋势向下呀，像智谱和minimax，提前抛能减少很多亏损，
+为什么没有触发」。查实：引擎里**确实没有**这条规则 —— 做 T 是「先卖后买、仓位不变」，
+实盘也**没有**自动止损（`check_stop_loss` 只管模拟盘）。用户随后授权：「要加就是新交易
+规则，得你定触发条件（跌破 MA20 / MA20 下穿 MA60 / 跌破成本 x%）、减多少、只给建议
+还是执行。你给个合适的补充一下把」。
+
+**落地口径（授权边界，未经再次确认不要改成执行）**：
+
+- **只给建议，永不成交**。`enabled: false` 默认关。`scan_once` / `decide` /
+  `_execute_one` **一个字节没动**；`_execute_one` 对 `hard_stop` / `trend_reduce`
+  直接原样返回（`if dec.get("action") not in T_ACTIONS: return dec`），架构上走不到下单。
+- 页面在趋势动作上**不显示「记一次做T」**（那是给真实 T 成交记的）；`trend_ticket`
+  是 `legs="sell_only"`、**没有 `buy_back` 腿** —— 若误用做 T 的单据模板，会凭空生成
+  「跌到 X 买回」的腿，与「趋势走坏降仓位」完全相反。
+
+#### 规则（`t_trading.trend_reduce_state`，纯函数、可离线回放）
+
+| 项 | 口径 |
+|---|---|
+| 趋势条件 | **收盘 < MA20 且 MA20 < MA60**（同时满足）。比单看「跌破 MA20」多一层趋势确认，震荡市单日破位不触发 |
+| 确认 | 条件连续 `confirm_days`（默认 2）个交易日 |
+| 减多少 | `reduce_pct`（33%）× 持仓 → 按申报单位**向下取整**，**至少留 1 手**；再按 T+1 可卖封顶 |
+| 一段下跌只发一次 | 触发后 `armed=false`；要连续 `rearm_days`（5）天收盘**站回 MA20** 才重新武装；两次触发至少隔 `cooldown_days`（10）；最多 `max_reductions`（2）次 |
+| 有效期 | `fresh_days`（2）个 **bar 序号**（不是自然日） |
+| 硬止损 | 收盘**新近下穿** `成本 × (1 - hard_stop_pct%)`（10%）→ 建议清掉可卖部分（**允许零股，不按整手**） |
+| 深亏保护 | 浮亏 ≤ `-deep_dd_pct`（25%）时，趋势信号降级为 `trend_wait`：**只提示不催卖**、`shares=0`。「一路阴跌 40% 后再催割肉，多半割在阶段低点」 |
+| 优先级 | **hard_stop > trend_reduce（含 trend_wait）> 做 T**。`trend_wait` **不覆盖** T（它不在 `TREND_ACTIONS` 里，只挂在 `item["trend"]`） |
+| 回放起点 | 建仓日 `first_date`（之前的 K 只当 MA 预热）；取不到就从窗口起点回放（更早触发，偏保守） |
+| 窗口 | `lookback_days` 180，实际取 `min(800, 180+60)` = **240 根**（MA60 + 回放都需要） |
+
+`shares=0` 是**合法结果不是 bug**，`why` 必须写清是哪一条挡住的（没有可减份额 /
+持仓不足 1 手 / 33% 不足 1 手 / T+1 锁定后不足 1 手 / 底仓至少留 1 手）。
+`_trend_shares` 额外返回「名义股数」`shares_raw`，就是为了这时能说清「本来想减多少」。
+
+#### 三个容易误判的语义（都是实现里刻意选的）
+
+1. **「一段下跌只发一次」**：`fresh_fire` 只看**最近一次**触发，且 `fresh_days=2`。
+   所以一个持续数周的空头排列，**只在触发当天和之后 1 个 bar 提示**，之后 `action=none`
+   （`why` 写「趋势信号曾在 X 触发（第 N 次）…本轮不再提示」）。
+   而且 `fires` **统计的是发出过的信号，不是用户执行过的次数** —— 用户 9 月忽略了一次，
+   10 月不会再被提醒，除非价格站回 MA20 连续 5 天**重新武装**。这是「不刷屏」的代价，
+   不是漏报。
+2. **`synthetic_today` 会吃掉一格有效期**：盘中用实时价补一根「今日」bar 后，窗口是
+   `[..., 今日]`；`fresh_days` 按 bar 序号算，所以「今天触发」= 第 0 格，
+   「昨天触发」= 第 1 格。**不要拿自然日去理解 `fresh_days`**。
+3. **深亏保护只挡 `trend_reduce`，不挡 `hard_stop`**：硬止损在 `deep_dd` 判断之前就
+   `return` 了。即「跌得极深」不会让 10% 硬止损失效，只会让「趋势减仓」变成一句提示。
+   `deep_dd_pct=100` 可关闭该保护（配置项，不必改代码）。
+
+#### 真实数据（2026-10-22，31 只实盘持仓，101 行情 + 101 日K 240 根）
+
+`scanned=31 would_act=1`：
+
+| 代码 | 名称 | 结论 | 依据 |
+|---|---|---|---|
+| **512710** | 军工龙头ETF富国 | **trend_reduce 15400 股** | 46900 股 × 33% = 15477 → 整手 **15400**，保留 31500；fires=1 / last_fire **2026-10-22** / streak=2 / sellable=46900 |
+| 000839 | 国安股份 | `trend_wait`（页面仍是 hold） | 浮亏 -98.5%，last_fire 2026-10-22、streak=2 → 新鲜但深亏，只提示 |
+| 002081 | 金螳螂 | `trend_wait`（页面仍是 hold） | 浮亏 -48.6%，last_fire 2026-10-21、streak=3 → 同上 |
+| 02513 / 01024 / 09696 / 510310 / 300274 / 301308 / 600406 / 600478 / 688795 | 智谱/快手-W 等 | `none`（保持 hold） | 均在 **2026-09-10** 触发过（streak 仍 26~30，说明条件一直成立），但早已超出 2 个 bar 的有效期 |
+| 00100 | MINIMAX-W | `none`（保持 hold） | **确有持仓**：140 股、成本 281.4、建仓 2026-09-24、浮亏 -42.9%；fires=1 / last_fire **2026-10-06** → 过期；即使新鲜也会因深亏降级为 `trend_wait` |
+| 159329 / 600979 / 301382 / 000723 / 003035 / 159321 | | `none` | last_fire 2026-10-08 / 10-16 / 10-13 / 10-14 / 10-14 / 10-14 → 过期 |
+| 301217 / 588000 | | `none` | fires=**2**（2026-09-29 两次）→ 已用完 `max_reductions`，除非重新武装 |
+
+⚠️ 512710 这一条是**贴线触发**：收盘 0.6200 vs MA20 0.6205（只低 0.08%）、
+MA20 0.6205 < MA60 0.6223。规则按定义该报，但这不是「暴跌」，是「趋势刚转弱」，
+是否执行由用户自己判断。
+
+> 这正是用户最初问题的答案：智谱/MINIMAX 不是「没满足条件」，而是**条件满足了、
+> 信号在 9 月/10 月初就发过了**；按「一段下跌只发一次」的口径，现在不会再催。
+> 如果希望「持续下跌期间每天提示」，要改的是 `fresh_days`（或去掉一次性语义），
+> 那属于**交易口径**，得先问。
+
+#### 接线
+
+| 位置 | 作用 |
+|---|---|
+| `t_trading.T_DEFAULTS["trend_reduce"]` | 10 个默认值：`enabled=false / confirm_days=2 / reduce_pct=33 / cooldown_days=10 / rearm_days=5 / max_reductions=2 / fresh_days=2 / hard_stop_pct=10 / deep_dd_pct=25 / lookback_days=180` |
+| `t_trading.TREND_ACTIONS` / `TREND_LABELS` / `ACT_ACTIONS` | 动作集合；`would_act` 只数 `ACT_ACTIONS` 且 `shares_suggest>0` 的（`shares=0` 的「提示」不算可操作） |
+| `t_trading.advisory` | `tr_on` 时取 240 根日K、读 `first_date`、用 `real_sellable_shares`（**读 `sa_trades`，不是 `sa_paper_trades`**）；趋势动作覆盖做T建议，保留 `t_action` 原判、清掉做T专有字段（`edge_pct/threshold/anchor_price/layer/movable`），`base_shares=held`、`pending=false`、`stabilizing=null` |
+| `app._t_advisory_loop` / `GET /api/t/advisory` | 通知按 `ACT_ACTIONS + shares>0`；`sig={(code, action)}` 所以 t_sell→trend_reduce 会重新通知；端点零写库（只有 `persist_advisory` 写判断日志） |
+| `config_schema.py` + `config.example.yaml` | 10 个键挂在 **`paper.t_trading.trend_reduce.*`**（不是 `t_trading.*` 顶层） |
+| `static/index.html` | `T_TREND_LABELS`、`T_ACT_KEYS`、`_tTrendLine`、`tIsTrend`；趋势动作不显示「记一次做T」 |
+
+#### 验证（都可重复跑，零 LLM）
+
+| 脚本 | 结果 |
+|---|---|
+| `test_trend_reduce.py`（离线） | **237/0**：条件/确认/冷却/重新武装/上限、T+1 封顶、整手与留 1 手、硬止损只认新近下穿（一直水下不触发）、深亏降级、`synthetic_today` 吃 freshness、`first_date` 回放起点、`shares=0` 的五种原因、`trend_ticket` 无买回腿、静态接线（`_execute_one` 未接趋势动作） |
+| `test_trend_reduce_e2e.py`（真 101 行情 + 101 日K，不烧 LLM） | **28/0**：A 101 报价/日K 240 根最新 ≥2026-10-15；B 31 只逐只 `trend_reduce_state`（`sellable=None`）；C `advisory` 关闭 vs 开启两态；D `_execute_one` 对趋势动作原样返回 + 端点注册；E `config.yaml` sha256 前后一致 |
+| `test_fpx.py` | PASS（价格必须走 `fpx` 4 位小数；⚠️ `cost` 是**价格**不是百分比，静态检查里归价格组） |
+
+⚠️ **E2E 的 60 根陷阱（本次实际踩到）**：B 段一开始只取 60 根日K，`start_i` 被顶到 59，
+回放只剩 1~2 天 → **几周前的旧信号被误判成「新鲜」**，B 段报了 6 只 `trend_reduce`，
+而页面（240 根）只有 1 只。**任何复算 `trend_reduce_state` 的脚本都必须用与 `advisory`
+相同的 240 根窗口**，否则结论与页面不一致，且不会报错。（同源教训：夹具/窗口与被测
+路径不一致时，「测试通过」不等于「线上如此」。）
+
+⚠️ `app.py` 开头有 **UTF-8 BOM**（`\xef\xbb\xbf`）。用 `encoding="utf-8"` 读成字符串再
+`ast.parse` 会因 `\ufeff` 报 `invalid non-printable character U+FEFF`；读它请用
+`utf-8-sig`。⚠️ 断言 `_execute_one` 有没有接趋势动作时要看**成员判断 + 提前 return**，
+不能用 `"trend_reduce" in src`（文档字符串里写着它，恒真）。
 
 ---
 
@@ -4494,3 +4894,204 @@ UI 提示「A 股须 100 股整数倍」但**既不取整也不拦截**。是否
 > 教训与「HTTP 200 但 data 为空」同源：**curl 能通 ≠ 页面能用**。curl 默认补的
 > header 恰好掩盖了前端缺 header。写前端请求的回归断言时，要断言**用哪个助手**，
 > 不是断言「请求发出去了」。
+
+---
+
+### 🛢💱 国际期货（含布油 OIL）+ 汇率进决策（2026-10-22 用户要求）
+
+用户原话：「主要期货加上布油OIL,和汇率这些，并将这些数据加入决策参考中」。
+两块**共用** `paper.futures_fx_inject` 一个注入开关，**默认开**（用户明确要求进决策）。
+
+| 组件 | 位置 | 要点 |
+|---|---|---|
+| 期货采集 | `futures_watch.py`（已有，本次扩种子） | `SEED_SYMBOLS = XAU/XAG/CL/**OIL**/NG/HG`；`SEED_NAMES` 含 `OIL=布伦特原油`、`CL=WTI原油` |
+| 汇率采集 | `fx_watch.py`（**新模块**） | 新浪 `hq.sinajs.cn/list=fx_*`，6 组：USD/CNY、USD/CNH、USD/JPY、EUR/CNY、USD/HKD、GBP/CNY |
+| 注入 | `paper_trading._decide_one` | `futures_fx_block`，append 顺序 **evo → inst → strategy → macro → futures_fx → mp** |
+| 端点 | `GET/POST /api/futures/quotes|refresh`、`/api/fx/quotes|refresh` | 空表或任一条 ts 超 300s 时自动刷一次 |
+| 守护 | `sa_futures` / `sa_fx` | `interval_minutes` 默认 15 |
+| 前端 | `static/index.html` 行情页两张卡 | `loadFutures` / `loadFx`，均已挂进 `market` 的 `TAB_LOADERS` |
+| 配置 | `futures.*` / `fx.*` / `paper.futures_fx_inject.*` | 全部默认开；`max_chars=1200`、`stale_minutes=45`（后两个 adv） |
+
+#### 数据源（实测，别再找替代）
+
+- 期货：`ak.futures_foreign_commodity_realtime(symbol=...)` —— **akshare 支持传 list 一次拿全部**
+  （实测 6 个符号 **0.33s / 1 次请求**，返回 `hf_XAU,hf_XAG,…`，名称/最新价/涨跌幅齐全）。
+  我们的代码仍**逐个符号发**（6 次请求），换的是**单符号故障隔离**（一个源失败不影响其余）；
+  要走批量就把 `fetch_quotes` 的循环换成 list 调用，别忘了给缺符号补退路。
+  ⚠️ 两者底层**都是新浪** `hq.sinajs.cn`（期货 `hf_` 前缀、汇率 `fx_` 前缀）。
+- 汇率：`hq.sinajs.cn/list=fx_susdcny,...` **一次批量**；**必须 `r.encoding="gbk"`**，否则中文乱码；18 字段里用 `[0]`时间 `[1]`买价 `[2]`卖价 `[3]`昨收 `[8]`最新 `[10]`涨跌幅 `[11]`涨跌额 `[17]`日期。
+- 已否决：腾讯外汇（`v_pv_none_match`，无此符号）；akshare 的汇率函数（数据停在很久以前，**静默给过期值**）。
+
+#### 注入文本（口径必须写明「宏观背景」）
+
+```
+【国际期货（宏观背景：大宗商品价格只用于判断成本/收入/资金面的间接传导，不能当作个股买卖的直接触发条件）】
+数据抓取于 {YYYY-MM-DD HH:MM}（北京时间）{stale}：
+  · 黄金 XAU 4116.36 美元/盎司（-0.60%）
+  · 布伦特原油 OIL 110.52 美元/桶（+1.57%）
+【汇率（宏观背景：用于判断汇率变动对成本/收入/资金面的间接影响，不能当作个股买卖的直接触发条件）】
+报价时间 {YYYY-MM-DD HH:MM}（北京时间）{stale}：
+  · 美元/人民币(在岸) USD/CNY 6.6748（-0.02%）
+```
+
+两条时间语义**不同，别合并**：期货是「**数据抓取于**」（源只给抓取时刻），汇率是
+「**报价时间**」（新浪给的是真实报价时刻）。滞后超 `stale_minutes` 追加
+`；⚠ 数据已滞后约 N 分钟（刷新可能失败）` / `；⚠ 报价已滞后约 N 分钟`。排序**确定性**：
+期货按 `SEED_SYMBOLS`、汇率按 `PAIR_ORDER` —— 决策上下文必须可复现。
+
+#### 空块 / 关掉的逐字节保证
+
+两个 `build_injection` 无数据都返回 `""`；`enabled=false` 时 `paper_trading` 根本不调它们。
+`futures_fx_block` 拼进上下文的方式是 `ctx += "\n" + block`，**只有非空才追加**
+—— 所以「关掉」与「从来没做过这个功能」逐字节相同（有断言钉死）。
+
+#### 踩到的两个坑
+
+1. 🔴 **`quotes_summary` 不 JOIN 名字 → 页面只显示代码**。`sa_futures_quotes` 只有
+   `symbol`，页面 `esc(i.name || i.symbol)` 静默回退成裸 `OIL` —— **数据一直在，
+   是展示层把中文名丢了**（与「`shortTitle` 是 list 被 str() 成垃圾」同一类）。
+   修法：`LEFT JOIN sa_futures_watch w ON w.symbol=q.symbol` 取 `w.name`。
+2. **`fmtLocalTs` 而不是 `slice(0,16)`**。DB 的 `timestamptz` 序列化成 UTC ISO，
+   `ts.replace('T',' ').slice(0,16)` 会显示**比北京时间早 8 小时**的时刻（本文件记过
+   N 次的同类坑）。新 helper 走 `new Date(ts)` 取本地时区，期货/汇率两张卡与
+   `updated_at` 全部改用它。
+
+#### 验证（都可重复跑，全在 `%LOCALAPPDATA%\Temp\opencode\`）
+
+| 脚本 | 结果 |
+|---|---|
+| `test_futures_fx_offline.py`（全 Fake） | **61/61**：Sina 18 字段解析、tuple vs dict 游标**逐字节同块**、单位/表头/滞后告警、空块 `""`、schema 默认值与代码一致、静态接线（守护/端点/append 顺序/截断）、UI 用 `fmtLocalTs` 且**无 `slice(0,16)`** |
+| `test_futures_fx_e2e.py`（真库 + 真网络） | **24/24**：建表幂等 ×2；真抓 OIL（布伦特 110.5 +1.57%）与全部 6 个种子；真抓 6 组汇率；落库后可读；注入块非空且**含中文名** |
+| `verify_futures_fx_in_context.py`（零 token） | **13/13**：monkeypatch `_llm_call` 捕获 `user_text`，`"\n"+block` **逐字节**出现在模型入参；OFF 块消失；**缺键 = 默认开**（块存在） |
+| `check_full_js.py` | 2 个 script 块 `node --check` 全过 |
+| 线上实测 | `/api/futures/quotes` 200 × 6 条带中文名；`/api/fx/quotes` 200 × 6 组；页面已含 `fx-card`/`loadFx`/`fmtLocalTs` |
+
+> ⚠️ 验证脚本第一版 11/4：OFF/DEFAULT 那两轮 0 次 LLM 调用，原因是**同一只票的
+> K 线源瞬时失败**（`[paper] 00136 K线不足，跳过今日决策`），不是功能坏了。
+> 改成 `run_any()` 遍历候选票直到有一只能走到 LLM 路径 —— **失败的不一定是要修的代码**。
+> ⚠️ 两个 `build_injection` 的契约是**连接（conn）不是游标（cur）**，传游标会让它们
+> catch 掉 `AttributeError` 后返回 `""`，两块**静默为空且不打日志**（与 macro_inject 同款）。
+
+---
+
+### 📡 行情全部经 101 data_service（2026-10-22，用户硬性要求）
+
+用户原话：**「本机不要直接调用任何数据源，都要经过101」**。这条只落到**行情**（K线/报价/
+分时/汇率/美股），其余信息源（新闻、公告、期货、加密等）仍在直连，清单见本节末尾。
+
+#### 改了什么
+
+| 位置 | 变化 |
+|---|---|
+| `market_data.py` | 变成**薄客户端**：`_base_url()`（env `SA_DATA_SERVICE_URL` → config `sector.data_service_url`，空则报错）、`service_get()` 用 `requests.Session(trust_env=False)`；**没有任何本机直连兜底** |
+| `app.py` | `_svc_get`(905) 是唯一出口；`fetch_quotes`(911) 走 `/quote`、`_em_kline_fields`(979) 走 `/kline`、`sample_market_volume_now`(1148)、`_hkd_cny_rate`(1567)、`_us_quote`(9388) 全部改走 101 |
+| 101 `data_service/market.py`（新） | `/kline` `/quote` `/intraday` 三个端点；东财 push2his 在 101 上也**不可达**，日K 实际走腾讯 `newfqkline`（`source=tx`）|
+| 镜像 | `sa-data-service:1.0.2`（`b8f1cd9d846f…`，healthy，`0.0.0.0:8080`）用 `Dockerfile.overlay` 叠层部署（101 磁盘只剩 ~2G，不能全量重建）|
+
+#### 必须记住的口径
+
+- **成交量单位**：A股/ETF 手；**科创板 688/689 是股 → ÷100**；港股股。`f57` 成交额单位元。
+- **secid**：前缀 1~3 位（`1.600519` / `0.000158` / `116.02513` / `100.HSI`），
+  原来写死 3 位是错的。
+- **`tx_to_secid("hkHSI")` 只对前缀小写化**，指数代码 `HSI` 的**大小写要保留**。
+- 港股没有 `mkline` → `/intraday` 用分时点合成，`source="tx_trend"`、`has_ohlc=false`。
+- 腾讯分时的 `data.<symbol>.data` 是 **dict**（`{date, data:[…]}`），不是 list。
+
+#### 验证（都可重复跑）
+
+`%LOCALAPPDATA%\Temp\opencode\verify_market_via_101.py` **14/0**（真 import app，
+`sys.sa_bootstrap_done=True` 不 boot daemon；`NO_PROXY=*` + 剔脚本目录）：
+日K 600519/513980/588000/02513 **各 61 根**（末根 2026-10-22）、
+`trend_state(02513)=down`（不再是 flat）、4 只报价 1311.01/12.37/452.2/1.394、
+HKDCNY 0.8504、AAPL 343.99、三大指数量比 1.39、
+且 app/market_data/t_trading/paper_trading **零行情源直连 URL**。
+离线侧 `data_service` 三套共 **185 项**（见下）。
+
+> 写脚本时错了两次，**都是测试自己的错**：① `fetch_kline_ohlcv` 的 symbol 要
+> **先过 `app._tx_symbol(code)`**（t_trading 就是这么传的），直接传 `600519` 会
+> 「无法识别 secid」；② 港股要传**原始 `02513`**，传 `hk02513` 会被再拼成 `szhk02513`。
+
+#### 代码备份：私有仓库 `hellostronger/sa-data-service`
+
+用户要求「在 GitHub 上建私有仓库保存，防止丢失」。已建：**private**，默认分支 main，
+HEAD `ccc1c7b`，23 个文件 = 101 上跑的那套（平铺包内容，目录名不必叫 `data_service`）。
+
+- 建仓方式：GitHub REST `POST /user/repos {private:true}`，用 GCM 里存的 PAT（**不回显、
+  不写进 remote URL**）；remote 是普通 `https://github.com/...`。
+- 仓库目录名与包名不同 → `run_tests.py` 用 `importlib.util.spec_from_file_location`
+  把仓库根注册成包 `data_service`，再跑 `selftest`(116) + `test_budget`(15) +
+  `test_market_proxy`(54) = **185/0**；**从 clone 出来的 `clone_check` 目录再跑一遍同样 185/0**。
+- 附 `DEPLOY.md`（部署/回滚/端点契约/单位表）+ `Dockerfile.overlay`（1.0.2 → 1.0.3）+ 修正过的
+  `docker-compose.yml`（`0.0.0.0:8080`、镜像 1.0.2）。
+- **已记录的漂移**：本地 `sources.py`/`aggregate.py` 比 101 上的**新**，含
+  `last_budget_skipped → degraded=True` 的静默降级修复；镜像 1.0.2 **只更新了
+  market.py/api.py**，即生产**还没跑**这版修复。仓库里放的是本地（较新）版本，
+  下一步叠 `1.0.3` 才生效。
+- 本仓库主目录 `docker-compose.yml` 仍是旧的 `1.0.0` + `127.0.0.1:8080`（与生产不符，
+  未改动，等确认）。
+
+#### 仍在本机直连的信息源（用户口径下待迁移，不是遗漏）
+
+`alerts.py` / `supply_events.py` / `stock_roster.py`（东财公告、解禁、减持）、
+`news_fetcher.py`（eastmoney/baidu/sina/searxng，雪球桥需**住宅 IP** 必须留在本机）、
+`fx_watch.py` / `global_markets.py`（新浪、腾讯）、`futures_watch.py`（akshare）、
+`crypto_watch.py`（gate.io/东财/新浪/搜狐/腾讯）、`econ_calendar.py` /
+`earnings_sync.py` / `institution_signals.py` / `ipo_*` / `blocktrade` 类（akshare + 东财
+datacenter）、`valuation_data.py`（东财/腾讯）、`sector.py`（东财回落）。
+
+---
+
+### 🔔 实盘建议通知接线 + 🔴 微信 `prepare failed` 根因链（2026-10-22 用户要求）
+
+用户要求：「实盘也要开启建议，并做邮件和微信通知」。实盘建议引擎（趋势减仓 +
+做 T，`t_trading.advisory`，只建议绝不下单）**此前只写页面不通知**，本轮把
+通知接通并验证；微信侧被服务端挡住，根因已查到**需要用户做一个动作**。
+
+#### 接线（零交易口径改动）
+
+| 项 | 值 |
+|---|---|
+| 事件 | `t_advisory`，已登记进 `notify_events.EVENTS`，默认 `{wx:true, email:true}` |
+| 配置 | `config.yaml`（**不提交**）：`t_adv.enabled=true` + `t_adv.interval_minutes=15` + `notify.events.t_advisory.{wx,email}=true`；`config.example.yaml` 同步示例 |
+| 守护 | `app._t_advisory_loop`：交易日 09:30–11:35 / 13:00–15:20 窗口内每 15 分钟扫一轮；**只读 + 通知**，`persist_advisory` 写判断日志 |
+| 去重 | `sig = {(code, action)}` 与上一轮比对，**只有变化才通知**（t_sell→trend_reduce 会重新触发） |
+| 标题 | 有趋势动作时 `🔁 实盘做T/趋势建议`，否则 `🔁 实盘做T建议` |
+| 路由验证 | `resolve_channels("t_advisory") == ["wx","email"]`（全局开关 ∩ 事件矩阵） |
+
+**实测**：`GET /api/t/advisory` → 200，`scanned=31, would_act=1`；512710 军工龙头ETF富国
+→ `trend_reduce 15400 股`（收盘 < MA20 且 MA20 < MA60 连续 2 日，第 1/2 次信号，
+保留 31500 股）。邮件两次实测送达 1145607886@qq.com。离线断言 64/0；
+回归 `test_trend_reduce.py` 237/0、`test_fpx.py` PASS。窗口已过 →
+**首次线上通知在次日 09:30–11:35 窗口**。
+
+#### 🔴 微信 `sendmessage ret=-2 errmsg=prepare failed`：根因是服务端要求活跃会话
+
+**排除法做满**（`%LOCALAPPDATA%\Temp\opencode\probe_wx_prepare2.py`，直连库取凭据
+不 import app）：
+
+| 变体 | 结果 |
+|---|---|
+| notify_stop → notify_start（两者都 `ret=0`）→ 带 context_token 发送 | ❌ ret=-2 prepare failed |
+| 不带 context_token | ❌ 同 |
+| `channel_version=2.4.9` + 不带 ctx | ❌ 同 |
+| 官方 `openclaw-weixin:{ts}-{8hex}` client_id 格式 | ❌ 同 |
+
+协议侧与官方插件 v2.4.9 源码**逐字节对齐**（headers / base_info / 枚举
+BOT=2·TEXT=1·FINISH=2 / payload / client_id 格式全部核过），官方源码里**没有**
+`-2`/`prepare` 的任何处理 → 不是我们协议写错。
+
+**决定性旁证**：`GET /api/notify/wx/inbound` → 入站长轮询健康
+（`poll_count=80, last_error=null`）但 **`msg_count=0` 自绑定以来恒为 0** ——
+用户 2026-09-30 扫码绑定后**从未给 bot 发过任何消息**。
+
+⇒ **结论**：除 `notifystart` 声明在线外，服务端还要求绑定后至少一次交互。
+**需要用户做的动作：在微信里给这个 bot 发一条任意消息**（发「帮助」即可；
+支持持仓/状态/盘前简报/盘后复盘/自选）。入站轮询会自动把新鲜
+`context_token` upsert 进 `sa_wx_users`（`record_inbound_context`），之后
+`POST /api/notify/test?channel=wx` 应即恢复；仍失败就到「通知」页重扫二维码。
+
+**已同步修正 `notifier.py` 模块 docstring**：旧结论「不需要用户先发消息、
+context_token 非出站必要条件」（2026-09-30 据单次实验下的断言）已被 10-22
+复测推翻，docstring 已改写为上述正确口径。`notifier.py` 内 582 行附近的
+运行时提示早就写着正确处置（「仍失败则需在微信里给 bot 发一条消息」），
+无需改。
