@@ -78,11 +78,39 @@ T_DEFAULTS = {
     # 写入 sa_t_advisory_log，让「为什么其他股票不适合做T」可回看。
     # 这是观测不是交易口径，所以默认开 —— 不改任何决策内容。
     "log_enabled": True,
+    # 趋势减仓 / 提前抛（2026-10-22 用户授权新增）。
+    # **只给建议、不成交**：`scan_once` / `decide` 一个字节都没动，卖出仍由
+    # 用户本人手动执行。为什么要有：做 T 是「持仓不变的份额置换」，趋势走坏时
+    # 它无能为力 —— 智谱 / MINIMAX 那种一路下行的票，要的是**先减一部分仓位**，
+    # 而不是等反弹做 T。默认关：它会建议真实减仓，属交易口径变更。
+    "trend_reduce": {
+        "enabled": False,        # 总开关（默认关）
+        "confirm_days": 2,       # 连续多少个交易日满足「收盘<MA20 且 MA20<MA60」
+        "reduce_pct": 33,        # 建议减掉现有持仓的百分比
+        "cooldown_days": 10,     # 两次减仓建议之间至少间隔的交易日
+        "rearm_days": 5,         # 连续收盘站回 MA20 多少天后重新武装
+        "max_reductions": 2,     # 同一段下跌最多建议减几次
+        "fresh_days": 2,         # 信号必须落在最近多少个交易日内才算有效
+        "hard_stop_pct": 10,     # 新近跌破成本 x% -> 硬止损建议
+        "deep_dd_pct": 25,       # 浮亏超过 x% 不再催卖，只提示（避免卖在坑里）
+        "lookback_days": 180,    # 回放窗口（交易日）
+    },
 }
 
 # T 操作的标记前缀。用来区分「做 T 的成交」和「普通 LLM 决策的成交」，
 # 因为做 T 的锚定价要沿着自己的成交链走，不能被普通买卖干扰。
 T_TAG = "[做T]"
+
+# 动作枚举。趋势减仓是**单向卖出**（不设接回价），与做 T 的往返是两回事，
+# 所以单独分组 —— 日志统计、推送、页面徽标都按这个分组走，
+# 任何「只要 t_sell/t_buy」的地方都必须同时问一句趋势动作算不算（漏了会静默少计）。
+T_ACTIONS = ("t_sell", "t_buy")
+TREND_ACTIONS = ("hard_stop", "trend_reduce")
+ACT_ACTIONS = T_ACTIONS + TREND_ACTIONS
+# trend_wait 只提示不催卖（深亏时割肉容易卖在坑里），不算可执行动作。
+TREND_LABELS = {"hard_stop": "止损（卖可卖份额）",
+                "trend_reduce": "趋势减仓（单向卖出）",
+                "trend_wait": "深亏提示（只提示不催卖）"}
 
 
 def _conf(raw: dict | None) -> dict:
@@ -91,6 +119,13 @@ def _conf(raw: dict | None) -> dict:
     lay = dict(T_DEFAULTS["layers"])
     lay.update((raw or {}).get("layers") or {})
     c["layers"] = lay
+    # 嵌套段必须显式深合并：config.yaml 里只写 trend_reduce.enabled 时，
+    # 浅 update 会让其余阈值全部丢失（与 mp.auth 那次是同一类坑）。
+    tr = dict(T_DEFAULTS["trend_reduce"])
+    sub = (raw or {}).get("trend_reduce")
+    if isinstance(sub, dict):
+        tr.update(sub)
+    c["trend_reduce"] = tr
     return c
 
 
@@ -352,6 +387,443 @@ def trend_state(bars: list[dict]) -> str:
     if last < ma20 < ma60:
         return "down"
     return "flat"
+
+
+def _ma_series(vals: list[float], n: int) -> list[float | None]:
+    """简单移动平均，前 n-1 个为 None（不够样本就不给值，不拿部分样本冒充）。"""
+    out: list[float | None] = [None] * len(vals)
+    s = 0.0
+    for i, v in enumerate(vals):
+        s += v
+        if i >= n:
+            s -= vals[i - n]
+        if i >= n - 1:
+            out[i] = s / n
+    return out
+
+
+def _clean_daily_bars(bars: list[dict]) -> list[dict]:
+    """日 K 归一：只留 {date, close}，按日期升序去重（同一天取最后一条）。
+
+    akshare / 腾讯 / 101 服务返回的 date 可能是 datetime / date / str，
+    close 可能是 Decimal 或字符串。**不归一就排序**会出现「10-9 排在 10-10 后面」
+    这种字符串序问题，MA 全错且不报错。
+    """
+    seen: dict[str, float] = {}
+    for b in (bars or []):
+        if not isinstance(b, dict):
+            continue
+        d = str(b.get("date") or "")[:10]
+        try:
+            close = float(b.get("close"))
+        except (TypeError, ValueError):
+            continue
+        if len(d) != 10 or not math.isfinite(close) or close <= 0:
+            continue
+        seen[d] = close
+    return [{"date": d, "close": seen[d]} for d in sorted(seen)]
+
+
+def _trend_shares(code: str, held: int, reduce_pct: float,
+                  sellable: int | None, lot: int) -> tuple[int, int]:
+    """(建议股数, 名义股数)。减仓按整手向下取整，且至少保留 1 手。
+
+    取整不是格式问题：A 股买入/卖出申报单位是 100 股（科创板 1 股起），
+    建议 66 股这种数在券商端根本下不出去。名义股数单独返回，是为了在
+    「不足 1 手」时能说清「本来想减多少」，而不是只显示一个 0。
+    """
+    held = max(0, int(held or 0))
+    lot = max(1, int(lot or 1))
+    raw = int(held * max(0.0, float(reduce_pct or 0)) / 100.0)
+    if held < lot or raw < lot:
+        return 0, raw
+    n = int(raw // lot) * lot
+    n = min(n, held - lot)                # 底仓至少留 1 手
+    if sellable is not None:
+        cap = max(0, min(int(sellable), held))
+        n = min(n, cap)
+        n = int(n // lot) * lot
+    return (n if n >= lot else 0), raw
+
+
+def trend_reduce_state(bars: list[dict], conf: dict | None = None, *,
+                       code: str = "", cost: float = 0.0, held: int = 0,
+                       sellable: int | None = None, price: float = 0.0,
+                       first_date: str = "", today: str = "",
+                       quote_date: str = "", t_plus_0: bool = False) -> dict:
+    """趋势减仓 / 提前抛 / 硬止损（**纯函数，只产建议，不成交**）。
+
+    用户 2026-10-22 授权时给的三个候选判据（跌破 MA20 / MA20 下穿 MA60 /
+    跌破成本 x%）在这里合成一条：**收盘 < MA20 且 MA20 < MA60**（比单看
+    「跌破 MA20」多一层趋势确认，震荡市里的单日破位不会触发），
+    再加一条**独立**的硬止损（新近跌破成本 x%）。
+
+    为什么必须做「回放」而不是只看今天
+    ----------------------------------
+    只看今天会犯两种错：① 破位第 5 天才提示，价格已经跌透；
+    ② 每轮都提示同一个信号，等于噪音。所以从建仓日 `first_date` 起逐日回放，
+    信号只在**触发当天及之后 fresh_days 个交易日**有效，一段下跌只发一次，
+    要等连续 `rearm_days` 天站回 MA20 才重新武装，两次之间还有 `cooldown_days`。
+
+    深亏保护（`deep_dd_pct`）
+    -------------------------
+    浮亏超过阈值时趋势信号只作提示（`trend_wait`），不催卖 —— 一路阴跌 40%
+    后再叫人割肉，多半割在阶段低点。这是**提示不是豁免**：止损线以内仍会
+    正常给建议，用户自己决定。
+
+    返回的 `shares` 已扣除 T+1 锁定（`sellable` 由调用方从 `sa_trades` 算），
+    并按申报单位取整。`shares=0` 时 `why` 里必须写清是哪一条挡住了
+    （锁定 / 不足 1 手 / 底仓只剩 1 手），否则用户只看到 0 无法判断该怎么办。
+    """
+    # `conf` 两种形态都要认：完整 T 配置（含 trend_reduce 子段）或**已经合并好的
+    # 子段本身**。只认前一种的话，调用方传子段时 `_conf()` 会去子段里找
+    # "trend_reduce" 找不到 → 静默回落到默认值（enabled=False），
+    # 表现为「页面开了开关但永远不触发」，且不报任何错。
+    raw = conf or {}
+    if "trend_reduce" in raw:
+        tr = _conf(raw).get("trend_reduce") or {}
+    else:
+        tr = dict(T_DEFAULTS["trend_reduce"])
+        tr.update(raw)
+    out: dict = {
+        "enabled": bool(tr.get("enabled")), "action": "none", "shares": 0,
+        "shares_raw": 0, "lot": lot_size(code), "sellable": sellable,
+        "ma20": None, "ma60": None, "close": None,
+        "streak": 0, "fires": 0, "last_fire_date": "", "last_fire_price": None,
+        "hard_stop_price": None, "hard_stop_date": "", "hard_stop_fresh": False,
+        "pnl_pct": None, "deep_dd": False, "why": "", "invalidate": "",
+        "truncated": False, "window_cut": False, "partial_window": False,
+        "bars_used": 0, "window_start": "", "synthetic_today": False,
+        "confirm_days": 0, "reduce_pct": 0.0, "rearm_days": 0,
+        "cooldown_days": 0, "max_reductions": 0, "fresh_days": 0,
+        "t_plus_0": bool(t_plus_0),
+    }
+    if not tr.get("enabled"):
+        out["why"] = "趋势减仓未启用（t_trading.trend_reduce.enabled = false）"
+        return out
+
+    def _int(key: str, default: int, lo: int, hi: int) -> int:
+        try:
+            return max(lo, min(hi, int(tr.get(key) if tr.get(key) is not None
+                                       else default)))
+        except (TypeError, ValueError):
+            return default
+
+    confirm_days = _int("confirm_days", 2, 1, 20)
+    rearm_days = _int("rearm_days", 5, 1, 60)
+    cooldown_days = _int("cooldown_days", 10, 0, 250)
+    max_reductions = _int("max_reductions", 2, 0, 20)
+    fresh_days = _int("fresh_days", 2, 1, 30)
+    lookback = _int("lookback_days", 180, 80, 800)
+    try:
+        reduce_pct = max(0.0, min(100.0, float(tr.get("reduce_pct")
+                                              if tr.get("reduce_pct") is not None
+                                              else 33)))
+    except (TypeError, ValueError):
+        reduce_pct = 33.0
+    try:
+        hard_stop_pct = max(0.0, min(90.0, float(tr.get("hard_stop_pct")
+                                                if tr.get("hard_stop_pct") is not None
+                                                else 10)))
+    except (TypeError, ValueError):
+        hard_stop_pct = 10.0
+    try:
+        deep_dd_pct = max(0.0, min(100.0, float(tr.get("deep_dd_pct")
+                                              if tr.get("deep_dd_pct") is not None
+                                              else 25)))
+    except (TypeError, ValueError):
+        deep_dd_pct = 25.0
+    out.update({"confirm_days": confirm_days, "rearm_days": rearm_days,
+                "cooldown_days": cooldown_days,
+                "max_reductions": max_reductions, "fresh_days": fresh_days,
+                "reduce_pct": reduce_pct})
+
+    all_bars = _clean_daily_bars(bars)
+    if not all_bars:
+        out["why"] = "取不到日K，趋势判不出（不用分时冒充日线趋势）"
+        return out
+    ev = all_bars[-lookback:]
+    out["window_cut"] = len(all_bars) > len(ev)
+    out["bars_used"] = len(ev)
+    out["window_start"] = ev[0]["date"]
+
+    fd = str(first_date or "")[:10]
+    out["partial_window"] = bool(fd) and ev[0]["date"] > fd
+    out["truncated"] = bool(out["window_cut"] or out["partial_window"])
+    if fd and ev[-1]["date"] < fd:
+        out["why"] = ("日K 最新一根 %s 早于建仓日 %s，无法回放趋势"
+                      % (ev[-1]["date"], fd))
+        return out
+
+    # 「今日」用实时价补一根，否则盘中永远只能看到昨天的收盘判断 ——
+    # 那正是「跌破 MA20 了却没提示」的成因。只补一次，且必须有明确的今日依据：
+    # 行情自带 updated_at 时必须等于今天；没有时只接受工作日且离上一根 ≤10 天
+    # （节假日没有行情，补一根会造出假收盘）。
+    td = str(today or "")[:10]
+    qd = str(quote_date or "")[:10]
+    if td and ev[-1]["date"] < td and price and float(price) > 0:
+        try:
+            gap = (datetime.strptime(td, "%Y-%m-%d")
+                   - datetime.strptime(ev[-1]["date"], "%Y-%m-%d")).days
+            wd = datetime.strptime(td, "%Y-%m-%d").weekday()
+        except ValueError:
+            gap, wd = 99, 7
+        today_ok = (qd == td) if qd else (wd < 5)
+        if today_ok and 0 <= gap <= 10:
+            ev = ev + [{"date": td, "close": float(price)}]
+            out["synthetic_today"] = True
+
+    n = len(ev)
+    closes = [b["close"] for b in ev]
+    out["close"] = round(closes[-1], 4)
+    out["bars_used"] = n
+    if n < 60:
+        out["why"] = ("日K 只有 %d 根（<60），MA60 算不出 —— 不给趋势建议"
+                      "（宁可不做，也不拿残缺均线猜）" % n)
+        return out
+    ma20 = _ma_series(closes, 20)
+    ma60 = _ma_series(closes, 60)
+    out["ma20"] = round(ma20[-1], 4) if ma20[-1] is not None else None
+    out["ma60"] = round(ma60[-1], 4) if ma60[-1] is not None else None
+
+    # 回放从建仓日开始（更早的 K 线只当均线预热，不参与信号计数）。
+    start_i = 59
+    if fd:
+        for i, b in enumerate(ev):
+            if b["date"] >= fd:
+                start_i = max(59, i)
+                break
+
+    # ---- 硬止损：只认「新近下穿」，不认「一直在水下」 ----
+    hs_price = round(cost * (1 - hard_stop_pct / 100.0), 4) if cost > 0 else None
+    out["hard_stop_price"] = hs_price
+    hs_cross_i = None
+    if hs_price is not None:
+        for i in range(max(1, start_i), n):
+            if closes[i] < hs_price <= closes[i - 1]:
+                hs_cross_i = i
+    hs_fresh = (hs_cross_i is not None
+                and (n - 1 - hs_cross_i) <= fresh_days - 1
+                and closes[-1] < hs_price)
+    out["hard_stop_fresh"] = bool(hs_fresh)
+    if hs_cross_i is not None:
+        out["hard_stop_date"] = ev[hs_cross_i]["date"]
+
+    # ---- 趋势回放：一段下跌只发一次，站回 MA20 才重新武装 ----
+    armed = True
+    fires = 0
+    last_fire_i = None
+    cond_streak = 0
+    above_run = 0
+    for i in range(start_i, n):
+        if ma20[i] is None or ma60[i] is None:
+            continue
+        cond = closes[i] < ma20[i] < ma60[i]
+        cond_streak = cond_streak + 1 if cond else 0
+        above_run = above_run + 1 if closes[i] > ma20[i] else 0
+        if not armed and above_run >= rearm_days:
+            armed = True
+            above_run = 0
+        if (armed and cond and cond_streak >= confirm_days
+                and fires < max_reductions
+                and (last_fire_i is None
+                     or i - last_fire_i >= cooldown_days)):
+            fires += 1
+            last_fire_i = i
+            armed = False
+            above_run = 0
+    out["fires"] = fires
+    out["streak"] = cond_streak
+    if last_fire_i is not None:
+        out["last_fire_date"] = ev[last_fire_i]["date"]
+        out["last_fire_price"] = round(closes[last_fire_i], 4)
+
+    cur_cond = bool(ma20[-1] is not None and ma60[-1] is not None
+                    and closes[-1] < ma20[-1] < ma60[-1])
+    fresh_fire = (last_fire_i is not None
+                  and (n - 1 - last_fire_i) <= fresh_days - 1
+                  and cur_cond)
+    ref_price = float(price) if price and float(price) > 0 else closes[-1]
+    pnl_pct = round((ref_price / cost - 1) * 100, 3) if cost > 0 else None
+    out["pnl_pct"] = pnl_pct
+    deep_dd = bool(pnl_pct is not None and pnl_pct <= -deep_dd_pct)
+    out["deep_dd"] = deep_dd
+    lot = out["lot"]
+
+    if hs_fresh:
+        want = min(int(held or 0),
+                   int(sellable) if sellable is not None else int(held or 0))
+        out.update({"action": "hard_stop", "shares": max(0, want),
+                    "shares_raw": max(0, want),
+                    "why": ("收盘 %s 跌破成本止损线 %s（成本 %s × (1-%s%%），"
+                            "下穿发生在 %s —— 建议卖出 %d 股"
+                            % (fpx(closes[-1]), fpx(hs_price),
+                               fpx(cost), fnum(hard_stop_pct, "%.0f"),
+                               ev[hs_cross_i]["date"], max(0, want))),
+                    "invalidate": (
+                        "若收盘重新站回 %s 之上，说明这次下穿可能是假摔；"
+                        "但止损是纪律，不因一次反抽推翻" % fpx(hs_price))})
+        if sellable is not None and want < int(held or 0):
+            out["why"] += "（T+1 锁定，今日可卖 %d / 持仓 %d）" % (want, held)
+        return out
+
+    if fresh_fire:
+        nsh, raw = _trend_shares(code, held, reduce_pct, sellable, lot)
+        head = ("收盘 %s < MA20 %s，且 MA20 < MA60 %s，已连续 %d 个交易日；"
+                "这是建仓以来第 %d/%d 次减仓信号（信号日 %s）"
+                % (fpx(closes[-1]), fpx(ma20[-1]), fpx(ma60[-1]),
+                   cond_streak, fires, max_reductions, ev[last_fire_i]["date"]))
+        if deep_dd:
+            out.update({
+                "action": "trend_wait", "shares": 0,
+                "why": ("%s。但浮亏 %s%% 已超过深亏阈值 %s%% —— "
+                        "此处割肉容易卖在阶段低点，**只提示不催卖**，"
+                        "要不要减由你决定" % (
+                            head, fnum(pnl_pct), fnum(deep_dd_pct, "%.0f"))),
+                "invalidate": ("若继续加速下跌，风险仍在；若放量站回 MA20 %s "
+                               "并连续 %d 天，趋势条件失效" % (
+                                   fpx(ma20[-1]), rearm_days)),
+            })
+            return out
+        if nsh <= 0:
+            if raw <= 0:
+                reason = "没有可减份额（持仓 %d 股，%s%% = 0 股）" % (
+                    held, fnum(reduce_pct, "%.0f"))
+            elif held < lot:
+                reason = "持仓 %d 股不足 1 个申报单位（%d 股）" % (held, lot)
+            elif raw < lot:
+                reason = ("按 %s%% 算只能减 %d 股，不足 1 个申报单位（%d 股）"
+                          % (fnum(reduce_pct, "%.0f"), raw, lot))
+            elif sellable is not None and int(sellable) < lot:
+                reason = "T+1 锁定后今日可卖 %d 股，不足 1 个申报单位" % int(sellable)
+            else:
+                reason = "底仓至少保留 1 个申报单位（%d 股），当前无可减份额" % lot
+            out.update({
+                "action": "trend_reduce", "shares": 0, "shares_raw": raw,
+                "why": "%s —— 但%s，这一轮给不出可执行股数" % (head, reason),
+                "invalidate": ("若收盘重新站上 MA20 %s 并连续 %d 个交易日，"
+                               "减仓建议作废" % (fpx(ma20[-1]), rearm_days)),
+            })
+            return out
+        out.update({
+            "action": "trend_reduce", "shares": nsh, "shares_raw": raw,
+            "why": ("%s —— 建议减 %d 股（约 %s%%），保留 %d 股"
+                    % (head, nsh, fnum(nsh / held * 100 if held else 0, "%.0f"),
+                       max(0, held - nsh))),
+            "invalidate": ("若收盘重新站上 MA20 %s 并连续 %d 个交易日，"
+                           "减仓建议作废" % (fpx(ma20[-1]), rearm_days)),
+        })
+        if sellable is not None and int(sellable) < nsh:
+            out["why"] += "（已按 T+1 可卖 %d 股封顶）" % int(sellable)
+        if out["partial_window"]:
+            out["why"] += "（注意：日K 从 %s 开始，未覆盖建仓日 %s 之前）" % (
+                ev[0]["date"], fd)
+        return out
+
+    # ---- 无可执行信号：把「差在哪」说清楚，别只给一句「不做」 ----
+    if last_fire_i is not None:
+        out["why"] = ("趋势信号曾在 %s 触发（第 %d 次），已超出 %d 个交易日的"
+                      "有效期或有价格站回 MA20，本轮不再提示"
+                      % (ev[last_fire_i]["date"], fires, fresh_days))
+    elif cur_cond:
+        out["why"] = ("收盘 %s < MA20 %s 且 MA20 < MA60，已连续 %d/%d 个交易日，"
+                      "还差 %d 天确认" % (
+                          fpx(closes[-1]), fpx(ma20[-1]), cond_streak,
+                          confirm_days, max(0, confirm_days - cond_streak)))
+    else:
+        out["why"] = ("未满足「收盘<MA20 且 MA20<MA60」：收盘 %s，MA20 %s，MA60 %s"
+                      % (fpx(closes[-1]), fpx(ma20[-1]), fpx(ma60[-1])))
+    if out["partial_window"]:
+        out["why"] += "（日K 从 %s 开始，未覆盖建仓日 %s 之前）" % (ev[0]["date"], fd)
+    out["invalidate"] = "—"
+    return out
+
+
+def real_sellable_shares(cur, code: str, held: int, today: str,
+                         t_plus_0: bool = False) -> int:
+    """**实盘** T+1 可卖股数。
+
+    ⚠️ 不能用 `PT.sellable_shares()` —— 它读的是 `sa_paper_trades`（模拟盘），
+       与 `sa_trades`（实盘）是两张完全不同的表。混用会拿模拟盘的持仓去封顶
+       实盘建议，**看起来有数字、实际毫不相干**（本模块已因同类“同名不同源”
+       踩过一次：`tx_symbol` 两份副本）。
+
+    `held` 是 `_derive_holdings` 按**全部流水**回放出来的净持仓（含今日成交），
+    所以今日买入的份额在 held 里但不可卖；今日卖出的份额已不在 held 里，
+    不需要再补回。`t_plus_0`（港股/QDII 等）直接全量可卖。
+    """
+    held = max(0, int(held or 0))
+    if held <= 0:
+        return 0
+    if t_plus_0:
+        return held
+    try:
+        # 必须给聚合列起 `AS shares`：RealDictCursor 下无别名的列名是 `coalesce`，
+        # `_r(r, 1, "shares")` 取不到 → bought 恒 0 → 把 T+1 锁定的份额当成可卖。
+        cur.execute("""SELECT side, COALESCE(SUM(shares),0) AS shares FROM sa_trades
+                       WHERE code=%s AND trade_date=%s GROUP BY side""",
+                    (code, today))
+        rows = cur.fetchall()
+    except Exception:                      # noqa: BLE001
+        # 查不到今日流水时**按最保守**处理：一分钱都不许卖。
+        # 反过来（默认全可卖）会让 T+1 建议直接违规，用户照着操作会被券商拒单。
+        return 0
+    bought = 0
+    for r in rows:
+        side = _r(r, 0, "side")
+        qty = _r(r, 1, "shares")
+        if str(side) == "buy":
+            try:
+                bought += int(qty or 0)
+            except (TypeError, ValueError):
+                pass
+    return max(0, min(held, held - bought))
+
+
+def trend_ticket(code: str, name: str, action: str, price: float, shares: int,
+                 conf: dict, fees_c=None, invalidate: str = "",
+                 t_plus_0: bool = False, sellable: int | None = None) -> dict:
+    """趋势减仓 / 硬止损的**单向卖出单**（纯函数）。
+
+    ⚠️ **绝不能让这种单子走 `execution_ticket(legs="t_sell")`** —— 那会凭空
+       生成一条「跌到 X 买回」的腿，用户照着做等于把刚减的仓位原价接回来，
+       与「趋势走坏先降仓位」完全相反。所以这里没有 `buy_back` 字段，
+       `legs="sell_only"` 让前端走另一套模板。
+
+    与做 T 的差别还有一层：做 T 卖的是**机动仓**（持仓不变），这里降的是
+    **总仓位**，减完不会买回。
+    """
+    shares = max(0, int(shares or 0))
+    price = float(price or 0)
+    t = {"code": code, "name": name, "legs": "sell_only", "action": action,
+         "shares": shares, "price": price,
+         "trigger_price": round(price, 4) if price > 0 else None,
+         "status": "ready" if (shares >= 1 and price > 0) else "blocked",
+         "sell": None, "net": None, "net_cash": None, "fee": None,
+         "fee_pct": None, "threshold_pct": None, "safety_mult": None,
+         "invalidate": invalidate, "t_plus_0": bool(t_plus_0),
+         "sellable": sellable, "warn": ""}
+    if shares < 1 or price <= 0:
+        t["warn"] = "没有可执行股数/价格，给不出卖出单"
+        return t
+    value = price * shares
+    fee = PT.trade_fees(code, name or "", "sell", value, fees_c or {})["total"]
+    t.update({
+        "sell": {"price": round(price, 4), "shares": shares,
+                 "gross_cash": round(value, 2),
+                 "net_cash": round(value - fee, 2),
+                 "fee": round(fee, 2)},
+        "net_cash": round(value - fee, 2), "fee": round(fee, 2),
+        "fee_pct": round(fee / value * 100, 4) if value else None,
+    })
+    if t_plus_0:
+        t["warn"] = "T+0 标的，卖出不受当日买入锁定限制"
+    elif sellable is not None and int(sellable) < int(shares):
+        t["warn"] = ("T+1：今日可卖仅 %d 股，建议股数已按其封顶"
+                     % int(sellable))
+    else:
+        t["warn"] = "只卖不买回（趋势减仓，不是做 T）；卖完该仓位永久降低"
+    return t
 
 
 def _refill_threshold(c: dict, base_edge: float, trend: str) -> float:
@@ -850,6 +1322,15 @@ def advisory(deps: dict, conf: dict, positions: dict, today: str = "",
     否则只能盲从，而盲从一个不会说「我可能错了」的建议比不做更危险。
     """
     c = _conf(conf)
+    tr = c.get("trend_reduce") or {}
+    tr_on = bool(tr.get("enabled"))
+    # 趋势判据要 MA60，还要从建仓日回放 —— 60 根根本不够。窗口按
+    # lookback + 60 取（101 `/kline` 的 days 上限 2000，这里封 800 留足余量）。
+    try:
+        _lb = max(80, min(800, int(tr.get("lookback_days") or 180)))
+    except (TypeError, ValueError):
+        _lb = 180
+    bars_days = min(800, _lb + 60) if tr_on else 60
     em_kline_fn = deps.get("em_kline_fn")
     tx_symbol_fn = deps.get("tx_symbol_fn") or MD.tx_symbol
     fetch_quotes = _quotes_fn(deps)
@@ -890,9 +1371,15 @@ def advisory(deps: dict, conf: dict, positions: dict, today: str = "",
         name = p.get("name") or ""
         held = int(p.get("shares") or 0)
         cost = float(p.get("cost") or p.get("avg_cost") or 0)
+        # 趋势回放的起点：建仓日之前没有「我的持仓」，那段 MA 只当预热。
+        # 调用方（app._derive_holdings / calc_position）本来就给出 first_date，
+        # 这里取不到就退回空串（回放从窗口起始算，会更早触发，属偏保守）。
+        first_date = str(p.get("first_date") or "")[:10]
+        t_plus_0 = PT.is_t_plus_0(code, name)
         it = {"code": code, "name": name, "shares": held, "cost": cost,
               "action": "hold", "shares_suggest": 0, "why": "",
-              "invalidate": "", "action_label": "不做"}
+              "invalidate": "", "action_label": "不做",
+              "first_date": first_date, "t_plus_0": t_plus_0}
         q = quotes.get(code) or {}
         price = q.get("price")
         if not price:
@@ -904,7 +1391,7 @@ def advisory(deps: dict, conf: dict, positions: dict, today: str = "",
         it["price"] = price
         it["pnl_pct"] = round((price / cost - 1) * 100, 3) if cost else None
 
-        anchor_info, today_t = None, []
+        anchor_info, today_t, sellable = None, [], None
         try:
             with get_conn() as conn:
                 cur = conn.cursor()
@@ -913,16 +1400,20 @@ def advisory(deps: dict, conf: dict, positions: dict, today: str = "",
                                WHERE code=%s AND trade_date=%s
                                  AND note LIKE %s""", (code, today, T_TAG + "%"))
                 today_t = [r[0] for r in cur.fetchall()]
+                if tr_on:
+                    sellable = real_sellable_shares(cur, code, held, today, t_plus_0)
         except Exception as exc:          # noqa: BLE001
             it["why"] = "读做T台账失败，不给建议：%s" % str(exc)[:100]
             it["invalidate"] = "—"
             items.append(it)
             continue
+        it["sellable"] = sellable
 
         bars_daily = []
         if em_kline_fn:
             try:
-                bars_daily = PT.fetch_kline_ohlcv(em_kline_fn, tx_symbol_fn(code), days=60)
+                bars_daily = PT.fetch_kline_ohlcv(em_kline_fn, tx_symbol_fn(code),
+                                                  days=bars_days)
             except Exception:              # noqa: BLE001
                 bars_daily = []
         intraday = None
@@ -933,6 +1424,15 @@ def advisory(deps: dict, conf: dict, positions: dict, today: str = "",
 
         anchors = layer_anchors(bars_daily, intraday, c)
         trend = trend_state(bars_daily)
+        trend_adv = None
+        if tr_on:
+            trend_adv = trend_reduce_state(
+                bars_daily, tr, code=code, cost=cost, held=held,
+                sellable=sellable, price=price, first_date=first_date,
+                today=today,
+                quote_date=str(q.get("updated_at") or q.get("date") or ""),
+                t_plus_0=t_plus_0)
+            it["trend"] = trend_adv
         if not anchor_info and cost:
             anchors = {"L0_cost": {"anchor": round(cost, 4), "now": round(price, 4),
                                    "edge_pct": round((price / cost - 1) * 100, 4),
@@ -962,6 +1462,44 @@ def advisory(deps: dict, conf: dict, positions: dict, today: str = "",
         # 执行单：**两条腿一次给全**。hold 状态也给「差多少才够门槛 / 为什么不做」，
         # 否则用户只看到一句「不做」，无法判断是「快了」还是「差很远」。
         it["ticket"] = _build_ticket(it, dec, c, fees_c, price)
+
+        # 趋势规则**优先于做 T**：已经判「该减仓」的仓位，再拿其中一部分去
+        # 高抛低吸是自相矛盾。这里只覆盖**建议与展示** —— decide / _execute_one
+        # 一个字节没动，所以它永远不会成交（与「只给建议」的授权一致）。
+        if tr_on and trend_adv:
+            it["t_action"] = it["action"]        # 保留做T原判，便于对照
+            ta = trend_adv.get("action") or "none"
+            if ta in TREND_ACTIONS:
+                old_act = it["action"]
+                old_why = it.get("why") or ""
+                t_shares = int(trend_adv.get("shares") or 0)
+                it.update({
+                    "action": ta, "shares_suggest": t_shares,
+                    "why": trend_adv.get("why", ""),
+                    "action_label": TREND_LABELS.get(ta, "不做"),
+                    "invalidate": trend_adv.get("invalidate", ""),
+                    # 做T专有的执行字段全部清掉：拿「做T门槛/锚价」去解释一笔
+                    # 单向减仓，会让页面和日志同时说谎。
+                    "edge_pct": None, "threshold": None, "anchor_price": None,
+                    "layer": "", "movable": 0, "base_shares": held,
+                    "pending": False, "stabilizing": None,
+                })
+                note = ""
+                if old_act == "t_sell":
+                    note = ("做T 本轮也判了高抛（%s%s）—— **只执行这一条，"
+                            "别重复下单**；区别是趋势减仓不接回，仓位永久降低"
+                            % (old_why[:60], "…" if len(old_why) > 60 else ""))
+                elif old_act == "t_buy":
+                    note = ("做T 本轮本来要接回，已被趋势规则覆盖：趋势走坏不接回"
+                            "（原判：%s%s）" % (old_why[:60],
+                                              "…" if len(old_why) > 60 else ""))
+                it["override_note"] = note
+                it["ticket"] = trend_ticket(
+                    code, name, ta, price, t_shares, c, fees_c,
+                    invalidate=it["invalidate"], t_plus_0=t_plus_0,
+                    sellable=sellable)
+                if note:
+                    it["ticket"]["note"] = note
         items.append(it)
 
         # 方向对错与盈亏**分开报**（借鉴 TradingAgents performance.py 的教训）
@@ -969,7 +1507,11 @@ def advisory(deps: dict, conf: dict, positions: dict, today: str = "",
             it["direction_check"] = t_direction_result(
                 cur_ro, code, "t_sell", float(it["anchor_price"]),
                 int(c.get("max_t_per_day") or 3))
-    would = [i for i in items if i["action"] in ("t_sell", "t_buy")]
+    # 趋势建议里 shares=0 的（T+1 锁死 / 不足 1 手 / 深亏只提示）不算可操作 ——
+    # 否则「本轮可操作 5 只」会包含根本卖不出去的行，与页面上的 0 股自相矛盾。
+    would = [i for i in items
+             if i.get("action") in ACT_ACTIONS
+             and int(i.get("shares_suggest") or 0) > 0]
     da = direction_accuracy(cur_ro) if cur_ro is not None else {
         "hits": 0, "total": 0, "rate": None, "note": "无读连接"}
     return {"items": items, "scanned": len(items), "would_act": len(would),
@@ -1526,22 +2068,33 @@ def read_log(deps: dict, days: int = 3, code: str = "",
                                   "created_at": d["created_at"],
                                   "n_items": 0, "n_act": 0, "act_codes": []})
         r["n_items"] += 1
-        if d["action"] in ("t_sell", "t_buy"):
+        act = d["action"]
+        if act in T_ACTIONS:
+            actionable = True
+        elif act in TREND_ACTIONS:
+            # 趋势行 shares=0 是「判出来了但今天卖不了/不值得卖」，不能算可操作，
+            # 否则「本轮可操作 N 只」里混着 0 股的行。
+            try:
+                actionable = int(d.get("shares_suggest") or 0) > 0
+            except (TypeError, ValueError):
+                actionable = False
+        else:
+            actionable = False
+        if actionable:
             r["n_act"] += 1
             if d["code"] not in r["act_codes"] and len(r["act_codes"]) < 10:
                 r["act_codes"].append(d["code"])
         cd = codes.setdefault(d["code"], {
             "code": d["code"], "name": d["name"], "total": 0,
-            "t_sell": 0, "t_buy": 0, "hold": 0,
+            "t_sell": 0, "t_buy": 0, "trend_reduce": 0, "hard_stop": 0,
+            "trend_wait": 0, "hold": 0,
             "last_action": None, "last_why": "", "last_created_at": "",
             "last_price": None, "last_edge_pct": None,
             "last_threshold_pct": None, "last_bias": None,
             "first_created_at": d["created_at"]})
         cd["total"] += 1
-        if d["action"] == "t_sell":
-            cd["t_sell"] += 1
-        elif d["action"] == "t_buy":
-            cd["t_buy"] += 1
+        if act in ("t_sell", "t_buy", "trend_reduce", "hard_stop", "trend_wait"):
+            cd[act] += 1
         else:
             cd["hold"] += 1
         if not cd["last_created_at"] or d["created_at"] > cd["last_created_at"]:

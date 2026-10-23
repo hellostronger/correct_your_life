@@ -542,77 +542,20 @@ def fetch_kline_ohlcv(em_kline_fn, symbol: str, days: int = 60) -> list[dict]:
     return out
 
 
-def _tencent_closes(symbol: str, days: int, quote_fn) -> dict:
-    """兜底源：腾讯日K收盘价 {date: close}。
-
-    主源 proxy.finance.qq.com（2026-09-24 实测可用）；web.ifzq.gtimg.cn 被
-    WAF 拦（501）作为第二备。东财 push2his 偶发断连，所以这里兜底链要可靠。
-    """
-    for host in ("https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get",
-                 "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"):
-        try:
-            import requests
-            resp = requests.get(host, params={"param": f"{symbol},day,,,{days},qfq"},
-                                timeout=15,
-                                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-            resp.raise_for_status()
-            bars = ((resp.json().get("data") or {}).get(symbol) or {})
-            bars = bars.get("qfqday") or bars.get("day") or []
-            out = {}
-            for b in bars:
-                if len(b) > 2:
-                    try:
-                        out[str(b[0])[:10]] = float(b[2])
-                    except (ValueError, TypeError):
-                        pass
-            if out:
-                return out
-        except Exception:
-            continue
-    return {}
-
-
 def fetch_close_series(em_kline_fn, symbol: str, days: int = 30) -> dict:
     """近 N 个交易日收盘价序列 {date: close}。
 
-    双源兜底：东财 push2his（偶发断连）→ 腾讯 proxy.finance.qq.com。
-    都失败返回 {}（调用方留 pending 重试）。
+    2026-10-22 起本机不再直连任何行情源：`em_kline_fn` 走 101 `/kline`，
+    主源东财、**101 侧**兜底腾讯 newfqkline。取不到返回 {}（调用方留 pending 重试）,
+    **不在本机再挂一条备用链路** —— 两条路字段口径不同，出问题时反而更难发现。
     """
     rows = fetch_kline_ohlcv(em_kline_fn, symbol, days)
-    if rows:
-        return {r["date"]: r["close"] for r in rows}
-    return _tencent_closes(symbol, days, None)
+    return {r["date"]: r["close"] for r in rows}
 
 
 def fetch_ohlcv(em_kline_fn, symbol: str, days: int = 60) -> list[dict]:
-    """近 N 个交易日完整 OHLCV。东财挂时兜底腾讯 fqkline（同样有 OHLCV）。
-
-    腾讯 bar 格式：[date, open, close, high, low, volume, ...]（注意 close 在第 3 位）。
-    """
-    rows = fetch_kline_ohlcv(em_kline_fn, symbol, days)
-    if rows:
-        return rows
-    try:
-        import requests
-        resp = requests.get(
-            "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get",
-            params={"param": f"{symbol},day,,,{days},qfq"}, timeout=15,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-        resp.raise_for_status()
-        bars = ((resp.json().get("data") or {}).get(symbol) or {})
-        bars = bars.get("qfqday") or bars.get("day") or []
-        out = []
-        for b in bars:
-            if len(b) >= 6:
-                try:
-                    out.append({"date": str(b[0])[:10], "open": float(b[1]),
-                                "close": float(b[2]), "high": float(b[3]),
-                                "low": float(b[4]), "vol": float(b[5]), "amount": 0.0})
-                except (ValueError, TypeError):
-                    continue
-        return out
-    except Exception:
-        return []
+    """近 N 个交易日完整 OHLCV（同上，单一路径经 101）。"""
+    return fetch_kline_ohlcv(em_kline_fn, symbol, days)
 
 
 def atr_pct(bars: list[dict], period: int = 14) -> float | None:
@@ -1680,6 +1623,33 @@ def _decide_one(deps, conf, stock, today, slot: str = ""):
                                        + f"\n[宏观块超长已截断，全文 {_n} 字符]")
         except Exception as exc:  # noqa: BLE001
             print(f"[paper] 宏观注入跳过: {exc}", flush=True)
+        # 国际期货 + 汇率注入（2026-10-22 用户要求）：布伦特/WTI/黄金/白银/
+        # 天然气/铜 + 6 组汇率。两块共用 paper.futures_fx_inject 一个开关，
+        # **默认开**（用户明确要求进决策）。两块都空时上下文逐字节不变；
+        # 超长按 max_chars 截断并留痕。同样必须在 with get_conn() 块内查询。
+        futures_fx_block = ""
+        try:
+            import futures_watch as _fw
+            import fx_watch as _fx
+            _ff = {**_fw.INJECT_DEFAULTS, **(conf.get("futures_fx_inject") or {})}
+            if _ff.get("enabled"):
+                _cap = max(300, int(_ff.get("max_chars") or 1200))
+                _stale = max(5, int(_ff.get("stale_minutes") or 45))
+                _parts = []
+                _fut = _fw.build_injection(conn, stale_minutes=_stale)
+                if _fut:
+                    _parts.append(_fut)
+                _fxb = _fx.build_injection(conn, stale_minutes=_stale)
+                if _fxb:
+                    _parts.append(_fxb)
+                if _parts:
+                    futures_fx_block = "\n".join(_parts)
+                    if len(futures_fx_block) > _cap:
+                        _n = len(futures_fx_block)
+                        futures_fx_block = (futures_fx_block[:_cap]
+                                            + f"\n[期货/汇率块超长已截断，全文 {_n} 字符]")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[paper] 期货/汇率注入跳过: {exc}", flush=True)
     ctx = _build_context(stock, quote, bars, news, events, market_note,
                          account, positions, past, conf, social,
                          event_news=event_news)
@@ -1691,6 +1661,8 @@ def _decide_one(deps, conf, stock, today, slot: str = ""):
         ctx += "\n" + strategy_block
     if macro_block:
         ctx += "\n" + macro_block
+    if futures_fx_block:
+        ctx += "\n" + futures_fx_block
     if mp_block:
         ctx += "\n" + mp_block
     # 3. LLM 调用 1：分析师

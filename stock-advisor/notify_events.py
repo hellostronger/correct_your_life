@@ -116,6 +116,15 @@ EVENTS: dict[str, dict[str, Any]] = {
         "help": "提款计划达标 / 剩 10·5·1 个交易日 / 逾期。每个里程碑只推一次。",
         "source": "app.check_withdrawal_once()",
     },
+    "t_advisory": {
+        "label": "🔁 实盘做T/趋势建议",
+        "group": "交易提醒",
+        "default": {"wx": True, "email": True},
+        "help": "实盘持仓的做T高抛/接回、趋势减仓、硬止损建议。"
+                "**只给建议、绝不下单**，实盘操作要你自己手动执行；"
+                "只在可执行信号集合（代码+动作）变化时推一次，不会每 N 分钟重发。",
+        "source": "app._t_advisory_loop()",
+    },
 
     # ---------------- 行情异动 ----------------
     "market_volume": {

@@ -10,12 +10,16 @@
      并立刻调 ilink/bot/msg/notifystart 声明本客户端在线
   3. 之后调 send_wx() 推送到该微信（协议细节见 ilink_client.py）
 
-收发模型：**不是**「必须用户先发一条消息」——2026-09-30 实测推翻了那个说法。
-真正的机制是 `ilink/bot/msg/notifystart`（见 ensure_session）：绑定成功后、
-以及服务每次启动后，向 iLink 声明本客户端在线，之后出站推送才有会话基础。
-`context_token` 只影响消息能否挂到正确的对话上，**不是出站的必要条件**
-（官方 sendMessageWeixin 在缺 context_token 时也只是 warn 一句就照发）。
-不声明在线的表现是 `sendmessage ret=-2 errmsg=prepare failed`。
+收发模型（2026-10-22 复核修正）：服务端要求**活跃会话**，仅声明在线不够。
+2026-09-30 曾实测「不声明在线 → sendmessage ret=-2 prepare failed」并据此刻
+断言「不需要用户先发消息、context_token 非必要」；2026-10-22 复测推翻：
+notifystart 返回 ret=0 之后 sendmessage 仍 ret=-2 prepare failed，且四种变体
+（带/不带 context_token、channel_version=2.4.9、官方 openclaw-weixin
+client_id 格式）无一例外；协议与官方插件 v2.4.9 逐字节对齐，官方源码也无
+-2 的处理逻辑；同期入站长轮询健康但 msg_count 自绑定以来恒为 0（用户从未
+给 bot 发过消息）。⇒ 除 notifystart 外，服务端还要求绑定后至少一次交互：
+**用户在微信里给 bot 发一条任意消息**（入站轮询会自动缓存新鲜
+context_token），出站即恢复。带旧 context_token 救不了 prepare failed。
 
 邮件通知走 SMTP：填发送邮箱（+授权码）和接收邮箱即可，支持 QQ/163/Gmail 等。
 QQ/163 需要在邮箱设置里开启 SMTP 并生成「授权码」（不是登录密码）。

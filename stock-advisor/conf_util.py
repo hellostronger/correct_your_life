@@ -209,7 +209,16 @@ def set_nested_key(config_path, section_key: str, dotted: str, value) -> None:
         lo, hi = found + 1, _block_end(lines, found + 1, hi, len(indent))
     if missing_parent is not None:
         depth, key = missing_parent
-        block = [""] + [f"{'  ' * depth}{part}:" for part in parts[depth - 1:-1]] \
+        # ⚠️ 每一层父键都要**递增缩进**（2026-10-22 实测踩过）：原来所有父键都用
+        # `'  ' * depth`，于是写 `paper.t_trading.trend_reduce.enabled`（连续缺两层）
+        # 会渲染成
+        #     t_trading:
+        #     trend_reduce:
+        #       enabled: true
+        # 两个父键同缩进 → YAML 变成 `paper.t_trading = None` +
+        # `paper.trend_reduce.enabled = true`，**键名整个错了且不报错**。
+        block = [""] + [f"{'  ' * (depth + off)}{part}:"
+                        for off, part in enumerate(parts[depth - 1:-1])] \
             + [rendered_leaf]
         lines[hi:hi] = block
         config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
