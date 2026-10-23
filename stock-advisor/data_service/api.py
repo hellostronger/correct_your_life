@@ -15,6 +15,13 @@ GET  /boards/{code}/constituents  板块成分股
 GET  /zt-pool                涨停池
 GET  /history/{name}         板块指数历史日线
 POST /collect                强制立刻采集一轮并返回
+
+行情代理（2026-10-22 新增：本机不再直连任何行情源）
+GET  /kline                  日 K（东财 CSV 口径，东财失败自动退腾讯）
+GET  /quote                  实时行情（A 股腾讯 / 港股新浪）
+GET  /intraday               分时 + 分钟 K（做 T 用）
+GET  /fx                     汇率（新浪 fx_*，一次批量）
+GET  /futures                国际期货（新浪 hf_*，如 XAU / OIL / CL）
 """
 from __future__ import annotations
 
@@ -72,7 +79,8 @@ def root() -> dict:
     return {"service": "sa-data-service", "version": __version__,
             "endpoints": ["/health", "/boards",
                           "/boards/{code}/constituents",
-                          "/zt-pool", "/history/{name}", "/collect"]}
+                          "/zt-pool", "/history/{name}", "/collect",
+                          "/kline", "/quote", "/intraday", "/fx", "/futures"]}
 
 
 @app.get("/health")
@@ -208,3 +216,83 @@ def force_collect(include_concept: bool = Query(True),
                       for b in rows[:10]],
             "degraded": snap["degraded"],
             "notes": snap["notes"]}
+
+
+# ---------------- 行情代理（本机只调这里，不直连行情源） ----------------
+
+@app.get("/kline")
+def kline(secid: str = Query(..., description="东财 secid，如 1.600519 / 116.02513"),
+          days: int = Query(60, ge=1, le=2000),
+          fields: str = Query("f51,f52,f53,f54,f55,f56,f57"),
+          source: str = Query("auto", pattern="^(auto|em|tx)$"),
+          beg: str = Query(""), end: str = Query("")) -> dict:
+    """日 K。返回东财 CSV 口径的 klines，调用方按 fields 的位置解析。
+
+    东财（push2his）在 101 上实测可用，失败自动退腾讯 newfqkline。
+    """
+    from . import market as M
+    try:
+        return M.kline(secid, days=days, fields=fields,
+                       source=source, beg=beg, end=end)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except M.UpstreamError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.get("/quote")
+def quote(symbols: str = Query(..., description="逗号分隔腾讯符号，如 sh600519,hk00100")) -> dict:
+    """批量实时行情。返回 {quotes: {symbol: {...}}, notes: []}。"""
+    from . import market as M
+    lst = [s.strip() for s in str(symbols or "").split(",") if s.strip()]
+    if not lst:
+        raise HTTPException(400, "symbols 不能为空")
+    try:
+        return M.quotes(lst)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/intraday")
+def intraday(code: str = Query(..., description="600519 / 00100 / sh600519"),
+             period: str = Query("m5"), count: int = Query(320, ge=1, le=1000)) -> dict:
+    """分时 + 分钟 K。结构与旧 market_data.fetch_intraday 逐字段一致。"""
+    from . import market as M
+    try:
+        return M.intraday(code, period=period, count=count)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except M.UpstreamError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.get("/fx")
+def fx(symbols: str = Query(...,
+                            description="逗号分隔新浪外汇符号，如 fx_susdcny,fx_susdcnh")) -> dict:
+    """批量汇率。返回 {quotes: {symbol: {...}}, notes: []}。"""
+    from . import market as M
+    lst = [s.strip() for s in str(symbols or "").split(",") if s.strip()]
+    if not lst:
+        raise HTTPException(400, "symbols 不能为空")
+    try:
+        return M.fx_quotes(lst)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except M.UpstreamError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.get("/futures")
+def futures(symbols: str = Query(...,
+                                 description="逗号分隔新浪外盘代码，如 XAU,OIL,CL,HG")) -> dict:
+    """批量国际期货。返回 {quotes: {symbol: {...}}, notes: []}。"""
+    from . import market as M
+    lst = [s.strip() for s in str(symbols or "").split(",") if s.strip()]
+    if not lst:
+        raise HTTPException(400, "symbols 不能为空")
+    try:
+        return M.futures_quotes(lst)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except M.UpstreamError as exc:
+        raise HTTPException(502, str(exc)) from exc

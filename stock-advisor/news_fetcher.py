@@ -37,6 +37,8 @@ from urllib.parse import quote, unquote, urlparse
 
 import requests
 
+import xq_bridge
+
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "config.yaml"
 
@@ -70,7 +72,11 @@ DEFAULT_CONF = {
         "searxng": {"enabled": False, "min_interval": 2.0, "timeout": 25, "url": ""},
         # 雪球讨论（2026-10-13 新增）。**不是直接抓雪球** —— 直连三个端点全部
         # 返回 WAF 挑战页（`{"_waf_bd8ce2ce37":...}`），HTTP 200 但零内容。
-        # 走 SearXNG 的 `site:` 限定反而稳：不需要登录 cookie。
+        # 两条路径：① 主 = 真浏览器桥打雪球内部 JSON API（见 `xq_bridge.py`），
+        # 拿真实发帖时间、召回实测 76% 相关；② 兜底 = SearXNG 的 `site:` 限定，
+        # 不用 cookie、不吃雪球实时风控，但只有被索引过的帖子。
+        # ⚠️ 桥的参数默认值**只在 `xq_bridge.DEFAULTS` 一份**，这里不放副本 ——
+        # 两处默认值必然会漂移（本文件记过多次「副本漂移」事故）。
         "xueqiu": {"enabled": False, "min_interval": 3.0, "timeout": 40,
                    "url": "", "time_range": "month", "max_keywords": 2},
         # DDG 已死（见文件头），默认关闭；留着开关是为了哪天网络通了能直接开回来
@@ -1253,18 +1259,124 @@ def _xq_aliases(name: str, code: str) -> list[str]:
     return list(dict.fromkeys(out))
 
 
-def fetch_xueqiu(code: str, name: str, limit: int, conf: dict,
-                  keyword: str = "") -> list[dict]:
-    """雪球讨论 —— **解禁/锁定这类事件的主要落点**（2026-10-13 用户提出）。
+def _xq_kws(ch_conf: dict, keyword: str = "") -> list[str]:
+    """这次要问雪球的事件词。
 
-    用户实例：MINIMAX-W 7 月解禁期到了，但创始团队自愿锁定 12 个月。
-    这条信息在**雪球**，不在任何现有渠道（实测 eastmoney/baidu/searxng/ak_em
-    搜「MiniMax + 解禁/锁定」全部 0 命中）。
+    默认围绕「解禁/禁售/锁定/锁仓」—— 这正是常规新闻渠道覆盖不到的部分
+    （实测 eastmoney/baidu/searxng/ak_em 搜「MiniMax + 解禁」**全部 0 命中**）。
+
+    ⚠️ `max_keywords` 用 `is None` 判缺省，**不能用 `or`**：写成
+    `int(ch_conf.get("max_keywords") or 2)` 会把用户显式填的 `0` 当成「没填」
+    而变回 2 个词 —— 0 的合理语义是「只问第一个词」（下限夹到 1，
+    一个词都不问等于这个渠道不干活）。
+    """
+    kws = [k for k in str(ch_conf.get("keywords")
+                          or "解禁 禁售 锁定 锁仓").split() if k]
+    if keyword:
+        kws = [keyword] + [k for k in kws if k != keyword]
+    raw = ch_conf.get("max_keywords")
+    cap = 2 if raw in (None, "") else max(1, int(raw))
+    return kws[:cap]
+
+
+def _xq_relevant(code: str, name: str, *texts: str) -> bool:
+    """相关性闸门：标题或正文里必须出现公司名/简称/代码。
+
+    **两条路径（桥 / SearXNG）共用这一套判据**，不能各判一遍。
+    为什么用了 `symbol=` 也必须过闸（2026-10-20 实测 6 组 × 10 条 = 59 条）：
+    雪球的 `symbol=` 只**缩范围、不严格过滤** —— 真提到该股的只有
+    **45/59 = 76%**，最糟的一组 `SH600519` + `业绩` 是 **0/10 全无关**。
+    撤掉闸门等于把别家公司的帖子灌进 `sa_news` 直接参与决策，
+    比没有这个渠道更糟。
+    """
+    blob = " ".join(str(t or "") for t in texts).lower()
+    aliases = [a for a in _xq_aliases(name, code) if len(a) >= 2]
+    return not aliases or any(a.lower() in blob for a in aliases)
+
+
+def _xq_via_bridge(code: str, name: str, limit: int, conf: dict,
+                   kws: list[str]) -> tuple[list[dict], str, "bool | None"]:
+    """主路径：借真浏览器（Kimi WebBridge）打雪球**内部搜索 API**。
+
+    返回 `(条目, 失败原因, 应答状态)`。第三个值只三种：
+    `None` = 这条路**没资格被判断**（桥未启用 / 本次没有代码可拼），
+    `True` = 桥**应答了**（哪怕 0 命中），`False` = 桥**坏了**。
+    区分这两件事是必须的：「0 条」是正常业务结果，「连不上」才是故障，
+    把前者当后者会把一条好渠道冷却掉（AGENTS.md 的老规矩）。
+
+    原因串必须**分得开**三种完全不同的故障：
+    桥不可达 / 桥没搜到 / 桥搜到了但全被闸门挡掉。
+    混成一句「搜索有结果但没有可用条目」会让人白排查半天（这条渠道
+    原先就是这么坏的，见 fetch_xueqiu 的历史）。
+
+    ⚠️ 本函数**不写渠道健康度**（既不打失败也不记成功）。健康度是
+    `xueqiu` 这**一个名字**共享的，两条路各记一次会把 3 次失败的阈值
+    在**同一只票**上就撞满 → 30 分钟冷却连带把另一条还能用的路一起禁掉。
+    记与不记由 `fetch_xueqiu` 统一判一次（见那里的 ⚠️ 健康度归属）。
+    """
+    bconf = xq_bridge.conf_of(conf)
+    if not bconf["enabled"]:
+        return [], "桥未启用", None
+    if not str(code or "").strip():
+        # 桥必须给 symbol=，主题轮/无名无码的调用**没有代码可拼**。
+        # 不挡的话 symbol_of('') 会得到 "SZ" → 雪球静默 0 条（最难查的那种失败）。
+        return [], "桥要股票代码，本次没有代码", None
+    t0 = time.time()
+    try:
+        raw = xq_bridge.search([(code, kw) for kw in kws], conf)
+    except xq_bridge.BridgeError as exc:
+        return [], f"桥{exc.reason}：{str(exc)[:70]}", False
+    except Exception as exc:                                   # noqa: BLE001
+        return [], f"桥异常 {type(exc).__name__}: {str(exc)[:70]}", False
+    ms = int((time.time() - t0) * 1000)
+    items: list[dict] = []
+    n_raw = n_gate = 0
+    for kw in kws:
+        for it in (raw.get((code, kw)) or []):
+            n_raw += 1
+            title = str(it.get("title") or "")
+            if not _xq_relevant(code, name, title, it.get("text")):
+                n_gate += 1
+                continue
+            # 桥给的是 created_at 毫秒换出来的**真实发帖时间**（不是索引时间）。
+            # 仍过一遍 _normalize_pub_dt：统一格式，并守住「没有完整年月日就丢」。
+            when = _normalize_pub_dt(str(it.get("publish_time") or ""))
+            if not when:
+                n_gate += 1
+                continue
+            item = _norm(code, title, str(it.get("url") or ""),
+                         "xueqiu", "雪球·桥", when)
+            # 解禁/锁仓描述的是**当前仍生效的约束**，不受 2 天时效限制 →
+            # 打标记，由 fetch_for_stock 在 LLM 过滤后加回（见 _is_event_item）
+            if _is_event_item(item):
+                item["_event"] = True
+            items.append(item)
+            if len(items) >= limit:
+                break
+        if len(items) >= limit:
+            break
+    if items:
+        return items, "", True
+    if not n_raw:
+        # 0 命中**不是故障**（这只票的这个话题确实没人讨论）→ alive=True
+        return [], f"桥空返（{ms}ms，{len(kws)} 组词 0 命中）", True
+    return [], f"桥 {n_raw} 条里 {n_gate} 条被相关性/时间闸门挡住", True
+
+
+def _xq_via_searxng(code: str, name: str, limit: int, conf: dict,
+                    kws: list[str]) -> tuple[list[dict], str, "bool | None"]:
+    """兜底路径：SearXNG 的 `site:xueqiu.com`。
+
+    ## 为什么还留着（桥都上了还要它干什么）
+    1. **桥会被风控**。实测 101 机房 IP 密集探测后 100% 跳
+       `check.xueqiu.com/captcha`，只能人工过一次验证；本机住宅 IP 干净。
+       两条都不可用时，搜索引擎这条路是唯一还能出货的（它走的是索引，
+       不吃雪球对实时请求的风控）。
+    2. **桥只查事件词**，SearXNG 的 `site:` 能捞到桥的词没覆盖到的讨论。
 
     ## 为什么不直连雪球
     实测首页 / 搜索 API / 个股页**三个端点全部**返回同一个 WAF 挑战页
     （`<textarea id="renderData">{"_waf_bd8ce2ce37":...}`），HTTP 200 但零内容。
-    而 `site:xueqiu.com` 经 SearXNG 反而稳定且**不需要登录 cookie**。
 
     ## 🔴 time_range 不是可选优化，是**能不能用的开关**
     实测同一句查询、同一台 searxng、同一批 6 条结果：
@@ -1290,6 +1402,16 @@ def fetch_xueqiu(code: str, name: str, limit: int, conf: dict,
     当初加它是因为搜公司名会返回雪球的**股票主页**（`/S/00100`），不是新闻。
     现在我们用 `site:` + **事件关键词**搜，返回的是文章页，判据完全不同：
     这里自己按 URL 形态收文章页、拒股票页与话题页。
+
+    ## 🔴 本函数**不写渠道健康度**（同 `_xq_via_bridge`，理由更硬）
+    以前每次查询失败都 `_mark_fail("xueqiu", …)`，而一只票要跑
+    `len(kws) * len(forms)` = **4 次**查询 —— 阈值只有 3，于是**同一只票**
+    自己就能把整个渠道冷却 30 分钟，连带把还能用的桥一起禁掉，而且下一只票
+    开头 `_channel_ready` 直接返回 `[]`，页面看到的就是「雪球两天没产出」。
+    现在只在返回值里说清楚第几个来源失败、为什么失败，记不记由 `fetch_xueqiu`
+    统一判一次（一只票一轮 = 最多一条健康度记录）。
+    失败原因**必须**随 note 冒到聚合层，否则「SearXNG 连不上」会被写成
+    「索引里就没有」—— 那是完全相反的结论（实测踩过，见 AGENTS.md）。
     """
     ch_conf = (conf.get("channels") or {}).get("xueqiu") or {}
     base = (ch_conf.get("url") or "").strip().rstrip("/")
@@ -1299,20 +1421,12 @@ def fetch_xueqiu(code: str, name: str, limit: int, conf: dict,
             "url") or ""
         base = base.strip().rstrip("/")
     if not base:
-        return []
-    ready, _why = _channel_ready("xueqiu", conf)
-    if not ready:
-        return []
-    # 事件词：默认围绕「解禁/锁仓」，这正是常规新闻渠道覆盖不到的部分
-    kws = [k for k in str(ch_conf.get("keywords")
-                          or "解禁 禁售 锁定 锁仓").split() if k]
-    if keyword:
-        kws = [keyword] + [k for k in kws if k != keyword]
-    max_kw = max(1, int(ch_conf.get("max_keywords") or 2))
-    kws = kws[:max_kw]
+        return [], "没配 SearXNG 地址", None
     time_range = (ch_conf.get("time_range") or "month").strip()
     seen: set[str] = set()
     items: list[dict] = []
+    n_gate = n_try = n_ok = 0
+    errs: list[str] = []
     # 🔴 查询写法决定成败（2026-10-13 实测 8 种形式）：
     #   `site:xueqiu.com MINIMAX 解禁`   6 命中 / **0 条**关于该股
     #   `site:xueqiu.com 00100 解禁`     5 命中 / **0 条**关于该股
@@ -1329,8 +1443,8 @@ def fetch_xueqiu(code: str, name: str, limit: int, conf: dict,
             if len(items) >= limit:
                 break
             _rate_limit("xueqiu", ch_conf.get("min_interval", 3.0))
-            t0 = time.time()
             q = form % kw
+            n_try += 1
             try:
                 r = requests.get(base + "/search",
                                  params={"q": q, "format": "json",
@@ -1340,10 +1454,8 @@ def fetch_xueqiu(code: str, name: str, limit: int, conf: dict,
                 r.raise_for_status()
                 data = r.json()
             except Exception as exc:                               # noqa: BLE001
-                _mark_fail("xueqiu", f"{type(exc).__name__}: {exc}",
-                           ms=int((time.time() - t0) * 1000),
-                           threshold=conf.get("health_fail_threshold", 3),
-                           cooldown_minutes=conf.get("health_cooldown_minutes", 30))
+                # 只留原因，不打健康度（见 docstring 的 🔴）
+                errs.append(f"{type(exc).__name__}: {str(exc)[:80]}")
                 continue
             try:
                 for it in (data.get("results") or []):
@@ -1362,17 +1474,16 @@ def fetch_xueqiu(code: str, name: str, limit: int, conf: dict,
                         continue
                     if re.fullmatch(r"(https?://)?(www\.)?xueqiu\.com/\S+", title):
                         continue
-                    # 🔴 相关性闸门：`site:` 的召回**很脏**，实测一次 6 条里 5 条
-                    # 与目标公司无关（固态电池/台积电提价/医疗瓶颈…）。不设闸门就会
-                    # 把它们灌进 sa_news 直接参与决策 —— 比没有这个渠道更糟。
-                    # 判据用**标题或摘要里出现公司名/代码**，不靠语义模型（贵且不稳）。
-                    blob = (title + " " + str(it.get("content") or "")).lower()
-                    aliases = [a for a in _xq_aliases(name, code) if len(a) >= 2]
-                    if aliases and not any(a.lower() in blob for a in aliases):
+                    # 🔴 `site:` 的召回**很脏**，实测一次 6 条里 5 条与目标公司
+                    # 无关（固态电池/台积电提价/医疗瓶颈…）→ 闸门见 _xq_relevant。
+                    if not _xq_relevant(code, name, title,
+                                         it.get("content"), it.get("title")):
+                        n_gate += 1
                         continue
                     when = _normalize_pub_dt(str(it.get("publishedDate") or ""))
                     if not when:
                         # 没有真实发布时间一律丢弃（项目铁律：宁可不写，不要假时间）
+                        n_gate += 1
                         continue
                     seen.add(url)
                     engine = str(it.get("engine") or "").strip()
@@ -1387,18 +1498,128 @@ def fetch_xueqiu(code: str, name: str, limit: int, conf: dict,
                     if len(items) >= limit:
                         break
             except Exception as exc:                               # noqa: BLE001
-                _mark_fail("xueqiu", f"解析失败 {type(exc).__name__}: {exc}",
-                           ms=int((time.time() - t0) * 1000),
-                           threshold=conf.get("health_fail_threshold", 3),
-                           cooldown_minutes=conf.get("health_cooldown_minutes", 30))
+                # 返回 200 但结构不是预期（引擎改版/被反爬页替换）——
+                # 这同样是**这条路坏了**，不能算「没查到」
+                errs.append(f"解析失败 {type(exc).__name__}: {str(exc)[:80]}")
                 continue
-            _mark_ok("xueqiu", ms=int((time.time() - t0) * 1000))
-    if not items:
-        # 静默 0 条是最难查的故障，明确说出来（AGENTS.md：别让「没产出」看起来像「没新闻」
-        _mark_fail("xueqiu", "搜索有结果但没有可用条目（多半是时间或标题被过滤）",
+            n_ok += 1
+    if items:
+        return items, "", True
+    alive = None if not n_try else bool(n_ok)
+    if errs:
+        return [], ("SearXNG %d/%d 次查询失败：%s%s" % (
+            len(errs), n_try, errs[0],
+            "" if len(errs) == 1 else "（另有 %d 次同类失败）" % (len(errs) - 1))
+        ), alive
+    return [], (f"SearXNG {n_try} 次查询捞到 {n_gate} 条"
+                f"但全被 URL/相关性/时间闸门挡住" if n_gate
+                else "SearXNG 没查到该股的文章页（索引里就没有）"), alive
+
+
+def fetch_xueqiu(code: str, name: str, limit: int, conf: dict,
+                  keyword: str = "") -> list[dict]:
+    """雪球讨论 —— **解禁/锁定这类事件的主要落点**（2026-10-13 用户提出）。
+
+    用户实例：MINIMAX-W 7 月解禁期到了，但创始团队自愿锁定 12 个月。
+    这条信息**只在雪球**（实测四个渠道搜「MiniMax + 解禁/锁定」全部 0 命中），
+    而雪球站内搜索直接有 —— 这就是这个渠道存在的全部理由。
+
+    ## 两条路径，先桥后搜索引擎
+    | | 拿什么 | 召回质量 | 什么时候用 |
+    |---|---|---|---|
+    | **桥**（`xq_bridge`） | 雪球内部 JSON API，带 cookie 的真浏览器 | 实测 **45/59 = 76%** 相关，日期是**真实发帖时间** | 主路径 |
+    | **SearXNG `site:`** | 搜索引擎索引 | 实测一次 6 条里 5 条无关，且只有**被索引过**的帖子 | 桥没拿满名额时补 |
+
+    桥的优势不只是召回率：SearXNG 拿不到「冷门但关键」的帖子（那正是用户
+    要找的那类），而桥能拿到。代价是桥会被 IP 风控（实测机房 IP 密集探测后
+    100% 跳验证码）—— 所以兜底路径必须留着。
+
+    ## ⚠️ 健康度归属：这一层是**唯一**写健康度的地方
+    `xueqiu` 只有一个健康度名字，而一只票要跑「桥 1 次 + SearXNG 4 次」查询。
+    两条路各自记账的话，**同一只票**自己就能撞满 `health_fail_threshold=3`
+    → 30 分钟冷却连带把另一条还能用的路一起禁掉，页面表现成「雪球两天没产出」。
+    所以路径函数只返回 `(条目, 原因, 应答状态)`，这里按**整只票一轮**判一次：
+
+    | 情况 | 记什么 |
+    |---|---|
+    | 有条目 | `_mark_ok`（兜底拿到条目同样重置失败计数 —— 渠道明明是好的）|
+    | 没条目 + 至少一条路**应答了**且没有路报错 | `_mark_ok` + 打印原因。0 条是业务结果不是故障 |
+    | 没条目 + 有路**报错**（alive=False）| `_mark_fail`，原因里含是哪个来源、为什么 |
+    | 两条路都没资格跑（桥禁用且没配 SearXNG 地址）| **什么都不记** —— 配置状态不是故障，记了会把「没配」伪装成「坏了」并触发冷却 |
+
+    静默 0 条是最难查的故障，所以两条路的原因都会出现（`_mark_fail` 或打印），
+    别让「没产出」看起来像「没新闻」（AGENTS.md）。
+    """
+    ch_conf = (conf.get("channels") or {}).get("xueqiu") or {}
+    ready, _why = _channel_ready("xueqiu", conf)
+    if not ready:
+        return []
+    kws = _xq_kws(ch_conf, keyword)
+    items, notes = [], []
+    b_items, b_note, b_alive = _xq_via_bridge(code, name, limit, conf, kws)
+    items.extend(b_items)
+    if b_note:
+        notes.append(b_note)
+    s_alive = None
+    if len(items) < limit:
+        s_items, s_note, s_alive = _xq_via_searxng(code, name, limit - len(items),
+                                                   conf, kws)
+        have = {x["url"] for x in items}
+        for x in s_items:
+            if x["url"] not in have:
+                items.append(x)
+                have.add(x["url"])
+        if s_note and len(items) < limit:
+            notes.append(s_note)
+    if items:
+        _mark_ok("xueqiu")
+        return items[:limit]
+    reason = "；".join(notes) or "两个来源都没有可用条目"
+    broken = (b_alive is False) or (s_alive is False)
+    if b_alive is None and s_alive is None:
+        return []                        # 没跑过，不配记健康度
+    if broken:
+        _mark_fail("xueqiu", reason,
                    threshold=conf.get("health_fail_threshold", 3),
                    cooldown_minutes=conf.get("health_cooldown_minutes", 30))
-    return items
+    else:
+        _mark_ok("xueqiu")
+        print(f"[news] 雪球 {code or name}：{reason}")
+    return []
+
+
+def _xq_prefetch(stocks: list[dict], conf: dict) -> None:
+    """一轮开始时，把「每只票 × 每个事件词」的雪球查询**一次批量**问完。
+
+    为什么要预热：`fetch_for_stock` 是逐票调 `fetch_xueqiu` 的，43 只票就是
+    43 次桥往返。桥一次 `evaluate` 能跑一批（`batch_size` 默认 6）、每个
+    session 只需 `navigate` 一次，且结果会进 `xq_bridge._CACHE`（TTL 1800s）——
+    所以**先批量问一遍，逐票时直接命中缓存**：一轮 HTTP 往返从 43 次降到
+    ~15 次 evaluate + 1 次 navigate。对机房 IP 的风控也更友好（次数少）。
+
+    ⚠️ 预热失败**绝不能**影响本轮：整段包 try/except，逐票路径自己退回
+    SearXNG。这里只是加速器，不是数据源。
+    """
+    ch_conf = (conf.get("channels") or {}).get("xueqiu") or {}
+    if not ch_conf.get("enabled", False):
+        return
+    if not xq_bridge.conf_of(conf)["enabled"]:
+        return
+    kws = _xq_kws(ch_conf)
+    pairs = [(s["code"], kw) for s in stocks for kw in kws]
+    if not pairs:
+        return
+    t0 = time.time()
+    try:
+        res = xq_bridge.search(pairs, conf)
+    except Exception as exc:                                   # noqa: BLE001
+        print(f"[news] 雪球桥预热失败（逐票时自动退回 SearXNG）："
+              f"{type(exc).__name__}: {exc}", flush=True)
+        return
+    hit = sum(1 for v in res.values() if v)
+    n = sum(len(v) for v in res.values())
+    print(f"[news] 雪球桥预热：{len(pairs)} 组 → {hit} 组有结果 / {n} 条，"
+          f"{time.time() - t0:.1f}s", flush=True)
 
 
 def fetch_duckduckgo(code: str, name: str, limit: int, conf: dict,
@@ -1836,6 +2057,9 @@ def fetch_watchlist(conf: dict | None = None) -> dict:
         for s in stocks
     }
     _prog_start(len(stocks), "自选股")
+    # 雪球先**一次批量**问完（43 次桥往返 → ~15 次）。放在逐票循环之前，
+    # 结果进 xq_bridge 的缓存，逐票时直接命中；失败只打印不影响本轮。
+    _xq_prefetch(stocks, conf)
     for i, s in enumerate(stocks):
         _prog_step(current=f"{s['name']}({s['code']})", done=i)
         outcome = fetch_for_stock(s["code"], s["name"], conf,
@@ -1973,7 +2197,12 @@ def fetch_topics(conf: dict | None = None, *, groups: list[str] | None = None,
                 # 主题轮只跑「按词搜」的渠道：主题词不是股票代码，
                 # ak_em（stock_news_em 认代码）跑不了；搜索类渠道单次 8~25s，
                 # 5 组共 40+ 个词，跑全了光搜索就要一小时。
-                if channel in ("duckduckgo", "bing", "searxng", "ak_em"):
+                # ⚠️ xueqiu 也在这里剔掉，理由和它们不同但更硬：**桥是按
+                # `symbol=` 检索的**，主题词没有代码 → `symbol_of("")` 拼出
+                # `SZ`，雪球**静默返回 0 条**（不报错）。留在主题轮等于每轮
+                # 白烧一批桥请求 + 把渠道健康度写成「空返」。
+                if channel in ("duckduckgo", "bing", "searxng", "ak_em",
+                               "xueqiu"):
                     continue
                 ready, why = _channel_ready(channel, conf)
                 if not ready:
