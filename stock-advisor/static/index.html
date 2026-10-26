@@ -431,6 +431,26 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
     .card { padding: 12px; border-radius: 10px; }
     th, td { padding: 6px 6px; }
   }
+
+  /* ---------- Skills ---------- */
+  .skill-card { border: 1px solid var(--border); border-radius: var(--r-sm);
+                padding: 10px 12px; margin-top: 8px; background: var(--card-2); }
+  .skill-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .skill-name { font-family: var(--mono); font-size: 13px; font-weight: 600; }
+  .skill-desc { color: var(--text-2); font-size: 12.5px; margin-top: 4px; }
+  .skill-meta { color: var(--text-3); font-size: 11.5px; margin-top: 4px;
+                display: flex; gap: 10px; flex-wrap: wrap; }
+  .skill-cap { background: var(--accent-soft); color: var(--accent-ink);
+               border-radius: 20px; padding: 0 7px; font-size: 11px; }
+  .skill-out { font-family: var(--mono); font-size: 12px; line-height: 1.55;
+               white-space: pre-wrap; word-break: break-word; max-height: 420px;
+               overflow: auto; background: var(--bg-2); border: 1px solid var(--border);
+               border-radius: var(--r-sm); padding: 10px; margin-top: 8px; }
+  .skill-warn { background: var(--warn-soft); color: var(--warn);
+                border-radius: var(--r-sm); padding: 6px 9px; font-size: 12px;
+                margin-top: 6px; }
+  .skill-cite a { display: block; font-size: 12px; overflow-wrap: anywhere;
+                  margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -460,6 +480,8 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       <button data-tab="tdesk">🔁 做T<span id="t-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="jq">📚 策略库/沙箱<span id="jq-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="analysis">🧠 分析技法<span id="anal-tab-badge" class="tab-badge hide">0</span></button>
+      <button data-tab="skills">🧩 Skills</button>
+      <button data-tab="research">🔬 研究</button>
       <button data-tab="notify">🔔 通知</button>
       <button data-tab="schedule">⚙️ 调度</button>
     </div>
@@ -1756,6 +1778,212 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       <div id="anal-empty" class="empty hide"></div>
     </div>
   </section>
+  <!-- Skills：外部项目一律通过 skills/<name>/ 的 JSON 契约接入，不复制上游代码 -->
+  <section id="tab-skills" class="hide">
+    <div class="card">
+      <div class="card-head">
+        <b style="font-size:13px">🧩 Skills · 外部能力接入</b>
+        <span class="row">
+          <span class="muted" id="skills-meta" style="font-size:12px"></span>
+          <button class="btn ghost" style="font-size:12px" onclick="loadSkills()">刷新</button>
+          <button class="btn ghost" style="font-size:12px" onclick="reloadSkills()">重新扫描</button>
+          <button class="btn ghost" style="font-size:12px" onclick="loadSkillRuns()">运行记录</button>
+        </span>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:4px">
+        每个 skill 都是 <code>skills/&lt;name&gt;/</code> 下的独立子进程：stdin 收
+        <code>{"params": ...}</code>，stdout 必须返回一个
+        <code>{ok, data, citations, warnings}</code> 对象。
+        <b>不复制上游代码、不经过 shell、数据库凭据不传入</b>；
+        超时 / 非零退出 / 输出不合法一律判失败，不把半截结果当成功。
+      </div>
+      <div id="skills-list" style="margin-top:10px"></div>
+      <div id="skills-empty" class="empty hide">
+        还没有 skill。复制 <code>skills/_template/</code> 到
+        <code>skills/&lt;name&gt;/</code> 开始接入；目录名、manifest 的 name 必须一致。
+      </div>
+    </div>
+
+    <div class="card hide" id="skills-output-card">
+      <div class="card-head">
+        <b style="font-size:13px" id="skills-output-title">运行结果</b>
+        <span class="row">
+          <span id="skills-output-badge"></span>
+          <button class="btn ghost" style="font-size:12px" onclick="copySkillOutput()">复制 JSON</button>
+          <button class="btn ghost" style="font-size:12px" onclick="hideSkillOutput()">关闭</button>
+        </span>
+      </div>
+      <div id="skills-output-meta" class="muted" style="font-size:12px"></div>
+      <div id="skills-output-warn"></div>
+      <div id="skills-output-cite" class="skill-cite"></div>
+      <pre class="skill-out" id="skills-output"></pre>
+    </div>
+
+    <div class="card hide" id="skills-runs-card">
+      <div class="card-head">
+        <b style="font-size:13px">🕘 最近运行（审计日志）</b>
+        <span class="row">
+          <span class="muted" id="skills-runs-meta" style="font-size:12px"></span>
+          <button class="btn ghost" style="font-size:12px" onclick="loadSkillRuns()">刷新</button>
+          <button class="btn ghost" style="font-size:12px"
+                  onclick="$('skills-runs-card').classList.add('hide')">关闭</button>
+        </span>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:4px">
+        只记录元数据（何时、哪个 skill、耗时、是否成功、错误码），
+        <b>不记录参数值和输出内容</b>，避免把用户数据/密钥落盘。
+      </div>
+      <div class="table-scroll" style="margin-top:8px">
+        <table>
+          <thead><tr><th>时间</th><th>Skill</th><th>版本</th><th>结果</th>
+            <th>耗时</th><th>错误</th></tr></thead>
+          <tbody id="skills-runs-body"></tbody>
+        </table>
+      </div>
+      <div id="skills-runs-empty" class="empty hide">还没有运行记录</div>
+    </div>
+  </section>
+  <!-- 研究引擎（Vibe-Trading sidecar） -->
+  <section id="tab-research" class="hide">
+    <div class="card">
+      <div class="card-head">
+        <b style="font-size:13px">🧭 十项目接入矩阵</b>
+        <span class="row">
+          <span class="muted" id="projects-meta" style="font-size:12px"></span>
+          <button class="btn ghost" style="font-size:12px" onclick="loadProjects(true)">重新探测</button>
+        </span>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:4px">
+        每个上游按最适合的方式接入：<b>REST sidecar</b>（Vibe / TSP / OpenBB）、
+        <b>本地服务</b>（daily）、<b>Skill/CLI</b>（last30days / day-trader）、
+        <b>独立进程</b>（freqtrade）、<b>代码移植</b>（TradingAgents）、
+        <b>离线 Notebook</b>（Kronos）。探针只做健康检查与 import，
+        <b>不写库、不触发交易、子进程不传 DB/密钥</b>。
+        <code>live</code> = 服务在线，<code>ready</code> = 已装可调用，
+        <code>offline</code> = 该启动没启动，<code>blocked</code> = 许可/形态不适配。
+      </div>
+      <div class="table-scroll" style="margin-top:8px">
+        <table>
+          <thead><tr><th>项目</th><th>仓库 / 许可</th><th>接入方式</th>
+            <th>市场</th><th>状态</th><th>说明</th></tr></thead>
+          <tbody id="projects-body"></tbody>
+        </table>
+      </div>
+      <div id="projects-empty" class="empty hide">还没有探测结果</div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <b style="font-size:13px">因子每日快照 · 已验证算子</b>
+        <span class="row">
+          <span class="muted" id="factor-meta" style="font-size:12px"></span>
+          <button class="btn ghost" style="font-size:12px" onclick="loadFactors()">刷新</button>
+          <button class="btn ghost" style="font-size:12px" onclick="runFactors(this)">重算</button>
+        </span>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:4px">
+        把 Vibe registry 里<b>验证过的算子</b>直接算到本站日线上：横截面 z + 面板样本内
+        rank IC 定向，结果落到 <code>sa_factor_*</code>，并注入策略每日结论与盘前/盘后报告。
+        <b>A 股 / 港股分两个面板</b>（A 股取 <code>sa_market_kline</code>，港股取
+        <code>sa_hk_kline</code> 的流动性样本），z 不跨市场比较。
+        计算由 <code>tools/factor_worker.py</code> 在 Vibe venv 子进程里完成，主应用不 import 上游。
+        <b>方向是样本内历史，不是明日预测。</b>
+      </div>
+      <div id="factor-state" class="skill-card">加载中…</div>
+      <div class="row" style="margin-top:10px">
+        <input id="factor-code" placeholder="查单票，如 600519 / 02513" style="width:220px"
+               onkeydown="if(event.key==='Enter')lookupFactor()">
+        <button class="btn ghost" style="font-size:12px" onclick="lookupFactor()">查暴露</button>
+        <span class="muted" id="factor-lookup-meta" style="font-size:12px"></span>
+      </div>
+      <div id="factor-lookup" style="margin-top:8px"></div>
+      <div id="factor-codes" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <b style="font-size:13px">🔬 Vibe-Trading · 外部研究引擎</b>
+        <span class="row">
+          <span class="muted" id="vibe-meta" style="font-size:12px"></span>
+          <button class="btn ghost" style="font-size:12px" onclick="loadResearch()">刷新</button>
+          <button class="btn ghost" style="font-size:12px" onclick="probeVibe(this)">契约测试</button>
+        </span>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:4px">
+        sidecar 独立部署在 <code>101.43.25.101</code>（systemd 托管，nginx <code>/vibe/</code> 反代，
+        只接国内 A 股与港股）。本站只走 REST，不 import 上游代码、不共享数据库连接。所有调用都按
+        <code>integrations/contracts/vibe.json</code> 校验字段；sidecar 挂了只有本页降级，
+        行情、持仓、模拟交易不受影响。
+        <button class="linkbtn" onclick="vibeHelp()">部署与启动方式</button>
+      </div>
+      <div id="vibe-state" class="skill-card">加载中…</div>
+      <div id="vibe-probe"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <b style="font-size:13px">🧪 因子库 <span class="muted" id="vibe-univ-label" style="font-weight:400;font-size:12px">A 股 · equity_cn</span></b>
+        <span class="row">
+          <span class="muted" id="vibe-alpha-meta" style="font-size:12px"></span>
+          <button class="btn ghost" style="font-size:12px" onclick="loadVibeAlphas()">刷新</button>
+        </span>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <select id="vibe-universe" onchange="onVibeUniverseChange()" style="width:150px">
+          <option value="equity_cn">A 股 · 沪深</option>
+          <option value="equity_hk">港股 · HK</option>
+        </select>
+        <select id="vibe-zoo" onchange="loadVibeAlphas()" style="width:130px">
+          <option value="">全部 zoo</option>
+          <option value="academic">academic</option>
+          <option value="alpha101">alpha101</option>
+          <option value="gtja191">gtja191</option>
+          <option value="qlib158">qlib158</option>
+          <option value="fundamental">fundamental</option>
+        </select>
+        <select id="vibe-theme" onchange="loadVibeAlphas()" style="width:130px">
+          <option value="">全部主题</option>
+          <option value="momentum">momentum</option>
+          <option value="reversal">reversal</option>
+          <option value="volume">volume</option>
+          <option value="volatility">volatility</option>
+          <option value="quality">quality</option>
+          <option value="value">value</option>
+          <option value="liquidity">liquidity</option>
+          <option value="microstructure">microstructure</option>
+          <option value="sentiment">sentiment</option>
+          <option value="growth">growth</option>
+          <option value="leverage">leverage</option>
+        </select>
+        <input id="vibe-q" placeholder="按 id / 名称过滤" style="width:200px"
+               oninput="renderVibeAlphas()">
+        <select id="vibe-limit" onchange="loadVibeAlphas()" style="width:110px">
+          <option value="50">前 50 条</option>
+          <option value="100" selected>前 100 条</option>
+          <option value="300">前 300 条</option>
+          <option value="500">全部（A 股 377 / 港股 180）</option>
+        </select>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:6px">
+        点条目看公式与源码（上游公开的因子定义）。这里只读元数据，
+        <b>不会把因子代码写进本站策略库</b>。港股暂不提供 bench（上游 0.1.18 无港股基准）。
+      </div>
+      <div id="vibe-alphas" style="margin-top:10px"></div>
+      <div id="vibe-alphas-empty" class="empty hide">没有匹配的因子</div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <b style="font-size:13px">👥 多智能体研究模板</b>
+        <span class="muted" id="vibe-preset-meta" style="font-size:12px"></span>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:4px">
+        上游内置的 DAG 研究团队，A 股与港股共用；已滤掉加密/商品/信用/宏观汇率/全球混合资产模板。
+        本站只展示模板与变量，<b>不在本地启动 swarm</b>——运行走 101 上的 sidecar，会消耗 token。
+      </div>
+      <div id="vibe-presets" style="margin-top:10px"></div>
+    </div>
+  </section>
   <!-- 通知 -->
   <section id="tab-notify" class="hide">
     <div class="card">
@@ -2600,8 +2828,14 @@ async function api(url, opts) {
     let msg = data.detail;
     if (Array.isArray(msg)) {
       msg = msg.map(x => x && (x.msg || x.type)).filter(Boolean).join('；');
+    } else if (msg && typeof msg === 'object') {
+      // Skill API 用 {code, message, ...} 结构化错误；优先展示人话 message
+      msg = msg.message || msg.code || JSON.stringify(msg);
     }
-    throw new Error(msg || resp.statusText);
+    const err = new Error(msg || resp.statusText);
+    err.detail = data.detail;   // 运行 id / stderr / 检查项等，调用方可展开
+    err.status = resp.status;
+    throw err;
   }
   return data;
 }
@@ -3547,6 +3781,45 @@ function _sdPaintState(st) {
     : '还没有手动运行记录（守护线程每天到点也会自动跑一轮）。';
 }
 
+// 因子同向/相悖：只统计本轮真的带 factor 字段的建议。老轮次没有字段就整行不显示，
+// 不能让「没跑因子」看起来像「0 同向 0 相悖」。
+function _sdFactorMini(sug) {
+  // 按市场分开统计：A 股与港股面板不同，把两边混成一个「同向 3」会误导。
+  const by = {};
+  (sug || []).forEach(x => {
+    const f = x.factor || {};
+    const s = f.status;
+    if (!s) return;
+    const mk = f.market_label || (String(x.code || '').length === 5 ? '港股' : 'A股');
+    const b = by[mk] || (by[mk] = { aligned: 0, against: 0, missing: 0, total: 0 });
+    b.total += 1;
+    if (s === 'aligned') b.aligned += 1;
+    else if (s === 'against') b.against += 1;
+    else if (s === 'missing' || s === 'unavailable' || s === 'error') b.missing += 1;
+  });
+  const marks = Object.entries(by);
+  if (!marks.length) return '';
+  return marks.map(([mk, b]) => `<div class="muted" style="font-size:11px">${
+    marks.length > 1 ? esc(mk) + ' ' : ''}因子
+    <span class="up">同向 ${fmt(b.aligned)}</span> / <span class="down">相悖 ${fmt(b.against)}</span>${
+    b.missing ? ' · 缺 ' + fmt(b.missing) : ''}</div>`).join('');
+}
+
+function _sdFactorCell(f) {
+  f = f || {};
+  const map = {
+    aligned: ['b-ok', '同向'], against: ['b-bad', '相悖'],
+    neutral: ['b-mute', '中性'], missing: ['b-mute', '缺数据'],
+    unavailable: ['b-mute', '不可用'], error: ['b-warn', '失败'],
+  };
+  const m = map[f.status];
+  if (!m) return '<span class="muted">—</span>';
+  const c = typeof f.composite === 'number' ? f.composite : null;
+  return `<span class="badge ${m[0]}">${m[1]}</span>${c == null ? '' :
+    `<div class="muted" style="font-size:11px" title="样本内 IC 定向，不是预测">z ${
+      _fxSigned(c, 2)}${f.market_label ? ' · ' + esc(f.market_label) : ''}</div>`}`;
+}
+
 async function loadStrategyDaily(silent) {
   const sum = $('sd-summary');
   if (!sum) return;
@@ -3566,18 +3839,27 @@ async function loadStrategyDaily(silent) {
     const rows = _SD_LATEST;
     const uni = d.universe || {};
     let nOk = 0, nSug = 0, nGateBad = 0;
+    let fA = 0, fG = 0, fM = 0, fAny = 0;
     rows.forEach(r => {
       if (r.status === 'ok') nOk += 1;
       if ((r.suggestions || []).length) nSug += 1;
       const g = (r.data_quality || {}).gate || {};
       if (g.verdict === 'reject') nGateBad += 1;
+      (r.suggestions || []).forEach(x => {
+        const s = (x.factor || {}).status;
+        if (!s) return;
+        fAny += 1;
+        if (s === 'aligned') fA += 1;
+        else if (s === 'against') fG += 1;
+        else if (s === 'missing' || s === 'unavailable' || s === 'error') fM += 1;
+      });
     });
     // 只列达门槛的候选，别让「9」被读成「库里只有 9 条策略」
     const uniLabel = uni.min_score == null ? '本轮候选策略'
       : '候选策略（可移植分 ≥ ' + uni.min_score + '）';
     const uniValue = uni.total == null ? fmt(rows.length)
       : fmt(rows.length) + ' / ' + fmt(uni.total);
-    sum.innerHTML = [
+    const tiles = [
       [uniLabel, uniValue],
       ['出结论', fmt(nOk)],
       ['未出结论', fmt(rows.length - nOk)],
@@ -3586,7 +3868,13 @@ async function loadStrategyDaily(silent) {
       ['最新轮次', last ? (last.run_id || '—') : '—'],
       ['本轮交易日', last && last.trade_date ? last.trade_date : '—'],
       ['本轮成功/失败', last ? fmt(last.n_ok) + '/' + fmt(last.n_failed) : '—'],
-    ].map(([k, v]) => `<div class="jq-stat"><div class="jq-stat-v">${jqEsc(v)}</div>
+    ];
+    // 没有因子快照的老轮次不显示这一格，免得把「没跑」误读成「0 同向 0 相悖」
+    if (fAny) {
+      tiles.splice(4, 0, ['建议·因子同向/相悖',
+        fmt(fA) + ' / ' + fmt(fG) + (fM ? ' · 缺 ' + fmt(fM) : '')]);
+    }
+    sum.innerHTML = tiles.map(([k, v]) => `<div class="jq-stat"><div class="jq-stat-v">${jqEsc(v)}</div>
         <div class="jq-stat-k">${jqEsc(k)}</div></div>`).join('');
 
     $('sd-body').innerHTML = rows.map(r => {
@@ -3606,6 +3894,7 @@ async function loadStrategyDaily(silent) {
         <td>${sug.length
           ? `${fmt(sug.length)} 条 <span class="muted" style="font-size:11px">买 ${
               fmt(nBuy)} / 卖 ${fmt(nSell)}</span><br>`
+            + _sdFactorMini(sug)
             + `<button class="link-btn" style="font-size:11px" `
             + `onclick="sdShow('${_tAttr(aid)}')">明细</button>`
           : '<span class="muted">—</span>'}</td>
@@ -3658,6 +3947,17 @@ function sdShow(articleId) {
   const met = row.metrics || {};
   const rm = dq.run_meta || {};
   const slice = dq.slice || {};
+  const fq = dq.factor || {};
+  const fqOk = fq.status === 'ok';
+  const fqLine = fqOk
+    ? `同向 ${fmt(fq.aligned)} · 相悖 ${fmt(fq.against)} · 中性 ${fmt(fq.neutral)}`
+      + ` · 缺数据 ${fmt(fq.missing)}`
+      + (fq.portfolio
+        ? `；组合均值 z ${_fxSigned(_fxNum(fq.portfolio.mean_composite), 2)}`
+          + `（${fmt(fq.portfolio.n)} 只）`
+        : '')
+      + (fq.as_of ? ` · 数据截至 ${fq.as_of}` : '')
+    : '';
 
   const sugRows = sug.slice(0, 100).map(x => {
     const isBuy = x.side === 'buy';
@@ -3670,10 +3970,11 @@ function sdShow(articleId) {
       <td>${_sdAmt(x.suggest_value, x.side)}</td>
       <td>${fmt(x.suggest_shares)}</td>
       <td>${fmtPx(x.price)}</td>
+      <td>${_sdFactorCell(x.factor)}</td>
       <td class="muted" style="font-size:11px">${jqEsc(x.reason || '')}</td>
     </tr>`;
   }).join('')
-    || '<tr><td colspan="8" class="muted">这一轮没有任何调仓建议</td></tr>';
+    || '<tr><td colspan="9" class="muted">这一轮没有任何调仓建议</td></tr>';
 
   const posRows = pos.slice(0, 60).map(p => `<tr>
       <td>${jqEsc(p.code || '')}</td><td>${jqEsc(p.name || '')}</td>
@@ -3747,7 +4048,7 @@ function sdShow(articleId) {
     <div class="table-scroll" style="max-height:320px;margin-top:4px">
       <table>
         <thead><tr><th>代码</th><th>名称</th><th>方向</th><th>目标权重变化</th>
-          <th>参考金额</th><th>股数</th><th>价格</th><th>依据</th></tr></thead>
+          <th>参考金额</th><th>股数</th><th>价格</th><th>因子</th><th>依据</th></tr></thead>
         <tbody>${sugRows}</tbody>
       </table>
     </div>
@@ -3762,6 +4063,19 @@ function sdShow(articleId) {
       jqEsc(dq.universe_reason)}</div>` : ''}
     ${(dq.warnings || []).length ? `<div class="muted" style="font-size:11px;margin-top:4px">告警：${
       jqEsc((dq.warnings || []).join('；'))}</div>` : ''}
+
+    <div style="margin-top:10px"><b style="font-size:12px">🧬 因子暴露</b>
+      <span class="muted" style="font-size:11px">验证算子 · 样本内 IC 定向 · 不是预测${
+        fq.run_id ? ' · ' + jqEsc(fq.run_id) : ''}</span></div>
+    ${fqOk
+      ? `<div class="muted" style="font-size:12px;margin-top:2px">${jqEsc(fqLine)}</div>`
+      : `<div class="muted" style="font-size:11px;margin-top:2px">${
+          fq.status
+            ? jqEsc((fq.status === 'unavailable' ? '本轮未注入因子快照：' : '因子不可用：')
+              + (fq.note || ''))
+            : '本轮没跑因子快照（老轮次，或计算失败/超时）。'}</div>`}
+    ${fqOk && fq.note ? `<div class="muted" style="font-size:11px;margin-top:1px">${
+      jqEsc(fq.note)}</div>` : ''}
 
     <div style="margin-top:10px"><b style="font-size:12px">🔎 前置条件</b>
       <span class="muted" style="font-size:11px">${jqEsc(pre.state || '')}${
@@ -4417,10 +4731,1159 @@ async function jqExtract(btn) {
   });
 }
 
+// ---------- Skills：外部能力接入 ----------
+// 后端只在 skills/<name>/ 下起独立子进程，stdout 必须是
+// {ok, data, citations, warnings} 一个 JSON 对象。这里不做任何“猜测式”容错：
+// 失败就把错误原样展示，不拿上一次结果冒充这一次。
+let _skills = [];
+let _lastSkillOutput = '';
+
+const _SKILL_STATUS = {
+  ready:       { t: '可用',     c: 'b-ok' },
+  unavailable: { t: '不可用',   c: 'b-warn' },
+  disabled:    { t: '已禁用',   c: 'b-warn' },
+  invalid:     { t: '清单错误', c: 'b-bad' },
+};
+
+async function loadSkills() {
+  const list = $('skills-list');
+  if (list && !list.innerHTML.trim()) list.innerHTML = skeletonBox(2);
+  try {
+    const d = await api('/api/skills');
+    _skills = d.skills || [];
+    renderSkills(_skills, d.runtime || {});
+  } catch (e) {
+    if (list) list.innerHTML = `<div class="muted">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+function renderSkills(rows, runtime) {
+  const list = $('skills-list');
+  const empty = $('skills-empty');
+  if (!list) return;
+  const ready = rows.filter(r => r.status === 'ready').length;
+  if ($('skills-meta')) {
+    $('skills-meta').textContent =
+      `${rows.length} 个 · ${ready} 可用` + (runtime && runtime.disabled ? ' · 运行时已关闭' : '');
+  }
+  if (empty) empty.classList.toggle('hide', rows.length > 0);
+  if (!rows.length) { list.innerHTML = ''; return; }
+
+  list.innerHTML = rows.map(s => {
+    const st = _SKILL_STATUS[s.status] || { t: s.status || '未知', c: 'b-warn' };
+    const canRun = s.status === 'ready';
+    // 目录名不合法的条目 API 无法寻址（会被名称校验拦下），按钮直接禁用；
+    // manifest 坏但目录名合法的条目仍可「检查」看具体哪一项不对。
+    const nameOk = /^[a-z0-9][a-z0-9_-]{0,63}$/.test(s.name);
+    const caps = (s.capabilities || [])
+      .map(c => `<span class="skill-cap">${esc(c)}</span>`).join('');
+    const reasons = (s.reasons || []).length
+      ? `<div class="skill-warn">${s.reasons.map(r => esc(r)).join('；')}</div>` : '';
+    const up = s.upstream && (s.upstream.name || s.upstream.version)
+      ? `上游 ${esc(s.upstream.name || '')}${s.upstream.version ? ' ' + esc(s.upstream.version) : ''}`
+      : '';
+    const meta = [
+      `v${esc(s.version || '—')}`,
+      `入口 ${esc(s.entrypoint || '—')}`,
+      `超时 ${esc(s.timeout_seconds || '—')}s`,
+      `${Math.round((s.max_output_bytes || 0) / 1024)} KB 输出上限`,
+      up,
+    ].filter(Boolean).map(x => `<span>${x}</span>`).join('');
+    return `<div class="skill-card">
+      <div class="skill-head">
+        <span class="skill-name">${esc(s.name)}</span>
+        <span class="badge ${st.c}">${esc(st.t)}</span>
+        ${caps}
+        <span style="flex:1"></span>
+        <button class="btn sm" data-act="run" data-skill="${esc(s.name)}"
+                ${canRun ? '' : 'disabled'}>运行</button>
+        <button class="btn ghost sm" data-act="check" data-skill="${esc(s.name)}"
+                ${nameOk ? '' : 'disabled'}>检查</button>
+        <button class="btn ghost sm" data-act="doc" data-skill="${esc(s.name)}"
+                ${nameOk ? '' : 'disabled'}>说明</button>
+      </div>
+      <div class="skill-desc">${esc(s.description || '（没有 description）')}</div>
+      <div class="skill-meta">${meta}</div>
+      ${reasons}
+    </div>`;
+  }).join('');
+
+  // 用 data-* + 事件绑定而不是把 name 拼进 onclick：即使目录名带引号
+  // 也不会破坏 HTML/JS（manifest 不合法的目录同样会出现在列表里）。
+  list.querySelectorAll('button[data-act]').forEach(btn => {
+    btn.onclick = () => {
+      const name = btn.dataset.skill;
+      if (btn.dataset.act === 'run') runSkill(name);
+      else if (btn.dataset.act === 'check') checkSkill(name);
+      else showSkillDoc(name);
+    };
+  });
+}
+
+async function runSkill(name) {
+  const s = _skills.find(x => x.name === name) || {};
+  const spec = (s.params && typeof s.params === 'object') ? s.params : {};
+  const keys = Object.keys(spec);
+  const hint = keys.length
+    ? '可用参数：' + keys.map(k => k + (spec[k] && spec[k].required ? '（必填）' : '')).join('、')
+    : 'manifest 没有声明参数，留空等同 {}';
+  let preset = '{\n  \n}';
+  let params = {};
+  let timeout = 0;
+  // JSON 写错时不关窗丢输入：重新弹同一个表单，把刚才的内容带回去。
+  for (;;) {
+    const v = await formDlg('运行 ' + name, [
+      { key: 'params', label: '参数（JSON 对象）', type: 'textarea',
+        value: preset, hint },
+      { key: 'timeout', label: '超时（秒）', type: 'number',
+        value: String(s.timeout_seconds || 120),
+        hint: `服务端会再取一次 min(本值, manifest 的 ${s.timeout_seconds || 120} 秒)` },
+    ], { okText: '运行', wide: true });
+    if (!v) return;
+
+    const txt = (v.params || '').trim();
+    if (!txt) {
+      params = {};
+    } else {
+      try {
+        params = JSON.parse(txt);
+      } catch (e) {
+        toastErr('参数不是合法 JSON：' + e.message + '（已保留输入）');
+        preset = txt;
+        continue;
+      }
+      if (!params || typeof params !== 'object' || Array.isArray(params)) {
+        toastErr('参数必须是 JSON 对象，例如 {"query": "..."}（已保留输入）');
+        preset = txt;
+        continue;
+      }
+    }
+    timeout = Math.max(1, parseInt(v.timeout, 10) || (s.timeout_seconds || 120));
+    break;
+  }
+
+  const card = $('skills-output-card');
+  card.classList.remove('hide');
+  $('skills-output-title').textContent = '运行 ' + name + '…';
+  $('skills-output-badge').innerHTML = '<span class="badge b-warn">运行中</span>';
+  $('skills-output-meta').textContent = `子进程启动中，最长 ${timeout} 秒`;
+  $('skills-output-warn').innerHTML = '';
+  $('skills-output-cite').innerHTML = '';
+  $('skills-output').textContent = '';
+  card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+  try {
+    const d = await jsonPost(
+      '/api/skills/' + encodeURIComponent(name) + '/run',
+      { params, timeout_seconds: timeout });
+    showSkillOutput(name, d);
+    loadSkillRuns(true);
+  } catch (e) {
+    const id = e.detail && e.detail.run_id ? ` · run ${e.detail.run_id}` : '';
+    $('skills-output-title').textContent = '运行 ' + name + ' 失败';
+    $('skills-output-badge').innerHTML = '<span class="badge b-bad">失败</span>';
+    $('skills-output-meta').textContent = e.message + id;
+    $('skills-output').textContent = JSON.stringify(e.detail || { message: e.message }, null, 2);
+    toastErr(e.message);
+    loadSkillRuns(true);
+  }
+}
+
+function showSkillOutput(name, d) {
+  const ok = d.ok === true;
+  const run = d.run || {};
+  $('skills-output-title').textContent =
+    '运行结果 · ' + name + ' v' + (run.version || '—');
+  $('skills-output-badge').innerHTML = ok
+    ? '<span class="badge b-ok">成功</span>'
+    : '<span class="badge b-bad">业务失败</span>';
+  $('skills-output-meta').textContent = [
+    run.run_id ? `run ${run.run_id}` : '',
+    run.duration_ms != null ? `耗时 ${run.duration_ms} ms` : '',
+    run.output_bytes != null ? `输出 ${run.output_bytes} B` : '',
+    d.upstream_version ? `上游 ${d.upstream_version}` : '',
+  ].filter(Boolean).join(' · ');
+
+  const warns = (d.warnings || []);
+  $('skills-output-warn').innerHTML = warns.length
+    ? warns.map(w => `<div class="skill-warn">⚠️ ${esc(w)}</div>`).join('') : '';
+
+  const cites = (d.citations || []).map(u => {
+    const href = _safeLink(u);
+    return href
+      ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">🔗 ${esc(u)}</a>`
+      : `<span class="faint">（忽略非 http(s) 链接）${esc(u)}</span>`;
+  });
+  $('skills-output-cite').innerHTML = cites.join('');
+
+  const txt = JSON.stringify(d, null, 2);
+  _lastSkillOutput = txt;
+  const LIMIT = 200000;
+  $('skills-output').textContent = txt.length > LIMIT
+    ? txt.slice(0, LIMIT) + '\n…（显示已截断，点「复制 JSON」获取完整内容）'
+    : txt;
+}
+
+function _safeLink(u) {
+  try {
+    const x = new URL(String(u));
+    return (x.protocol === 'http:' || x.protocol === 'https:') ? x.href : '';
+  } catch (e) { return ''; }
+}
+
+async function checkSkill(name) {
+  try {
+    const d = await jsonPost(
+      '/api/skills/' + encodeURIComponent(name) + '/check', {});
+    const rows = (d.checks || []).map(c => `<tr>
+      <td class="mono">${esc(c.name)}</td>
+      <td>${c.ok ? '✅' : '❌'}</td>
+      <td class="muted">${esc(c.detail || '')}</td></tr>`).join('');
+    const badge = d.ok
+      ? '<span class="badge b-ok">通过</span>'
+      : '<span class="badge b-bad">未通过</span>';
+    const reasons = (d.reasons || []).length
+      ? `<div class="skill-warn">${d.reasons.map(r => esc(r)).join('；')}</div>` : '';
+    infoDlg('检查 ' + name,
+      `<div class="row">${badge}<span class="muted">${esc(d.status || '')}</span></div>
+       ${reasons}
+       <div class="table-scroll" style="margin-top:8px"><table>
+         <thead><tr><th>检查项</th><th>结果</th><th>说明</th></tr></thead>
+         <tbody>${rows}</tbody></table></div>`,
+      { wide: true });
+  } catch (e) {
+    toastErr('检查失败：' + e.message);
+  }
+}
+
+async function showSkillDoc(name) {
+  try {
+    const d = await api('/api/skills/' + encodeURIComponent(name));
+    const meta = [
+      `v${esc(d.version || '—')}`,
+      `状态 ${esc(d.status || '—')}`,
+      `入口 ${esc(d.entrypoint || '—')}`,
+      d.upstream && d.upstream.name
+        ? `上游 ${esc(d.upstream.name)}${d.upstream.version ? ' ' + esc(d.upstream.version) : ''}`
+        : '',
+      d.path ? `目录 ${esc(d.path)}` : '',
+    ].filter(Boolean).join(' · ');
+    const body = `<div class="muted" style="font-size:12px">${meta}</div>`
+      + `<pre class="skill-out" style="max-height:520px">${esc(d.readme || '（没有 SKILL.md）')}</pre>`
+      + (d.readme_truncated
+        ? '<div class="faint" style="margin-top:4px">SKILL.md 超过 64 KB，已截断显示</div>' : '');
+    infoDlg(name, body, { wide: true });
+  } catch (e) {
+    toastErr('读取说明失败：' + e.message);
+  }
+}
+
+async function reloadSkills() {
+  try {
+    const d = await jsonPost('/api/skills/reload', {});
+    _skills = d.skills || [];
+    renderSkills(_skills, d.runtime || {});
+    toastOk(`已重新扫描：${_skills.length} 个 skill`);
+  } catch (e) {
+    toastErr('重新扫描失败：' + e.message);
+  }
+}
+
+async function loadSkillRuns(quiet) {
+  const card = $('skills-runs-card');
+  if (!card) return;
+  if (quiet && card.classList.contains('hide')) return;
+  card.classList.remove('hide');
+  const body = $('skills-runs-body');
+  if (!body.innerHTML.trim()) {
+    body.innerHTML = '<tr><td colspan="6" class="muted">加载中…</td></tr>';
+  }
+  try {
+    const d = await api('/api/skills/runs?limit=50');
+    const rows = d.runs || [];
+    $('skills-runs-meta').textContent = rows.length ? `最近 ${rows.length} 条` : '';
+    $('skills-runs-empty').classList.toggle('hide', rows.length > 0);
+    body.innerHTML = rows.map(r => {
+      const t = r.started_at ? new Date(r.started_at) : null;
+      const ts = t && isFinite(t.getTime())
+        ? t.toLocaleString('zh-CN', { hour12: false })
+        : (r.started_at || '—');
+      const ok = r.ok === true;
+      const err = r.error_code
+        ? esc(r.error_code) + (r.error_code === 'exit_nonzero' && r.exit_code != null
+          ? ' · exit ' + esc(r.exit_code) : '')
+        : '';
+      return `<tr>
+        <td class="muted">${esc(ts)}</td>
+        <td class="mono">${esc(r.name || '—')}</td>
+        <td class="muted">v${esc(r.version || '—')}</td>
+        <td><span class="badge ${ok ? 'b-ok' : 'b-bad'}">${ok ? '成功' : '失败'}</span></td>
+        <td class="num">${r.duration_ms != null ? esc(r.duration_ms) + ' ms' : '—'}</td>
+        <td class="muted">${err || '—'}</td>
+      </tr>`;
+    }).join('');
+  } catch (e) {
+    body.innerHTML = `<tr><td colspan="6" class="muted">加载失败：${esc(e.message)}</td></tr>`;
+  }
+}
+
+function hideSkillOutput() {
+  $('skills-output-card').classList.add('hide');
+}
+
+async function copySkillOutput() {
+  if (!_lastSkillOutput) return;
+  try {
+    await navigator.clipboard.writeText(_lastSkillOutput);
+    toastOk('已复制完整 JSON');
+  } catch (e) {
+    const ta = document.createElement('textarea');
+    ta.value = _lastSkillOutput;
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); toastOk('已复制完整 JSON'); }
+    catch (_) { toastErr('复制失败'); }
+    ta.remove();
+  }
+}
+
+// ---------- 因子每日快照（已验证算子） ----------
+// 后端 /api/factors/*；计算在 tools/factor_worker.py（Vibe venv 子进程），
+// 主应用不 import 上游。合成方向 = 面板**样本内** rank IC 的符号 × 截面 z，
+// 页面上所有文案都必须带「样本内 / 不是预测」，别让读者当成明日信号。
+let _FACTOR_POLL = null;
+
+const _FX_THEME = {
+  momentum: '动量', reversal: '反转', volume: '量能', volatility: '波动',
+  quality: '质量', value: '估值', liquidity: '流动性',
+  microstructure: '微观结构', sentiment: '情绪', growth: '成长', leverage: '杠杆',
+};
+const _FX_CONF = {
+  strong: { t: '强', c: 'b-ok' }, medium: { t: '中', c: 'b-warn' },
+  weak: { t: '弱', c: 'b-mute' }, none: { t: '无', c: 'b-mute' },
+};
+
+function _fxNum(v) {
+  const n = Number(v);
+  return isFinite(n) ? n : null;
+}
+
+function _fxSigned(n, digits) {
+  if (n == null) return '—';
+  return (n > 0 ? '+' : '') + n.toFixed(digits);
+}
+
+/** theme_scores 是 {theme: {z, n}}；按 |z| 取前几个做成小标签 */
+function _fxThemeChips(themes, limit) {
+  const rows = Object.entries(themes || {}).map(([k, v]) => ({
+    k, z: _fxNum(v && v.z),
+  })).filter(x => x.z != null)
+    .sort((a, b) => Math.abs(b.z) - Math.abs(a.z))
+    .slice(0, limit || 4);
+  if (!rows.length) return '<span class="muted" style="font-size:11px">各主题接近中性</span>';
+  return rows.map(x => `<span class="skill-cap" title="${esc(_FX_THEME[x.k] || x.k)}">${
+    esc(_FX_THEME[x.k] || x.k)} ${_fxSigned(x.z, 2)}</span>`).join(' ');
+}
+
+/** 快照日期离今天多少天（行情停更要显眼，别让人以为因子是今天的） */
+function _fxStaleDays(asOf) {
+  const t = Date.parse(String(asOf || '') + 'T00:00:00+08:00');
+  if (!isFinite(t)) return null;
+  return Math.max(0, Math.round((Date.now() - t) / 86400000));
+}
+
+async function loadFactors(quiet) {
+  const state = $('factor-state');
+  if (!state) return;
+  if (!state.dataset.loaded && !quiet) state.innerHTML = skeletonBox(2);
+  const [a, b] = await Promise.allSettled([
+    api('/api/factors/status'), api('/api/factors/latest')]);
+  state.dataset.loaded = '1';
+  const st = a.status === 'fulfilled' ? (a.value.data || {}) : null;
+  if (b.status !== 'fulfilled') {
+    const msg = (b.reason && b.reason.message) || '读取因子快照失败';
+    if ($('factor-meta')) $('factor-meta').textContent = '读取失败';
+    state.innerHTML = `<div class="skill-head">
+        <span class="skill-name">factor-zoo</span>
+        <span class="badge b-bad">读取失败</span></div>
+      <div class="skill-warn">${esc(msg)}</div>`;
+    $('factor-codes').innerHTML = '';
+    return;
+  }
+  const latest = b.value.data || null;
+  if (!latest) { renderFactorEmpty(st); return; }
+  renderFactorSnap(latest, st);
+}
+
+function renderFactorEmpty(st) {
+  const state = $('factor-state');
+  if (!state) return;
+  const conf = (st && st.config) || {};
+  const wp = (st && st.worker_python) || '';
+  const wOk = !!(st && st.worker_exists);
+  const uni = st && st.hk_universe;
+  if ($('factor-meta')) $('factor-meta').textContent = '尚无快照';
+  if ($('factor-codes')) $('factor-codes').innerHTML = '';
+  state.innerHTML = `<div class="skill-head">
+      <span class="skill-name">factor-zoo</span>
+      <span class="badge b-warn">尚无快照</span>
+      <span class="skill-cap">A股 ${fmt(conf.pool_size)} 只</span>
+      <span class="skill-cap">港股 ${fmt(conf.hk_pool_size)} 只</span>
+    </div>
+    <div class="skill-warn">还没有跑过因子快照。点右上「重算」跑一轮（A 股 + 港股各一轮，
+      约 2 分钟：取面板日线 + 逐算子算 IC）。</div>
+    <div class="muted" style="font-size:11px;margin-top:6px">
+      港股样本：<b>${uni && uni.exists ? fmt(uni.count) + ' 只' : '缺失'}</b>
+      <code>${esc((uni && uni.file) || 'integrations/hk_universe.json')}</code>；
+      日线表 <code>sa_hk_kline</code> 由 101 <code>/kline</code> 增量同步。
+    </div>
+    <div class="muted" style="font-size:11px;margin-top:4px">
+      worker：<b>${wOk ? '就绪' : '找不到'}</b>
+      <code>${esc(wp || '（未解析到 Vibe venv）')}</code>
+      ${wOk ? '' : '；设置 <code>FACTOR_WORKER_PYTHON</code> 或 config.yaml 的 <code>factor.worker_python</code>'}
+    </div>`;
+}
+
+function _fxCodeRow(x, mk) {
+  const c = _fxNum(x.composite);
+  const cf = _FX_CONF[x.confidence] || _FX_CONF.none;
+  const themes = x.theme_scores || {};
+  const tag = mk || x.market_label
+    ? `<span class="skill-cap" style="margin-right:4px">${
+        esc(mk || x.market_label)}</span>` : '';
+  return `<tr style="cursor:pointer" onclick="factorLookupCode('${_tAttr(x.code)}')">
+    <td class="mono">${tag}${esc(x.code)}</td>
+    <td class="${cls(c)}"><b>${_fxSigned(c, 2)}</b></td>
+    <td><span class="badge ${cf.c}">${cf.t}</span></td>
+    <td class="num">${fmt(x.n_used)} / ${fmt(x.n_alphas)}</td>
+    <td>${x.missing
+      ? `<span class="muted" style="font-size:11px">${esc(x.missing)}</span>`
+      : _fxThemeChips(themes, 3)}</td>
+  </tr>`;
+}
+
+/** 一个市场面板的关注票 + 极性两端表（A 股与港股必须分开列，z 不能跨市场比） */
+function _fxRowTables(rows, mk) {
+  const valid = rows.filter(x => _fxNum(x.composite) != null);
+  const focusAll = valid.filter(x => (x.top || []).length);
+  const focus = focusAll.slice(0, 30);
+  const focusMissing = rows.filter(x => !(x.top || []).length && x.missing);
+  const endRows = valid.length <= 13 ? valid
+    : valid.slice(0, 8).concat(valid.slice(-5));
+  const endLabel = valid.length <= 13 ? '全部' : '前 8 / 后 5';
+  const rowHtml = list => list.map(x => _fxCodeRow(x, mk)).join('');
+  return `
+    <div class="row" style="justify-content:space-between;align-items:baseline;margin-top:8px">
+      <b style="font-size:12px">⭐ 关注票（自选 / 持仓 / 策略建议）</b>
+      <span class="muted" style="font-size:11px">点任意一行查单票暴露 · 共 ${
+        focusAll.length} 只有日线 + ${focusMissing.length} 只缺数据，
+        表格最多列 ${focus.length} 只</span>
+    </div>
+    ${focus.length + focusMissing.length ? `<div class="table-scroll" style="max-height:260px;margin-top:4px">
+      <table><thead><tr><th>代码</th><th>合成 z</th><th>置信</th>
+        <th>参与/可算算子</th><th>主要风格</th></tr></thead>
+        <tbody>${rowHtml(focus)}${rowHtml(focusMissing)}</tbody></table>
+    </div>` : '<div class="muted" style="font-size:11px;margin-top:2px">关注池为空（自选/持仓都会自动纳入）</div>'}
+
+    <div class="row" style="justify-content:space-between;align-items:baseline;margin-top:10px">
+      <b style="font-size:12px">📊 面板极性两端（${fmt(valid.length)} 只里取 ${endLabel}）</b>
+      <span class="muted" style="font-size:11px">z 越高越偏多；只描述风格位置</span>
+    </div>
+    <div class="table-scroll" style="max-height:320px;margin-top:4px">
+      <table><thead><tr><th>代码</th><th>合成 z</th><th>置信</th>
+        <th>参与/可算算子</th><th>主要风格</th></tr></thead>
+        <tbody>${rowHtml(endRows)}</tbody></table>
+    </div>`;
+}
+
+/** A股 + 港股双市场：每个市场单独一块，绝不把两边 z 混在一起排序 */
+function renderFactorSnapMulti(s, st) {
+  const state = $('factor-state');
+  if (!state) return;
+  const order = { a: 0, hk: 1 };
+  const items = Object.entries(s.markets || {})
+    .sort((x, y) => (order[x[0]] ?? 9) - (order[y[0]] ?? 9));
+  const params = s.params || {};
+  const maxStale = Math.max(...items.map(([, d]) => _fxStaleDays(d.as_of) ?? 0), 0);
+  if ($('factor-meta')) {
+    $('factor-meta').textContent = items.map(([m, d]) =>
+      `${d.market_label || m} ${d.as_of || '—'} · ${fmt((d.panel || {}).codes)}只`
+      + `×${fmt((d.panel || {}).days)}天 · ${fmt(d.n_alphas)}算子`
+      + `（${fmt(d.n_used)}有 IC）`).join(' ｜ ');
+  }
+  const headCaps = items.map(([m, d]) => `<span class="skill-cap">${
+    esc(d.market_label || (m === 'a' ? 'A股' : '港股'))} · ${fmt(d.n_codes)} 只</span>`).join(' ');
+  const summaries = items.map(([m, d]) => {
+    const dStale = _fxStaleDays(d.as_of);
+    const sync = d.sync || {};
+    const syncWarn = sync && (sync.ok === false || sync.degraded)
+      ? `<span class="badge b-warn" title="${_tAttr(sync.error || sync.note || ((sync.failed || 0) + ' 只同步失败'))}">日线同步失败，用库内旧数据</span>`
+      : '';
+    return `<div class="muted" style="font-size:12px;margin-top:4px">
+      <b>${esc(d.market_label || (m === 'a' ? 'A股' : '港股'))}</b>
+      面板 <b>${fmt((d.panel || {}).codes || d.n_codes)}</b> 只 ×
+      <b>${fmt((d.panel || {}).days || d.n_days)}</b> 个交易日
+      （${esc((d.panel || {}).start || '—')} ~ ${esc((d.panel || {}).end || d.as_of || '—')}），
+      算子 <b>${fmt(d.n_alphas)}</b> 个，其中 <b>${fmt(d.n_used)}</b> 个 IC 达标；
+      用时 ${d.elapsed_s == null ? '—' : Math.round(d.elapsed_s) + 's'}
+      ${syncWarn}
+      ${dStale != null && dStale > 5
+        ? `<span class="badge b-warn">行情滞后 ${dStale} 天</span>` : ''}
+    </div>`;
+  }).join('');
+  const confRows = items.map(([m, d]) => {
+    const md = d.codes || {};
+    const vals = Object.keys(md).map(k => md[k] || {});
+    const n = c => vals.filter(x => x.confidence === c).length;
+    const miss = vals.filter(x => _fxNum(x.composite) == null).length;
+    return `<span class="skill-cap">${esc(d.market_label || m)}：</span>${
+      n('strong') ? `<span class="badge b-ok">强 ${n('strong')}</span>` : ''}${
+      n('medium') ? `<span class="badge b-warn">中 ${n('medium')}</span>` : ''}${
+      n('weak') ? `<span class="badge b-mute">弱 ${n('weak')}</span>` : ''}${
+      miss ? `<span class="badge b-mute">缺 ${miss}</span>` : ''}`;
+  }).join(' ');
+  state.innerHTML = `<div class="skill-head">
+      <span class="skill-name">factor-zoo</span>
+      <span class="badge b-ok">快照可用</span>
+      ${headCaps}
+      ${(s.missing_markets || []).map(m =>
+        `<span class="badge b-warn">${esc(m)} 暂无快照</span>`).join(' ')}
+      ${maxStale > 5 ? `<span class="badge b-warn">部分市场行情滞后 ${maxStale} 天</span>` : ''}
+      <span style="flex:1"></span>
+      <span class="muted" style="font-size:11px">A股 + 港股分面板，z 不跨市场比较</span>
+    </div>
+    ${summaries}
+    <div class="muted" style="font-size:11px;margin-top:4px">
+      方向口径：每个算子先算「t 日因子值 vs t+1 日收益」的横截面 rank IC，
+      |IC| ≥ ${fmt(params.ic_min_abs)}、|IR| ≥ ${fmt(params.ic_min_ir)}、
+      样本 ≥ ${fmt(params.ic_min_days)} 天才按 IC 符号定向；合成 z 截断 ±${fmt(params.z_clip)}。
+      港股置信按「有效/可算算子」比例（20% 强、10% 中），A 股按绝对数（80/40）。
+      <b>样本内统计，不是明日预测。</b>
+    </div>
+    <div class="row" style="margin-top:6px;gap:6px">${confRows}</div>`;
+
+  const box = $('factor-codes');
+  if (!box) return;
+  box.innerHTML = items.map(([m, d]) => {
+    const codes = d.codes || {};
+    const rows = Object.keys(codes).map(code => ({ code, ...(codes[code] || {}) }));
+    rows.sort((a, b) => (_fxNum(b.composite) ?? -1e9) - (_fxNum(a.composite) ?? -1e9));
+    return `<div class="skill-card" style="margin-top:10px">
+      <div class="skill-head">
+        <span class="skill-name">${esc(d.market_label || (m === 'a' ? 'A股' : '港股'))}</span>
+        <span class="skill-cap">${esc(d.as_of || '—')}</span>
+        <span class="skill-cap">${esc(d.run_id || '')}</span>
+        <span style="flex:1"></span>
+        <span class="muted" style="font-size:11px">${esc(fmtLocalTs(d.created_at))}</span>
+      </div>
+      ${_fxRowTables(rows, d.market_label || '')}
+    </div>`;
+  }).join('');
+}
+
+function renderFactorSnap(s, st) {
+  const state = $('factor-state');
+  if (!state) return;
+  if (s.markets && Object.keys(s.markets).length) {
+    renderFactorSnapMulti(s, st);
+    return;
+  }
+  const codes = s.codes || {};
+  const rows = Object.keys(codes).map(code => ({ code, ...(codes[code] || {}) }));
+  rows.sort((a, b) => (_fxNum(b.composite) ?? -1e9) - (_fxNum(a.composite) ?? -1e9));
+  const valid = rows.filter(x => _fxNum(x.composite) != null);
+  const missing = rows.length - valid.length;
+  const panel = s.panel || {};
+  const params = s.params || {};
+  const stale = _fxStaleDays(s.as_of);
+  const nStrong = valid.filter(x => x.confidence === 'strong').length;
+  const nMedium = valid.filter(x => x.confidence === 'medium').length;
+  const nWeak = valid.filter(x => x.confidence === 'weak').length;
+
+  if ($('factor-meta')) {
+    $('factor-meta').textContent = `最新 ${s.as_of} · ${fmt(s.n_codes)} 只 × ${fmt(s.n_days)} 天`
+      + ` · ${fmt(s.n_alphas)} 算子（${fmt(s.n_used)} 有 IC）`
+      + (s.elapsed_s == null ? '' : ` · ${Math.round(s.elapsed_s)}s`);
+  }
+
+  state.innerHTML = `<div class="skill-head">
+      <span class="skill-name">factor-zoo</span>
+      <span class="badge b-ok">快照可用</span>
+      <span class="skill-cap">${esc(s.market_label || s.universe || 'equity_cn')}</span>
+      <span class="skill-cap">${fmt(s.n_codes)} 只</span>
+      ${stale != null && stale > 5
+        ? `<span class="badge b-warn">行情滞后 ${stale} 天</span>` : ''}
+      <span style="flex:1"></span>
+      <span class="muted" style="font-size:11px">${esc(s.run_id || '')} · ${
+        esc(fmtLocalTs(s.created_at))}</span>
+    </div>
+    <div class="muted" style="font-size:12px;margin-top:6px">
+      面板 <b>${fmt(panel.codes || s.n_codes)}</b> 只 × <b>${fmt(panel.days || s.n_days)}</b>
+      个交易日（${esc(panel.start || '—')} ~ ${esc(panel.end || s.as_of || '—')}），
+      算子 <b>${fmt(s.n_alphas)}</b> 个，其中 <b>${fmt(s.n_used)}</b> 个 IC 达标参与定向；
+      用时 ${s.elapsed_s == null ? '—' : Math.round(s.elapsed_s) + 's'}；registry ${
+        esc(s.upstream_version || '—')}。
+    </div>
+    <div class="muted" style="font-size:11px;margin-top:4px">
+      方向口径：每个算子先算「t 日因子值 vs t+1 日收益」的横截面 rank IC，
+      |IC| ≥ ${fmt(params.ic_min_abs)}、|IR| ≥ ${fmt(params.ic_min_ir)}、
+      样本 ≥ ${fmt(params.ic_min_days)} 天才按 IC 符号定向；合成 z 截断 ±${fmt(params.z_clip)}。
+      <b>样本内统计，不是明日预测。</b>
+    </div>
+    <div class="row" style="margin-top:6px;gap:6px">
+      ${nStrong ? `<span class="badge b-ok">强 ${nStrong}</span>` : ''}
+      ${nMedium ? `<span class="badge b-warn">中 ${nMedium}</span>` : ''}
+      ${nWeak ? `<span class="badge b-mute">弱 ${nWeak}</span>` : ''}
+      ${missing ? `<span class="badge b-mute">缺日线 ${missing}</span>` : ''}
+      ${st && st.worker_exists === false ? '<span class="badge b-bad">worker 路径失效</span>' : ''}
+    </div>`;
+
+  const box = $('factor-codes');
+  if (!box) return;
+  box.innerHTML = _fxRowTables(rows, s.market_label || '');
+}
+
+function factorLookupCode(code) {
+  const inp = $('factor-code');
+  if (inp) inp.value = code;
+  const box = $('factor-lookup');
+  if (box && box.scrollIntoView) box.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  lookupFactor(code);
+}
+
+async function lookupFactor(arg) {
+  const inp = $('factor-code');
+  let code = String(arg == null ? (inp && inp.value) || '' : arg).trim();
+  code = code.replace(/\.(SH|SZ|HK|XSHG|XSHE)$/i, '').replace(/^(SH|SZ|HK)/i, '');
+  if (/^\d{4}$/.test(code)) code = code.padStart(5, '0');
+  if (!/^\d{5,6}$/.test(code)) {
+    toastErr('代码要 5-6 位数字（A 股 6 位如 600519，港股 5 位如 02513 / 00700）');
+    return;
+  }
+  if (inp) inp.value = code;
+  const box = $('factor-lookup'), meta = $('factor-lookup-meta');
+  if (meta) meta.textContent = '查询中…';
+  if (box) box.innerHTML = skeletonBox(1);
+  try {
+    const d = await api('/api/factors/code/' + encodeURIComponent(code));
+    renderFactorCode(d.data || {});
+    if (meta) meta.textContent = '';
+  } catch (e) {
+    if (meta) meta.textContent = '';
+    if (!box) return;
+    const mk = code.length === 5 ? '港股' : 'A 股';
+    box.innerHTML = e.status === 404
+      ? `<div class="skill-warn">最新 ${mk} 因子快照里没有 <code>${esc(code)}</code>：
+          不在面板（${mk === '港股'
+            ? '港股只覆盖 integrations/hk_universe.json 的流动性样本 + 自选/持仓'
+            : 'A 股按成交额取前 600 只 + 自选/持仓'}）、
+          日线不足 120 天、或最近一轮重算失败。先点右上「重算」再查。</div>`
+      : `<div class="skill-warn">查询失败：${esc(e.message)}</div>`;
+  }
+}
+
+function renderFactorCode(d) {
+  const box = $('factor-lookup');
+  if (!box) return;
+  const run = d.run || {}, det = d.detail || {}, code = d.code || '';
+  const c = _fxNum(det.composite);
+  const cf = _FX_CONF[det.confidence] || _FX_CONF.none;
+  const top = det.top || [];
+  const topRows = top.map(t => {
+    const z = _fxNum(t.z);
+    return `<tr>
+      <td class="mono" style="font-size:11px">${esc(t.id || '')}</td>
+      <td>${esc(t.nickname || '—')}</td>
+      <td>${(t.themes || []).map(x => `<span class="skill-cap">${
+        esc(_FX_THEME[x] || x)}</span>`).join(' ') || '<span class="muted">—</span>'}</td>
+      <td class="${cls(z)}">${_fxSigned(z, 2)}</td>
+      <td class="num">${t.pct == null ? '—' : fmt(t.pct) + '%'}</td>
+      <td class="num">${t.ic_mean == null ? '—' : _fxSigned(_fxNum(t.ic_mean), 4)}</td>
+      <td>${t.ic_used
+        ? '<span class="badge b-ok">参与定向</span>'
+        : '<span class="muted" style="font-size:11px">IC 未达标</span>'}</td>
+    </tr>`;
+  }).join('');
+
+  box.innerHTML = `<div class="skill-card" style="margin-top:0">
+    <div class="skill-head">
+      <span class="skill-name">${esc(code)}</span>
+      <span class="skill-cap">${esc(det.market_label || run.market_label || (
+        String(code).length === 5 ? '港股' : 'A股'))}</span>
+      <span class="badge ${cf.c}">置信 ${cf.t}</span>
+      <span class="muted" style="font-size:11px">数据截至 ${esc(det.as_of || run.as_of || '—')} ·
+        ${fmt(det.n_used)} / ${fmt(det.n_alphas)} 个算子参与合成</span>
+      <span style="flex:1"></span>
+      <b class="${cls(c)}" style="font-size:18px">${_fxSigned(c, 2)}</b>
+    </div>
+    ${det.missing ? `<div class="skill-warn">${esc(det.missing)}</div>` : ''}
+    <div style="margin-top:6px">${_fxThemeChips(det.theme_scores, 8)}</div>
+    ${top.length ? `<div class="table-scroll" style="max-height:260px;margin-top:8px">
+      <table><thead><tr><th>算子</th><th>名称</th><th>主题</th><th>截面 z</th>
+        <th>分位</th><th>样本内 IC</th><th>定向</th></tr></thead>
+        <tbody>${topRows}</tbody></table>
+    </div>
+    <div class="muted" style="font-size:11px;margin-top:4px">
+      只列 |z| 最大的 ${top.length} 个算子；合成 z 是所有「IC 达标」算子的定向 z 截断均值。
+      IC 为面板样本内 rank IC（因子 t vs 收益 t+1），<b>不是预测</b>。
+    </div>` : `<div class="muted" style="font-size:11px;margin-top:6px">
+      这只票不在关注池里，算子明细没有落库（合成 z 仍可用）；加入自选或持仓后下一轮会保存。
+    </div>`}
+  </div>`;
+}
+
+async function runFactors(btn) {
+  if (btn) { btn.disabled = true; btn.textContent = '计算中…'; }
+  clearTimeout(_FACTOR_POLL);
+  const state = $('factor-state');
+  if (state) state.innerHTML = `<div class="skill-head">
+      <span class="skill-name">factor-zoo</span>
+      <span class="badge b-warn">正在重算</span>
+      <span class="skill-cap">A股 + 港股</span></div>
+    <div class="muted" style="font-size:12px;margin-top:6px">
+      两个市场各取面板日线 → 逐算子计算 → 样本内 IC 定向 → 落库。
+      A 股约 2 分钟、港股约 3 秒，别关页面。</div>`;
+  try {
+    await api('/api/factors/run?force=true', { method: 'POST' });
+    _fxPollRun(btn);
+  } catch (e) {
+    toastErr('启动重算失败：' + e.message);
+    if (btn) { btn.disabled = false; btn.textContent = '重算'; }
+    loadFactors();
+  }
+}
+
+function _fxPollRun(btn) {
+  const tick = async () => {
+    let s = null;
+    try {
+      const d = await api('/api/factors/run/status');
+      s = d.data || {};
+    } catch (e) {
+      _FACTOR_POLL = setTimeout(tick, 5000);
+      return;
+    }
+    if (s.running) {
+      const secs = s.started_at
+        ? Math.max(0, Math.round((Date.now() - Date.parse(s.started_at + '+08:00')) / 1000))
+        : null;
+      const state = $('factor-state');
+      if (state) state.innerHTML = `<div class="skill-head">
+          <span class="skill-name">factor-zoo</span>
+          <span class="badge b-warn">正在重算</span>
+          <span class="skill-cap">A股 + 港股</span>
+          <span class="muted" style="font-size:11px">已用 ${secs == null ? '—' : secs + 's'}</span>
+        </div>
+        <div class="muted" style="font-size:12px;margin-top:6px">
+          两个市场各取面板日线 → 逐算子计算 → 样本内 IC 定向 → 落库。
+          A 股约 2 分钟、港股约 3 秒，别关页面。</div>`;
+      _FACTOR_POLL = setTimeout(tick, 3000);
+      return;
+    }
+    if (btn) { btn.disabled = false; btn.textContent = '重算'; }
+    const r = s.result || {};
+    const mkTxt = Object.entries(r.markets || {}).map(([m, d]) =>
+      `${d.market_label || (m === 'a' ? 'A股' : '港股')} ${d.as_of || ''}`
+      + ` · ${fmt((d.panel || {}).codes || d.n_codes)} 只`).join('；');
+    const errTxt = (r.errors || []).map(e => `${
+      e.market === 'a' ? 'A股' : '港股'}：${e.error}`).join('；');
+    if (r.ok) {
+      toastOk(`因子快照已更新：${mkTxt || r.as_of || ''}`
+        + (errTxt ? `（${errTxt}）` : ''));
+    } else {
+      toastErr('因子重算失败：' + (r.error || errTxt || s.error || '未知错误'));
+    }
+    loadFactors();
+  };
+  _FACTOR_POLL = setTimeout(tick, 1500);
+}
+
+// ---------- 研究引擎（Vibe-Trading REST sidecar） ----------
+// 前端不做字段猜测：所有结构由后端按 integrations/contracts/vibe.json 校验过。
+// sidecar 没起时只把本页降级成「未连接 + 启动方式」，不抛红、不连累其它标签。
+let _vibeAlphas = [];
+let _vibeAlphaTotal = 0;
+
+const _VIBE_ZOO_LABEL = {
+  academic: 'academic', alpha101: 'alpha101', gtja191: 'gtja191',
+  qlib158: 'qlib158', fundamental: 'fundamental',
+};
+
+/** 把后端/上游各种形状的错误压成一行人话，绝不显示 [object Object] */
+function _vibeErrText(x) {
+  if (x == null || x === '') return '';
+  if (typeof x === 'string') return x;
+  if (Array.isArray(x)) return x.map(_vibeErrText).filter(Boolean).join('；');
+  if (typeof x === 'object') {
+    return _vibeErrText(x.message || x.detail || x.code) || JSON.stringify(x);
+  }
+  return String(x);
+}
+
+const PROJECT_STATE = {
+  live:    ['在线', 'b-ok'],
+  ready:   ['就绪', 'b-ok'],
+  offline: ['未启动', 'b-warn'],
+  blocked: ['不适配', 'b-mute'],
+  missing: ['缺依赖', 'b-bad'],
+};
+
+async function loadProjects(refresh) {
+  const body = $('projects-body');
+  if (!body) return;
+  if (!refresh && body.dataset.loaded === '1') return;
+  if ($('projects-meta')) $('projects-meta').textContent = '探测中…';
+  try {
+    const d = await api('/api/projects' + (refresh ? '?refresh=true' : ''));
+    const rows = (d && d.projects) || [];
+    const s = (d && d.summary) || {};
+    body.innerHTML = rows.map(p => {
+      const [label, cls] = PROJECT_STATE[p.state] || [p.state || '未知', 'b-mute'];
+      const commit = p.commit ? `<span class="muted" style="font-size:11px">@${esc(p.commit)}</span>` : '';
+      return `<tr>
+        <td><b>${esc(p.name || p.id)}</b><br>${commit}</td>
+        <td>${esc(p.repo || '')}<br><span class="muted" style="font-size:11px">${esc(p.license || '')}</span></td>
+        <td>${esc(p.mode || '')}<br><span class="muted" style="font-size:11px">${esc(p.runtime || '')}</span></td>
+        <td>${esc(p.market || '')}</td>
+        <td><span class="badge ${cls}">${esc(label)}</span></td>
+        <td style="font-size:12px">${esc(p.detail || '')}</td>
+      </tr>`;
+    }).join('');
+    if ($('projects-meta')) {
+      const when = (d && d.checked_at) || '';
+      $('projects-meta').textContent =
+        `${s.connected || 0}/${s.total || rows.length} 已接入 · live ${s.live || 0} / ready ${s.ready || 0}`
+        + ` / offline ${s.offline || 0} / blocked ${s.blocked || 0} · ${when}`;
+    }
+    body.dataset.loaded = '1';
+    $('projects-empty').classList.toggle('hide', !!rows.length);
+  } catch (e) {
+    if ($('projects-meta')) $('projects-meta').textContent = '探测失败';
+    body.innerHTML = `<tr><td colspan="6" class="muted">${esc(e.message || '未知错误')}</td></tr>`;
+  }
+}
+
+async function loadResearch() {
+  const box = $('vibe-state');
+  if (box && !box.dataset.loaded) box.innerHTML = skeletonBox(2);
+  let connected = false;
+  try {
+    const d = await api('/api/integrations/vibe/summary');
+    const s = d.data || {};
+    connected = !!s.ok;
+    renderVibeState(s);
+    if (box) box.dataset.loaded = '1';
+  } catch (e) {
+    renderVibeDown(e);
+    if (box) box.dataset.loaded = '1';
+  }
+  // sidecar 没起时不再多发一轮因子请求（每次连死端口约 2 秒）
+  if (connected) loadVibeAlphas();
+  else clearVibeAlphas('sidecar 未连接，因子库不可用');
+}
+
+function clearVibeAlphas(msg) {
+  _vibeAlphas = [];
+  _vibeAlphaTotal = 0;
+  const box = $('vibe-alphas');
+  if (box) box.innerHTML = `<div class="muted" style="font-size:12px">${esc(msg)}</div>`;
+  if ($('vibe-alpha-meta')) $('vibe-alpha-meta').textContent = '';
+  const empty = $('vibe-alphas-empty');
+  if (empty) empty.classList.add('hide');
+}
+
+function renderVibeDown(e) {
+  const msg = _vibeErrText(e.detail) || e.message || '未知错误';
+  if ($('vibe-meta')) $('vibe-meta').textContent = '未连接';
+  if ($('vibe-state')) {
+    $('vibe-state').innerHTML = `<div class="skill-head">
+        <span class="skill-name">vibe-trading</span>
+        <span class="badge b-bad">未连接</span>
+        <span style="flex:1"></span>
+        <button class="btn ghost sm" onclick="vibeHelp()">启动方式</button>
+      </div>
+      <div class="skill-warn">${esc(msg)}</div>
+      <div class="muted" style="font-size:12px;margin-top:6px">
+        sidecar 没起只影响本页；<code>VIBE_BASE_URL</code> 可指向别的实例（默认只允许本机）。
+      </div>`;
+  }
+  const presets = $('vibe-presets');
+  if (presets) presets.innerHTML = '<div class="muted" style="font-size:12px">未连接，无法读取模板</div>';
+  clearVibeAlphas('sidecar 未连接，因子库不可用');
+}
+
+function renderVibeState(s) {
+  const h = s.health || {};
+  const ok = !!s.ok;
+  const blocks = s.blocks || {};
+  const ready = blocks.ready || {};
+  const rd = blocks.readiness || {};
+  const ds = blocks.data_sources || {};
+  const pr = blocks.swarm_presets || {};
+
+  if ($('vibe-meta')) {
+    $('vibe-meta').textContent = ok
+      ? `已连接 · 上游 ${s.tested_version || ''}`
+      : '未连接';
+  }
+
+  const counts = (rd.ok && rd.data && rd.data.zoo_counts) || {};
+  const countPills = Object.entries(counts).map(([k, v]) =>
+    `<span class="skill-cap">${esc(_VIBE_ZOO_LABEL[k] || k)} ${esc(v)}</span>`).join('');
+
+  const univ = (rd.ok && rd.data && rd.data.universes) || {};
+  // 上游 readiness 只有 csi300/sp500/btc-usdt 三个基准域，本站只展示 A 股基准；
+  // 港股没有基准域（0.1.18 限制），因子库仍可切换过去看。
+  const univPills = Object.entries(univ).filter(([k]) => k === 'csi300').map(([k, v]) => {
+    const yes = v && v.ready === true;
+    return `<span class="badge ${yes ? 'b-ok' : 'b-warn'}">${esc(k)} ${yes ? '可用' : '不可用'}</span>
+      <span class="muted" style="font-size:11px;margin-right:8px">${esc((v && v.reason) || '')}</span>`;
+  }).join('');
+
+  let chain = '';
+  if (ds.ok && ds.data) {
+    const short = o => {
+      const list = (o && o.effective_order) || [];
+      return list.slice(0, 3).join(' → ') + (list.length > 3 ? ' → …' : '');
+    };
+    const a = (ds.data.source_orders || []).find(x => x && x.market === 'a_share');
+    const hk = (ds.data.source_orders || []).find(x => x && x.market === 'hk_equity');
+    if (a) chain = 'A股链路 ' + short(a);
+    if (hk) chain += (chain ? '；' : '') + '港股链路 ' + short(hk);
+  }
+  const tushare = (ds.ok && ds.data)
+    ? (ds.data.tushare_token_configured ? 'Tushare 已配' : 'Tushare 未配')
+    : '';
+
+  // /ready 返 503 是「没配 LLM」的正式诊断，不是接口坏了；
+  // 但 sidecar 本身没连上时不该误报成「LLM 未配置」。
+  const llm = !ok
+    ? '<span class="badge b-warn">LLM 未检测</span>'
+    : ready.ok
+      ? '<span class="badge b-ok">LLM 就绪</span>'
+      : `<span class="badge b-warn">LLM 未配置</span>
+         <span class="muted" style="font-size:11px">${esc(_vibeErrText(ready.detail || ready.error))}</span>`;
+
+  const presetCount = (pr.ok && Array.isArray(pr.data)) ? `${pr.data.length} 个` : '—';
+
+  const err = ok ? '' : `<div class="skill-warn">连不上 sidecar：${esc(_vibeErrText(h.error || h))}</div>`;
+
+  const box = $('vibe-state');
+  if (!box) return;
+  box.innerHTML = `<div class="skill-head">
+      <span class="skill-name">vibe-trading</span>
+      <span class="badge ${ok ? 'b-ok' : 'b-bad'}">${ok ? '已连接' : '未连接'}</span>
+      ${llm}
+      <span style="flex:1"></span>
+      <span class="muted mono" style="font-size:11.5px">${esc(s.base_url || '')}</span>
+    </div>
+    ${err}
+    <div class="skill-meta">${countPills}
+      <span class="skill-cap">A 股 + 港股</span>
+      ${chain ? `<span>${esc(chain)}</span>` : ''}
+      ${tushare ? `<span>${esc(tushare)}</span>` : ''}
+      <span>研究模板 ${esc(presetCount)}</span>
+    </div>
+    ${univPills ? `<div class="skill-meta" style="margin-top:6px">${univPills}</div>` : ''}
+    <div class="skill-meta"><span>上游 ${esc(s.upstream || 'HKUDS/Vibe-Trading')} ${esc(s.tested_version || '')}</span></div>`;
+
+  renderVibePresets(pr);
+}
+
+function renderVibePresets(pr) {
+  const box = $('vibe-presets');
+  if (!box) return;
+  if (!pr.ok) {
+    box.innerHTML = `<div class="muted" style="font-size:12px">读取失败：${esc(_vibeErrText(pr.error))}</div>`;
+    if ($('vibe-preset-meta')) $('vibe-preset-meta').textContent = '';
+    return;
+  }
+  const rows = Array.isArray(pr.data) ? pr.data : [];
+  if ($('vibe-preset-meta')) $('vibe-preset-meta').textContent = rows.length ? `${rows.length} 个` : '';
+  if (!rows.length) {
+    box.innerHTML = '<div class="muted" style="font-size:12px">上游没有返回模板</div>';
+    return;
+  }
+  box.innerHTML = rows.map(p => {
+    const vars = (p.variables || []).map(v =>
+      `<span class="skill-cap" title="${esc(v.description || '')}">${esc(v.name)}${v.required ? '*' : ''}</span>`
+    ).join('');
+    return `<div class="skill-card">
+      <div class="skill-head">
+        <span class="skill-name">${esc(p.name)}</span>
+        <span class="muted" style="font-size:12px">${esc(p.title || '')}</span>
+        <span style="flex:1"></span>
+        <span class="muted" style="font-size:11px">${esc(p.agent_count || '—')} 个 agent · ${esc(p.source || '')}</span>
+      </div>
+      <div class="skill-desc">${esc(p.description || '')}</div>
+      <div class="skill-meta">${vars}</div>
+    </div>`;
+  }).join('');
+}
+
+function onVibeUniverseChange() {
+  const u = ($('vibe-universe') || {}).value || 'equity_cn';
+  if ($('vibe-univ-label')) {
+    $('vibe-univ-label').textContent = u === 'equity_hk' ? '港股 · equity_hk' : 'A 股 · equity_cn';
+  }
+  loadVibeAlphas();
+}
+
+async function loadVibeAlphas() {
+  const box = $('vibe-alphas');
+  if (!box) return;
+  if (!box.innerHTML.trim()) box.innerHTML = skeletonBox(2);
+  const qs = new URLSearchParams();
+  const universe = ($('vibe-universe') || {}).value || 'equity_cn';
+  const zoo = ($('vibe-zoo') || {}).value || '';
+  const theme = ($('vibe-theme') || {}).value || '';
+  const limit = ($('vibe-limit') || {}).value || '100';
+  qs.set('universe', universe);
+  qs.set('limit', limit);
+  if (zoo) qs.set('zoo', zoo);
+  if (theme) qs.set('theme', theme);
+  try {
+    const d = await api('/api/integrations/vibe/alphas?' + qs.toString());
+    _vibeAlphas = (d.data && d.data.alphas) || [];
+    _vibeAlphaTotal = (d.data && d.data.total) || _vibeAlphas.length;
+    renderVibeAlphas();
+  } catch (e) {
+    _vibeAlphas = [];
+    _vibeAlphaTotal = 0;
+    box.innerHTML = `<div class="skill-warn">因子库加载失败：${esc(_vibeErrText(e.detail) || e.message)}</div>`;
+    if ($('vibe-alpha-meta')) $('vibe-alpha-meta').textContent = '未连接';
+  }
+}
+
+function renderVibeAlphas() {
+  const box = $('vibe-alphas');
+  const empty = $('vibe-alphas-empty');
+  if (!box) return;
+  const q = (($('vibe-q') || {}).value || '').trim().toLowerCase();
+  const rows = q
+    ? _vibeAlphas.filter(a => ((a.id || '') + ' ' + (a.nickname || '')).toLowerCase().includes(q))
+    : _vibeAlphas;
+  if ($('vibe-alpha-meta')) {
+    $('vibe-alpha-meta').textContent = _vibeAlphas.length
+      ? `${rows.length} / 已取 ${_vibeAlphas.length} 条（总 ${_vibeAlphaTotal}）`
+      : '';
+  }
+  if (empty) empty.classList.toggle('hide', rows.length > 0);
+  if (!rows.length) { box.innerHTML = ''; return; }
+  box.innerHTML = rows.map(a => {
+    const themes = (a.theme || []).map(t => `<span class="skill-cap">${esc(t)}</span>`).join('');
+    return `<div class="skill-card" data-alpha="${esc(a.id)}" style="cursor:pointer"
+                 title="查看公式与源码">
+      <div class="skill-head">
+        <span class="skill-name">${esc(a.id)}</span>
+        <span class="badge">${esc(a.zoo || '')}</span>
+        ${themes}
+        <span style="flex:1"></span>
+        <span class="muted" style="font-size:11px">${esc((a.universe || []).join(' · '))}</span>
+      </div>
+      <div class="skill-desc">${esc(a.nickname || '（上游未提供别名）')}</div>
+      <div class="skill-meta">
+        <span>预热 ${esc(a.min_warmup_bars == null ? '—' : a.min_warmup_bars)} bars</span>
+        <span>衰减 ${esc(a.decay_horizon == null ? '—' : a.decay_horizon)} bars</span>
+      </div>
+    </div>`;
+  }).join('');
+  box.onclick = e => {
+    const el = e.target.closest('[data-alpha]');
+    if (el) showVibeAlpha(el.dataset.alpha);
+  };
+}
+
+async function showVibeAlpha(id) {
+  try {
+    const d = await api('/api/integrations/vibe/alphas/' + encodeURIComponent(id));
+    const a = (d.data && d.data.alpha) || {};
+    const code = (d.data && d.data.source_code) || '';
+    const m = a.meta || {};
+    const kv = [
+      ['zoo', a.zoo],
+      ['主题', (m.theme || []).join(', ')],
+      ['适用市场', (m.universe || []).join(', ')],
+      ['需要列', (m.columns_required || []).join(', ')],
+      ['频率', (m.frequency || []).join(', ')],
+      ['预热', m.min_warmup_bars != null ? m.min_warmup_bars + ' bars' : ''],
+      ['衰减', m.decay_horizon != null ? m.decay_horizon + ' bars' : ''],
+      ['需要行业', m.requires_sector ? '是' : '否'],
+    ].filter(x => x[1] != null && x[1] !== '')
+      .map(x => `<span>${esc(x[0])}：<b>${esc(x[1])}</b></span>`).join('');
+    const body = `<div class="skill-meta">${kv}</div>
+      ${m.notes ? `<div class="muted" style="font-size:12px;margin-top:6px">${esc(m.notes)}</div>` : ''}
+      <div class="skill-desc" style="margin-top:8px"><b>公式</b></div>
+      <pre class="skill-out">${esc(m.formula_latex || '上游未提供公式')}</pre>
+      <div class="skill-desc" style="margin-top:8px"><b>源码（只读展示，不落库）</b></div>
+      <pre class="skill-out" style="max-height:380px">${esc(code || '上游未返回源码')}</pre>`;
+    infoDlg(m.nickname || a.id || id, body, { wide: true });
+  } catch (e) {
+    toastErr('读取因子失败：' + (_vibeErrText(e.detail) || e.message));
+  }
+}
+
+async function probeVibe(btn) {
+  await withBusy(btn, '测试中…', async () => {
+    const box = $('vibe-probe');
+    if (!box) return;
+    box.innerHTML = '<div class="muted" style="font-size:12px;margin-top:8px">逐个能力真调上游并校验必填字段…</div>';
+    try {
+      const d = await jsonPost('/api/integrations/vibe/probe', {});
+      const x = d.data || {};
+      const rows = (x.checks || []).map(c => {
+        const st = c.ok === true ? ['通过', 'b-ok']
+          : c.ok === false ? ['失败', 'b-bad'] : ['跳过', 'b-warn'];
+        const detail = c.ok === true
+          ? (c.elapsed_ms != null ? c.elapsed_ms + ' ms' : '—')
+          : (c.skipped || _vibeErrText(c.error));
+        return `<tr>
+          <td class="mono">${esc(c.capability)}</td>
+          <td><span class="badge ${st[1]}">${st[0]}</span></td>
+          <td class="muted">${esc(detail)}</td>
+        </tr>`;
+      }).join('');
+      box.innerHTML = `<div class="skill-head" style="margin-top:10px">
+          <b style="font-size:12px">契约测试</b>
+          <span class="badge ${x.ok ? 'b-ok' : 'b-bad'}">${x.ok ? '全部通过' : '有失败项'}</span>
+          <span class="muted" style="font-size:11.5px">上游 ${esc(x.tested_version || '')} · ${esc(x.base_url || '')}</span>
+        </div>
+        <div class="table-scroll"><table>
+          <thead><tr><th>能力</th><th>结果</th><th>详情</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table></div>`;
+    } catch (e) {
+      box.innerHTML = `<div class="skill-warn">契约测试失败：${esc(_vibeErrText(e.detail) || e.message)}</div>`;
+    }
+  });
+}
+
+function vibeHelp() {
+  infoDlg('Vibe-Trading sidecar：部署在 101', `<div class="muted" style="font-size:12.5px">
+      服务由 101 上的 systemd 单元 <code>vibe-trading</code> 托管，只监听 loopback，
+      由 nginx 以 <code>/vibe/</code> 反代并校验 Bearer。日常不用手工起：
+      <code>systemctl status vibe-trading</code> / <code>journalctl -u vibe-trading -f</code>。
+    </div>
+    <pre class="skill-out"># 健康检查（带 token 时）
+curl -H "Authorization: Bearer $VIBE_API_KEY" http://101.43.25.101/vibe/health</pre>
+    <div class="muted" style="font-size:12px">
+      · 本机 <code>.env</code>：<code>VIBE_BASE_URL=http://101.43.25.101/vibe</code>、
+        <code>VIBE_ALLOW_REMOTE=1</code>、<code>VIBE_API_KEY=…</code>（与 101 上的一致）。<br>
+      · 研究范围：A 股 <code>equity_cn</code>（377 个因子）+ 港股 <code>equity_hk</code>（180 个），
+        因子库可切换市场；美股/加密因子不收。<br>
+      · bench：上游 0.1.18 只有 <code>csi300</code> / <code>sp500</code> / <code>btc-usdt</code>
+        三个基准域，<b>没有港股基准</b>，本站只开放 <code>csi300</code>（还需 Tushare token）。<br>
+      · 加密/商品/信用/宏观汇率/全球混合资产模板不透出；A 股与港股共用其余模板。<br>
+      · 状态目录 <code>/opt/vibe-trading/home</code>，日志 <code>/opt/vibe-trading/logs/</code>。<br>
+      · 因子库/模板不需要 LLM；agent、swarm、bench 才需要模型与行情。
+      · 本机自起（仅调试）：<code>D:\\vibe-trading\\.venv\\Scripts\\vibe-trading.exe serve --port 8899</code>。
+    </div>`);
+}
+
 // ---- 标签页 ----
 const TABS = ['market', 'sector', 'holdings', 'strategies', 'plans', 'calendar', 'news',
               'bili', 'wb', 'xhs', 'mp', 'x', 'reports', 'paper', 'tdesk', 'notify', 'schedule',
-              'jq', 'analysis'];
+              'jq', 'analysis', 'skills', 'research'];
 const TAB_LOADERS = {
   // ⚠️ 港股解禁**不**挂在 market 的自动加载里（2026-10-13 用户报「一直加载中」）：
   //   ① 真解析每份公告约 40 秒 × N 只，会把整个自选页拖住几��钟；
@@ -4446,6 +5909,8 @@ const TAB_LOADERS = {
   notify:    () => { loadNotifyConf(); loadNotifyMatrix(); refreshWxChat(); },
   jq:        () => { loadJqLib(); loadJqList(); loadAdopted(); loadStrategyScorecard(); loadStrategyDaily(); },
   analysis:  loadTechniques,
+  skills:    loadSkills,
+  research:  () => { loadProjects(); loadFactors(); loadResearch(); },
   schedule:  () => { loadSchedule(); loadConfigAll(); },
 };
 function switchTab(name) {

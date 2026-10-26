@@ -63,6 +63,8 @@ import config_schema
 import cost_estimate
 import crypto_watch
 import etf_flows
+import factor_api
+import factor_zoo
 import futures_watch
 import fx_watch
 import holiday_calendar
@@ -71,9 +73,12 @@ import ipo_calendar
 import ipo_llm
 import ipo_market
 import ipo_strategy
+import integration_api
 import lot_rate
 import macro_rates
 import notify_events
+import project_api
+import skill_api
 import wechat_mp
 import wx_chat
 import wx_commands
@@ -885,6 +890,23 @@ def _migrate_json_if_any():
 
 app = FastAPI(title="Stock Advisor", version="0.2.0")
 
+# Skill 运行时（/api/skills）：外部项目一律走 skills/<name>/ 的 JSON 契约，
+# 不 import 上游代码。增删 skill 后点「重新扫描」即可，不需要重启进程。
+app.include_router(skill_api.router)
+
+# 外部研究引擎（/api/integrations/vibe）：sidecar 走 REST，字段契约见
+# integrations/contracts/vibe.json。sidecar 没起时只影响「研究」页，不影响本站。
+app.include_router(integration_api.router)
+
+# 因子桥（/api/factors）：把 Vibe registry 里验证过的算子算成每日暴露。
+# 计算在 tools/factor_worker.py（Vibe venv 子进程），主应用不 import 上游。
+app.include_router(factor_api.router)
+factor_api.init(get_conn)
+
+# 十项目接入矩阵（/api/projects）：只读探针，不写库、不触发交易。
+# 上游挂掉只让矩阵变灰，不影响行情/持仓/通知。
+app.include_router(project_api.router)
+
 # ---------------- 行情（全部经 101 data_service，本机不直连任何行情源） ----------------
 # 2026-10-22 用户裁决：本机对东财 push2his 的 HTTPS 被重置、腾讯旧 fqkline 全 501，
 # 而 101 直连同样的源正常。所以行情 / 日K / 分时 / 汇率 / 美股统一由 101 的
@@ -913,6 +935,9 @@ def _svc_get(path: str, params: dict, timeout: int = 60) -> dict:
     return market_data.service_get(path, params, timeout)
 
 
+_QUOTE_BATCH = 300      # 101 `/quote` 单次符号上限（data_service/market.py 里写死）
+
+
 def fetch_quotes(codes: list[str]) -> dict[str, dict]:
     """批量抓取实时行情快照（经 101 `/quote`）。失败条目带 error 字段。
 
@@ -923,14 +948,19 @@ def fetch_quotes(codes: list[str]) -> dict[str, dict]:
     if not codes:
         return result
     syms = {c: _tx_symbol(c) for c in codes}
-    try:
-        payload = _svc_get(
-            "/quote", {"symbols": ",".join(dict.fromkeys(syms.values()))},
-            timeout=30)
-        got = payload.get("quotes") or {}
-    except Exception as exc:            # 行情失败不影响 CRUD
-        print(f"[quote] 101 行情失败: {exc}", flush=True)
-        got = {}
+    uniq = list(dict.fromkeys(syms.values()))
+    got: dict = {}
+    # 101 `/quote` 单次最多 300 个符号（超了直接 400，整批行情全没）。自选/策略
+    # 股票池可能远超 300，所以在这里分批；某一批失败只影响该批。
+    for i in range(0, len(uniq), _QUOTE_BATCH):
+        batch = uniq[i:i + _QUOTE_BATCH]
+        try:
+            payload = _svc_get(
+                "/quote", {"symbols": ",".join(batch)}, timeout=30)
+            got.update(payload.get("quotes") or {})
+        except Exception as exc:        # 行情失败不影响 CRUD
+            print(f"[quote] 101 行情失败（第 {i // _QUOTE_BATCH + 1} 批 "
+                  f"{len(batch)} 个）: {exc}", flush=True)
     for c in codes:
         q = got.get(syms[c]) or {}
         if q and not q.get("error"):
@@ -4979,6 +5009,12 @@ def _strategy_daily_loop():
                 time.sleep(600)
                 continue
             deps = {"get_conn": get_conn}
+            # 因子快照一轮只算一次（strategy_daily.run_all 内调用 factor_fn）；
+            # 用已验证算子给每条建议标「样本内 IC 同向/相悖」，不改 status、不下单。
+            # snapshot_all = A 股 + 港股各算一轮，合并后按代码分流。
+            deps["factor_fn"] = lambda: factor_zoo.snapshot_all(deps)
+            deps["factor_attach"] = lambda snap, sugg, pos=None: \
+                factor_zoo.attach_to_suggestions(snap, sugg, pos)
             # 「到点了吗 + 今天跑过没有」都在 should_run 里（按 started_at 去重，
             # 不能按 trade_date —— 行情可能停在几天前）。
             due = strategy_daily.should_run(deps, conf)
@@ -5000,6 +5036,7 @@ def _strategy_daily_loop():
             acts = [r for r in (res.get("rows") or []) if r.get("suggestions")]
             if acts:
                 lines, n_show, rejected = [], 0, set()
+                fstat = {}
                 for r in acts:
                     if n_show >= 16:
                         break
@@ -5020,8 +5057,12 @@ def _strategy_daily_loop():
                                 s["suggest_value"])
                         else:
                             _amt = "股数不确定"
+                        _f = s.get("factor") or {}
+                        _mark = {"aligned": " ·因子同向",
+                                 "against": " ·因子相悖"}.get(_f.get("status"), "")
                         lines.append(f"· 「{_t}」{_side} {s.get('code')} "
-                                     f"{s.get('name') or ''} {_amt}（{_w}）")
+                                     f"{s.get('name') or ''} {_amt}（{_w}）{_mark}")
+                        fstat[_f.get("status")] = fstat.get(_f.get("status"), 0) + 1
                         n_show += 1
                     g = r.get("gate") or {}
                     if g.get("verdict") == "reject":
@@ -5033,10 +5074,15 @@ def _strategy_daily_loop():
                 if rejected:
                     gate_txt = ("\n⚠ 数据质量闸门未通过（%s）：结论仅供参考，"
                                 "不代表可直接照做" % "、".join(sorted(rejected)[:3]))
+                factor_txt = ""
+                if fstat.get("aligned") or fstat.get("against") or fstat.get("missing"):
+                    factor_txt = ("\n因子（验证算子，样本内 IC）：同向 %d / 相悖 %d / 缺数据 %d"
+                                  % (fstat.get("aligned", 0), fstat.get("against", 0),
+                                     fstat.get("missing", 0)))
                 _notifier_notify_safe(
                     "📤 策略每日结论 %s" % (res.get("trade_date") or ""),
-                    "%d 条策略给出调仓建议：\n%s%s%s"
-                    % (len(acts), "\n".join(lines), extra, gate_txt),
+                    "%d 条策略给出调仓建议：\n%s%s%s%s"
+                    % (len(acts), "\n".join(lines), extra, factor_txt, gate_txt),
                     event="strategy_daily")
             iv = max(10, int(conf.get("interval_minutes") or 1440))
             time.sleep(iv * 60)
@@ -5171,6 +5217,10 @@ def _paper_deps(conf: dict | None = None) -> dict:
         "market_fn": market_volume_status,
         "trading_days_fn": _trading_days_between,
         "notify_fn": notifier.notify,
+        # 因子暴露：模拟盘每条决策都带「验证算子的横截面位置」（样本内 IC 定向）。
+        # snapshot_all 内部按市场各自 30 分钟缓存；一轮只调用一次，失败返回
+        # {ok:false}，paper_trading 会安静跳过这一块，不影响决策与成交。
+        "factor_fn": lambda: factor_zoo.snapshot_all({"get_conn": get_conn}),
     }
 
 
@@ -9355,6 +9405,9 @@ def _report_deps() -> dict:
         "crypto_fn": lambda: crypto_watch.crypto_lines(_crypto_deps()),
         "crypto_link_fn": lambda: crypto_watch.link_lines(_crypto_deps()),
         "strategy_gate_fn": lambda: SG.report_lines(get_conn, days=14, limit=6),
+        # 因子桥：验证过的算子 → 自选股风格暴露。注入失败只是少一段，不影响报告。
+        "factor_brief_fn": lambda codes: factor_zoo.brief_lines(
+            factor_zoo.snapshot_all({"get_conn": get_conn}), codes),
         # 分析技法注入：单独建连接（不能复用其它 deps 的游标，那会串事务）
         "anal_tech_fn": lambda: _anal_tech_block_with_conn(),
         "mp_fn": lambda: wechat_mp.digest_lines(_mp_deps(), hours=36),

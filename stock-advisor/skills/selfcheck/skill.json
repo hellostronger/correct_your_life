@@ -1,0 +1,40 @@
+{
+  "name": "selfcheck",
+  "version": "1.0.0",
+  "description": "Skill 运行时自检：验证 stdin/stdout 契约、工作目录、环境变量隔离和超时机制，不依赖任何外部服务。",
+  "entrypoint": "run.py",
+  "enabled": true,
+  "hidden": false,
+  "read_only": true,
+  "timeout_seconds": 20,
+  "max_output_bytes": 65536,
+  "capabilities": ["diagnostics", "contract-demo"],
+  "env_allow": [],
+  "requires": {
+    "commands": [],
+    "env": []
+  },
+  "upstream": {
+    "name": "builtin",
+    "version": "1.0.0",
+    "url": "",
+    "commit": ""
+  },
+  "params": {
+    "echo": {
+      "type": "any",
+      "required": false,
+      "description": "原样回显，用来验证 stdin 参数传递"
+    },
+    "sleep_seconds": {
+      "type": "number",
+      "required": false,
+      "description": "模拟耗时（0-3 秒），配合 timeout_seconds 验证超时终止"
+    },
+    "fail": {
+      "type": "boolean",
+      "required": false,
+      "description": "返回 ok=false，验证业务失败路径"
+    }
+  }
+}

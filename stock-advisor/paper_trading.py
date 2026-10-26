@@ -82,6 +82,10 @@ DEFAULTS = {
     "tplus1_extra": "",           # 逗号分隔的代码/关键词，强制当 T+1
     "fees": {},                   # 交易费率覆盖（见 DEFAULT_FEES），完整键在 config.yaml
     "judge_holdings_only": False, # True=每轮只判已持仓（最省）；False=全自选股都判
+    # 因子暴露注入（2026-10-26）：把 Vibe 验证算子的逐票横截面 z + 样本内 IC
+    # 方向放进决策上下文。**只是第二意见**：prompt 明确要求同向仅作佐证、
+    # 相悖必须说明理由，不能仅凭因子改变仓位。快照一轮只算一次（30 分钟缓存）。
+    "factor_inject": True,
     # —— Bull/Bear 多空辩论（TradingAgents-astock 对抗机制移植）——
     # 在分析师报告之后、交易员决策之前插入 Bull→Bear→Research Manager 辩论。
     # 每轮 3 次 LLM 调用（Bull + Bear + Manager），默认关闭。
@@ -1076,6 +1080,46 @@ def _build_context(stock: dict, quote: dict, bars: list[dict],
     return "\n".join(ctx)
 
 
+def _factor_block(snap: dict, code: str) -> str:
+    """单票因子暴露（Vibe 验证算子，样本内 IC 定向）。
+
+    只描述「这只票在横截面上的风格位置」，**不是预测**。快照按市场各自成面板
+    （A 股 / 港股），这里按代码自动取对应市场；缺失（无日线/面板不够）或快照
+    不可用时返回空串，上下文里就不出现这一块 —— 因子只做第二意见，
+    绝不能因为因子缺失/异常拖垮一只票的决策。
+    """
+    if not snap or not snap.get("ok"):
+        return ""
+    import factor_zoo as _fz
+    key = _fz.normalize_code(code) or str(code)
+    c = (snap.get("codes") or {}).get(key) or {}
+    if c.get("missing") or c.get("composite") is None:
+        return ""
+    try:
+        comp = float(c["composite"])
+    except (TypeError, ValueError):
+        return ""
+    conf = _fz.CONF_LABEL.get(str(c.get("confidence") or ""), "—")
+    themes = []
+    for k, v in (c.get("theme_scores") or {}).items():
+        try:
+            themes.append((str(k), float((v or {}).get("z"))))
+        except (TypeError, ValueError):
+            continue
+    themes.sort(key=lambda kv: -abs(kv[1]))
+    t_txt = "、".join("%s %+.2f" % (_fz.THEME_LABEL.get(k, k), z)
+                     for k, z in themes[:3] if abs(z) >= 0.3)
+    mk = str(c.get("market_label") or _fz.MARKET_LABEL.get(
+        str(c.get("market") or "a"), "A股"))
+    return ("【因子暴露（Vibe 验证算子；方向为面板样本内 rank IC，不是预测）】\n"
+            "- %s数据截至 %s：综合 z %+.2f（%s，%d/%d 个算子参与合成）｜%s\n"
+            "- 这是横截面风格位置，不是明日涨跌预测。与你的判断同向时只作佐证；"
+            "相悖时必须说明理由，不能仅凭它改变仓位。"
+            % (mk, c.get("as_of") or snap.get("as_of") or "—", comp, conf,
+               int(c.get("n_used") or 0), int(c.get("n_alphas") or 0),
+               t_txt or "各主题接近中性"))
+
+
 def position_limit_status(cur, conf: dict) -> dict:
     """当前持仓只数 vs 上限。0 / 未配 = 不限。
 
@@ -1194,6 +1238,24 @@ def run_decisions(deps: dict, slot: str = "", only: set | None = None,
     # ⚠️ 用 `not in done` 而不是「已判数」——done 里还可能有别的 slot 混进来的。
     _todo = [s for s in stocks if s["code"] not in done]
     _total = len(_todo)
+    # 因子快照：一轮只算一次（factor_zoo 内部按参数/关注池缓存 30 分钟），
+    # 逐票只读 codes[code]。失败/超时只是本轮不带因子块，**不影响决策与成交**；
+    # 快照计算要几十秒，绝不能放进每只票的并发线程里各算一遍。
+    factor_snap = None
+    if conf.get("factor_inject", True) and callable(deps.get("factor_fn")):
+        try:
+            factor_snap = deps["factor_fn"]()
+            if not (factor_snap or {}).get("ok"):
+                print(f"[paper] 因子快照不可用，本轮不带因子块: "
+                      f"{str((factor_snap or {}).get('error'))[:200]}", flush=True)
+                factor_snap = None
+            else:
+                print(f"[paper] 因子快照 {factor_snap.get('run_id')} "
+                      f"as_of={factor_snap.get('as_of')} "
+                      f"codes={len(factor_snap.get('codes') or {})}", flush=True)
+        except Exception as exc:                     # noqa: BLE001
+            print(f"[paper] 因子快照异常，本轮不带因子块: {exc}", flush=True)
+            factor_snap = None
     # ---- 并发度（2026-10-14，用户批准）----
     # 为什么必须并发：串行 43 只 × 每只 4~10 分钟（辩论开着，每只多 3 次 LLM）
     # = **5.7 小时一轮**，而循环是同步调用的 → 一天实际只跑 1 轮，
@@ -1230,7 +1292,8 @@ def run_decisions(deps: dict, slot: str = "", only: set | None = None,
         idx, stock = idx_stock
         code = stock["code"]
         try:
-            plan = _decide_one(deps, conf, stock, today, slot)
+            plan = _decide_one(deps, conf, stock, today, slot,
+                               factor_snap=factor_snap)
             with _lock:
                 done.add(code)   # 股间不重入（并发手动触发/线程双写防护）
             if plan:
@@ -1485,7 +1548,7 @@ def append_decision_sidecar(stock: dict, decision: dict, slot: str = "") -> str:
         return ""
 
 
-def _decide_one(deps, conf, stock, today, slot: str = ""):
+def _decide_one(deps, conf, stock, today, slot: str = "", factor_snap=None):
     """只做决策，**不成交**。返回 None（跳过）或可交给 _execute_decision 的执行包。
 
     2026-10-05 改为两阶段：以前这里是「决策完立刻按代码字典序成交」，导致同轮
@@ -1659,6 +1722,16 @@ def _decide_one(deps, conf, stock, today, slot: str = ""):
         ctx += "\n" + inst_block
     if strategy_block:
         ctx += "\n" + strategy_block
+    # 因子暴露（2026-10-26）：与「策略信号」并列的第二种独立证据。
+    # 用 try 包住：某只票的 theme_scores 形状异常不能中断这一只的决策。
+    if factor_snap:
+        try:
+            factor_block = _factor_block(factor_snap, code)
+        except Exception as exc:                     # noqa: BLE001
+            factor_block = ""
+            print(f"[paper] {code} 因子块渲染失败（忽略）: {exc}", flush=True)
+        if factor_block:
+            ctx += "\n" + factor_block
     if macro_block:
         ctx += "\n" + macro_block
     if futures_fx_block:

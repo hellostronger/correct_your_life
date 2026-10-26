@@ -1,6 +1,9 @@
 fastapi>=0.115
 uvicorn>=0.30
 requests>=2.31
+# 外部研究引擎适配器（integrations/base.py）直接 import；此前只是 anthropic/twscrape 的
+# 传递依赖，显式钉住避免上游换实现时被抽走
+httpx>=0.27,<1
 psycopg2-binary>=2.9
 PyYAML>=6.0
 anthropic>=1.5

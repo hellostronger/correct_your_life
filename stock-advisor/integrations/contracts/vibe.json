@@ -1,0 +1,135 @@
+{
+  "integration": "vibe",
+  "upstream": "HKUDS/Vibe-Trading",
+  "tested_version": "0.1.18",
+  "notes": "只声明本项目真正用到的能力；每次升级先跑 /api/integrations/vibe/probe。响应字段以 0.1.18 实测为准：/alpha/list 用 alphas/total，/alpha/readiness 用 universes/zoo_counts。研究范围是 A 股+港股（equity_cn 377 个、equity_hk 180 个因子）；bench 上游只有 csi300(Tushare) / sp500(Yahoo) / btc-usdt(OKX) 三个基准域，没有港股基准，缺数据时 job 会停在 loading_data 或 result.error。",
+  "health": {
+    "method": "GET",
+    "path": "/health",
+    "timeout": 5,
+    "required": {
+      "status": "str",
+      "service": "str"
+    }
+  },
+  "capabilities": {
+    "ready": {
+      "method": "GET",
+      "path": "/ready",
+      "timeout": 5,
+      "type": "dict",
+      "allow_status": [503],
+      "required": {},
+      "probe": true,
+      "description": "LLM 就绪检查；未配置模型时返 503 + detail，属于有效诊断而不是故障"
+    },
+    "data.sources": {
+      "method": "GET",
+      "path": "/settings/data-sources",
+      "timeout": 10,
+      "required": {
+        "tushare_token_configured": "bool",
+        "source_orders": "list"
+      },
+      "description": "行情源配置与各市场 fallback 链（a_share: tencent → eastmoney → ...）"
+    },
+    "alpha.list": {
+      "method": "GET",
+      "path": "/alpha/list",
+      "query": ["zoo", "theme", "universe", "limit"],
+      "timeout": 20,
+      "required": {
+        "status": "str",
+        "alphas": "list",
+        "total": "int"
+      },
+      "probe": {"limit": 3},
+      "description": "因子库列表；478 条，limit 缺省返回全部，带 total/returned/truncated"
+    },
+    "alpha.get": {
+      "method": "GET",
+      "path": "/alpha/{alpha_id}",
+      "timeout": 15,
+      "required": {
+        "status": "str",
+        "alpha": "dict",
+        "source_code": "str"
+      },
+      "probe": {"alpha_id": "academic_bab"},
+      "description": "单因子元数据 + 公式 + 源码（源码在顶层 source_code，不在 alpha 内）"
+    },
+    "alpha.readiness": {
+      "method": "GET",
+      "path": "/alpha/readiness",
+      "timeout": 10,
+      "required": {
+        "universes": "dict",
+        "zoo_counts": "dict"
+      },
+      "description": "每个基准域是否可用（csi300 需 Tushare，sp500 用公开数据，btc-usdt 单资产）"
+    },
+    "alpha.bench.start": {
+      "method": "POST",
+      "path": "/alpha/bench",
+      "timeout": 20,
+      "required": {
+        "status": "str",
+        "job_id": "str"
+      },
+      "probe": false,
+      "description": "启动异步因子基准测试，立即返回 job_id；有副作用故契约测试跳过"
+    },
+    "alpha.bench.get": {
+      "method": "GET",
+      "path": "/alpha/bench/{job_id}",
+      "timeout": 10,
+      "required": {
+        "job_id": "str",
+        "status": "str",
+        "progress": "dict"
+      },
+      "description": "轮询 job 快照；status ∈ queued/running/done/error"
+    },
+    "swarm.presets": {
+      "method": "GET",
+      "path": "/swarm/presets",
+      "timeout": 10,
+      "type": "list",
+      "required": {
+        "0.name": "str",
+        "0.title": "str",
+        "0.variables": "list"
+      },
+      "description": "内置多智能体研究团队模板（DAG 工作流 + 变量定义）"
+    },
+    "swarm.runs": {
+      "method": "GET",
+      "path": "/swarm/runs",
+      "query": ["limit"],
+      "timeout": 10,
+      "type": "list",
+      "required": {},
+      "description": "历史 swarm 运行；空列表也算正常"
+    },
+    "skills.list": {
+      "method": "GET",
+      "path": "/skills",
+      "timeout": 10,
+      "type": "list",
+      "required": {
+        "0.name": "str",
+        "0.description": "str"
+      },
+      "description": "上游自带的 90 个研究 skill 元数据（只读，不执行）"
+    },
+    "runs.list": {
+      "method": "GET",
+      "path": "/runs",
+      "query": ["limit"],
+      "timeout": 10,
+      "type": "list",
+      "required": {},
+      "description": "研究运行记录；agent 未跑过时为空列表"
+    }
+  }
+}

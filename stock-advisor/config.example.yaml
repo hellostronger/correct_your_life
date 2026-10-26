@@ -236,6 +236,10 @@ paper:
   # ⚠️ 本机到云库 RTT 中位 1.9 秒，每只票要开好几次连接 —— 并发只解决
   #    LLM 那一段，DB 往返是另一块（占比不大，但不是零）。
   decision_concurrency: 12
+  # 因子暴露注入（2026-10-26）：模拟盘每条决策上下文里都带「验证算子在
+  # 横截面上的风格位置 + 样本内 IC 方向」。只是第二意见：同向仅作佐证，
+  # 相悖必须说明理由。快照一轮只算一次，失败静默跳过，不影响决策与成交。
+  factor_inject: true
 
   # Bull/Bear 多空辩论（debate.py；TradingAgents-astock 对抗机制的本地移植）
   # 决策链：分析师 → 交易员① → [触发] → Bull→Bear→Judge → 交易员②
@@ -609,3 +613,36 @@ strategy_daily:
   max_stale_days: 45         # 行情滞后超过这个天数判 data_stale，不跑
   run_time: "15:30"          # 每天几点跑（当天已跑过自动跳过；周末不跑）
   interval_minutes: 1440     # 线程检查周期，不是运行周期
+
+# 因子桥（2026-10-26）：把 Vibe-Trading registry 里**能算的**算子直接算到本站
+# 日线上，落 sa_factor_run / sa_factor_alpha / sa_factor_code，并注入策略每日
+# 结论与盘前/盘后报告。计算由 tools/factor_worker.py 在 Vibe venv 的子进程里完成，
+# 主应用不 import 上游。**方向不是硬编码**：用面板自身的样本内 rank IC 定符号。
+# 实测：600 只池 + 关注票 ≈ 684 只 × 309 天 × 357 个算子，一轮约 45~130 秒。
+# ⚠️ 这里没有 `enabled` 的调度线程；快照由策略每日结论轮次 / 日报生成时按需计算，
+# 缓存 cache_minutes 分钟。手动「重算」在「🔬 研究」页。
+factor:
+  enabled: true
+  universe: equity_cn        # 默认面板；snapshot_all 会同时算 A 股与港股
+  pool_size: 600             # 按窗口内平均成交额取前 N 只做横截面（关注票总会加入）
+  lookback_days: 460         # 计算窗口（自然日），要覆盖最长 warmup 253 根
+  min_bars: 200              # 窗口内日线少于这个数的票不进面板
+  ic_horizon: 1              # 因子 t 日值 vs t+1 日收益
+  ic_min_days: 120           # 样本内 IC 至少这么多个交易日
+  ic_min_abs: 0.015          # |IC| 达标才参与定向
+  ic_min_ir: 0.15            # |IC_IR| 达标才参与定向
+  z_clip: 3.0                # 合成前单算子 z 截断
+  align_threshold: 0.25      # 建议同向/相悖的合成 z 门槛
+  timeout: 900               # worker 子进程超时(秒)
+  cache_minutes: 30          # 同一参数/关注池复用快照的分钟数
+  keep_days: 90              # 快照保留天数（更早的轮次级联删除）
+  worker_python: ""          # 留空自动找 D:\vibe-trading\.venv 或 /opt/vibe-trading/.venv
+  # ---- 港股面板（sa_hk_kline，与 A 股完全分表/分面板，z 不能混算）----
+  hk_enabled: true
+  hk_pool_size: 100          # 港股样本按窗口内成交额取前 N 只（universe 只有 100 只）
+  hk_lookback_days: 365      # 港股夜期短、上市晚，窗口比 A 股短；02513 这类新股也够 120 根
+  hk_min_bars: 120           # 港股窗口内少于这个数不进面板
+  hk_sync_minutes: 30        # 港股日线增量同步的最小间隔(分钟)
+  hk_strong_ratio: 0.20      # 港股置信按「有效算子/可用算子」比例：strong ≥20%
+  hk_medium_ratio: 0.10      # 港股 medium ≥10%（A 股仍用绝对 80/40）
+

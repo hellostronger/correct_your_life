@@ -343,7 +343,7 @@ def fetch_intraday(code: str, period: str = "m5", count: int = 320) -> dict:
     }, timeout=90)
 
 
-def fetch_kline(code: str, start: str, end: str) -> list[dict]:
+def fetch_kline(code: str, start: str, end: str, timeout: int = 60) -> list[dict]:
     """取日 K（经 101，服务端自动降级：东财 → 腾讯 `newfqkline`）。
 
     `source=auto` 让 101 决定用哪条线；本机**不再自己合并两个源** ——
@@ -353,7 +353,7 @@ def fetch_kline(code: str, start: str, end: str) -> list[dict]:
     payload = _get_json("/kline", {
         "secid": secid_of(code), "source": "auto", "fields": EM_FIELDS,
         "days": _need_days(start, end), "beg": start, "end": end,
-    }, timeout=60)
+    }, timeout=timeout)
     source = str(payload.get("source") or "")
     rows = _rows_from_csv(code, payload.get("klines"), source, start, end)
     if not rows:
@@ -372,9 +372,20 @@ def last_date(cur, code: str) -> str | None:
 
 
 def store_kline(cur, rows: list[dict]) -> int:
-    """写入 K 线。ON CONFLICT 保证幂等 —— 同一天被重复拉到不会产生重复行。"""
+    """写入 K 线。ON CONFLICT 保证幂等 —— 同一天被重复拉到不会产生重复行。
+
+    **拒绝 5 位港股代码**：港股的 volume 单位是股、金额是 HKD，和 A 股
+    「手」混在一张表里会让回测/因子池静默算错。港股日线走
+    ``factor_zoo._sync_hk`` → ``sa_hk_kline``。
+    """
     if not rows:
         return 0
+    bad = sorted({str(r.get("code")) for r in rows
+                  if len(str(r.get("code") or "")) == 5})
+    if bad:
+        raise ValueError(
+            "港股代码不能写入 sa_market_kline（%s）：港股日线在 sa_hk_kline"
+            % "、".join(bad[:5]))
     from psycopg2.extras import execute_values
     # execute_values 而非 executemany：这台远程共享云库单语句往返约 65ms，
     # executemany 逐行往返会把 6000 行写成一分钟级（实测 1200 行 81.7 秒）。
@@ -403,6 +414,10 @@ def sync_code(deps: dict, code: str, years: float = 3.0,
     get_conn = deps["get_conn"]
     code = str(code).strip()
     end = end or date.today().isoformat()
+    if is_hk(code):
+        return {"code": code, "fetched": 0,
+                "error": "港股日线不写 sa_market_kline；请用 factor_zoo._sync_hk "
+                         "同步到 sa_hk_kline"}
     if code in _inflight:
         return {"code": code, "skipped": True, "why": "同进程内正在同步"}
     _inflight.add(code)

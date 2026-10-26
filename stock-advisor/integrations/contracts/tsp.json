@@ -1,0 +1,33 @@
+{
+  "integration": "tsp",
+  "upstream": "shy3130/tick-stock-panel",
+  "tested_version": "0.3.16",
+  "notes": "tick-stock-panel 单容器 sidecar（默认 http://127.0.0.1:3018）。只读行情/指标；不接 write:ext / paper:trade。字段以 0.3.16 的 /api/openapi.json 与实测 /api/kline/daily 为准。",
+  "health": {
+    "method": "GET",
+    "path": "/api/openapi.json",
+    "query": ["tier"],
+    "timeout": 5,
+    "type": "dict",
+    "required": {
+      "openapi": "str",
+      "info": "dict",
+      "paths": "dict"
+    }
+  },
+  "capabilities": {
+    "kline.daily": {
+      "method": "GET",
+      "path": "/api/kline/daily",
+      "query": ["symbol", "limit"],
+      "timeout": 20,
+      "type": "dict",
+      "required": {
+        "symbol": "str",
+        "rows": "list"
+      },
+      "probe": {"symbol": "600519.SH", "limit": 2},
+      "description": "日 K + 均线/量能等指标；symbol 需带 .SH/.SZ/.HK 后缀"
+    }
+  }
+}

@@ -1,0 +1,7810 @@
+{
+ "upstream": "HKUDS/Vibe-Trading",
+ "upstream_version": "0.1.18",
+ "generated_at": "2026-10-25T17:19:16Z",
+ "source": "src.factors.registry.get_default_registry()",
+ "note": "computable=true 表示只需 open/high/low/close/volume/amount 且不需要行业分类；fund:/val: 字段当前数据面未提供。",
+ "alphas": [
+  {
+   "id": "academic_bab",
+   "zoo": "academic",
+   "nickname": "Frazzini-Pedersen 2014 betting-against-beta",
+   "themes": [
+    "volatility"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 253,
+   "decay": 252,
+   "computable": true,
+   "notes": "Frazzini & Pedersen (2014) BAB. Price-only proxy: market return is the cross-sectional mean of daily per-stock returns (equal-weighted, not value-weighted as in the original). Beta is Cov(r_i, r_m) / Var(r_m) over a single 252-day window (paper uses separate 1y vol / 5y correlation windows). Factor score is negative beta, cross-sectional z-scored so low-beta names rank highest, matching the long leg of the original long-short construction."
+  },
+  {
+   "id": "academic_carhart_mom",
+   "zoo": "academic",
+   "nickname": "Carhart 1997 momentum — 12m-1m return",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 252,
+   "decay": 60,
+   "computable": true,
+   "notes": "Carhart (1997) UMD momentum factor. Return from 12 months ago to 1 month ago, so the most recent month is skipped and today's price never enters; cross-sectional z-score per date for long-short ranking. Top z-scores = winners. Constructed directly from prices, so this matches the original definition modulo the z-score wrapper. Canonical 252d window; declared decay_horizon=60 due to registry schema cap (le=60); real signal horizon=252."
+  },
+  {
+   "id": "academic_cma",
+   "zoo": "academic",
+   "nickname": "[PRICE PROXY] FF2015 CMA — investment via inverse volume growth",
+   "themes": [
+    "quality"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 120,
+   "decay": 60,
+   "computable": true,
+   "notes": "[PRICE PROXY] for the Fama-French (2015) CMA (Conservative Minus Aggressive) investment factor. The original definition uses total-asset growth from fundamental data; here we use the negative 60-day change in log average volume as an activity-growth proxy, then cross-sectional z-score per date for long-short ranking. Top z-scores = volume contraction (conservative / low-growth proxy)."
+  },
+  {
+   "id": "academic_corr_rewire",
+   "zoo": "academic",
+   "nickname": "correlation-rewiring stability score",
+   "themes": [
+    "volatility"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 142,
+   "decay": 60,
+   "computable": true,
+   "notes": "Causal rolling rendition of the correlation-regime skill's Mode 4 (rewiring leaderboard): per-asset row mean of |corr(event) - corr(calm)| where the event window is the trailing 20 bars and the calm baseline is the 120 bars immediately before it, sign-flipped and cross-sectionally z-scored so correlation-stable names rank highest. Framed as a structural risk / crowding lens, not a validated alpha: the author's public validation of the underlying regime machinery covers regime detection and attribution on historical replays only and makes no return-prediction claim for this cross-sectional form"
+  },
+  {
+   "id": "academic_high52w",
+   "zoo": "academic",
+   "nickname": "George-Hwang 2004 52-week-high momentum",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 252,
+   "decay": 60,
+   "computable": true,
+   "notes": "George & Hwang (2004) 52-week-high momentum. Ratio of current close to the trailing 252-day maximum close, cross-sectional z-score per date for long-short ranking. Top z-scores = names trading nearest their 52-week high. Canonical 252d window; declared decay_horizon=60 due to registry schema cap (le=60); real signal horizon spans months."
+  },
+  {
+   "id": "academic_hml",
+   "zoo": "academic",
+   "nickname": "[PRICE PROXY] FF1993 HML — value via inverse 252d return",
+   "themes": [
+    "value"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 252,
+   "decay": 60,
+   "computable": true,
+   "notes": "[PRICE PROXY] for the Fama-French (1993) HML (High Minus Low) value factor. The original definition uses book-to-market ratio from fundamental data; here we use the negative 252-day total return as a long-term reversal proxy, then cross-sectional z-score per date for long-short ranking. Top z-scores = long-term underperformers (deeper value). Canonical 252d window; declared decay_horizon=60 due to registry schema cap (le=60); real signal horizon=252."
+  },
+  {
+   "id": "academic_illiq",
+   "zoo": "academic",
+   "nickname": "Amihud 2002 illiquidity — |return| per dollar volume",
+   "themes": [
+    "liquidity"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 22,
+   "decay": 21,
+   "computable": true,
+   "notes": "Amihud (2002) ILLIQ. Daily |simple return| divided by dollar volume (close * volume), averaged over a trailing 21-day window, then cross-sectional z-score per date for long-short ranking. Top z-scores = least liquid names, which carry the illiquidity premium. Uses a 1-day return (one extra warmup bar over the 21-day average window)."
+  },
+  {
+   "id": "academic_mkt_rf",
+   "zoo": "academic",
+   "nickname": "[PRICE PROXY] Market factor (Sharpe 1964) — 21d demeaned return",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 21,
+   "decay": 21,
+   "computable": true,
+   "notes": "[PRICE PROXY] for the Sharpe (1964) / Fama-French market factor (MKT-RF). The original definition uses value-weighted market excess returns; here we use a 21-day per-stock total return and cross-sectional z-score per date for long-short ranking. Top z-scores = strong recent winners; bottom = losers."
+  },
+  {
+   "id": "academic_retskew",
+   "zoo": "academic",
+   "nickname": "Harvey-Siddique 2000 return skewness — inverse 60d skew",
+   "themes": [
+    "volatility"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 61,
+   "decay": 60,
+   "computable": true,
+   "notes": "Harvey & Siddique (2000) skewness premium. Negative of the trailing 60-day sample skewness of daily simple returns, cross-sectional z-score per date for long-short ranking. Top z-scores = most negatively-skewed names, which command a return premium over lottery-like positively-skewed names. Uses a 1-day return (one extra warmup bar over the 60-day window)."
+  },
+  {
+   "id": "academic_rmw",
+   "zoo": "academic",
+   "nickname": "[PRICE PROXY] FF2015 RMW — quality via inverse 60d volatility",
+   "themes": [
+    "quality"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": "[PRICE PROXY] for the Fama-French (2015) RMW (Robust Minus Weak) profitability factor. The original definition uses operating profitability from fundamental data; here we use the negative of 60-day return volatility as a low-vol-quality proxy, then cross-sectional z-score per date for long-short ranking. Top z-scores = lower vol (quality / robust)."
+  },
+  {
+   "id": "academic_smb",
+   "zoo": "academic",
+   "nickname": "[PRICE PROXY] FF1993 SMB — small-minus-big via inverse dollar-volume",
+   "themes": [
+    "quality"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": "[PRICE PROXY] for the Fama-French (1993) SMB (Small Minus Big) size factor. The original definition uses market capitalization from book equity data; here we use the negative log of 60-day average dollar volume (close * volume) as a liquidity-weighted size proxy, then cross-sectional z-score per date for long-short ranking. Top z-scores = smaller / less liquid names."
+  },
+  {
+   "id": "academic_strev",
+   "zoo": "academic",
+   "nickname": "Jegadeesh 1990 short-term reversal — inverse 21d return",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 21,
+   "decay": 21,
+   "computable": true,
+   "notes": "Jegadeesh (1990) one-month reversal. Negative trailing 21-day return, cross-sectional z-score per date for long-short ranking. Top z-scores = recent one-month losers, which tend to rebound. Constructed directly from prices, matching the original definition modulo the z-score wrapper."
+  },
+  {
+   "id": "fund_accruals",
+   "zoo": "fundamental",
+   "nickname": "Accruals - inverse (NI-CFO)/TA, Sloan 1996",
+   "themes": [
+    "quality"
+   ],
+   "columns": [
+    "fund:accruals"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 1,
+   "decay": 252,
+   "computable": false,
+   "notes": "Balance-sheet accrual proxy: high accruals indicate low earnings quality; sign inverted so high score = low accruals. PIT-safe from the fundamental panel; missing statements remain NaN and are excluded from that date's cross-section."
+  },
+  {
+   "id": "fund_asset_growth",
+   "zoo": "fundamental",
+   "nickname": "Asset growth - inverse investment factor",
+   "themes": [
+    "growth"
+   ],
+   "columns": [
+    "fund:asset_growth"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 1,
+   "decay": 252,
+   "computable": false,
+   "notes": "Inverse PIT-safe asset-growth factor. High asset growth is treated as aggressive investment and receives lower scores; low/negative growth receives higher scores."
+  },
+  {
+   "id": "fund_book_to_market",
+   "zoo": "fundamental",
+   "nickname": "Book-to-market - equity over market cap (FF HML characteristic)",
+   "themes": [
+    "value"
+   ],
+   "columns": [
+    "close",
+    "fund:total_equity",
+    "fund:shares_diluted"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 1,
+   "decay": 252,
+   "computable": false,
+   "notes": "Valuation proxy: close times weighted-average diluted shares is not reported market capitalization; adjusted closes can change the level. Fama-French (1993) HML-style book-to-market proxy built from PIT-safe total equity and shares diluted aligned to the daily close panel; the academic_hml factor in the academic zoo is only a price proxy. High B/M (cheap relative to book value) scores high. market_cap = close x shares_diluted is computed here in the factor file by design: _fundamental_schema.py lines 210-212 deliberately keep price-dependent value factors such as book_to_market out of DERIVED_"
+  },
+  {
+   "id": "fund_cash_to_assets",
+   "zoo": "fundamental",
+   "nickname": "Cash to assets - balance-sheet cash ratio",
+   "themes": [
+    "quality"
+   ],
+   "columns": [
+    "fund:cash",
+    "fund:total_assets"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 1,
+   "decay": 252,
+   "computable": false,
+   "notes": "Balance-sheet cash ratio (cash and equivalents / total assets): high cash holdings signal defensive capacity and financial flexibility. Zero or missing total assets become NaN via safe division before cross-sectional z-scoring; PIT-safe from the filed-date-anchored fundamental panel."
+  },
+  {
+   "id": "fund_cfo_yield",
+   "zoo": "fundamental",
+   "nickname": "CFO yield - operating cash flow over total assets",
+   "themes": [
+    "quality"
+   ],
+   "columns": [
+    "fund:cfo",
+    "fund:total_assets"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 1,
+   "decay": 252,
+   "computable": false,
+   "notes": "Valuation proxy: close times weighted-average diluted shares is not reported market capitalization; adjusted closes can change the level. Cash-flow return on assets: the cash-backed counterpart of ROA, so accrual-heavy earnings score lower here. Zero or missing total assets become NaN via safe division before cross-sectional z-scoring; PIT-safe from the filed-date-anchored fundamental panel."
+  },
+  {
+   "id": "fund_dividend_yield",
+   "zoo": "fundamental",
+   "nickname": "Dividend yield TTM - dv_ttm (daily market data)",
+   "themes": [
+    "value"
+   ],
+   "columns": [
+    "val:dv_ttm"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 1,
+   "decay": 252,
+   "computable": false,
+   "notes": "Trailing dividend yield from the val: namespace (tushare daily_basic dv_ttm, CN A-share only), reported in percent units — cross-sectional z-scoring is scale-invariant, so no unit conversion is applied. High dividend yield scores high. Keyed by trade_date, so PIT-safe by construction with no filing lag. Missing dates or non-CN symbols stay NaN and are excluded from that date's cross-section. Lineage: JoinQuant style-pro divyild; akshare/Eastmoney dv_ttm convention."
+  },
+  {
+   "id": "fund_dividend_yield_ind_neutral",
+   "zoo": "fundamental",
+   "nickname": "Dividend yield TTM industry-neutral - within-industry dv_ttm (daily market data)",
+   "themes": [
+    "value"
+   ],
+   "columns": [
+    "val:dv_ttm"
+   ],
+   "requires_sector": true,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 1,
+   "decay": 252,
+   "computable": false,
+   "notes": "Industry-neutralized trailing dividend yield: each name is z-scored against its Shenwan level-1 industry peers instead of the whole cross-section (sector tag from tushare index_member_all SW2021 membership, point-in-time via in_date/out_date). This removes the industry confounding that dominates raw A-share dividend yield — mature banks and utilities pay structurally high dividends while growth industries pay almost none, so a raw high-yield screen is largely an industry bet. High dividend yield relative to industry peers scores high; dv_ttm is reported in percent units and cross-sectional z-s"
+  },
+  {
+   "id": "fund_earnings_growth",
+   "zoo": "fundamental",
+   "nickname": "Earnings growth - sign-safe YoY net income expansion",
+   "themes": [
+    "growth"
+   ],
+   "columns": [
+    "fund:earnings_growth"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 1,
+   "decay": 252,
+   "computable": false,
+   "notes": "PIT-safe earnings growth from the fundamental panel's derived field ``earnings_growth``. The schema-side formula is sign-safe: delta net_income / abs(lag_365d net_income), so a negative year-ago base does not flip the growth sign (the proposal #6 footnote resolution; the alternative NaN-on-negative-base was not chosen). Calendar-day lag per the #1564 lesson. High earnings growth scores high, matching the JoinQuant net_profit_growth_rate convention. Missing statements or a zero/missing year-ago base remain NaN and are excluded from that date's cross-section."
+  },
+  {
+   "id": "fund_earnings_yield",
+   "zoo": "fundamental",
+   "nickname": "Earnings yield - net income over market cap",
+   "themes": [
+    "value"
+   ],
+   "columns": [
+    "close",
+    "fund:net_income",
+    "fund:shares_diluted"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 1,
+   "decay": 252,
+   "computable": false,
+   "notes": "Hybrid value factor using PIT-safe net income and shares diluted aligned to the daily close panel. Division by zero/non-finite market cap becomes NaN before cross-sectional scoring."
+  },
+  {
+   "id": "fund_fcf_yield",
+   "zoo": "fundamental",
+   "nickname": "FCF yield - (CFO - capex) over market cap",
+   "themes": [
+    "value"
+   ],
+   "columns": [
+    "close",
+    "fund:cfo",
+    "fund:capex",
+    "fund:shares_diluted"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 1,
+   "decay": 252,
+   "computable": false,
+   "notes": "Valuation proxy: close times weighted-average diluted shares is not reported market capitalization; adjusted closes can change the level. PIT-safe free-cash-flow yield: FCF = CFO - capex, scaled by market cap (close x shares_diluted) computed in the factor file per the _fundamental_schema.py price-dependent convention. Sign assumption: capex is reported as a positive magnitude (SEC concept PaymentsToAcquirePropertyPlantAndEquipment), so subtracting it from CFO yields FCF directly. High FCF yield (cheap on cash generation, cf. Lakonishok-Shleifer-Vishny 1994 cash-flow yield value factors) score"
+  },
+  {
+   "id": "fund_gross_profitability",
+   "zoo": "fundamental",
+   "nickname": "Gross profitability - gross profit over total assets",
+   "themes": [
+    "quality"
+   ],
+   "columns": [
+    "fund:gross_profitability"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 1,
+   "decay": 252,
+   "computable": false,
+   "notes": "PIT-safe Novy-Marx style gross profitability from the fundamental panel; cross-sectional z-score per date with missing issuers excluded."
+  },
+  {
+   "id": "fund_leverage",
+   "zoo": "fundamental",
+   "nickname": "Leverage - inverse debt/equity (low leverage scores high)",
+   "themes": [
+    "leverage"
+   ],
+   "columns": [
+    "fund:leverage"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 1,
+   "decay": 252,
+   "computable": false,
+   "notes": "PIT-safe market leverage (total debt / total equity) from the fundamental panel; sign inverted so low leverage scores high — heavily levered firms carry distress risk and lower expected returns. Zero-equity or missing statements already yield NaN in the derived field and are excluded from that date's cross-section."
+  },
+  {
+   "id": "fund_operating_margin",
+   "zoo": "fundamental",
+   "nickname": "Operating margin - operating income over revenue",
+   "themes": [
+    "quality"
+   ],
+   "columns": [
+    "fund:operating_income",
+    "fund:revenue"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 1,
+   "decay": 252,
+   "computable": false,
+   "notes": "Operating profitability (operating income / revenue), cross-sectionally z-scored per date. Captures pricing power and cost efficiency before financing and tax effects. Zero-revenue or missing statements become NaN via safe division and are excluded from that date's cross-section; PIT-safe from the fundamental panel."
+  },
+  {
+   "id": "fund_pb",
+   "zoo": "fundamental",
+   "nickname": "P/B - inverse price-to-book (daily market data)",
+   "themes": [
+    "value"
+   ],
+   "columns": [
+    "val:pb"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 1,
+   "decay": 252,
+   "computable": false,
+   "notes": "Nonpositive multiples are excluded rather than ranked as cheap. Inverse price-to-book from the val: namespace (tushare daily_basic pb, CN A-share only): low PB (cheap relative to book value) scores high, the daily-market-data counterpart of fund_book_to_market. Keyed by trade_date, so PIT-safe by construction with no filing lag. Missing dates or non-CN symbols stay NaN and are excluded from that date's cross-section. Lineage: JoinQuant style book_to_price_ratio; akshare/Eastmoney pb convention."
+  },
+  {
+   "id": "fund_pb_ind_neutral",
+   "zoo": "fundamental",
+   "nickname": "P/B industry-neutral - inverse within-industry price-to-book (daily market data)",
+   "themes": [
+    "value"
+   ],
+   "columns": [
+    "val:pb"
+   ],
+   "requires_sector": true,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 1,
+   "decay": 252,
+   "computable": false,
+   "notes": "Nonpositive multiples are excluded rather than ranked as cheap. Industry-neutralized inverse price-to-book: each name is z-scored against its Shenwan level-1 industry peers instead of the whole cross-section (sector tag from tushare index_member_all SW2021 membership, point-in-time via in_date/out_date). This removes the industry confounding that dominates raw A-share PB — banks and cyclicals are structurally cheap on book value while technology names are structurally expensive, so a raw low-PB screen is largely an industry bet. Low PB relative to industry peers scores high. A name with no ind"
+  },
+  {
+   "id": "fund_ps_ttm",
+   "zoo": "fundamental",
+   "nickname": "P/S TTM - inverse price-to-sales (daily market data)",
+   "themes": [
+    "value"
+   ],
+   "columns": [
+    "val:ps_ttm"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 1,
+   "decay": 252,
+   "computable": false,
+   "notes": "Nonpositive multiples are excluded rather than ranked as cheap. Inverse trailing price-to-sales from the val: namespace (tushare daily_basic ps_ttm, CN A-share only): low PS scores high. PS stays informative for loss-making names where earnings yield fails. Keyed by trade_date, so PIT-safe by construction with no filing lag. Missing dates or non-CN symbols stay NaN and are excluded from that date's cross-section. Lineage: JoinQuant style-pro sales-to-price; akshare/Eastmoney ps_ttm convention."
+  },
+  {
+   "id": "fund_ps_ttm_ind_neutral",
+   "zoo": "fundamental",
+   "nickname": "P/S TTM industry-neutral - inverse within-industry price-to-sales (daily market data)",
+   "themes": [
+    "value"
+   ],
+   "columns": [
+    "val:ps_ttm"
+   ],
+   "requires_sector": true,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 1,
+   "decay": 252,
+   "computable": false,
+   "notes": "Nonpositive multiples are excluded rather than ranked as cheap. Industry-neutralized inverse trailing price-to-sales: each name is z-scored against its Shenwan level-1 industry peers instead of the whole cross-section (sector tag from tushare index_member_all SW2021 membership, point-in-time via in_date/out_date). This removes the industry confounding that dominates raw A-share PS — software and platform names carry structurally high margins and high PS while distributors and manufacturers are structurally low, so a raw low-PS screen is largely an industry bet. Low PS relative to industry peer"
+  },
+  {
+   "id": "fund_revenue_growth",
+   "zoo": "fundamental",
+   "nickname": "Revenue growth - YoY top-line expansion",
+   "themes": [
+    "growth"
+   ],
+   "columns": [
+    "fund:revenue_growth"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 1,
+   "decay": 252,
+   "computable": false,
+   "notes": "PIT-safe revenue growth from the fundamental panel's derived field ``revenue_growth`` (revenue / lag_365d(revenue) - 1, calendar-day lag per the #1564 lesson rather than a row-wise shift). High top-line growth scores high, matching the JoinQuant operating_revenue_growth_rate convention. Missing statements or a missing year-ago base remain NaN and are excluded from that date's cross-section."
+  },
+  {
+   "id": "fund_roa",
+   "zoo": "fundamental",
+   "nickname": "ROA - return on assets (PIT-safe fundamentals)",
+   "themes": [
+    "quality"
+   ],
+   "columns": [
+    "fund:roa"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 1,
+   "decay": 252,
+   "computable": false,
+   "notes": "PIT-safe return on assets (net income / total assets) from the fundamental panel; cross-sectional z-score per date. Higher ROA means a more profitable asset base and scores higher. Missing statements remain NaN and are excluded from that date's cross-section."
+  },
+  {
+   "id": "fund_roe",
+   "zoo": "fundamental",
+   "nickname": "ROE - return on equity (PIT-safe fundamentals)",
+   "themes": [
+    "quality"
+   ],
+   "columns": [
+    "fund:roe"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 1,
+   "decay": 252,
+   "computable": false,
+   "notes": "PIT-safe return on equity from the fundamental panel; cross-sectional z-score per date. Missing statements remain NaN and are excluded from that date's cross-section."
+  },
+  {
+   "id": "gtja191_001",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "reversal"
+   ],
+   "columns": [
+    "volume",
+    "close",
+    "open"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 7,
+   "decay": 6,
+   "computable": true,
+   "notes": "Standard GTJA #1: lag-1 log-volume change rank vs intraday return rank, 6d corr."
+  },
+  {
+   "id": "gtja191_002",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal",
+    "microstructure"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 2,
+   "decay": 1,
+   "computable": true,
+   "notes": "Daily change in close-position-within-range."
+  },
+  {
+   "id": "gtja191_003",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 7,
+   "decay": 6,
+   "computable": true,
+   "notes": "Wilder-style accumulation of signed daily moves over 6 days."
+  },
+  {
+   "id": "gtja191_004",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum",
+    "volume"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 20,
+   "decay": 8,
+   "computable": true,
+   "notes": "Breakout signal: short-MA vs long-MA +/- 1 std, volume-relative tiebreaker. Output in {-1, +1}."
+  },
+  {
+   "id": "gtja191_005",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "volume",
+    "high"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 13,
+   "decay": 5,
+   "computable": true,
+   "notes": "Max over 3 days of 5d corr of TSRANK(volume,5) and TSRANK(high,5)."
+  },
+  {
+   "id": "gtja191_006",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "open",
+    "high"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 5,
+   "decay": 4,
+   "computable": true,
+   "notes": "Sign of 4d change of weighted price; cross-sectionally ranked, negated."
+  },
+  {
+   "id": "gtja191_007",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "microstructure"
+   ],
+   "columns": [
+    "close",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 4,
+   "decay": 3,
+   "computable": true,
+   "notes": "VWAP via A-share amount/volume (equity_cn convention)."
+  },
+  {
+   "id": "gtja191_008",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "high",
+    "low",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 5,
+   "decay": 4,
+   "computable": true,
+   "notes": "Negated rank of 4d change in mid-vwap composite."
+  },
+  {
+   "id": "gtja191_009",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "microstructure"
+   ],
+   "columns": [
+    "high",
+    "low",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 8,
+   "decay": 7,
+   "computable": true,
+   "notes": "SMA(n=7, m=2) of midpoint change times range / volume."
+  },
+  {
+   "id": "gtja191_010",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volatility",
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 21,
+   "decay": 5,
+   "computable": true,
+   "notes": "Per-day return = pct_change(1) via (close - delay(close,1))/delay(close,1)."
+  },
+  {
+   "id": "gtja191_011",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "microstructure"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 7,
+   "decay": 6,
+   "computable": true,
+   "notes": "Accumulated money-flow-multiplier × volume over 6 days."
+  },
+  {
+   "id": "gtja191_012",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal",
+    "microstructure"
+   ],
+   "columns": [
+    "open",
+    "close",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 11,
+   "decay": 10,
+   "computable": true,
+   "notes": "Open-minus-10d-vwap rank times negative rank of |close-vwap|."
+  },
+  {
+   "id": "gtja191_013",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "microstructure"
+   ],
+   "columns": [
+    "high",
+    "low",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 1,
+   "decay": 1,
+   "computable": true,
+   "notes": "Geometric mean of high/low minus vwap."
+  },
+  {
+   "id": "gtja191_014",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 6,
+   "decay": 5,
+   "computable": true,
+   "notes": "Simple 5d momentum = delta(close, 5)."
+  },
+  {
+   "id": "gtja191_015",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "open",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 2,
+   "decay": 1,
+   "computable": true,
+   "notes": "Overnight gap return."
+  },
+  {
+   "id": "gtja191_016",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "microstructure"
+   ],
+   "columns": [
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 11,
+   "decay": 5,
+   "computable": true,
+   "notes": "Max over 5d of rank of rolling rank-volume vs rank-vwap correlation."
+  },
+  {
+   "id": "gtja191_017",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 16,
+   "decay": 15,
+   "computable": true,
+   "notes": "rank(vwap - 15d max(vwap)) is non-positive; we use signed_power for safety."
+  },
+  {
+   "id": "gtja191_018",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 6,
+   "decay": 5,
+   "computable": true,
+   "notes": "5d price ratio."
+  },
+  {
+   "id": "gtja191_019",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 6,
+   "decay": 5,
+   "computable": true,
+   "notes": "Piecewise 5d momentum normalized differently in up/down regimes."
+  },
+  {
+   "id": "gtja191_020",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 7,
+   "decay": 6,
+   "computable": true,
+   "notes": "6d return in pct."
+  },
+  {
+   "id": "gtja191_021",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 12,
+   "decay": 6,
+   "computable": true,
+   "notes": "Rolling 6-day slope of MA6(close) vs time index. REGBETA proxied by ts_cov / ts_std**2."
+  },
+  {
+   "id": "gtja191_022",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 10,
+   "decay": 12,
+   "computable": true,
+   "notes": "SMA(12, m=1) of 3-day-difference in price-deviation-from-MA6."
+  },
+  {
+   "id": "gtja191_023",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volatility"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 22,
+   "decay": 20,
+   "computable": true,
+   "notes": "Up-volatility share. SMA(20, m=1) of STD(20) over up/down days."
+  },
+  {
+   "id": "gtja191_024",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 6,
+   "decay": 5,
+   "computable": true,
+   "notes": "SMA(5, m=1) of 5d delta(close)."
+  },
+  {
+   "id": "gtja191_025",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum",
+    "volume"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 61,
+   "decay": 9,
+   "computable": true,
+   "notes": "Long-window RET sum approximated with 60d cap (warmup feasibility); see notes."
+  },
+  {
+   "id": "gtja191_026",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum",
+    "microstructure"
+   ],
+   "columns": [
+    "close",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 35,
+   "decay": 7,
+   "computable": true,
+   "notes": "230d corr approximated with 30d window; see notes."
+  },
+  {
+   "id": "gtja191_027",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 18,
+   "decay": 12,
+   "computable": true,
+   "notes": "WMA proxied by decay_linear."
+  },
+  {
+   "id": "gtja191_028",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 12,
+   "decay": 9,
+   "computable": true,
+   "notes": "Stochastic-like indicator double-smoothed."
+  },
+  {
+   "id": "gtja191_029",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum",
+    "volume"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 7,
+   "decay": 6,
+   "computable": true,
+   "notes": "6d return times current volume."
+  },
+  {
+   "id": "gtja191_030",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volatility"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 21,
+   "decay": 20,
+   "computable": true,
+   "notes": "Multi-factor REGRESI not implementable in pure-fn zoo; degraded to WMA of squared daily return (idio proxy). See notes."
+  },
+  {
+   "id": "gtja191_031",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 13,
+   "decay": 12,
+   "computable": true,
+   "notes": "Bias-12: deviation of close from MA12 in pct."
+  },
+  {
+   "id": "gtja191_032",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "high",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 7,
+   "decay": 3,
+   "computable": true,
+   "notes": "Negated 3d sum of rank-corr(rank(high), rank(volume), 3)."
+  },
+  {
+   "id": "gtja191_033",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum",
+    "volume"
+   ],
+   "columns": [
+    "low",
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 61,
+   "decay": 5,
+   "computable": true,
+   "notes": "240d/20d long-window approximated with 60d/20d (warmup feasibility)."
+  },
+  {
+   "id": "gtja191_034",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 13,
+   "decay": 12,
+   "computable": true,
+   "notes": "MA12 over close."
+  },
+  {
+   "id": "gtja191_035",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "open",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 25,
+   "decay": 15,
+   "computable": true,
+   "notes": "Element-wise min of two ranks, negated."
+  },
+  {
+   "id": "gtja191_036",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 8,
+   "decay": 6,
+   "computable": true,
+   "notes": "Rolling 6d corr summed over 2 days then ranked."
+  },
+  {
+   "id": "gtja191_037",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "open",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 16,
+   "decay": 10,
+   "computable": true,
+   "notes": "Change over 10d of product (sum(open,5)*sum(ret,5))."
+  },
+  {
+   "id": "gtja191_038",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "high"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 21,
+   "decay": 20,
+   "computable": true,
+   "notes": "When current high > MA20(high), output -delta(high,2); else 0."
+  },
+  {
+   "id": "gtja191_039",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "close",
+    "open",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 63,
+   "decay": 14,
+   "computable": true,
+   "notes": "180d / 37d windows approximated with 30d / 10d. See notes."
+  },
+  {
+   "id": "gtja191_040",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 27,
+   "decay": 26,
+   "computable": true,
+   "notes": "Up-volume vs down-volume ratio over 26 days."
+  },
+  {
+   "id": "gtja191_041",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "microstructure"
+   ],
+   "columns": [
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 9,
+   "decay": 5,
+   "computable": true,
+   "notes": "5d max of 3d delta(vwap), ranked, negated."
+  },
+  {
+   "id": "gtja191_042",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "high",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 11,
+   "decay": 10,
+   "computable": true,
+   "notes": "Negative rank of 10d std(high) times 10d corr(high, volume)."
+  },
+  {
+   "id": "gtja191_043",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "momentum"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 7,
+   "decay": 6,
+   "computable": true,
+   "notes": "Signed volume accumulation over 6 days."
+  },
+  {
+   "id": "gtja191_044",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "low",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 27,
+   "decay": 10,
+   "computable": true,
+   "notes": "Sum of two TSRANK terms."
+  },
+  {
+   "id": "gtja191_045",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "close",
+    "open",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 44,
+   "decay": 15,
+   "computable": true,
+   "notes": "150d MA volume approximated with 30d window."
+  },
+  {
+   "id": "gtja191_046",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 25,
+   "decay": 24,
+   "computable": true,
+   "notes": "Mean of four MA windows over price."
+  },
+  {
+   "id": "gtja191_047",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 10,
+   "decay": 9,
+   "computable": true,
+   "notes": "Williams %R style indicator smoothed with SMA(9,1)."
+  },
+  {
+   "id": "gtja191_048",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "momentum"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 21,
+   "decay": 5,
+   "computable": true,
+   "notes": "Rank of 3d signed momentum sum times 5d/20d volume ratio, negated."
+  },
+  {
+   "id": "gtja191_049",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 13,
+   "decay": 12,
+   "computable": true,
+   "notes": "Down-side range as share of total range over 12 days."
+  },
+  {
+   "id": "gtja191_050",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 13,
+   "decay": 12,
+   "computable": true,
+   "notes": "Signed version of #49."
+  },
+  {
+   "id": "gtja191_051",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 13,
+   "decay": 12,
+   "computable": true,
+   "notes": "Up-range share over 12 days."
+  },
+  {
+   "id": "gtja191_052",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "microstructure"
+   ],
+   "columns": [
+    "high",
+    "low",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 27,
+   "decay": 26,
+   "computable": true,
+   "notes": "Bull power / bear power ratio over 26 days."
+  },
+  {
+   "id": "gtja191_053",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 13,
+   "decay": 12,
+   "computable": true,
+   "notes": "Pct of up-days in 12d window."
+  },
+  {
+   "id": "gtja191_054",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volatility",
+    "microstructure"
+   ],
+   "columns": [
+    "close",
+    "open"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 11,
+   "decay": 10,
+   "computable": true,
+   "notes": "Negated rank of (std|c-o|,10) + (c-o) + corr(c,o,10)."
+  },
+  {
+   "id": "gtja191_055",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "microstructure"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low",
+    "open"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 22,
+   "decay": 20,
+   "computable": true,
+   "notes": "Sumof complex per-day score over 20 days; numerator simplified."
+  },
+  {
+   "id": "gtja191_056",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 60,
+   "decay": 19,
+   "computable": true,
+   "notes": "Boolean comparator returns 1/0; 40d mean truncated."
+  },
+  {
+   "id": "gtja191_057",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 10,
+   "decay": 9,
+   "computable": true,
+   "notes": "KDJ %K-style indicator with SMA(3,1) smoothing."
+  },
+  {
+   "id": "gtja191_058",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 21,
+   "decay": 20,
+   "computable": true,
+   "notes": "Pct of up-days in 20d window."
+  },
+  {
+   "id": "gtja191_059",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 22,
+   "decay": 20,
+   "computable": true,
+   "notes": "Like alpha #3 but with 20d window."
+  },
+  {
+   "id": "gtja191_060",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "microstructure"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 21,
+   "decay": 20,
+   "computable": true,
+   "notes": "20-day version of alpha #11."
+  },
+  {
+   "id": "gtja191_061",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "volume",
+    "amount",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 53,
+   "decay": 17,
+   "computable": true,
+   "notes": "80d mean volume approximated with 30d."
+  },
+  {
+   "id": "gtja191_062",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "high",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 6,
+   "decay": 5,
+   "computable": true,
+   "notes": "Negated 5d corr(high, rank(volume))."
+  },
+  {
+   "id": "gtja191_063",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 7,
+   "decay": 6,
+   "computable": true,
+   "notes": "RSI-6 style."
+  },
+  {
+   "id": "gtja191_064",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "close",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 30,
+   "decay": 14,
+   "computable": true,
+   "notes": "60d mean truncated to 10d; ts_max window 13→4 and decay_linear 14→6 for warmup feasibility."
+  },
+  {
+   "id": "gtja191_065",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 7,
+   "decay": 6,
+   "computable": true,
+   "notes": "MA6 over close."
+  },
+  {
+   "id": "gtja191_066",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 7,
+   "decay": 6,
+   "computable": true,
+   "notes": "Bias-6 pct."
+  },
+  {
+   "id": "gtja191_067",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 25,
+   "decay": 24,
+   "computable": true,
+   "notes": "RSI-24 style."
+  },
+  {
+   "id": "gtja191_068",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "high",
+    "low",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 16,
+   "decay": 15,
+   "computable": true,
+   "notes": "Like alpha #9 but with SMA(15, m=2)."
+  },
+  {
+   "id": "gtja191_069",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "microstructure"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 22,
+   "decay": 20,
+   "computable": true,
+   "notes": "DTM/DBM as in GTJA spec."
+  },
+  {
+   "id": "gtja191_070",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volatility",
+    "volume"
+   ],
+   "columns": [
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 7,
+   "decay": 6,
+   "computable": true,
+   "notes": "6d std of amount (turnover)."
+  },
+  {
+   "id": "gtja191_071",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 25,
+   "decay": 24,
+   "computable": true,
+   "notes": "Bias-24."
+  },
+  {
+   "id": "gtja191_072",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 16,
+   "decay": 15,
+   "computable": true,
+   "notes": "Williams %R style with SMA(15,1)."
+  },
+  {
+   "id": "gtja191_073",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "close",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 35,
+   "decay": 16,
+   "computable": true,
+   "notes": "Composite of decay-linear of close-volume corr minus another decay term."
+  },
+  {
+   "id": "gtja191_074",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "low",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 30,
+   "decay": 20,
+   "computable": true,
+   "notes": "40d MA volume truncated to 10d; SUM windows kept at 20."
+  },
+  {
+   "id": "gtja191_075",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "sentiment",
+    "momentum"
+   ],
+   "columns": [
+    "close",
+    "open"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 30,
+   "decay": 50,
+   "computable": true,
+   "notes": "Benchmark unavailable in zoo panel; degraded to row-mean(close) as benchmark proxy. Window 50→20. See notes."
+  },
+  {
+   "id": "gtja191_076",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volatility",
+    "volume"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 22,
+   "decay": 20,
+   "computable": true,
+   "notes": "Coefficient-of-variation of |daily return|/volume over 20 days."
+  },
+  {
+   "id": "gtja191_077",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "high",
+    "low",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 37,
+   "decay": 20,
+   "computable": true,
+   "notes": "40d MA truncated to 30d."
+  },
+  {
+   "id": "gtja191_078",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "high",
+    "low",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 23,
+   "decay": 12,
+   "computable": true,
+   "notes": "CCI-12 style."
+  },
+  {
+   "id": "gtja191_079",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 13,
+   "decay": 12,
+   "computable": true,
+   "notes": "RSI-12."
+  },
+  {
+   "id": "gtja191_080",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 6,
+   "decay": 5,
+   "computable": true,
+   "notes": "5d volume change pct."
+  },
+  {
+   "id": "gtja191_081",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 22,
+   "decay": 21,
+   "computable": true,
+   "notes": "SMA(21, m=2) of volume."
+  },
+  {
+   "id": "gtja191_082",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 21,
+   "decay": 20,
+   "computable": true,
+   "notes": "Williams %R with SMA(20,1)."
+  },
+  {
+   "id": "gtja191_083",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "high",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 6,
+   "decay": 5,
+   "computable": true,
+   "notes": "Negated rank of 5d cov(rank(high), rank(volume))."
+  },
+  {
+   "id": "gtja191_084",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "momentum"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 21,
+   "decay": 20,
+   "computable": true,
+   "notes": "20d version of alpha #43."
+  },
+  {
+   "id": "gtja191_085",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "momentum"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 39,
+   "decay": 20,
+   "computable": true,
+   "notes": "Vol-adjusted contrarian momentum."
+  },
+  {
+   "id": "gtja191_086",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 22,
+   "decay": 20,
+   "computable": true,
+   "notes": "Returns -1 / +1 / -delta depending on second-derivative thresholds."
+  },
+  {
+   "id": "gtja191_087",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "microstructure"
+   ],
+   "columns": [
+    "close",
+    "open",
+    "high",
+    "low",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 22,
+   "decay": 11,
+   "computable": true,
+   "notes": "Sum of two decay-linear terms, negated."
+  },
+  {
+   "id": "gtja191_088",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 21,
+   "decay": 20,
+   "computable": true,
+   "notes": "20d return pct."
+  },
+  {
+   "id": "gtja191_089",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 28,
+   "decay": 27,
+   "computable": true,
+   "notes": "MACD-like signal."
+  },
+  {
+   "id": "gtja191_090",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 6,
+   "decay": 5,
+   "computable": true,
+   "notes": "Negated rank of 5d corr(rank vwap, rank volume)."
+  },
+  {
+   "id": "gtja191_091",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "reversal"
+   ],
+   "columns": [
+    "close",
+    "low",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 35,
+   "decay": 5,
+   "computable": true,
+   "notes": "40d mean truncated to 30d."
+  },
+  {
+   "id": "gtja191_092",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "close",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 60,
+   "decay": 15,
+   "computable": true,
+   "notes": "180d mean truncated to 30d."
+  },
+  {
+   "id": "gtja191_093",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "microstructure"
+   ],
+   "columns": [
+    "open",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 22,
+   "decay": 20,
+   "computable": true,
+   "notes": "Sum of downside range moves over 20 days."
+  },
+  {
+   "id": "gtja191_094",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "momentum"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 31,
+   "decay": 30,
+   "computable": true,
+   "notes": "30d signed volume."
+  },
+  {
+   "id": "gtja191_095",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volatility",
+    "volume"
+   ],
+   "columns": [
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 21,
+   "decay": 20,
+   "computable": true,
+   "notes": "20d std of amount."
+  },
+  {
+   "id": "gtja191_096",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 12,
+   "decay": 9,
+   "computable": true,
+   "notes": "KDJ %D-style double smoothed."
+  },
+  {
+   "id": "gtja191_097",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volatility",
+    "volume"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 11,
+   "decay": 10,
+   "computable": true,
+   "notes": "10d std of volume."
+  },
+  {
+   "id": "gtja191_098",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 60,
+   "decay": 30,
+   "computable": true,
+   "notes": "100d windows truncated to 30d for warmup feasibility."
+  },
+  {
+   "id": "gtja191_099",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 6,
+   "decay": 5,
+   "computable": true,
+   "notes": "Negated rank of 5d cov(rank close, rank volume)."
+  },
+  {
+   "id": "gtja191_100",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volatility",
+    "volume"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 21,
+   "decay": 20,
+   "computable": true,
+   "notes": "20d std of volume."
+  },
+  {
+   "id": "gtja191_101",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "momentum"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 80,
+   "decay": 15,
+   "computable": true,
+   "notes": "Inequality cast to float via .astype('float64')."
+  },
+  {
+   "id": "gtja191_102",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 7,
+   "decay": 6,
+   "computable": true,
+   "notes": "SMA(x,n,m) -> x.ewm(alpha=m/n, adjust=False).mean()."
+  },
+  {
+   "id": "gtja191_103",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": "Days since the most recent extreme; today=0. Ties choose the latest bar (port policy)."
+  },
+  {
+   "id": "gtja191_104",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 25,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_105",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "open",
+    "volume",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_106",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 21,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_107",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 2,
+   "decay": 1,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_108",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal",
+    "volume"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 125,
+   "decay": 6,
+   "computable": true,
+   "notes": "x^y interpreted as x ** y after rank; both terms in (0,1]."
+  },
+  {
+   "id": "gtja191_109",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volatility"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 20,
+   "decay": 10,
+   "computable": true,
+   "notes": "SMA -> ewm(alpha=2/10)."
+  },
+  {
+   "id": "gtja191_110",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 21,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_111",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "microstructure"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 12,
+   "decay": 11,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_112",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 13,
+   "decay": 12,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_113",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 27,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_114",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 7,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_115",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 40,
+   "decay": 30,
+   "computable": true,
+   "notes": "x^y -> np.power after rank."
+  },
+  {
+   "id": "gtja191_116",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": "Rolling OLS slope vs. linear index; cov(c,t,20)/var(t,20)."
+  },
+  {
+   "id": "gtja191_117",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "momentum"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 33,
+   "decay": 32,
+   "computable": true,
+   "notes": "ret = close/delay(close,1) - 1."
+  },
+  {
+   "id": "gtja191_118",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_119",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 60,
+   "decay": 26,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_120",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 1,
+   "decay": 1,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_121",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 80,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_122",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 40,
+   "decay": 13,
+   "computable": true,
+   "notes": "Triple SMA of log close."
+  },
+  {
+   "id": "gtja191_123",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 90,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_124",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 32,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_125",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 120,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_126",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 1,
+   "decay": 1,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_127",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volatility"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 24,
+   "decay": 12,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_128",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 16,
+   "decay": 14,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_129",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 13,
+   "decay": 12,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_130",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 60,
+   "decay": 40,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_131",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 84,
+   "decay": 50,
+   "computable": true,
+   "notes": "DELAT in report typo = DELTA."
+  },
+  {
+   "id": "gtja191_132",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "liquidity"
+   ],
+   "columns": [
+    "close",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_133",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": "Days since the most recent extreme; today=0. Ties choose the latest bar (port policy)."
+  },
+  {
+   "id": "gtja191_134",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum",
+    "volume"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 13,
+   "decay": 12,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_135",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 22,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_136",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum",
+    "volume"
+   ],
+   "columns": [
+    "open",
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 11,
+   "decay": 10,
+   "computable": true,
+   "notes": "ret = close/delay(close,1) - 1."
+  },
+  {
+   "id": "gtja191_137",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volatility"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 2,
+   "decay": 1,
+   "computable": true,
+   "notes": "Transcribed from the standard 137 implementation; piecewise denominator."
+  },
+  {
+   "id": "gtja191_138",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 119,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_139",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "open",
+    "volume",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_140",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 100,
+   "decay": 60,
+   "computable": true,
+   "notes": "MIN(a,b) elementwise -> np.minimum."
+  },
+  {
+   "id": "gtja191_141",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "high",
+    "volume",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 24,
+   "decay": 15,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_142",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "reversal"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 26,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_143",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 2,
+   "decay": 1,
+   "computable": true,
+   "notes": "Recursive SELF unrolled to cumulative product of (1 + up_return) since series start."
+  },
+  {
+   "id": "gtja191_144",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "liquidity"
+   ],
+   "columns": [
+    "close",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 21,
+   "decay": 20,
+   "computable": true,
+   "notes": "SUMIF -> (x*cond).rolling(n).sum(); COUNT -> cond.rolling(n).sum()."
+  },
+  {
+   "id": "gtja191_145",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 26,
+   "decay": 26,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_146",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 81,
+   "decay": 60,
+   "computable": true,
+   "notes": "Standardised return deviation; SMA(.,61,2)=ewm(alpha=2/61)."
+  },
+  {
+   "id": "gtja191_147",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 24,
+   "decay": 12,
+   "computable": true,
+   "notes": "Rolling OLS slope of MA12 against linear index, window 12."
+  },
+  {
+   "id": "gtja191_148",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 75,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_149",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 253,
+   "decay": 60,
+   "computable": true,
+   "notes": "Downside beta vs. benchmark; uses fallback cross-sectional mean if benchmark_close missing."
+  },
+  {
+   "id": "gtja191_150",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 1,
+   "decay": 1,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_151",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 21,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_152",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 50,
+   "decay": 26,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_153",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 24,
+   "decay": 24,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_154",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 198,
+   "decay": 60,
+   "computable": true,
+   "notes": "Original returns boolean; we cast to float and multiply by -1."
+  },
+  {
+   "id": "gtja191_155",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 40,
+   "decay": 27,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_156",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 10,
+   "decay": 5,
+   "computable": true,
+   "notes": "MAX elementwise -> np.maximum."
+  },
+  {
+   "id": "gtja191_157",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 12,
+   "decay": 5,
+   "computable": true,
+   "notes": "PROD(.,1) is identity; we use it directly."
+  },
+  {
+   "id": "gtja191_158",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volatility"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 16,
+   "decay": 15,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_159",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 25,
+   "decay": 24,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_160",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volatility"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 22,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_161",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volatility"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 13,
+   "decay": 12,
+   "computable": true,
+   "notes": "Average True Range (12)."
+  },
+  {
+   "id": "gtja191_162",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 24,
+   "decay": 12,
+   "computable": true,
+   "notes": "RSI-style normalised."
+  },
+  {
+   "id": "gtja191_163",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 21,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_164",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 20,
+   "decay": 13,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_165",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volatility"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 142,
+   "decay": 48,
+   "computable": true,
+   "notes": "SUMAC = expanding cumulative sum approximated by rolling 48-day cumulative sum."
+  },
+  {
+   "id": "gtja191_166",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volatility"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 40,
+   "decay": 20,
+   "computable": true,
+   "notes": "Skewness-style; constants from report."
+  },
+  {
+   "id": "gtja191_167",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 13,
+   "decay": 12,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_168",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_169",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 50,
+   "decay": 26,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_170",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 21,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_171",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "microstructure"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 1,
+   "decay": 1,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_172",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 20,
+   "decay": 14,
+   "computable": true,
+   "notes": "Wilder's ADX-style indicator; mean over last 6 bars."
+  },
+  {
+   "id": "gtja191_173",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 40,
+   "decay": 13,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_174",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volatility"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 22,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_175",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volatility"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 7,
+   "decay": 6,
+   "computable": true,
+   "notes": "ATR(6)."
+  },
+  {
+   "id": "gtja191_176",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 18,
+   "decay": 12,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_177",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close",
+    "high"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": "Days since the most recent extreme; today=0. Ties choose the latest bar (port policy)."
+  },
+  {
+   "id": "gtja191_178",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum",
+    "volume"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 2,
+   "decay": 1,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_179",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 62,
+   "decay": 50,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_180",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "reversal"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 67,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_181",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volatility"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 40,
+   "decay": 20,
+   "computable": true,
+   "notes": "Benchmark falls back to cross-sectional mean of close."
+  },
+  {
+   "id": "gtja191_182",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 21,
+   "decay": 20,
+   "computable": true,
+   "notes": "Benchmark falls back to cross-sectional mean of close."
+  },
+  {
+   "id": "gtja191_183",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volatility"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 70,
+   "decay": 24,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_184",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "open",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 202,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_185",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "open",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 1,
+   "decay": 1,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_186",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 27,
+   "decay": 14,
+   "computable": true,
+   "notes": "alpha172 averaged with its 6-day lag."
+  },
+  {
+   "id": "gtja191_187",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "open",
+    "high"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 21,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_188",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volatility"
+   ],
+   "columns": [
+    "close",
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 13,
+   "decay": 11,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_189",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volatility"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 12,
+   "decay": 6,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "gtja191_190",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 39,
+   "decay": 20,
+   "computable": true,
+   "notes": "Complex log of ratio of conditional squared deviations."
+  },
+  {
+   "id": "gtja191_191",
+   "zoo": "gtja191",
+   "nickname": "",
+   "themes": [
+    "volume"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn"
+   ],
+   "warmup": 25,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_beta10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_beta20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_beta30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_beta5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_beta60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_cntd10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": "A missing close leaves window+1 rolling rows NaN; on sparse panels this can trigger the >95% NaN registry guard (from ~30% missing bars)."
+  },
+  {
+   "id": "qlib158_cntd20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": "A missing close leaves window+1 rolling rows NaN; on sparse panels this can trigger the >95% NaN registry guard (from ~15% missing bars)."
+  },
+  {
+   "id": "qlib158_cntd30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": "A missing close leaves window+1 rolling rows NaN; on sparse panels this can trigger the >95% NaN registry guard (from ~10% missing bars)."
+  },
+  {
+   "id": "qlib158_cntd5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": "A missing close leaves window+1 rolling rows NaN; on sparse panels this can trigger the >95% NaN registry guard (from ~40% missing bars)."
+  },
+  {
+   "id": "qlib158_cntd60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": "A missing close leaves window+1 rolling rows NaN; on sparse panels this can trigger the >95% NaN registry guard (from ~5% missing bars)."
+  },
+  {
+   "id": "qlib158_cntn10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": "A missing close leaves window+1 rolling rows NaN; on sparse panels this can trigger the >95% NaN registry guard (from ~30% missing bars)."
+  },
+  {
+   "id": "qlib158_cntn20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": "A missing close leaves window+1 rolling rows NaN; on sparse panels this can trigger the >95% NaN registry guard (from ~15% missing bars)."
+  },
+  {
+   "id": "qlib158_cntn30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": "A missing close leaves window+1 rolling rows NaN; on sparse panels this can trigger the >95% NaN registry guard (from ~10% missing bars)."
+  },
+  {
+   "id": "qlib158_cntn5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": "A missing close leaves window+1 rolling rows NaN; on sparse panels this can trigger the >95% NaN registry guard (from ~40% missing bars)."
+  },
+  {
+   "id": "qlib158_cntn60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": "A missing close leaves window+1 rolling rows NaN; on sparse panels this can trigger the >95% NaN registry guard (from ~5% missing bars)."
+  },
+  {
+   "id": "qlib158_cntp10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": "A missing close leaves window+1 rolling rows NaN; on sparse panels this can trigger the >95% NaN registry guard (from ~30% missing bars)."
+  },
+  {
+   "id": "qlib158_cntp20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": "A missing close leaves window+1 rolling rows NaN; on sparse panels this can trigger the >95% NaN registry guard (from ~15% missing bars)."
+  },
+  {
+   "id": "qlib158_cntp30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": "A missing close leaves window+1 rolling rows NaN; on sparse panels this can trigger the >95% NaN registry guard (from ~10% missing bars)."
+  },
+  {
+   "id": "qlib158_cntp5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": "A missing close leaves window+1 rolling rows NaN; on sparse panels this can trigger the >95% NaN registry guard (from ~40% missing bars)."
+  },
+  {
+   "id": "qlib158_cntp60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": "A missing close leaves window+1 rolling rows NaN; on sparse panels this can trigger the >95% NaN registry guard (from ~5% missing bars)."
+  },
+  {
+   "id": "qlib158_cord10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "microstructure"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_cord20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "microstructure"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_cord30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "microstructure"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_cord5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "microstructure"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_cord60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "microstructure"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_corr10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "microstructure"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_corr20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "microstructure"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_corr30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "microstructure"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_corr5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "microstructure"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_corr60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "microstructure"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_imax10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "high"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_imax20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "high"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_imax30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "high"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_imax5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "high"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_imax60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "high"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_imin10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_imin20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_imin30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_imin5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_imin60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_imxd10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_imxd20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_imxd30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_imxd5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_imxd60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_klen",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "microstructure"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 1,
+   "decay": 1,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_klow",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "microstructure"
+   ],
+   "columns": [
+    "open",
+    "low",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 1,
+   "decay": 1,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_klow2",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "microstructure"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 1,
+   "decay": 1,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_kmid",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "microstructure"
+   ],
+   "columns": [
+    "open",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 1,
+   "decay": 1,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_kmid2",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "microstructure"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 1,
+   "decay": 1,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_ksft",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "microstructure"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 1,
+   "decay": 1,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_ksft2",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "microstructure"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 1,
+   "decay": 1,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_kup",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "microstructure"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 1,
+   "decay": 1,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_kup2",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "microstructure"
+   ],
+   "columns": [
+    "open",
+    "high",
+    "low",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 1,
+   "decay": 1,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_ma10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_ma20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_ma30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_ma5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_ma60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_max10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "high",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_max20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "high",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_max30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "high",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_max5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "high",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_max60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "high",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_min10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "low",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_min20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "low",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_min30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "low",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_min5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "low",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_min60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "low",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_qtld10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_qtld20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_qtld30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_qtld5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_qtld60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_qtlu10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_qtlu20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_qtlu30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_qtlu5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_qtlu60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_rank10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_rank20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_rank30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_rank5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_rank60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_resi10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_resi20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_resi30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_resi5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_resi60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_roc10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_roc20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_roc30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_roc5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_roc60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_rsqr10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_rsqr20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_rsqr30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_rsqr5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_rsqr60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_rsv10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "high",
+    "low",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_rsv20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "high",
+    "low",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_rsv30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "high",
+    "low",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_rsv5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "high",
+    "low",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_rsv60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "high",
+    "low",
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_std10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_std20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_std30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_std5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_std60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "momentum"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_sumd10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_sumd20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_sumd30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_sumd5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_sumd60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_sumn10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_sumn20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_sumn30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_sumn5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_sumn60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_sump10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_sump20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_sump30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_sump5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_sump60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "reversal"
+   ],
+   "columns": [
+    "close"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vma10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vma20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vma30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vma5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vma60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vstd10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vstd20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vstd30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vstd5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vstd60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vsumd10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vsumd20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vsumd30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vsumd5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vsumd60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vsumn10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vsumn20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vsumn30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vsumn5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vsumn60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vsump10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vsump20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vsump30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vsump5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_vsump60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_wvma10",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 10,
+   "decay": 10,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_wvma20",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 20,
+   "decay": 20,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_wvma30",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 30,
+   "decay": 30,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_wvma5",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 5,
+   "decay": 5,
+   "computable": true,
+   "notes": ""
+  },
+  {
+   "id": "qlib158_wvma60",
+   "zoo": "qlib158",
+   "nickname": "",
+   "themes": [
+    "volume",
+    "volatility"
+   ],
+   "columns": [
+    "close",
+    "volume"
+   ],
+   "requires_sector": false,
+   "universes": [
+    "equity_cn",
+    "equity_hk"
+   ],
+   "warmup": 60,
+   "decay": 60,
+   "computable": true,
+   "notes": ""
+  }
+ ]
+}

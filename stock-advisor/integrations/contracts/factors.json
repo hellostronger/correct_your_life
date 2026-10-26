@@ -1,0 +1,48 @@
+{
+  "integration": "factor-bridge",
+  "upstream": "HKUDS/Vibe-Trading",
+  "tested_version": "0.1.18",
+  "notes": "主应用不 import 上游：factor_zoo 把 sa_market_kline 导成 long CSV，用 Vibe venv 的 python 跑 tools/factor_worker.py，worker 调 registry.compute。方向不是硬编码，而是面板自身的样本内 rank IC（|IC|/|IR|/天数三重门槛）。港股算子已在目录里，但 sa_market_kline 还没有港股日线，worker 会返回 missing。",
+  "transport": {
+    "kind": "subprocess",
+    "python_env": ["config.yaml factor.worker_python", "FACTOR_WORKER_PYTHON", "VIBE_PYTHON",
+                   "D:\\\\vibe-trading\\\\.venv\\\\Scripts\\\\python.exe", "/opt/vibe-trading/.venv/bin/python"],
+    "script": "tools/factor_worker.py",
+    "timeout_s": 900
+  },
+  "job": {
+    "panel": "str: long CSV, columns code,trade_date,open,high,low,close,volume",
+    "out": "str: worker 输出 JSON 路径",
+    "universe": "str: equity_cn | equity_hk",
+    "as_of": "str: YYYY-MM-DD（面板最后一行）",
+    "focus_codes": "list[str]: 只给这些票返回 top 算子明细",
+    "amount_multiplier": "float: A 股 100（volume=手），港股 1（volume=股）",
+    "ic_horizon": "int: 默认 1（t 因子 vs t+1 收益）",
+    "ic_min_days": "int: 默认 120",
+    "ic_min_abs": "float: 默认 0.015",
+    "ic_min_ir": "float: 默认 0.15",
+    "z_clip": "float: 默认 3.0（仅聚合时截断）"
+  },
+  "response_required": {
+    "ok": "bool",
+    "upstream_version": "str",
+    "universe": "str",
+    "as_of": "str",
+    "panel": "dict: codes/days/start/end/rows",
+    "params": "dict",
+    "alphas": "list: id/zoo/nickname/themes/columns/ic_mean/ic_ir/ic_days/coverage/error",
+    "codes": "dict[code]: composite/confidence/n_used/n_alphas/theme_scores/top/missing",
+    "skipped": "list: 未参与计算的算子及原因",
+    "errors": "list: 计算失败的算子",
+    "elapsed_s": "float"
+  },
+  "verified": {
+    "date": "2026-10-26",
+    "panel": "670 只票 × 309 个交易日（2025-06-27 ~ 2026-09-30）",
+    "alphas": "357 个价格量能算子（CN 全集 377，去掉 20 个需要财报/估值/行业）",
+    "ic": "356 个有样本内 IC；gtja191_138 因 >95% NaN 被 registry 拒绝（预期错误）",
+    "timing": "COPY 面板约 40s + worker 约 50s（本机到 101 的带宽是瓶颈）",
+    "storage": "sa_factor_run / sa_factor_alpha / sa_factor_code；快照保留 90 天",
+    "sample": "600519 综合 +0.60（91 个方向可信算子）；600519/601318/00700 三条建议注记 = aligned/neutral/missing"
+  }
+}

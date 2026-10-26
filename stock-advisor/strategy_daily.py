@@ -742,11 +742,21 @@ def _mk_summary(res_row):
     if dq.get("as_of"):
         bits.append("数据截至 %s（滞后 %s 天）"
                     % (dq["as_of"], dq.get("stale_days")))
+    f = dq.get("factor") or {}
+    if f.get("status") == "ok" and f.get("total"):
+        bits.append("因子同向 %d / 相悖 %d（%s）"
+                    % (f.get("aligned", 0), f.get("against", 0),
+                       f.get("as_of") or "—"))
     return "；".join(bits)[:1000]
 
 
-def run_one(deps, d, conf):
-    """跑一条策略并给出结论。任何失败都返回可读 status/reason，不抛异常。"""
+def run_one(deps, d, conf, factor_snap=None):
+    """跑一条策略并给出结论。任何失败都返回可读 status/reason，不抛异常。
+
+    ``factor_snap`` 由 run_all 预算一次后传入：因子面板很贵（数百只票 ×
+    300+ 算子），不能每条策略各算一遍；也不属于策略本身，缺失时只是没有
+    因子注记，不影响结论。
+    """
     code = str(d.get("src_code") or "")
     if not code.strip():
         return _result(d, "no_code",
@@ -917,6 +927,19 @@ def run_one(deps, d, conf):
     dq["warnings"] = (run.get("warnings") or [])[:20]
     dq["notes"] = (res.get("notes") or [])[:10]
 
+    # 因子注记：用已验证算子给「这条建议在历史 IC 方向上是同向还是相悖」，
+    # 不是预测、不改 status。缺 worker / 缺快照时只写 unavailable。
+    if factor_snap is not None:
+        attach = deps.get("factor_attach")
+        if callable(attach):
+            try:
+                dq["factor"] = attach(factor_snap, sugg, pos)
+            except Exception as exc:             # noqa: BLE001
+                dq["factor"] = {"status": "error", "note": str(exc)[:200]}
+        else:
+            dq["factor"] = {"status": "unavailable",
+                            "note": "未注入 factor_attach"}
+
     metrics = dict(run.get("metrics") or {})
     metrics["trade_stats"] = run.get("trade_stats") or {}
     metrics["n_trades"] = run.get("n_trades_total")
@@ -1050,12 +1073,31 @@ def run_all(deps, conf=None, only=None):
                     "reason": "没有候选策略（portable_score >= %s）"
                               % conf["min_score"]}
         _start_run(deps, run_id)
+        # 因子快照一轮只算一次（watchlist+holdings+上一轮策略标的）。
+        # 失败/未配置都只影响注记，不拦策略结论。
+        factor_snap = None
+        if callable(deps.get("factor_fn")):
+            try:
+                t_f = time.time()
+                factor_snap = deps["factor_fn"]()
+                if not (factor_snap or {}).get("ok"):
+                    print("[sd] 因子快照不可用：%s"
+                          % str((factor_snap or {}).get("error"))[:300], flush=True)
+                    factor_snap = None
+                else:
+                    print("[sd] 因子快照 %s（%d 只票，%.0fs）"
+                          % (factor_snap.get("run_id"),
+                             len(factor_snap.get("codes") or {}),
+                             time.time() - t_f), flush=True)
+            except Exception as exc:             # noqa: BLE001
+                print("[sd] 因子快照异常：%s" % str(exc)[:300], flush=True)
+                factor_snap = None
         rows = []
         n_ok = n_failed = n_act = 0
         err = ""
         for d in cand:
             try:
-                r = run_one(deps, d, conf)
+                r = run_one(deps, d, conf, factor_snap=factor_snap)
             except Exception as exc:             # noqa: BLE001
                 traceback.print_exc()
                 r = _result(d, "run_failed",
@@ -1093,7 +1135,8 @@ def run_all(deps, conf=None, only=None):
                           # 回测闸门只影响「结论可信度」，**不改变 status**
                           # （见模块 docstring）。所以必须单独带出来，
                           # 否则界面/通知会把 reject 的结论当成可信结论展示。
-                          "gate": (r.get("data_quality") or {}).get("gate") or {}}
+                          "gate": (r.get("data_quality") or {}).get("gate") or {},
+                          "factor": (r.get("data_quality") or {}).get("factor") or {}}
                          for r in rows]}
 
 
