@@ -115,7 +115,8 @@ DEFAULT_INTERVALS = {
     # 实盘做T建议（2026-10-11）。登记进这一张表就自动出现在「⚙️ 调度」页：
     # 复选框 + 间隔输入框都由 SCH_INTERVALS 通用生成，不用写任何专用 UI。
     # ⚠️ 只读、只推建议、**绝不下单**（实盘操作始终由本人手动执行）。
-    "t_adv": {"enabled": False, "interval_minutes": 15},
+    # 默认开（2026-10-27 用户要求）：只读建议，不涉及任何成交。
+    "t_adv": {"enabled": True, "interval_minutes": 15},
     # 聚宽策略每日结论（2026-10-23）。读写的就是 config.yaml 顶层 strategy_daily 段，
     # 与 strategy_daily.load_daily_conf() 同一份 —— 不复制真源。
     # 默认开（用户要求「每天运行」）；enabled 只是「本线程要不要自己跑」
@@ -4876,7 +4877,9 @@ def _t_advisory_loop():
             # 那是另一件事，不该被这条链路连带改变。
             # 趋势减仓 / 硬止损建议仍由 `paper.t_trading.trend_reduce.enabled` 管。
             iv_conf = _conf_section("t_adv")
-            if not iv_conf.get("enabled"):
+            # 缺省即开（2026-10-27 用户要求默认开启）。本线程只读、绝不下单；
+            # 用户在调度页取消勾选会显式写入 enabled: false，那时才停。
+            if not iv_conf.get("enabled", True):
                 time.sleep(300)
                 continue
             now = datetime.now()

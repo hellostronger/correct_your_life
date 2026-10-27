@@ -432,11 +432,13 @@ schedule:
 # ⚠️ 这是**顶层**段（不是 paper.intervals.t_adv）：调度页
 # （DEFAULT_INTERVALS / SCH_INTERVALS / /api/schedule）读写的就是顶层 `t_adv`。
 # 本段 enabled 就是「实盘建议」的总开关（页面「⚙️ 调度」里同一个复选框）。
+# 默认开（2026-10-27 用户要求）：只读建议、绝不下单，所以默认生效是安全的；
+# 要停就在调度页取消勾选，会显式写入 enabled: false。
 # ⚠️ 与 `paper.t_trading.enabled` **无关**：那个开关管的是**模拟盘**做 T 成交，
 # 实盘建议不需要它、也不会因为它开启而成交。趋势减仓/硬止损建议另由
 # `paper.t_trading.trend_reduce.enabled` 控制。
 t_adv:
-  enabled: false
+  enabled: true
   interval_minutes: 15
 
 # 国际期货盯盘（黄金/白银/WTI/布伦特/天然气/铜，akshare 国际商品实时报价）

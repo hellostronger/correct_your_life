@@ -9530,6 +9530,9 @@ async function loadSchedule() {
       // news 没有真身 enabled（0 分钟即关闭），接口用周期反推，别画复选框
       const box = $('sch-iv-' + k + '-on');
       if (box) box.classList.toggle('hide', iv.has_enabled === false);
+      // 以前这里只回填分钟数、不回填勾选状态，于是 bili/wb/sector/volume/t_adv
+      // 的复选框永远是未勾选 —— 页面看起来像关着，实际配置可能是开着的。
+      if (iv.has_enabled !== false) $('sch-iv-' + k).checked = !!iv.enabled;
       $('sch-iv-' + k + '-min').value = iv.interval_minutes ?? 30;
     });
   } catch (e) { toastErr('加载调度设置失败: ' + e.message); }
@@ -9548,9 +9551,11 @@ async function saveSchedule() {
         calendar: { start_time: $('sch-cs').value, end_time: $('sch-ce').value },
       },
       intervals: Object.fromEntries(SCH_INTERVALS.map(k => {
+        // 只有 news 这种 has_enabled=false 的模块才该省略 enabled；
+        // 以前对没有 `-on` 包裹元素的模块一律发 undefined，勾选等于白勾。
         const on = $('sch-iv-' + k + '-on');
         return [k, {
-          enabled: !on || on.classList.contains('hide') ? undefined : on.checked,
+          enabled: on && on.classList.contains('hide') ? undefined : $('sch-iv-' + k).checked,
           interval_minutes: +$('sch-iv-' + k + '-min').value }];
       })),
       crypto: {
