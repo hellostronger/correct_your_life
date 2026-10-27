@@ -35,9 +35,9 @@ PROJECTS: list[dict] = [
     },
     {
         "id": "tsp", "name": "tick-stock-panel", "repo": "shy3130/tick-stock-panel",
-        "license": "MIT", "mode": "Docker sidecar", "runtime": "docker :3018",
+        "license": "MIT", "mode": "REST sidecar", "runtime": "101 systemd + nginx",
         "surface": ["REST", "OpenAPI"], "market": "A股",
-        "url": "http://127.0.0.1:3018", "dir": BASE / "tick-stock-panel",
+        "url": "http://101.43.25.101/tsp-api", "dir": BASE / "tick-stock-panel",
     },
     {
         "id": "daily", "name": "daily_stock_analysis", "repo": "ZhuLinsen/daily_stock_analysis",
@@ -173,8 +173,10 @@ def _probe_tsp(p: dict) -> dict:
             info = (h.get("payload") or {}).get("info") or {}
             return {"state": "live",
                     "detail": f"{info.get('title', 'Tick Stock Panel')} {info.get('version', '')}".strip(),
-                    "extra": {"elapsed_ms": h.get("elapsed_ms")}}
-        err = (h.get("error") or {}).get("message") or "容器未启动"
+                    "extra": {"elapsed_ms": h.get("elapsed_ms"),
+                              "base_url": h.get("base_url"),
+                              "auth": h.get("auth")}}
+        err = (h.get("error") or {}).get("message") or "sidecar 未连接"
         return {"state": "offline", "detail": err}
     except Exception as exc:                       # noqa: BLE001
         return {"state": "offline", "detail": f"{type(exc).__name__}: {exc}"}
