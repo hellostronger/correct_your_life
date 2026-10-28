@@ -1697,6 +1697,7 @@ NoneType.__format__`，成果**全部丢失**。真因是 `f"{r.get('price'):.2f
 | 远端服务器 | `101.43.25.101`（腾讯云上海；跑着 WeRSS + LLM 网关 `:3000`） |
 | SSH | `python stock-advisor/_remote.py <脚本.sh>`（base64 送脚本，绕开 PowerShell 编码破坏） |
 | LLM 网关 | `http://101.43.25.101:3000`，非 Anthropic 官方，`base_url` 一设就走代理分支 |
+| **Python 解释器** | **`D:\Python310\python.exe`**（2026-10-26 起，用户把它从 C 盘迁到 D 盘）。`C:\Python310` 只剩 `Lib/Scripts/etc/include/share`、**没有 `python310.dll`** ⇒ 旧路径全部作废；PATH 上的 `pip.exe` 仍指向 `C:\Python310\Scripts\pip.exe`，是**跑起来的死壳**（`--version` 无输出） |
 
 ### 网络环境（每次写网络代码都要注意）
 
@@ -2232,6 +2233,153 @@ UTF-8 重定向日志 + `NO_PROXY=*` + 固定 cwd + 剔掉会遮蔽真 `click` �
 ⚠️ 我因此犯了个错：为了上修复**先 kill 了用户 15:02:48 起的进程**，
 结果四种起法全失败、**服务停了 20 分钟**才找到能活的那一种。
 **正确顺序是先把能存活的起法验证通过，再动旧进程。**
+
+### 🔴 解释器搬家把服务弄死了（2026-10-26：C:\Python310 → D:\Python310）
+
+**症状**：用户说「拉取最新代码并重启」。pull 是**真 no-op**
+（`FETCH_HEAD` == HEAD == `4fb4144f`，`rev-list --left-right --count` = `0 0`），
+但**服务已经死了** —— 我上一轮还报告「PID 19612 活着」，**那是过期结论**，
+它死于当天 **14:05:25**（`app.log` 末行时刻，日志里**没有任何** `Shutting down`
+⇒ 被外部杀掉，不是自己退的）。
+
+**真因不是代码，是用户自己在做的 Python C:→D: 迁移**：
+
+| 时刻 | 事件（全部来自文件系统/日志证据，不是推测） |
+|---|---|
+| 12:11–12:13 | `requirements*.txt` 快照 |
+| 12:26 | `D:\python-migration\python-3.10.0-amd64.exe` 落地 |
+| 12:41 | `elevated-migrate.ps1` + `machine-path-backup.txt` 写出 |
+| 14:02–14:04 | `D:\Python310` 建目录、`install-d*.log` |
+| **14:05:25** | **`app.log` 最后一行 —— 卸载器把 `C:\Python310` 掏空，正在跑的 14:00 决策轮当场死掉** |
+| 14:22 起 | 一个 `-burn.clean.room` 子进程挂到现在（WiX/burn 卸载阶段等待，CPU 近零） |
+
+⚠️ `elevated-migrate.ps1` **从没执行过**（没有 `elevated.log`、没有
+`ELEVATED_DONE.txt`）⇒ **迁移做到一半就停了**，`C:\Python310\Lib\site-packages`
+之所以还在，只是因为**卸载器删不掉被运行中进程锁住的文件**。
+这种「半成品迁移」是最难查的：没有一个报错指向它。
+
+**恢复方式（用户选的方案：用备份灌依赖，不联网）**：
+`robocopy D:\python-migration\site-packages-backup D:\Python310\Lib\site-packages`
+（2.4G / 1133 条目 → 目标原本只有 `README.txt, pip, pip-21.2.3.dist-info` 3 项）。
+选它而不是 `pip install` 的理由：`D:\dev-cache\pip` 只有 62K，重装等于重下
+pandas/numpy/akshare 全家；而且**只往空目录里加文件**，不动用户正在做的迁移。
+
+**验证口径**：`robocopy` 退出码 **3 < 8 = 成功**（0/1/2/3 都算成功，别当失败）；
+DST 条目 3 → **1135**；18 个运行时模块逐个 `import` 全 OK
+（fastapi/uvicorn/requests/psycopg2/yaml/anthropic/twscrape/curl_cffi/akshare/
+pandas/numpy/pymilvus/jieba/av/bs4/lxml/openpyxl）。
+
+#### 🔴 三个当场踩到的工具坑（都会把成功显示成失败）
+
+1. **Git Bash 把 robocopy 的 `/E` 改写成路径 `E:/`**
+   → 「无效参数 #3:'E:/'」+ 打印用法横幅，**`/R:1 /W:1 /MT:16` 也一起丢掉**。
+   绕过：**把命令写进 `.ps1` 文件里跑**（或 `//E` / `MSYS2_ARG_CONV_EXCL`）。
+2. **`… | tail -20; echo $?` 读的是 `tail` 的状态，不是程序的**
+   —— 我因此拿到 `ROBOCOPY_EXIT=0` 以为成功，其实那次是**彻底失败**。
+   必须在 PowerShell 里读 `$LASTEXITCODE`。
+3. **PowerShell 把 stderr 的 `UserWarning` 报成 `NativeCommandError` 并中止脚本**
+   （`$ErrorActionPreference='Stop'` + `2>&1`）：jieba 的
+   `pkg_resources is deprecated` 警告让导入自检**在第 13 个模块处断掉**，
+   看着像「依赖没灌进去」。**这是老坑第 N 次复发**（本文件 10-17 那条
+   「E2E 退出码 1 ≠ 失败：py_mini_racer 的 stderr 警告」是同一件事）。
+   修法：**stderr 重定向到文件**（`2> $err`），别用 `2>&1`。
+   ⚠️ 顺带：我拿 `import mini_racer` 去探，报 MISS —— **真名是 `py_mini_racer`**，
+   这是**探针写错不是依赖缺失**（本文件反复出现的「失败的不一定是要修的代码」）。
+
+#### ⚠️ 现在仍存在的解析顺序事实（不是这次弄坏的）
+
+`sys.path` 里 **`C:\Users\Strong\AppData\Roaming\Python\Python310\site-packages`
+排在 `D:\Python310\lib\site-packages` 之前**（下标 5 vs 6），user-site 有 91 个条目
+（含一份 `py_mini_racer`，`from py_mini_racer import py_mini_racer` 在它上面**失败**）。
+这个顺序只按 **(主版本号, 用户)** 决定，与解释器在 C 还是 D 无关 ⇒
+旧的 `C:\Python310\python.exe` 面对的是**同一个** user-site，遮蔽行为没变。
+只有我的离线 V8 测试脚本会碰到它（生产 `app.py` 不 import mini_racer，
+测试也已按本文件记录改用 node 真跑 V8）。
+另外 `easy-install.pth` 会往 `sys.path` 塞 `d:\yolo_chenxiang\chattts-main`（无关项目，
+`*.pth` 里**没有任何** `C:\Python310` 残留 —— grep 验过）。
+
+#### ✅ `C:\Python310` 已彻底删除（2026-10-26，用户授权「c盘的python环境无用，就直接删除吧」）
+
+**数据丢失闸门（先过再删）**：`[System.IO.Directory]::GetFileSystemEntries` 逐项对比
+两个 site-packages —— `C_SP=1133 / D_SP=1135 / ONLY_IN_C=0` ⇒ C 盘那份没有任何 D 盘缺的包。
+⚠️ 用 .NET API 而不是 `Get-ChildItem`：**对不存在的目录 `Get-ChildItem -EA SilentlyContinue`
+会回落到当前工作目录**，把仓库根列出来当成「C 盘 python 的内容」（上一轮就是这么探错的）。
+
+**删除过程（共 4 个工具坑，全部当场踩到）**：
+
+1. **Git Bash 里 `cmd /c "rd /s /q …"` 是假成功** —— 只打印 cmd 横幅、什么都没删，
+   退出码还是 0。必须 `cmd //c`（双斜杠阻止 MSYS 改写）。发现方式：删后立即复查存在性
+   + 重新计数（`SP_LEFT=1133`，一根没动）。
+2. **`… | tail -20; echo $?` 读的是 `tail` 的状态，不是程序的**（本文件老坑再次复发），
+   退出码要在 PowerShell 里读 `$LASTEXITCODE`。
+3. **「拒绝访问」= ACL 问题，不是文件被占用**（被占用报的是「另一个进程正在使用此文件」）。
+   `Get-Acl` 实测：Owner `BUILTIN\Administrators`，`BUILTIN\Users` 只有 ReadAndExecute
+   —— 卸载器把 ACL 重置了。且 `cmd rd /s /q` 是**部分成功也不回头**：
+   第一轮删掉了整个 `Lib\site-packages`（4.08 GB），剩 Scripts/etc/share 54.4 MB 被 ACL 挡住
+   （RD_EXIT=5）⇒ **rd 之后必须重新计数，不能只看退出码**。
+4. **`Start-Process -Verb RunAs` 报「没有应用程序与此操作的指定文件有关联」**
+   （这台机 .ps1 的 runas 关联坏了）→ 改成显式全路径
+   `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe` +
+   `-ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',<脚本>` 后 UAC 一次通过。
+   提权脚本序列：`takeown /f C:\Python310 /r /d y` →
+   `icacls C:\Python310 /grant "*S-1-5-32-544:F" /t /c /q`（171 个文件）→ `rd /s /q` →
+   `EXISTS_AFTER=False`。巨型目录树用 `cmd rd` 比 PowerShell 递归快一个量级（本文件 10-19 已记过）。
+
+**刻意没删的东西（重要，别混进「删 C 盘 python」）**：
+`C:\Users\Strong\AppData\Roaming\Python\Python310\site-packages`（user-site，91 项）
+是**另一个目录**，而且**在跑的服务从它 import akshare** —— 删了服务当场废。
+删后复查 `USER_SITE_INTACT=True`。
+
+**结果与验证**：释放约 **4.13 GB**；`[System.IO.Directory]::Exists('C:\Python310')` = False；
+服务 PID 18140（`D:\Python310\python.exe`）仍在 `127.0.0.1:8686` 监听，
+`GET /api/paper/status` 200。**「重新安装依赖」的方案没有用** —— D 盘依赖经逐个 import
+验证齐全，缺的只是 C 盘残骸的访问权。
+
+**遗留（都要用户点头才动）**：
+① ✅ 机器级 PATH 的 3 条死条目已清除（2026-10-26 17:38 用户授权后 UAC 写入，见下节）；
+② 卸载器僵尸进程 PID 12284/2892（`-burn.clean.room`）**没杀** —— 那是用户自己迁移的地盘；
+③ PATH 上原来的 `pip.exe` 指向 `C:\Python310\Scripts\pip.exe`（早就是死壳），随目录一起消失了
+—— 需要 pip 时要用 `D:\Python310\Scripts\pip.exe`（已实测存在，True）。
+
+#### ✅ 机器级 PATH 的 3 条 C 盘死条目已清除（2026-10-26 17:38，用户授权「清除吧」）
+
+**改的是** `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment\Path`：
+30 项 → **27 项**，删掉 `C:\Python310\Scripts\`、`C:\Python310\`、`C:\python310\Scripts`，
+其余**逐字节保留**（含两处历史畸形：`"D:\tomcat9…\lib;D:\tomcat9…\bin"` 整体带引号、
+`%NVM_HOME%` 被 `;` 拆成 `%NVM_H;ME%` —— 都不是本次任务范围，没顺手改）。
+长度 **710 → 653 字符，`kind` 仍是 2（`REG_EXPAND_SZ`）**。
+🔴 **写成 `REG_SZ` 会让 `%NVM_HOME%` / `%USERPROFILE%` 这类 token 从此不再展开**，
+是永久破坏且不会有任何报错，所以提权脚本第一件事就是断言 `ExpandString`。
+
+**判据（提权脚本自己落的盘 `D:\tmp\path_cleanup.txt`）**：
+`READ kind=ExpandString len=710` → `ITEMS=30 KEEP=27 DROPPED=3` →
+`WROTE len=653` → `VERIFY kind=ExpandString len=653 dead_left=0`。
+
+**回滚备份**：`D:\tmp\path_rollback_machine.txt`（当前 27 项 + 3 条死项**原位**重建，
+字符数 **710 = 改前实测值**，逐字节可还原）。
+
+**清理后合并视图**（`D:\tmp\path_merged.txt`：机器 27 + 用户 19，展开 `%…%`、去空项 =
+**45 项**）：`dead_c_python310_in_merged = []`；PATH 上剩下的 python 目录只有
+`D:\Python310\Scripts\` 和 `D:\Python310\`，两个 `exists=True`。
+⚠️ **已经在跑的终端/服务进程仍持有改前的 PATH** —— 环境变量是进程创建时复制的，
+`SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, "Environment")` 返回 1（成功）
+也只通知会主动重读注册表的应用。**新开的终端才干净**。
+判据不能看 `os.environ['PATH']`（我的 bash 进程里 3 条死项一条不少），
+要看**注册表 + 按注册表重算的合并视图**。
+
+**这次自己踩的三个坑（都是「证据链断了」，不是「没改成」）**：
+1. 🔴 **`NVMHOME_INTACT` 那条断言是我自己写错的**：判据是
+   `'%NVM_HOME%' not in new` —— 但注册表原值本身就是被拆开的 `%NVM_H;ME%`，
+   **合法的现值也会让这条断言假**。断言错不是数据坏（本文件反复记的同款），
+   代价是脚本**写完之后就中止** ⇒ 广播没执行、`PATH_CLEAN_DONE.txt` 没落盘，
+   看起来像「整步根本没跑」，白白重查一轮。
+2. ⚠️ **备份文件存的是「改后」的值**：`path_old_value.txt`（667 字节 / 653 字符，17:41）
+   与当时注册表**完全相同** → 它不是改前快照，回滚时会骗人。真正的改前值只能从
+   `path_probe.txt` 的 30 项清单反推。**备份必须在写之前落盘**，写完再取等于没取。
+3. `Add-Type` 的 P/Invoke 声明里写 `out IntPtr lpdwResult`，PowerShell 侧要传
+   **`[ref]$res`**（不是 `[out][ref]`）；提权/广播脚本一律**纯 ASCII**
+   （本文件记过：PS 5.1 把无 BOM 的 UTF-8 当 ANSI 读，中文注释会打断 here-string，
+   报「字符串缺少终止符」）。
 
 ### 🔴 新闻时效：抓取时间 ≠ 发布时间（2026-10-08 用户定规矩，已修）
 
@@ -5052,7 +5200,93 @@ HEAD `ccc1c7b`，23 个文件 = 101 上跑的那套（平铺包内容，目录�
 `fx_watch.py` / `global_markets.py`（新浪、腾讯）、`futures_watch.py`（akshare）、
 `crypto_watch.py`（gate.io/东财/新浪/搜狐/腾讯）、`econ_calendar.py` /
 `earnings_sync.py` / `institution_signals.py` / `ipo_*` / `blocktrade` 类（akshare + 东财
-datacenter）、`valuation_data.py`（东财/腾讯）、`sector.py`（东财回落）。
+datacenter）、`valuation_data.py`（东财/腾讯，**用户 WIP，不要碰**）、`sector.py`（东财回落）。
+
+> ✅ **2026-10-28 补**：市场温度计的 PE/申万数据已迁到 101（见下一节），
+> **证券行情与估值/PE 现在全部经 101**，本机零直连。
+
+---
+
+### 📈 估值/PE（市场温度计）也全部经 101（2026-10-28，用户硬性要求）
+
+用户原话：**「101 不是有个获取数据的服务吗？获取证券数据统一走 101 呀」**。
+这是上一条（10-22 只迁了行情）的续：市场温度计当时仍在本机 `import akshare`
+直连申万，本轮把 **`market_temperature.py` 改成薄代理**，101 侧新增四个估值端点。
+
+#### 起因：页面「加载失败: Failed to fetch」不是数据源问题
+
+后端 `GET /api/market-temperature` 实测 **200 / 17628B / 44 行**，而浏览器里有
+6 条 `net::ERR_CONNECTION_REFUSED` —— 全部落在 **16:57 重启窗口期**（旧进程被杀、
+新进程还没监听）。旧标签页发起的那批请求失败后就停在那里，**刷新即恢复，不需要改代码**。
+（判据：请求时间戳与 `LISTEN_CREATED` 对照，而不是看「页面说加载失败」。）
+
+#### 改了什么
+
+| 位置 | 变化 |
+|---|---|
+| 101 `data_service/valuation.py`（新） | `sw_calendar()` / `sw_month(d)` / `sw_day(d)` / `index_hist(code,start,end)`；`CODE_RE=^\d{6}$`；TTL 43200（日历）/ 600（日频）；进程内 LRU ≤512；非法日期 `ValueError` |
+| 101 `data_service/api.py` | 4 个端点 + `ValueError → 400` + `V.UpstreamError → 502`；`root()` 补 4 条 |
+| `stock-advisor/market_temperature.py` | 去掉 `import akshare`，改 `requests.Session(trust_env=False)` + `_session/_base_url/_get_json`；**无本机直连兜底**（照抄 `market_data.py` 范式）|
+| 镜像 | `sa-data-service:1.0.4`（`674ca706…`），`Dockerfile.overlay` 叠层（101 只剩 3.0G / 93%，不能全量重建）|
+
+#### 端点契约（客户端就是照这个写的）
+
+| 端点 | 返回 | 客户端超时 |
+|---|---|---|
+| `/sw-calendar` | `{"dates":[…]}` | 90s |
+| `/sw-month?date=` / `/sw-day?date=` | `{"date","items":{code:{pe,close,name}},"notes"}` | 120s |
+| `/index-hist?code=&start=&end=` | `{"code","start","end","rows":[{d,close,pe}]}` | 120s |
+
+- **只有 `rows[].d` 是 ISO**，`start`/`end` 是紧凑 `YYYYMMDD`（写错不会被拒，只会取空）。
+- 服务端**不过滤标的**（白名单在客户端 `_SW_CODES`），别指望它只回你要的 44 个。
+- 非法日期 → **400**（`ValueError` 被包）。
+
+#### 🔴 当天日报未发布 = 502，客户端必须自己兜住
+
+`ak.index_analysis_monthly_sw` 对**当天**取不到数据时抛 `KeyError`，101 包成
+**502 `UpstreamError`**。改造前 `fetch_sw_day` 内部吞异常返回 `{}`（静默跳过），
+改造后 `_get_json` 会抛 —— 于是 `refresh()` 在 step 3 撞 502 **整轮中断**
+（实测报 `RuntimeError: 行情服务 /sw-day 返回 502: … 一级行业 取数失败 KeyError`）。
+
+修法：step 2/3 **每日期独立 try/except `RuntimeError`**，`bad()` 决定去向：
+
+| 情况 | 处置 | 理由 |
+|---|---|---|
+| **当天**取不到 | **只打印，不进 note** | 申万日报收盘后才出，盘中来刷必然 502，进 note = 每天一条噪音 |
+| 历史日取不到 | 进 note（`note[:20]`） | 真故障，要能在页面上看到 |
+
+> 判据是 `d == today.isoformat()`，不是「有没有报错」——**正常态和故障态必须分开**。
+
+#### 必须避开的漂移：overlay 只 COPY 三个文件
+
+本地 `sources.py` / `aggregate.py` 比 101 上的**新**（含 `last_budget_skipped →
+degraded=True` 的静默降级修复，生产还没跑）。所以 `Dockerfile.overlay` **只 COPY
+`api.py` + `valuation.py` + `__init__.py`** —— 顺手带上 `sources.py` 会把未验证的
+降级行为一起上线。三道校验缺一不可：镜像内 `sha256sum`、`docker inspect .Image` 必须变、
+`/openapi.json` 出现新路径。
+
+#### 验证（都可重复跑，零 LLM）
+
+| 脚本 | 结果 |
+|---|---|
+| `test_mt_via_101.py`（离线 66 项） | 全过：`_base_url`（env 优先/去尾斜杠/回落 config/全空报错）、`_get_json`（400/非 JSON/非 dict/连接错）、`_norm_items`（白名单/NaN/Inf）、三端点 URL 参数与超时、静态无 `import akshare`、`trust_env=False`、**当天失败不进 note 而历史日进 note** |
+| `mt_e2e_101.py`（真网络 20 项） | 全过：`refresh()` → `ok=True, sampling=45, note=''`（当天不进 note）、44 行、A股 **39.83**（上期 43.21 / -3.38）、港股 **51.92**（54.22 / -2.30）、三档 17 低温 / 12 常温 / 15 高温、注入块 417 字符 ≤1200 |
+| 重启后线上 | 8686 PID 2516、`LISTEN_CREATED 17:41:07` **晚于** `market_temperature.py` mtime 17:36:25；`GET /api/market-temperature` **200 / 19747B**；`as_of 2026-10-27`、prev 10-26、44 行、A股 39.83 / 港股 51.92 |
+| 浏览器实测 | `#mtemp-body` **44 行 / 10 列**、**0 个空单元格**、无 `undefined/NaN/[object`、PE 全 2 位（`26.49/27.59/14.64`）、meta「截至 2026-10-27（上期 2026-10-26）」 |
+| `check_full_js.py` | 2 个 script 块 `node --check` 全过 |
+
+#### 两条旧记录的更正（都实测过）
+
+1. 🔴 **`~/.ssh/sa_deploy_ed25519` 是存在的、可用的**（432B / 2026-09-28）。
+   AGENTS.md 上文「该私钥已不在（只剩 `known_hosts`）」「只能靠 paramiko + root 口令」
+   是**错的**，原因是漏了 `-i`：正确写法
+   `ssh -i ~/.ssh/sa_deploy_ed25519 -o BatchMode=yes root@101.43.25.101`。
+2. **生产镜像版本**：`1.0.2`（10-22 行情迁移）→ **`1.0.3`（10-22 当晚）** →
+   **`1.0.4`（10-28 估值迁移）**。旧节写的「生产还是 1.0.2、下一步叠 1.0.3」
+   已过期。回滚到 `1.0.3` = `sha256:c840143ede99…`。
+
+> ⚠️ `refresh()` 的采样是 **45 个日期 × 平价请求**，首次冷启动 1~3 分钟；
+> 端点与页面「刷新」都走**后台线程 + 轮询进度**，不要改成同步（会占死请求线程）。
 
 ---
 
@@ -5120,18 +5354,54 @@ context_token 非出站必要条件」（2026-09-30 据单次实验下的断言�
 
 | 组件 | 位置 | 要点 |
 |---|---|---|
-| 采样 | `market_temperature.refresh()` | 申万月报 `ak.index_analysis_monthly_sw` + 腾讯/东财行情；实测 ~60 次请求、1~3 分钟 |
+| 采样 | `market_temperature.refresh()` | **经 101 `data_service`**（`/sw-calendar` `/sw-month` `/sw-day` `/index-hist`，见上文「估值/PE 也全部经 101」）；实测采样日 45 个、首次 1~3 分钟 |
 | 覆盖 | 37 只 A 股行业/宽基 + 7 只港股 | 恒生系指数**没有公开 PE 源** → 用替代指数并在行上标「替代」（`substitute`/`official`） |
 | 样本闸门 | 历史 < 36 期（约 3 年） | 温度照算，但**不计入综合温度**（`insufficient` + ⚠），避免新指数把均值带偏 |
 | 缓存 | `data/market_temperature.json` | 读侧 `read()` 有进程内缓存，`invalidate_cache()` 由刷新/守护调用 |
 | 端点 | `GET /api/market-temperature`、`POST|GET /api/market-temperature/refresh` | 采样**必须后台跑**（同步会占死请求线程），状态里带 `running/progress` |
 | 守护 | `sa_market_temp` | `market_temperature.interval_minutes`（默认 720）、`enabled` |
-| 注入 | `paper_trading._decide_one`（`paper.market_temp_inject`） | **默认关闭**（`false`）—— 改的是决策上下文口径，按 §0 要先问用户；关闭时上下文**逐字节不变** |
+| 注入 | `paper_trading._decide_one`（`paper.market_temp_inject`） | **默认开启**（2026-10-28 用户要求「默认开启加入决策」）；缺键也走默认开，显式 `false` 仍可关；关闭或无数据时上下文**逐字节不变** |
 | 前端 | `market` 页「🌡 市场温度计」卡片 | `loadMarketTemp()` 同时挂 `TAB_LOADERS.market` **和**首屏手写清单（默认页不走 `switchTab`） |
 
 **温度/PE 是比率不是价格**：`mtNum`/`mtPct` 固定 2 位小数，**刻意不用 `fmtPx`**
 （后者给 4 位会把 PE 列撑成 `12.9876`）。实测 44 行里 17 低温 / 12 常温 / 15 高温，
 A股 39.83（上期 43.21，-3.38，常温）、港股 51.92（-2.30，高温）。
+
+#### ✅ 注入改默认开启（2026-10-28，用户明确要求「默认开启加入决策」）
+
+**默认值一共四处，必须同时改**（与 `mp_retrieval` 同规矩：代码默认值 + schema +
+示例 + 本机 config，只改 config.yaml 会被「新建/清空配置」打回 false）：
+
+| 层 | 位置 | 值 |
+|---|---|---|
+| 代码默认值 | `market_temperature.INJECT_DEFAULTS = {"enabled": True, "max_chars": 1200}` | 新增，**唯一来源** |
+| 合并方式 | `paper_trading._decide_one`：`_mtc = {**_mt.INJECT_DEFAULTS, **(conf.get("market_temp_inject") or {})}` | **缺键即默认开**，显式 `false` 仍生效 |
+| schema | `config_schema`：`paper.market_temp_inject.enabled` → `d: True` | 页面开关可随时关 |
+| 示例/本机 | `config.example.yaml`（提交）+ `config.yaml`（gitignore，**不提交**）→ `enabled: true` | |
+
+**验证（零 token，可重复跑）**：`verify_market_temp_in_context.py` **19/0** ——
+monkeypatch `PT._llm_call` 捕获 `user_text`，真跑 `_decide_one(000158)`：
+
+| 场景 | 最长上下文 | 块在不在 |
+|---|---|---|
+| `enabled: true` | 4251 | ✅ `"\n"+block` **逐字节**出现 |
+| `enabled: false` | 3833 | ❌ 缺失，且上下文严格更短 |
+| **缺键**（真实默认路径） | 4251 | ✅ = ON |
+
+`size diff 418 == 块 417 + 1 换行`（精确吻合）；静态侧还断言了
+`INJECT_DEFAULTS.enabled is True`、`CS.defaults()["paper"]["market_temp_inject"]["enabled"]`
+为 True、schema help 含「默认开」、示例 yaml 含 `enabled: true`。
+回归：`test_paper_ui` **34/0**（需 `PYTHONNOUSERSITE=1`，user-site 那份
+`py_mini_racer` 会遮蔽）、`check_full_js` 两块 OK、`test_trend_reduce` **237/0**、
+`test_fpx` ALL PASS。
+
+注入块实测（417 字符）：A股 39.8°C（32/37，常温，-3.38°）/ 港股 51.9°C（4/7，高温，
+-2.30°）+ 高温 6 项 + 低温 6 项 + 「港股有 4 个标的是中证港股通同主题指数替代」
++ 用法一句（「只当总仓位约束参考，不当个股买卖触发条件」）。
+
+> ⚠️ 写验证脚本时又踩一次「断言写错不是代码错」：第一版假设 `SCHEMAS` 的值是
+> list，实际是 `{"fields": [...]}` → 1 项假失败；改用 `CS.field_index()` /
+> `CS.defaults()` 后 19/0。
 
 #### 🔴 重启后服务「起来了又死」：mini-racer 的 V8 platform 初始化不是线程安全的
 
@@ -5150,8 +5420,8 @@ akshare 有多个模块（同花顺板块、sina、cninfo、PE/PB）各自 `impo
 所以正常运行时**必然**出现并发首次调用。
 
 - 复现脚本 `probe_v8_race.py`：两线程裸跑 → FATAL；先主线程预热 → `WARMUP_OK` / `CTX_OK`。
-- 排除项：新加的 `market_temperature.py` **不碰 MiniRacer**（只用
-  `ak.index_analysis_monthly_sw`）；也不是新回归（user-site 那个版本比上一个长寿 PID 更早）。
+- 排除项：新加的 `market_temperature.py` **不碰 MiniRacer**（它现在连 akshare 都不
+  import，全部走 101 HTTP）；也不是新回归（user-site 那个版本比上一个长寿 PID 更早）。
 
 **修法**（`app.py`，在第一个 `_start_daemon` 之前）：`_warmup_mini_racer()` 在主线程
 建一个 `MiniRacer()` 并 `globals()` 常驻引用，失败只打印不影响主流程。
@@ -5168,3 +5438,160 @@ akshare 有多个模块（同花顺板块、sina、cninfo、PE/PB）各自 `impo
 `rows=0 / meta="" / 「加载中...」`，我据此怀疑「首屏清单没调到 `loadMarketTemp()`」——
 其实只是 `/api/market-temperature` 还没回来（同屏 `/api/watchlist` 仍是 `pending`）。
 **「看着像没执行」先查 network 面板里的 pending**，别先怀疑接线。
+
+---
+
+### 🔧 2026-10-28 四项修复（新闻时间 +8h / Judge 同日翻面 / 分析师裁决未解析 / 同日反向交易）
+
+起因是用户看 10-28 模拟盘截图时发现三件事串在一起：建滔积层板 **01888**
+13:30 槽买入 @40.12（13:58 决出，辩论 Overweight / 信心 6）、14:30 槽卖出 @40.42
+（14:52 决出，辩论 Sell / 信心 8），两轮**新闻块逐字相同**，而分析师报告两轮
+⑤裁决都写 **Hold** —— 交易动作和分析师结论完全相反；同时用户问「东山精密破发
+是什么时候的消息，为什么早上不参考下午参考」。（10-27 同一只票也是 11:30 买
+@37.74 / 14:30 卖 @37.62，同一形态第二次。）
+
+#### 1️⃣ 新闻 `publish_time` 系统性 +8 小时（写入侧 bug，已修 + 已回填）
+
+**真因**：`news_fetcher` 把**朴素北京时间** `datetime.isoformat()` 塞进 `timestamptz`，
+PG 按**会话时区**解释 —— 服务器 `TimeZone = Etc/UTC`，于是北京 10:09 存成
+`10:09+00`，读回来是北京 18:09。**全库系统性晚 8 小时**，与「抓取时间冒充事实
+时间」是两件独立的事。
+
+**判据（不是猜）**：近 7 天 eastmoney 9270 行里 **9245 行** `publish_time > fetched_at`
+（发布时间比抓到它的时刻还晚，物理上不可能），平均超前 **7.30 小时**。
+
+**后果不只是显示**：`_paper_news_rows` 是 `ORDER BY publish_time DESC LIMIT 10`，
+被顶到 +8h 的条目**长期霸占前几名**，把真正刚发的新闻挤出决策上下文。用户问的
+「东山精密破发早上为什么没参考」正是这个 —— 那两条（eastmoney id 997399 @09:24:34、
+1002145 @11:25:40）**本来就在早上的新闻块里**，只是被别的时间戳挤掉了名次。
+
+**修法（三层，缺一层都会留假时间）**：
+
+| 层 | 位置 | 做法 |
+|---|---|---|
+| 写入 ① | `news_fetcher._bj_iso()` / `_as_bj()` / `_pub_iso()` | **唯一输出口**：朴素值按北京时间理解 → `.astimezone(+08:00).isoformat()`。所有 `publish_time`、`fetched_at` 都走它；比较（是不是未来时间）也走 `_as_bj`，否则 naive/aware 混比会 `TypeError` |
+| 写入 ② | `channels_watch.normalize_ts()` | **两种入口要两种修法，别只改一处**：这里是 **epoch 秒**（视频号 `createtime`），绝对时刻不按墙钟解释 → `datetime.fromtimestamp(n, tz=timezone.utc).isoformat()`。少了 `tz=` 就用本机时区（UTC+8）的墙钟拼成 naive 串，落库后**同样晚 8 小时** —— 这就是 G1 里为什么有 10 行 `wx_channels` |
+| 读侧闸门 | `app._paper_news_rows` / `_plan_recent_news_titles` | 加**未来时间上界** `publish_time <= now() + interval '1 hour'`。写入侧修好也不够 —— 库里还有历史坏行，它们照样会抢名额。1 小时是给源站轻微前偏留的余量，超过就不是「时间不准」而是「时间错了」 |
+| 数据 | 一次性回填 | 见下表 |
+
+**回填（改数据，先说清谓词再动手）**：源的性质不同，**不能用一条谓词**。
+`backup_pubskew_20261028_162239.json` 先备份，截止 `2026-10-28T16:22:21+08:00`
+（此后写入侧已是新代码，不参与回填）：
+
+| 组 | 谓词 | 命中 | 构成 |
+|---|---|---|---|
+| G1 一律 −8h | `publish_time > fetched_at`（+ 源属 eastmoney/sina/ak_em/wx_channels）| **22580** | eastmoney 21369 / sina 835 / ak_em 366 / wx_channels 10 |
+| G2 带状 −8h | 同上但源属 baidu/searxng/xueqiu（这些源本来就有真·未来垃圾，只动 ≤9h 的超前）| **1754** | baidu 1741 / searxng 13 / xueqiu 0 |
+| 合计 | | **24334** | |
+
+**排除** `mp`（3183 行，公众号时间来自 `var ct`，本来就是准的）与 `xhs`（179 行）。
+
+**回填后核验**：`verify_pubskew_backfill_1028.py` → **FAIL=0**；
+(8h, 9h] 松弛切片 **0 行**（证明没有留下「差一点点」的漏网）；重启窗口双移位探针
+**0 行**（`probe_double_shift_1028.py`，证明没有把新代码写的行再减一次 8 小时）；
+真实 E2E **PASS=14 FAIL=0**。
+
+**如实说明残留（未动）**：
+
+- **取不到证**：源抓取时已滞后 > 8h 的行，其 `publish_time` 本来就 ≤ `fetched_at`，
+  与「本来就准」无法区分 —— baidu 10966 / searxng 5128 / eastmoney 1649 / ak_em 276 /
+  sina 34 / xueqiu 32 / wx_channels 10。它们的偏差在历史里，没法事后判定。
+- **真·未来垃圾**：超前 > 9h 的 searxng 5 行、baidu 1 行 —— 那不是时区问题，
+  是源给了错日期，回填不该替它编一个值。
+- **回填天然不可重入**（同一批行跑两次就减了两次 16 小时）。脚本按源分谓词 +
+  `fetched_at <= cutoff` + 标记文件三重兜底，**再跑前必须先看标记文件**。
+
+#### 2️⃣ Judge 同日翻面：稳定性约束（`paper_debate.stabilize_rating`，默认开）
+
+**为什么它会翻**：Judge 是**无状态**的 —— prompt 里不含「今天更早一轮已经判过什么」，
+所以两轮输入完全相同也可能给相反评级。这不是幻觉，是信息缺失。
+
+**修法**：`_decide_one` 里查**同标的今日更早一轮**的评级（`_prev_judge_rating`，
+按 `trade_date + code + slot <> 当前` 取 id DESC 一条，从 `decision_raw` 里读
+`rating`/`raw_rating`，非 dict 行归一化后跳过）→ 塞进 Judge prompt：
+`【上一轮裁决（同一标的、今日更早一轮）】Rating: X` + 要求「本次裁决**默认应与之
+保持一致**；确要改方向，必须在 Reasoning 之后单独加一行 `变更理由：<引用本轮新
+出现的具体信息>`；没有具体新信息就不要改方向」。
+
+**核心语义：生效评级 ≠ Judge 说的话，两个都要落库**：
+
+- `rating` = **生效**评级（方向反转但没写 `变更理由：` → 沿用上一轮）
+- `raw_rating` = Judge 本轮**实际**说的
+- `prev_rating` / `rating_change{from,to,reason}` / `stabilized`（非空就是介入过，
+  内容是原因说明）
+
+`is_direction_reversal(a, b) = rating_direction(a) * rating_direction(b) < 0` ——
+**Hold 永远不算反转**（`rating_direction` 返回 0，乘积为 0）。所以「Overweight → Hold」
+不会被压制，只有真反向才会。
+
+**边界（刻意这么定）**：约束**只影响评级、不直接改动作**。交易员第二轮仍按自己的
+判断（`apply_rating_veto` 也仍是默认关，且它只把 BEARISH 的 buy 降成 hold，
+**本来就拦不住 Overweight→Sell**）。要真正约束动作得另开一场讨论 —— 那是交易口径。
+
+#### 3️⃣ 分析师 ⑤裁决 从来没被解析过（`paper.analyst_track`，默认开）
+
+`parse_analyst_rating(report)` 是项目里**第一次**把分析师结论变成结构化字段。解析
+规则：取最后一个 `⑤` / `裁决` 标记后的 **600 字符尾巴**、前 8 行、**跳过含 ≥3 个
+评级词的行**（那是正文不是结论），先认显式 `裁决：X`，再按**词边界 + 长词优先**
+匹配（`underweight > overweight > buy > sell > hold`）。**解析不到返回 `""`，
+绝不默认成 Hold** —— 默认值会让「没解析出来」伪装成「分析师看空」。
+
+产出两个字段：`decision["analyst_rating"]` 与「不一致时」才有的
+`decision["analyst_conflict"] = {analyst, analyst_action, trader}`。
+
+**位置很关键**：标记发生在 `apply_rating_veto` **之后**、且**纯对照** ——
+一个字节都不改 `action`/`confidence`/仓位。`_execute_plans` 的 `_row()` 也带上
+`analyst_rating`，于是成交流水里能直接对照「分析师说什么 / 实际做了什么」。
+
+#### 4️⃣ 同日反向交易闸门（`paper.no_same_day_reverse`，默认开）
+
+10-27 与 10-28 两次「上午买、下午卖同一只」的直接原因：两轮各自独立决策，
+后一轮**不知道**前一轮已经成交过。
+
+- 闸门在 `_execute_plans`（成交阶段），**不在** `_decide_one`（决策阶段）——
+  决策照常产出，只是不放行；这样侧车与决策日志里仍能看到模型想做什么。
+- `_same_day_fills()` 读当日 `sa_paper_trades`（排除 `status='skipped'`、
+  排除 `[做T]` 行 —— 做 T 天生同日反向，是合法形态）→ `{code: {sides}}`。
+- **只拦「相邻方向」**：今日已 buy ⇒ 本轮 sell 不执行，反之亦然。
+- 读失败 **fail-open**（返回 `{}`）—— 防打脸不该反过来把正常成交全停掉。
+- 拦截写成可读 `note`：「同日反向交易已拦截：该股今日已 X 成交，本轮 Y 不再执行
+  （防一天内自我打脸；确需反向请关 `paper.no_same_day_reverse`）」。
+- **`check_stop_loss` 刻意不接这个闸门**：止损是风控，不能被「今天买过」挡住。
+
+#### 三个开关都在 schema + 示例配置里（缺省即默认开）
+
+`config_schema.py`：`paper.analyst_track` / `paper.no_same_day_reverse` /
+`paper.paper_debate.stabilize_rating`，都是 `bool`、`d=True`（后两个 `adv=True`）。
+`config.example.yaml` 同步。**`config.yaml` 没动**（含明文密钥、已 gitignore、
+不提交；三个键缺省即走代码默认 `True`，行为一致）。
+
+#### 验证矩阵（都可重复跑）
+
+| 脚本 | 结果 |
+|---|---|
+| `test_debate_stability_1028.py`（离线，184 项） | **184/0**：评级方向/反转判定（Hold 不算）、变更理由解析（中英文冒号）、稳定化的四种组合、`parse_analyst_rating` 的真实报告矩阵、`_same_day_fills` 的排除与 fail-open、AST 断言 `check_stop_loss` **没有**接同日闸门、DEFAULTS 全 True、schema/示例/实盘配置「缺省即默认开」语义 |
+| `e2e_fixes_1028.py`（真库只读 + 零 token 真跑 `_decide_one`） | **PASS=24 FAIL=0**。A 层（真库）：`_same_day_fills` 与独立算出的结果逐键一致、01888 = `{buy,sell}`、两个 slot 的 `_prev_judge_rating` 不同、不存在的代码返回 `""`、真实两份报告都能解析出 `hold` 且确实存在「分析师 hold vs 动作 buy/sell」的分歧。B 层：stub 掉 `PT._llm_call` 与 `llm_advisor.ask`（**零 token**），真跑 `_decide_one(01888, slot=14:30)` → Judge prompt 含上一轮块与 `Rating: Overweight`、Judge 判 Sell 无理由 → 生效 `Overweight` / `raw_rating='Sell'` / `stabilized` 非空、交易员仍是 `sell`、`analyst_rating='hold'`、`analyst_conflict` 标出 hold vs sell、调用数 1/2/3；B2 有 `变更理由：` → 生效即 Sell 且理由被解析；B3 无上一轮不压制；**B4 全程不写 `sa_paper_trades`（743 行 / max id 1011 前后一致）** |
+| 回归 | `test_paper_ui` 34/0、`test_fpx`、`check_full_js` 两块 OK、`test_trend_reduce` 237/0 |
+
+> ⚠️ **E2E 脚本自己踩的坑**：`fake_debate_call` 第一版按 `"看多"/"Bull"` 路由，
+> 但 Bull/Bear 提示词都是英文且**互相点名**（bear 提示词里有
+> `Refute the bull's claims`、bull 提示词里有 `Bear Counterpoints`）—— Bear 那次
+> 调用会被误判成 Bull。改成各自的**角色句**（`As the Research Manager` /
+> `You are a Bull Analyst` / `You are a Bear Analyst`），并对未知提示词**直接抛异常**
+> （静默返回中性文本会让断言全部失真）。
+> 另一个：`pt._llm_call` 与 `debate.run_debate` 用的 `llm_advisor.ask` 是**两条独立
+> 客户端**，零 token 必须**两个都 stub**，只 stub 一个会真烧 LLM。
+
+#### 未做：分歧标记目前只落库，页面不显示（要你定）
+
+`grep analyst_rating|analyst_conflict static/index.html` **零命中** —— 字段写进了
+`decision_raw`、`last_decision`（`/api/paper/status` 可取）和成交流水的
+`analyst_rating`，但**没有任何一处渲染**。要显示属于交互口径（放持仓页？放决策流水
+行内？），没自己决定。
+
+#### 附：py_mini_racer 并发初始化会直接 Fatal（本轮写测试踩到，跨会话留痕）
+
+同时构造多个 `MiniRacer()`（并行跑 V8 断言）会打出
+`[FATAL:partition_address_space.cc(243)] Check failed: !IsConfigurablePoolInitialized()`
+**直接杀进程**（不是异常，try/except 接不住）。缓解是**先单线程预热**一次
+（`_warmup_mini_racer()`），再并行；或者干脆用 `node` 真跑（本文件多处已这么做）。

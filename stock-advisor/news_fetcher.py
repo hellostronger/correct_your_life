@@ -31,7 +31,7 @@ import re
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
@@ -427,8 +427,74 @@ def _norm(code: str, title: str, url: str, source: str,
         "url": url,
         "source": source,
         "media": media or SOURCE_LABEL.get(source, source),
-        "publish_time": publish_time,   # ISO 字符串或 None
+        "publish_time": publish_time,   # 带 +08:00 偏移的 ISO 字符串或 None
     }
+
+
+# ---------------- 发布时间一律按北京时间 + 带偏移输出（2026-10-28 修） --------
+#
+# 🔴 修的是什么：`sa_news.publish_time` 是 `TIMESTAMPTZ`，而原来这里所有产出
+# 都是**朴素** ISO（`2026-10-28T10:09:00`，北京墙钟但不带偏移）。psycopg2 把
+# 朴素串交给 PG 时，PG 按**会话时区**解释 —— 服务器是 `Etc/UTC`，于是北京
+# 10:09 被存成 `10:09+00`，读出来是北京 18:09：**全库系统性晚 8 小时**。
+# 实测 2026-10-28：近 7 天 eastmoney 9270 行里 9245 行 `publish_time > fetched_at`
+# （时间比抓到它的时刻还晚，物理上不可能），平均超前 7.30 小时。
+#
+# 后果不只是显示难看：`_paper_news_rows` 按 `publish_time DESC LIMIT 10` 取新闻，
+# 被顶到 +8h 的条目会**长期霸占**前几名，把真正刚发的新闻挤出决策上下文。
+#
+# 所以规则只有一条：**本模块产出的 publish_time 必须是带 +08:00 的 aware ISO**。
+# 朴素 datetime 一律按北京时间理解（所有来源给的都是本地墙钟），再带偏移输出。
+
+_BJ_TZ = timezone(timedelta(hours=8))
+
+
+def _bj_now() -> datetime:
+    """当前北京时间（aware）。"""
+    return datetime.now(_BJ_TZ)
+
+
+def _bj_iso(dt: datetime | None) -> str | None:
+    """datetime → 带 +08:00 偏移的 ISO；朴素值按北京时间理解。
+
+    这是本模块**唯一**的发布时间输出口 —— 新代码要产出 publish_time 就走它，
+    别再直接 `.isoformat()`（那就是本轮 +8h bug 的来源）。
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_BJ_TZ)
+    return dt.astimezone(_BJ_TZ).isoformat(timespec="seconds")
+
+
+def _as_bj(dt: datetime | None) -> datetime | None:
+    """解析出的 datetime → aware 北京时间；朴素值按北京时间理解。
+
+    用于**比较**（如「是不是未来时间」）。原来直接拿朴素值跟 `datetime.now()`
+    比，只要一边变成 aware 这个比较就会抛 TypeError —— 所以比较也要走这里。
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=_BJ_TZ)
+    return dt.astimezone(_BJ_TZ)
+
+
+def _pub_iso(v) -> str | None:
+    """任意来源的 publish_time（ISO 串 / datetime / None）→ 带偏移的 ISO 或 None。
+
+    给不走时效闸门、但直接写库的路径用（如 `_save_topic_items`）：
+    解析不了就写 NULL，**绝不把原始串直接塞进 timestamptz** —— 朴素串会被
+    PG 按会话时区（UTC）解释成晚 8 小时，而格式不对的串会让整条 INSERT 报错。
+    """
+    if not v:
+        return None
+    try:
+        dt = (datetime.fromisoformat(v.replace("Z", "+00:00"))
+              if isinstance(v, str) else v)
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return _bj_iso(_as_bj(dt))
 
 
 # ---------------- 相对时间 → 绝对 ISO（百度新闻只给「6小时前」这种） ----------------
@@ -468,17 +534,17 @@ def _cn_relative_to_iso(text: str, now: datetime | None = None) -> str | None:
     """
     if not text:
         return None
-    now = now or datetime.now()
+    now = _as_bj(now) or _bj_now()
     s = re.sub(r"\s+", " ", str(text)).strip()
     # 去掉百度偶尔带的前缀，如「发布于：」
     s = re.sub(r"^发布于[:：]\s*", "", s)
 
     if s in ("刚刚", "刚才", "just now"):
-        return now.isoformat(timespec="seconds")
+        return _bj_iso(now)
     for pat, fn in _REL_PATTERNS:
         m = pat.match(s)
         if m:
-            return fn(m, now).isoformat(timespec="seconds")
+            return _bj_iso(fn(m, now))
 
     m = re.match(r"^(今天|昨天|前天)\s*(\d{1,2}):(\d{2})$", s)
     if m:
@@ -487,7 +553,7 @@ def _cn_relative_to_iso(text: str, now: datetime | None = None) -> str | None:
             hour=int(m.group(2)), minute=int(m.group(3)),
             second=0, microsecond=0)
         # 「今天26:30」不可能，说明是明天或数据有误，宁可不给
-        return None if base > now + timedelta(hours=1) else base.isoformat(timespec="seconds")
+        return None if base > now + timedelta(hours=1) else _bj_iso(base)
 
     m = re.match(r"^(\d{4})年(\d{1,2})月(\d{1,2})日(?:\s*(\d{1,2}):(\d{2}))?$", s)
     if m:
@@ -495,24 +561,24 @@ def _cn_relative_to_iso(text: str, now: datetime | None = None) -> str | None:
         hh = int(m.group(4) or 0)
         mm = int(m.group(5) or 0)
         try:
-            return datetime(y, mo, d, hh, mm).isoformat(timespec="seconds")
+            return _bj_iso(datetime(y, mo, d, hh, mm))
         except ValueError:
             return None
 
     m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})[ T]?(\d{1,2})?:?(\d{2})?:?(\d{2})?$", s)
     if m:
         try:
-            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
-                            int(m.group(4) or 0), int(m.group(5) or 0),
-                            int(m.group(6) or 0)).isoformat(timespec="seconds")
+            return _bj_iso(datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                                    int(m.group(4) or 0), int(m.group(5) or 0),
+                                    int(m.group(6) or 0)))
         except ValueError:
             return None
 
     # 裸 HH:MM（百度结果里出现过），按今天算；跨天的给不出日期就不给
     m = re.match(r"^(\d{1,2}):(\d{2})$", s)
     if m:
-        return now.replace(hour=int(m.group(1)), minute=int(m.group(2)),
-                           second=0, microsecond=0).isoformat(timespec="seconds")
+        return _bj_iso(now.replace(hour=int(m.group(1)), minute=int(m.group(2)),
+                                   second=0, microsecond=0))
     return None
 
 
@@ -565,10 +631,10 @@ def _normalize_pub_dt(raw: str) -> str | None:
     s = str(raw).strip()
     if not s:
         return None
-    # 13 位毫秒时间戳（weibo create_at 之类）
+    # 13 位毫秒时间戳（weibo create_at 之类）—— Unix 时间戳是 UTC，必须显式带 tz
     if s.isdigit() and len(s) == 13:
         try:
-            return datetime.fromtimestamp(int(s) / 1000.0).isoformat(timespec="seconds")
+            return _bj_iso(datetime.fromtimestamp(int(s) / 1000.0, tz=timezone.utc))
         except (ValueError, OSError, OverflowError):
             return None
     # ISO / 常见分隔
@@ -580,7 +646,7 @@ def _normalize_pub_dt(raw: str) -> str | None:
                           int(m.group(4) or 0), int(m.group(5) or 0), int(m.group(6) or 0))
         except ValueError:
             return None
-        return dt.isoformat(timespec="seconds")
+        return _bj_iso(dt)
     # 相对表述（「6小时前」/「发布于：4个月前」）交给已有的中文解析器
     return _cn_relative_to_iso(s)
 
@@ -593,28 +659,39 @@ def extract_publish_time(html: str, *, now: datetime | None = None) -> str | Non
     """
     if not html:
         return None
-    now = now or datetime.now()
+    now = _as_bj(now) or _bj_now()
+
+    def _ok(iso: str | None) -> str | None:
+        """统一的未来时间闸门（2026-10-28 补）。
+
+        原来只有结构化元数据那条路径判未来，正文文本路径（`_PUB_TEXT_RE` /
+        `_PUB_TEXT_LABELED_RE`）**直接返回** —— 站点预发布/时钟错时给出未来的
+        日期，条目会永远留在「近 7 日」窗口里，比没有时间更坏（docstring
+        写的规矩，代码只做到了一条路）。
+        """
+        if not iso:
+            return None
+        try:
+            dt = _as_bj(datetime.fromisoformat(iso))
+        except ValueError:
+            return None
+        return iso if dt <= now + timedelta(days=1) else None
+
     for pat in _PUB_RE:
         m = pat.search(html)
         if not m:
             continue
-        iso = _normalize_pub_dt(m.group(1))
+        iso = _ok(_normalize_pub_dt(m.group(1)))
         if iso:
-            try:
-                dt = datetime.fromisoformat(iso)
-                if dt.replace(tzinfo=None) > now + timedelta(days=1):
-                    continue          # 未来时间，丢弃这个候选，继续找下一个
-            except ValueError:
-                continue
             return iso
     m = _PUB_TEXT_RE.search(html)
     if m:
-        return _normalize_pub_dt(m.group(0))
+        return _ok(_normalize_pub_dt(m.group(0)))
     m = _PUB_TEXT_LABELED_RE.search(html)
     if m:
         # 从**日期本身**开始截，不能传 group(0) —— 那个含「发布时间：」前缀，
         # 而 _normalize_pub_dt 用的是 re.match（锚定开头），带前缀会解析失败。
-        return _normalize_pub_dt(m.group(0)[m.start(1) - m.start(0):])
+        return _ok(_normalize_pub_dt(m.group(0)[m.start(1) - m.start(0):]))
     return None
 
 
@@ -664,13 +741,13 @@ def llm_extract_publish_time(title: str, body: str, conf: dict | None = None) ->
         dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
     except ValueError:
         return None
-    iso = dt.isoformat(timespec="seconds")
+    iso = _bj_iso(dt)
     # 交叉验证：正文里必须真的出现过这个日期，否则是模型编的
     probe = "%d-%02d-%02d" % (dt.year, dt.month, dt.day)
     alt = "%d年%d月%d日" % (dt.year, dt.month, dt.day)
     if probe not in body and alt not in body:
         return None
-    if dt > datetime.now() + timedelta(days=1):
+    if _as_bj(dt) > _bj_now() + timedelta(days=1):
         return None
     return iso
 
@@ -737,7 +814,7 @@ def search_publish_time(title: str, summary: str, *, rounds: int = 3,
                 r.encoding = r.apparent_encoding or r.encoding
                 iso = extract_publish_time(r.text)
                 if iso:
-                    found.append(datetime.fromisoformat(iso).replace(tzinfo=None))
+                    found.append(_as_bj(datetime.fromisoformat(iso)))
             except Exception:                             # noqa: BLE001
                 continue
         if found:
@@ -749,7 +826,7 @@ def search_publish_time(title: str, summary: str, *, rounds: int = 3,
     found.sort()
     if (found[-1] - found[0]).days > span_days:
         return None                # 跨度太大，无法据此断代
-    return found[0].isoformat(timespec="seconds")
+    return _bj_iso(found[0])
 
 
 def resolve_publish_time(url: str, title: str, conf: dict | None = None,
@@ -874,7 +951,7 @@ def fetch_eastmoney(code: str, name: str, limit: int, conf: dict,
                     if art else a.get("url", ""),
                     "eastmoney",
                     a.get("columns") and a["columns"][0].get("name") or "公告",
-                    a.get("notice_date")))
+                    _pub_iso(a.get("notice_date"))))
         except Exception:
             pass    # 结构性缺失，不计健康度（见 docstring）
     _rate_limit("eastmoney", ch_conf.get("min_interval", 1.0))
@@ -894,7 +971,7 @@ def fetch_eastmoney(code: str, name: str, limit: int, conf: dict,
         for art in ((payload.get("result") or {}).get("cmsArticleWebOld") or []):
             items.append(_norm(code, art.get("title", ""), art.get("url", ""),
                                "eastmoney", art.get("mediaName", ""),
-                               art.get("date")))
+                               _pub_iso(art.get("date"))))
         _mark_ok("eastmoney", ms=int((time.time() - t0) * 1000))
     except Exception as exc:
         _mark_fail("eastmoney", f"资讯搜索 {type(exc).__name__}: {exc}",
@@ -1041,7 +1118,7 @@ def fetch_sina(code: str, name: str, limit: int, conf: dict,
                 if not any(kw in title for kw in short_names if kw):
                     continue
                 ts = art.get("ctime") or art.get("intime")
-                publish = (datetime.fromtimestamp(int(ts)).isoformat(timespec="seconds")
+                publish = (_bj_iso(datetime.fromtimestamp(int(ts), tz=timezone.utc))
                            if ts else None)
                 if art.get("url") and title not in {i["title"] for i in items}:
                     items.append(_norm(code, title, art.get("url", ""), "sina",
@@ -1940,7 +2017,7 @@ def save_to_db(items: list[dict], related_map: dict[str, list[str]] | None = Non
     skipped_no_time = 0
     skipped_bad_time = 0
     skipped_too_old = 0
-    now = datetime.now()
+    now = _bj_now()
     max_age_days = 7  # 只保留最近 7 天的新闻，旧新闻对决策没有价值
     # ⚠️ 例外：**股份状态类**（解禁/禁售/锁定期/减持承诺，见 `_is_event_item`）
     # 用更宽的窗口。理由：这类描述的是**当前仍生效的约束**
@@ -1967,12 +2044,18 @@ def save_to_db(items: list[dict], related_map: dict[str, list[str]] | None = Non
             # 「时间解析失败不过滤，宁可保留」，那等于放进来一条时效未知
             # 的新闻，和上面那条 NULL 是一个洞。
             try:
-                pub_dt = (datetime.fromisoformat(pub.replace("Z", "+00:00"))
-                          if isinstance(pub, str) else pub)
-                pub_dt = pub_dt.replace(tzinfo=None)
-            except (ValueError, TypeError):
+                _parsed = (datetime.fromisoformat(pub.replace("Z", "+00:00"))
+                           if isinstance(pub, str) else pub)
+                pub_dt = _as_bj(_parsed)
+                if pub_dt is None:
+                    raise ValueError("empty publish_time")
+            except (ValueError, TypeError, AttributeError):
                 skipped_bad_time += 1
                 continue
+            # ⚠️ 写库一律写**规范化后的带偏移串**，不写调用方原值 ——
+            # 上游任何一个调用方漏了偏移，都会被 PG 按会话时区（UTC）解释成
+            # 「晚 8 小时」，而这里是把关的最后一道（2026-10-28 修）。
+            pub_iso = _bj_iso(pub_dt)
             # 时效闸门按**条目类别**取窗口：普通新闻 7 天，状态类 180 天。
             limit_days = event_max_age_days if it.get("_event") else max_age_days
             if (now - pub_dt).days > limit_days:
@@ -1987,7 +2070,7 @@ def save_to_db(items: list[dict], related_map: dict[str, list[str]] | None = Non
                 "INSERT INTO sa_news (code, title, url, source, media, publish_time, sentiment) "
                 "VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (url) DO NOTHING",
                 (it["code"], it["title"], it["url"], it["source"], it["media"],
-                 it.get("publish_time"), senti))
+                 pub_iso, senti))
             inserted += cur.rowcount
             if senti == "neg":  # 已存在的旧新闻，利空标记仍要补上
                 cur.execute(
@@ -2114,7 +2197,7 @@ def fetch_watchlist(conf: dict | None = None) -> dict:
         print(f"[news] 主题词阶段失败（不影响本轮个股入库）: {exc}", flush=True)
     finally:
         _prog_finish()
-    return {"fetched_at": datetime.now().isoformat(timespec="seconds"),
+    return {"fetched_at": _bj_iso(_bj_now()),
             "stocks": per_stock, "total_new": total_new,
             "topics": topics, "health": health_snapshot(conf)}
 
@@ -2235,7 +2318,7 @@ def fetch_topics(conf: dict | None = None, *, groups: list[str] | None = None,
     items = list(url_items.values())
     # code 为空的条目：save_to_db 要能处理（sa_news.code 可空）
     new_n = _save_topic_items(items)
-    return {"fetched_at": datetime.now().isoformat(timespec="seconds"),
+    return {"fetched_at": _bj_iso(_bj_now()),
             "groups": per_group_stat, "unique": len(items), "total_new": new_n}
 
 
@@ -2275,7 +2358,7 @@ def _save_topic_items(items: list[dict]) -> int:
                        VALUES (%s,%s,%s,%s,%s,%s, now(), %s, %s)
                        ON CONFLICT (url) DO NOTHING""",
                     (TOPIC_CODE, title, url, source, media,
-                     it.get("publish_time"), senti, it.get("topic") or ""))
+                     _pub_iso(it.get("publish_time")), senti, it.get("topic") or ""))
                 new_n += cur.rowcount or 0
     return new_n
 

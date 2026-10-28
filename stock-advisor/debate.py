@@ -61,10 +61,53 @@ def load_debate_conf(conf: dict) -> dict:
         "risk_critic": True,
         "risk_critic_always": False,
         "enforce_rating": False,
+        # 裁决稳定性：把「同一标的今日更早一轮的评级」喂给 Judge，并要求
+        # 方向反转时必须写明「变更理由：引用本轮新出现的具体信息」。
+        # 默认开 —— 2026-10-28 01888 建滔积层板 13:58 判 Overweight 买入、
+        # 14:52 判 Sell 卖出，两轮新闻块逐条相同，属于无新证据的翻面。
+        "stabilize_rating": True,
     }
     section = conf.get("paper_debate") or {}
     defaults.update({k: v for k, v in section.items() if v is not None})
     return defaults
+
+
+def rating_direction(rating: str) -> int:
+    """评级的方向：+1 看多 / -1 看空 / 0 中性（Hold 或无法识别）。
+
+    只用于判「方向反转」，不参与任何交易动作 —— `enforce_rating` 那套否决
+    逻辑（`apply_rating_veto`）保持独立。
+    """
+    r = str(rating or "").strip()
+    if not r:
+        return 0
+    norm = {x.lower(): x for x in (BEARISH_RATINGS | BULLISH_RATINGS)}
+    canon = norm.get(r.lower(), r)
+    if canon in BULLISH_RATINGS:
+        return 1
+    if canon in BEARISH_RATINGS:
+        return -1
+    return 0
+
+
+def is_direction_reversal(prev_rating: str, cur_rating: str) -> bool:
+    """两轮评级是否发生**方向反转**（看多 ↔ 看空）。
+
+    Hold 与任何评级都不算反转：「Overweight → Hold」是转谨慎，不是翻面。
+    2026-10-28 的坏样本正是 Overweight → Sell（+1 → -1）。
+    """
+    a, b = rating_direction(prev_rating), rating_direction(cur_rating)
+    return a * b < 0
+
+
+def parse_judge_change(text: str) -> str:
+    """从 Judge 输出里取 `变更理由：…` 那一行的内容；没有则返回 ""。"""
+    if not text:
+        return ""
+    m = re.search(r"变更理由\s*[:：]\s*(.+)", text)
+    if not m:
+        return ""
+    return m.group(1).strip().split("\n")[0].strip()
 
 
 def needs_risk_critic(debate_conf: dict, code: str, name: str) -> bool:
@@ -181,6 +224,8 @@ def run_debate(
     llm_call: Callable[[str, str, int], str] | None = None,
     risk_critic_check: bool = False,
     risk_critic_text: str = "",
+    prev_rating: str = "",
+    stabilize: bool = True,
 ) -> dict:
     """运行 Bull/Bear 辩论，返回辩论结果。
 
@@ -193,6 +238,8 @@ def run_debate(
         llm_call: LLM 调用函数，默认用 llm_advisor.ask()
         risk_critic_check: True 时在本函数内跑一次 Risk Critic（+1 次调用）
         risk_critic_text: 已有的风险清单文本（跑过了就别再跑一次）
+        prev_rating: 同一标的**今日更早一轮**的 Judge 评级（"" = 没有）
+        stabilize: True 时，方向反转但 Judge 没写 `变更理由：` → 沿用上一轮评级
 
     Returns:
         {
@@ -203,6 +250,12 @@ def run_debate(
             "judge_decision": str,    # Research Manager 的投资计划
             "rounds": int,            # 实际轮次
             "llm_calls": int,         # LLM 调用次数
+            # —— 裁决稳定性（2026-10-28 新增，均为追加字段）——
+            "rating": str,            # **生效**评级（可能被稳定化沿用上一轮）
+            "raw_rating": str,        # Judge 本轮实际给出的评级
+            "prev_rating": str,       # 传入的上一轮评级（原样回显）
+            "rating_change": dict,    # {"from","to","reason"}；未反转时 reason 为空
+            "stabilized": str,        # 非空 = 本轮评级被沿用上一轮，内容是原因说明
         }
     """
     if llm_call is None:
@@ -323,6 +376,25 @@ Deliver a compelling bear argument grounded in A-share market realities. Refute 
         "并在 Reasoning 里点名是哪一条否决的。\n"
         "「跌停卖不掉」「T+1 无法当日止损」这类结构性缺陷不因股价便宜而被抵消。\n"
         if risk_report else "")
+    # --- 裁决稳定性（2026-10-28）---
+    # Judge 的 prompt 原来是**完全无状态**的：不知道同一只票今天早些时候已经
+    # 判过什么，所以同样的输入也能合理地给出相反结论。实测 01888 建滔积层板
+    # 13:58 Overweight（买入）、14:52 Sell（卖出），两轮新闻块逐条相同。
+    # 这里把上一轮评级摆给 Judge 看，并要求**方向反转必须写明依据**。
+    prev_rating = str(prev_rating or "").strip()
+    stability_block = ""
+    if stabilize and prev_rating:
+        stability_block = (
+            "【上一轮裁决（同一标的、今日更早一轮）】\n"
+            f"Rating: {prev_rating}\n"
+            "本次裁决**默认应与之保持一致**。只有当本轮辩论或上下文里出现了"
+            "**上一轮没有的新信息**（新公告、新新闻、价格结构变化、新出现的"
+            "结构性风险）才允许改变方向。\n"
+            "若你给出的评级与上一轮**方向相反**（看多↔看空），"
+            "必须在 Reasoning 之后单独加一行：\n"
+            "`变更理由：<引用那条本轮新出现的具体信息>`\n"
+            "**没有具体新信息就不要改方向** —— 重复同样的证据却翻转结论，"
+            "对交易员是最有害的输出。\n")
     manager_prompt = f"""As the Research Manager and debate facilitator, critically evaluate this round of debate and deliver a clear, actionable investment plan for the trader.
 
 Stock: {name}（{code}）
@@ -337,7 +409,7 @@ Rating Scale (use exactly one):
 Be decisive — but do not let decisiveness override the structural-risk veto below.
 Reserve Hold ONLY when the evidence is genuinely balanced; a vague "maybe" is not a reason.
 
-{veto_rule}{risk_block}
+{stability_block}{veto_rule}{risk_block}
 Debate History:
 {_compact_history(history)}
 
@@ -352,6 +424,20 @@ Output in Chinese."""
     manager_resp = llm_call(manager_prompt, "")
     llm_calls += 1
 
+    # 生效评级 vs 原始评级：只有「方向反转 + 没写变更理由」才沿用上一轮。
+    # 有理由的反转照常放行 —— 我们拦的是「无新证据的翻面」，不是「改主意」。
+    raw_rating = parse_judge_rating(manager_resp)
+    change_reason = parse_judge_change(manager_resp)
+    eff_rating = raw_rating
+    stabilized = ""
+    if (stabilize and prev_rating and is_direction_reversal(prev_rating, raw_rating)
+            and not change_reason):
+        eff_rating = prev_rating
+        stabilized = (f"Judge 本轮判 {raw_rating}，与今日上一轮 {prev_rating} 方向相反，"
+                      f"但未给出「变更理由」→ 沿用上一轮评级 {prev_rating}")
+    rating_change = {"from": prev_rating, "to": raw_rating,
+                     "reason": change_reason}
+
     return {
         "bull_history": bull_history.strip(),
         "bear_history": bear_history.strip(),
@@ -360,6 +446,11 @@ Output in Chinese."""
         "judge_decision": manager_resp.strip(),
         "rounds": max_rounds,
         "llm_calls": llm_calls,
+        "rating": eff_rating,
+        "raw_rating": raw_rating,
+        "prev_rating": prev_rating,
+        "rating_change": rating_change,
+        "stabilized": stabilized,
     }
 
 
@@ -471,8 +562,13 @@ def apply_rating_veto(debate_conf: dict, rating: str, action: str,
 
 
 def format_debate_for_trader(debate_result: dict) -> str:
-    """把辩论结果格式化成交易员 prompt 的附加段。"""
-    rating = parse_judge_rating(debate_result["judge_decision"])
+    """把辩论结果格式化成交易员 prompt 的附加段。
+
+    评级优先取 `debate_result["rating"]`（生效评级，可能已被稳定化沿用上一轮）；
+    只有老调用方没带这个键时才回退到现场解析 `judge_decision`。
+    """
+    rating = (debate_result.get("rating")
+              or parse_judge_rating(debate_result.get("judge_decision") or ""))
     risk = debate_result.get("risk_report") or ""
     parts = [
         f"\n\n【多空辩论结果（{debate_result['rounds']} 轮，评级 {rating}）】",
@@ -482,6 +578,14 @@ def format_debate_for_trader(debate_result: dict) -> str:
         parts.append("\n【风险审查员标注的结构性风险】\n" + risk[:1800])
     parts.append("\n【看多要点】\n" + debate_result["bull_history"][:1500])
     parts.append("\n【看空要点】\n" + debate_result["bear_history"][:1500])
+    # 稳定化说明必须给交易员看到：否则它会以为「Judge 判 Sell」而照做，
+    # 而系统实际上已经沿用了上一轮评级。两者信息不一致比不告诉它更坏。
+    stabilized = debate_result.get("stabilized") or ""
+    if stabilized:
+        parts.append(
+            "\n【稳定性约束】\n"
+            f"{stabilized}\n"
+            "没有新出现的具体信息时，不要因为 Judge 这句话就翻转今日已经做过的判断。")
     veto = debate_result.get("veto_note")
     if veto:
         parts.append(f"\n【系统硬约束】\n{veto}")

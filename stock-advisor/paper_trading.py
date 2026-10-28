@@ -86,6 +86,18 @@ DEFAULTS = {
     # 方向放进决策上下文。**只是第二意见**：prompt 明确要求同向仅作佐证、
     # 相悖必须说明理由，不能仅凭因子改变仓位。快照一轮只算一次（30 分钟缓存）。
     "factor_inject": True,
+    # —— 分析师裁决对照（2026-10-28 加，只记录不改动作）——
+    # 2026-10-28 01888 建滔积层板：分析师报告 ⑤裁决 两轮都是 Hold，
+    # 实际先 buy 后 sell —— 页面上只看到成交，看不到「分析师的判断跟交易员
+    # 差多远」。这里把 ⑤裁决 解析出来落进 decision_raw，并由
+    # `analyst_conflict` 标出分歧。**纯可观测性，不参与任何闸门。**
+    "analyst_track": True,
+    # —— 同日反向交易闸门（2026-10-28 加）——
+    # 同一只票在同一天既买又卖（无 T 意图）通常是「上一轮没新证据的翻面」
+    # 被顺次执行，两头都付了手续费。实测 01888 10-27/10-28 各出现一次
+    # 「11:30 买、14:30 卖」。**只拦成交阶段，止损失败/止损卖出不受影响**；
+    # 做 T 的买卖腿（reasoning 带 `[做T]` 前缀）显式放行。
+    "no_same_day_reverse": True,
     # —— Bull/Bear 多空辩论（TradingAgents-astock 对抗机制移植）——
     # 在分析师报告之后、交易员决策之前插入 Bull→Bear→Research Manager 辩论。
     # 每轮 3 次 LLM 调用（Bull + Bear + Manager），默认关闭。
@@ -96,6 +108,9 @@ DEFAULTS = {
         "trigger_on_buy": True,    # 对 buy 决策启用辩论
         "trigger_on_sell": True,   # 对 sell 决策启用辩论
         "min_confidence": 5,       # 交易员 confidence >= 此值时才触发（0=不限）
+        # 裁决稳定性：把同一标的今日更早一轮的评级喂给 Judge，方向反转必须
+        # 写明「变更理由」。默认开 —— 见 debate.run_debate 的 stability_block。
+        "stabilize_rating": True,
     },
 }
 
@@ -1332,6 +1347,59 @@ def run_decisions(deps: dict, slot: str = "", only: set | None = None,
             "position_limit": limit, "skipped_by_limit": sorted(blocked_by_limit)}
 
 
+def _same_day_fills(deps, today: str) -> dict:
+    """读今日已成交的方向：`{code: {"buy", "sell"}}`；读失败返回 `{}`（放行）。
+
+    为什么需要（2026-10-28 用户报 01888 建滔积层板）：同一只票 13:30 轮买、
+    14:30 轮卖（10-27 也是 11:30 买、14:30 卖），两轮之间唯一的差别是 Judge
+    翻了面。净结果是白付两次手续费 + 两次滑点，而「同日反向」并不是加仓/减仓的
+    正常形态 —— 它几乎总是「自己跟自己打架」。
+
+    ⚠️ 只拦**成交阶段**（`_execute_plans`）：止损卖出走 `check_stop_loss` 的
+    独立路径，完全不受这里影响。否则「先买后跌破止损」当天就止不了损 ——
+    风控被纪律闸门挡住是本末倒置。
+    ⚠️ 排除 `[做T]` 行：做 T 的定义就是「同日先卖后买、仓位不变」，
+    那些行由 `t_trading` 直接调 `_execute_decision` 写入，reasoning 以
+    `t_trading.T_TAG` 打头，必须显式放行。
+    ⚠️ 读失败**放行**（fail-open）：这是纪律闸门不是资金闸门，为了读不到历史
+    就把整轮交易停掉，风险大于收益。
+    """
+    conn_fn = deps.get("get_conn") if isinstance(deps, dict) else None
+    if not conn_fn or not today:
+        return {}
+    try:
+        import t_trading
+        tag = t_trading.T_TAG
+    except Exception:
+        tag = "[做T]"
+    try:
+        with conn_fn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT code, side, COALESCE(reasoning, '') AS why "
+                "FROM sa_paper_trades "
+                "WHERE trade_date = %s AND side IN ('buy', 'sell') "
+                "  AND COALESCE(status, '') <> 'skipped'",
+                (today,))
+            rows = cur.fetchall() or []
+    except Exception as exc:  # noqa: BLE001
+        print(f"[paper] 同日反向闸门读取今日成交失败（本轮不拦截）: {exc}", flush=True)
+        return {}
+    out: dict[str, set] = {}
+    for r in rows:
+        if isinstance(r, dict):
+            code, side, why = r.get("code"), r.get("side"), r.get("why")
+        else:
+            code = r[0] if len(r) > 0 else None
+            side = r[1] if len(r) > 1 else None
+            why = r[2] if len(r) > 2 else ""
+        if not code or not side:
+            continue
+        if str(why or "").startswith(tag):
+            continue
+        out.setdefault(str(code), set()).add(str(side))
+    return out
+
+
 def _execute_plans(deps, conf, plans: list, today: str, slot: str) -> list[dict]:
     """按「先卖后买、买入按风险收益率比降序」逐笔成交。返回结果列表（成交顺序）。
 
@@ -1359,31 +1427,51 @@ def _execute_plans(deps, conf, plans: list, today: str, slot: str) -> list[dict]
         print(f"[paper] 本轮 {len(buys)} 个买入候选，按风险收益率比排序："
               + " > ".join(f"{p['stock']['name']}({p['roi']:.2f})" for p in buys),
               flush=True)
+    # 同日反向闸门（默认开）：今天已买过的票本轮不再卖，反之亦然。
+    blockers = (_same_day_fills(deps, today)
+                if conf.get("no_same_day_reverse", True) else {})
     results = []
     buy_rank = 0
+
+    def _row(plan, executed, note):
+        stock, decision = plan["stock"], plan["decision"]
+        return {
+            "code": stock["code"], "name": stock["name"],
+            "action": decision["action"], "executed": executed,
+            "reasoning": decision["reasoning"], "note": note,
+            # 资金分配的可观测性：哪几只是因为 ROI 高才抢到现金的
+            "roi": round(plan["roi"], 4),
+            "expected_up_pct": decision.get("expected_up_pct"),
+            "stop_loss_pct": decision.get("stop_loss_pct"),
+            "target_value_pct": decision.get("target_value_pct"),
+            # 分析师 ⑤裁决（解析得到才带，解析不到为 None）—— 与最终动作不一致时
+            # decision 里还会有 analyst_conflict，页面上可以直接对照。
+            "analyst_rating": decision.get("analyst_rating"),
+            # 名次只在买入内部计 —— 卖出不占号，否则前端会显示「第一笔买入
+            # 排第 2」，读起来像有笔买入没排上。
+            "funding_rank": buy_rank if decision["action"] == "buy" else None,
+        }
+
     for p in sells + buys:
         stock, decision = p["stock"], p["decision"]
         if decision["action"] == "buy":
             buy_rank += 1
+        _act = decision["action"]
+        if blockers and _act in ("buy", "sell"):
+            _opp = "sell" if _act == "buy" else "buy"
+            if _opp in blockers.get(stock["code"], ()):
+                note = (f"同日反向交易已拦截：该股今日已{_opp}成交，本轮 {_act} 不再执行"
+                        f"（防一天内自我打脸；确需反向请关 paper.no_same_day_reverse）")
+                print(f"[paper] {stock['code']} {note}", flush=True)
+                results.append(_row(p, False, note))
+                continue
         try:
             executed, note = _execute_decision(deps, conf, stock, today, decision,
                                                p["quote"], slot, bars=p["bars"])
         except Exception as exc:
             traceback.print_exc()
             executed, note = False, f"成交异常（已隔离，不影响其余）: {exc}"
-        results.append({
-            "code": stock["code"], "name": stock["name"],
-            "action": decision["action"], "executed": executed,
-            "reasoning": decision["reasoning"], "note": note,
-            # 资金分配的可观测性：哪几只是因为 ROI 高才抢到现金的
-            "roi": round(p["roi"], 4),
-            "expected_up_pct": decision.get("expected_up_pct"),
-            "stop_loss_pct": decision.get("stop_loss_pct"),
-            "target_value_pct": decision.get("target_value_pct"),
-            # 名次只在买入内部计 —— 卖出不占号，否则前端会显示「第一笔买入
-            # 排第 2」，读起来像有笔买入没排上。
-            "funding_rank": buy_rank if decision["action"] == "buy" else None,
-        })
+        results.append(_row(p, executed, note))
     return results
 
 
@@ -1449,6 +1537,113 @@ def _cap(text, cap: int = DEBATE_TEXT_CAP) -> str:
     return text[:cap] + f"...[截断，全文 {len(text)} 字符，见 sidecar]"
 
 
+# 分析师 ⑤裁决 的五档评级（ANALYST_PROMPT 里逐字列出来的那一串）。
+# 顺序是**长词在前**：先认 underweight/overweight，否则含 "buy" 的句子会抢走
+# （debate.parse_judge_rating 同款坑，那边已经有这条纪律）。
+_RATING_WORDS = ("underweight", "overweight", "buy", "sell", "hold")
+_RATING_ACTION = {
+    "buy": "buy",
+    "overweight": "buy",
+    "hold": "hold",
+    "underweight": "sell",
+    "sell": "sell",
+}
+
+
+def parse_analyst_rating(report: str) -> str:
+    """从分析师报告 ⑤裁决 里取出评级词；取不到返回 ""。
+
+    为什么需要（2026-10-28 用户报 01888 建滔积层板）：ANALYST_PROMPT 要求 ⑤裁决
+    必须给「Buy / Overweight / Hold / Underweight / Sell 之一」，但这份报告
+    **从来没有被解析过** —— 交易员只读自由文本，于是「分析师写 Hold、交易员却
+    buy/sell」这种分歧在页面上完全看不见。解析结果只做**对照标记**
+    （decision["analyst_rating"] / ["analyst_conflict"]），**不参与任何交易动作**
+    —— 改动作属交易口径，须先问。
+
+    取法（宁缺毋滥）：
+    · 只看**最后一处** `⑤` / `裁决` 之后的文本；找不到标记返回 ""，
+      绝不拿 ③看多论点 / ④看空论点 里的词当裁决；
+    · 跳过含 **≥3 个**评级词的行 —— ANALYST_PROMPT 自己就把那五个词原样列了一遍
+      （「Buy / Overweight / Hold / Underweight / Sell 之一」），模型偶尔会把要求
+      回显出来，那一行不是结论；
+    · 优先认 `裁决：X` 的显式写法，再退回词边界扫描（长词优先）；
+    · 解析不出来返回 ""，**绝不默认 Hold** —— 「没写」不能伪装成「明确中性」。
+    """
+    text = str(report or "")
+    if not text:
+        return ""
+    pos = max(text.rfind("⑤"), text.rfind("裁决"))
+    if pos < 0:
+        return ""
+    tail = text[pos:pos + 600]
+    for line in tail.splitlines()[:8]:
+        low = line.lower()
+        if sum(1 for w in _RATING_WORDS if w in low) >= 3:
+            continue
+        m = re.search(r"裁决\s*[:：]?\s*([A-Za-z]+)", line)
+        cand = (m.group(1) if m else "").lower()
+        if cand in _RATING_ACTION:
+            return cand
+        for w in _RATING_WORDS:
+            if re.search(r"\b" + w + r"\b", low):
+                return w
+    return ""
+
+
+_PREV_RATING_COLS = ("decision_raw",)
+
+
+def _prev_judge_rating(cur, code: str, today: str, slot: str = "") -> str:
+    """读该股**今日更早一轮**的 Judge（辩论）评级；读不到返回 ""。
+
+    为什么需要（2026-10-28 用户报 01888 建滔积层板）：同一只票当天的两轮拿到了
+    **完全相同的新闻块**，交易员据此先 buy（13:30 轮）后 sell（14:30 轮），
+    两轮之间唯一的差别是 Judge 翻了面（Overweight → Sell）。Judge 的 prompt
+    本身是**无状态**的，同样的输入本来就可能给出不同结论 —— 所以要把上一轮
+    评级喂回去，并要求「方向反转必须写明变更理由」
+    （见 debate.run_debate 的 stability_block）。
+
+    ⚠️ **必须在 `with get_conn()` 块内调用** —— 出块连接就关了，再 execute 是 500。
+    ⚠️ 排除本轮 `slot`：手动重跑同一轮时不能锁死在自己上一轮的结论上。
+    """
+    if not code or not today:
+        return ""
+    try:
+        cur.execute(
+            "SELECT decision_raw FROM sa_paper_trades "
+            "WHERE trade_date = %s AND code = %s AND slot <> %s "
+            "  AND decision_raw IS NOT NULL "
+            "  AND COALESCE(status, '') <> 'skipped' "
+            "ORDER BY id DESC LIMIT 1",
+            (today, code, slot or ""),
+        )
+        row = cur.fetchone()
+    except Exception as exc:
+        print(f"[paper] {code} 读取上一轮辩论评级失败（本轮不加稳定性约束）: {exc}",
+              flush=True)
+        return ""
+    if not row:
+        return ""
+    if not isinstance(row, dict):
+        row = dict(zip(_PREV_RATING_COLS, row))
+    try:
+        dec = _decision_of(row) or {}
+    except Exception:
+        dec = {}
+    deb = dec.get("debate") if isinstance(dec, dict) else None
+    if not isinstance(deb, dict):
+        return ""
+    for key in ("rating", "raw_rating"):
+        v = str(deb.get(key) or "").strip()
+        if v:
+            return v
+    try:
+        import debate as debate_mod
+        return debate_mod.parse_judge_rating(deb.get("judge_decision", ""))
+    except Exception:
+        return ""
+
+
 def _pack_debate(debate_result: dict, rating: str, round2_failed: bool = False) -> dict:
     """把 run_debate() 的产物打成一个 dict，**原样进 decision_raw**。
 
@@ -1458,10 +1653,19 @@ def _pack_debate(debate_result: dict, rating: str, round2_failed: bool = False) 
     """
     if not debate_result:
         return {}
+    change = debate_result.get("rating_change") or {}
+    if not isinstance(change, dict):
+        change = {}
     return {
         "rounds": debate_result.get("rounds", 0),
         "llm_calls": debate_result.get("llm_calls", 0),
+        # rating 是**最终生效**的评级（稳定性约束后）；raw_rating 是 Judge 原始输出。
+        # 两者不同就说明约束真的介入过，页面上必须能看出来。
         "rating": rating,
+        "raw_rating": debate_result.get("raw_rating") or rating,
+        "prev_rating": debate_result.get("prev_rating") or "",
+        "rating_change": change,
+        "stabilized": debate_result.get("stabilized") or "",
         "risk_critic": bool(debate_result.get("risk_report")),
         "risk_report": _cap(debate_result.get("risk_report", "")),
         "bull_history": _cap(debate_result.get("bull_history", "")),
@@ -1714,19 +1918,30 @@ def _decide_one(deps, conf, stock, today, slot: str = "", factor_snap=None):
         except Exception as exc:  # noqa: BLE001
             print(f"[paper] 期货/汇率注入跳过: {exc}", flush=True)
         # 市场温度注入（2026-10-28）：PE 十年分位数 → 总仓位约束参考。
-        # **默认关**（paper.market_temp_inject.enabled 默认 false）——它改的是
-        # 决策上下文口径（AGENTS.md §0）。关掉或无数据时上下文逐字节不变
-        #（build_injection 返回 ""，这里不追加）。只读 data/market_temperature/
-        # 的磁盘缓存（read() 自带 5 分钟 TTL），不查库、每只票调用是毫秒级。
+        # **默认开**（paper.market_temp_inject.enabled 默认 true，2026-10-28 用户
+        # 明确要求「默认开启加入决策」）。缺键也走默认开。关掉或无数据时上下文
+        # 逐字节不变（build_injection 返回 ""，这里不追加）。只读
+        # data/market_temperature/ 的磁盘缓存（read() 自带 5 分钟 TTL），
+        # 不查库、每只票调用是毫秒级。
         market_temp_block = ""
         try:
             import market_temperature as _mt
-            _mtc = conf.get("market_temp_inject") or {}
+            _mtc = {**_mt.INJECT_DEFAULTS, **(conf.get("market_temp_inject") or {})}
             if _mtc.get("enabled"):
                 _cap = max(300, int(_mtc.get("max_chars") or 1200))
                 market_temp_block = _mt.build_injection(max_chars=_cap)
         except Exception as exc:  # noqa: BLE001
             print(f"[paper] 市场温度注入跳过: {exc}", flush=True)
+        # 上一轮辩论评级（2026-10-28）：给 Judge 做「同标的同时段一致性」约束。
+        # ⚠️ **必须在 with 块内查** —— 出块连接就关了，再 execute 是 500。
+        # 读失败只让本轮失去稳定性约束，绝不能中断这一只票的决策。
+        _prev_rating = ""
+        try:
+            import debate as _debate_cfg
+            if _debate_cfg.load_debate_conf(conf).get("stabilize_rating", True):
+                _prev_rating = _prev_judge_rating(cur, code, today, slot)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[paper] {code} 上一轮评级读取跳过: {exc}", flush=True)
     ctx = _build_context(stock, quote, bars, news, events, market_note,
                          account, positions, past, conf, social,
                          event_news=event_news)
@@ -1818,8 +2033,16 @@ def _decide_one(deps, conf, stock, today, slot: str = "", factor_snap=None):
             debate_result = debate_mod.run_debate(
                 report, ctx, code, name,
                 max_rounds=int(debate_conf.get("max_rounds", 1)),
-                risk_critic_check=_want_rc)
-            _rating = debate_mod.parse_judge_rating(debate_result["judge_decision"])
+                risk_critic_check=_want_rc,
+                prev_rating=_prev_rating,
+                stabilize=bool(debate_conf.get("stabilize_rating", True)))
+            # 用**生效**评级（稳定性约束后），不是 Judge 的原始输出 ——
+            # 否则「Judge 翻面但未给理由 → 沿用上一轮」这条约束对交易员无效。
+            _rating = (debate_result.get("rating")
+                       or debate_mod.parse_judge_rating(debate_result["judge_decision"]))
+            if debate_result.get("stabilized"):
+                print(f"[paper] {code} 裁决稳定性约束：{debate_result['stabilized']}",
+                      flush=True)
             # 把辩论结果注入交易员 prompt，重新决策
             debate_block = debate_mod.format_debate_for_trader(debate_result)
             raw_trader_2 = _llm_call(
@@ -1863,11 +2086,33 @@ def _decide_one(deps, conf, stock, today, slot: str = "", factor_snap=None):
                 try:
                     decision["debate"] = _pack_debate(
                         debate_result,
-                        debate_mod.parse_judge_rating(
-                            debate_result.get("judge_decision", "")),
+                        # 与正常分支同口径：优先取生效评级（可能已被稳定性约束
+                        # 沿用上一轮），否则下一轮 `_prev_judge_rating` 会读到
+                        # 未生效的 raw 值，稳定性链条在这里断掉。
+                        (debate_result.get("rating")
+                         or debate_mod.parse_judge_rating(
+                             debate_result.get("judge_decision", ""))),
                         round2_failed=True)
                 except Exception:
                     pass
+    # 分析师 ⑤裁决 ⇄ 最终动作 的对照（2026-10-28）。**只标记，不改动作。**
+    # 动机见 parse_analyst_rating：那份报告从来没被解析过，于是「分析师写 Hold、
+    # 交易员却 buy/sell」这种分歧在页面上完全看不见 —— 01888 两轮报告都写
+    # Hold，成交却是先买后卖，而没有任何地方把它摆出来。
+    if conf.get("analyst_track", True):
+        try:
+            _ar = parse_analyst_rating(report)
+            if _ar:
+                decision["analyst_rating"] = _ar
+                _aa = _RATING_ACTION[_ar]
+                _ta = decision["action"]
+                if _aa != _ta:
+                    decision["analyst_conflict"] = {
+                        "analyst": _ar, "analyst_action": _aa, "trader": _ta}
+                    print(f"[paper] {code} 分析师裁决与最终动作不一致："
+                          f"分析师 {_ar}({_aa}) vs 交易员 {_ta}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[paper] {code} 分析师裁决对照跳过: {exc}", flush=True)
     # 5. 只交回执行包，不在这里成交（排序权归 run_decisions）
     return {"stock": stock, "quote": quote, "bars": bars, "decision": decision,
             "roi": roi_score(decision)}

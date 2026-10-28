@@ -71,7 +71,7 @@ import shutil
 import subprocess
 import time
 import wave
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 
@@ -1208,10 +1208,16 @@ def extract_text(profile: dict) -> tuple:
 
 
 def normalize_ts(ts) -> str:
-    """视频号的时间戳单位实测混乱（秒/毫秒都有）→ 统一成 ISO 字符串。
+    """视频号的时间戳单位实测混乱（秒/毫秒都有）→ 统一成**带 +00:00 的** ISO 字符串。
 
     判据：> 1e11 视为毫秒。写错会让 publish_time 落到 1970/55000 年，
-    而 `sa_news.publish_time` 只是 TEXT/TIMESTAMPTZ，不报错。
+    而 `sa_news.publish_time` 是 TIMESTAMPTZ，不报错。
+
+    ⚠️ 必须带时区（2026-10-28 修）：原来 `datetime.fromtimestamp(n)` 返回**本地
+    墙钟的朴素值**，写进 `TIMESTAMPTZ` 时被 PG 按会话时区（服务器是 Etc/UTC）
+    解释 → 北京时间被当成 UTC，系统性**晚 8 小时**（实测 sa_news 里 sina /
+    ak_em / eastmoney 全中，`publish_time > fetched_at` 共计上万行）。
+    epoch 秒是绝对时刻，直接 `tz=timezone.utc` 换算才是同一时刻。
     """
     try:
         n = int(float(ts))
@@ -1222,7 +1228,7 @@ def normalize_ts(ts) -> str:
     if n > 1e11:
         n //= 1000
     try:
-        return datetime.fromtimestamp(n).isoformat(timespec="seconds")
+        return datetime.fromtimestamp(n, tz=timezone.utc).isoformat(timespec="seconds")
     except (OverflowError, OSError, ValueError):
         return ""
 

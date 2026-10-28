@@ -2953,11 +2953,14 @@ def _plan_market_note() -> str:
 
 
 def _plan_recent_news_titles(held: list[dict]) -> list[str]:
-    """持仓股近 3 天新闻标题（最多 12 条，去重），给模型判断消息面。"""
+    """持仓股近 3 天新闻标题（最多 12 条，去重），给模型判断消息面。
+
+    未来时间上界与 `_paper_news_rows` 同一道闸门（原因见那里的第四条）：
+    写入侧已改成带 +08:00，但库里仍有历史坏行，坏时间戳会挤掉最新名额。
+    """
     codes = [h["code"] for h in held][:12]
     if not codes:
         return []
-    since = datetime.now().isoformat(timespec="seconds")
     try:
         with get_conn() as conn, conn.cursor() as cur:
             cur.execute(
@@ -2967,6 +2970,7 @@ def _plan_recent_news_titles(held: list[dict]) -> list[str]:
                 "    LEFT JOIN sa_news_related r ON r.url = n.url "
                 "   WHERE (n.code = ANY(%s) OR r.code = ANY(%s)) "
                 "     AND n.publish_time IS NOT NULL "
+                "     AND n.publish_time <= now() + interval '1 hour' "
                 "     AND n.publish_time > now() - interval '3 days' "
                 "   ORDER BY n.url, n.publish_time DESC"
                 ") t ORDER BY publish_time DESC LIMIT 12",
@@ -5246,6 +5250,14 @@ def _paper_news_rows(code: str, limit: int = 10) -> list[dict]:
     7 天窗口会把它挡掉，于是模型只看到「跌了 13%」看不到「为什么有争议」。
     判据用**标题命中事件词**（与 `news_fetcher._EVENT_KW` 同一套词），
     仍然是硬编码词表而非语义判断 —— 这里要的是**可复现**，不是聪明。
+
+    ⚠️ 第四条（2026-10-28 加）：**必须有未来时间的上界**（now + 1 小时）。
+    原来只有下界，于是「发布时间比抓取时间还晚」的坏行会正当地排在最前面，
+    把真正新鲜的新闻挤出前 10 名（`ORDER BY publish_time DESC LIMIT 10`）。
+    实测根因是写入侧把**朴素北京时间**塞进 `TIMESTAMPTZ`，被 PG 按会话时区
+    （UTC）解释 → 系统性 +8 小时（见 news_fetcher 顶部 `_bj_iso` 那段）。
+    写入侧已修，但库里还有历史坏行，所以这里再加一道读侧闸门：
+    1 小时是给源站轻微前偏留的余量，超过就不是「时间不准」而是「时间错了」。
     """
     try:
         with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -5257,6 +5269,8 @@ def _paper_news_rows(code: str, limit: int = 10) -> list[dict]:
                 "    LEFT JOIN sa_news_related r ON r.url = n.url "
                 "   WHERE (n.code = %s OR r.code = %s) "
                 "     AND n.publish_time IS NOT NULL "
+                # 未来时间上界：坏时间戳不许占据最新名额（见 docstring 第四条）
+                "     AND n.publish_time <= now() + interval '1 hour' "
                 # ⚠️ LIKE 的字面 % 必须写成带引号的 '%%解禁%%'：
                 #    写成 '%(解禁%%' 会被 psycopg2 当成**命名占位符**，
                 #    整条语句报 `argument formats can't be mixed` —— 而
@@ -5297,6 +5311,8 @@ def _paper_event_rows(code: str, limit: int = 6) -> list[dict]:
                 "   WHERE (n.code = %s OR r.code = %s) "
                 "     AND n.publish_time IS NOT NULL "
                 "     AND n.publish_time > now() - interval '180 days' "
+                # 未来时间上界（与 _paper_news_rows 同一道闸门，见那里的第四条）
+                "     AND n.publish_time <= now() + interval '1 hour' "
                 # 字面 % 用 '%%'；写成 '%(…' 会被 psycopg2 当成命名占位符，
                 # 整条报 `argument formats can't be mixed`，而调用方的 except
                 # 把它吞成「没查到」—— 症状看起来像「这票没有相关讨论」。
@@ -8087,7 +8103,10 @@ def list_news(code: str = "", limit: int = 30):
     """
     limit = max(1, min(limit, 200))
     params: list = []
-    conds = ["n.publish_time IS NOT NULL"]
+    # 未来时间上界：与 _paper_news_rows 同一道闸门（见那里的第四条），
+    # 否则库里历史坏行（被当成 UTC 的北京时间）会永远占据最新列表。
+    conds = ["n.publish_time IS NOT NULL",
+             "n.publish_time <= now() + interval '1 hour'"]
     join = ""
     if re.fullmatch(r"\d{5,6}", code or ""):
         target = code if len(code) == 6 else code.zfill(5)
