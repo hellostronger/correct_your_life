@@ -76,6 +76,7 @@ import ipo_strategy
 import integration_api
 import lot_rate
 import macro_rates
+import market_temperature
 import notify_events
 import project_api
 import skill_api
@@ -9592,6 +9593,77 @@ def _fx_loop():
             time.sleep(300)
 
 
+# ---------------- 市场温度计（market_temperature.py，PE 十年分位数）----------------
+
+_mt_refresh_state = {"running": False, "result": None, "progress": "",
+                     "started_at": ""}
+
+
+@app.get("/api/market-temperature")
+def market_temperature_view():
+    d = market_temperature.read()
+    return {"ok": bool(d) and "error" not in d,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "conf": market_temperature.conf(),
+            "data": d}
+
+
+@app.post("/api/market-temperature/refresh")
+def market_temperature_refresh():
+    """后台采样刷新。**不能同步跑**：约 60+ 次网络请求、1~3 分钟，会占死请求线程。"""
+    if _mt_refresh_state["running"]:
+        return {"ok": False, "running": True, "message": "已有一次在刷新"}
+    _mt_refresh_state.update(running=True, result=None, progress="",
+                             started_at=datetime.now().isoformat(timespec="seconds"))
+
+    def _progress(msg: str) -> None:
+        _mt_refresh_state["progress"] = msg
+
+    def _run() -> None:
+        try:
+            res = market_temperature.refresh(progress=_progress)
+            market_temperature.invalidate_cache()
+            d = market_temperature.read(fresh=True) or {}
+            _mt_refresh_state["result"] = {"refresh": res,
+                                           "as_of": d.get("as_of"),
+                                           "error": d.get("error")}
+        except Exception as exc:  # noqa: BLE001
+            _mt_refresh_state["result"] = {"error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            _mt_refresh_state["running"] = False
+            _mt_refresh_state["progress"] = ""
+
+    threading.Thread(target=_run, name="mt_refresh", daemon=True).start()
+    return {"ok": True, "started": True}
+
+
+@app.get("/api/market-temperature/refresh")
+def market_temperature_refresh_status():
+    return {"ok": True, **_mt_refresh_state}
+
+
+def _market_temp_loop():
+    """市场温度采样：enabled=false 或 interval_minutes<=0 时轮内跳过。"""
+    while True:
+        try:
+            conf = market_temperature.conf()
+            interval = int(conf.get("interval_minutes") or 0)
+            if conf.get("enabled", True) and interval > 0:
+                if not _mt_refresh_state["running"]:
+                    res = market_temperature.refresh()
+                    market_temperature.invalidate_cache()
+                    print(f"[market_temp] 采样刷新 as_of={res.get('as_of')}"
+                          f" 新增申万 {res.get('sw_new', 0)} 份"
+                          f"{'（' + res['note'] + '）' if res.get('note') else ''}",
+                          flush=True)
+                time.sleep(max(interval, 1) * 60)
+            else:
+                time.sleep(600)
+        except Exception as exc:
+            print(f"[market_temp] loop error: {exc}", flush=True)
+            time.sleep(600)
+
+
 class CryptoWatchIn(BaseModel):
     contract: str = Field(min_length=3, max_length=32, description="合约名，如 TSLA_USDT")
     name: str = Field(default="", max_length=64)
@@ -10545,6 +10617,26 @@ if _BOOTSTRAP:
     except Exception as exc:
         print(f"[strategy_daily] init tables failed: {exc}", flush=True)
 
+
+def _warmup_mini_racer() -> None:
+    """在起任何守护线程之前，先在主线程建一个 MiniRacer 并常驻引用。
+
+    mini-racer 0.14 的 V8 platform 是惰性初始化的，且这一步不是线程安全的：
+    两个守护线程同时首次 `MiniRacer()` 会 native abort
+    （`partition_address_space.cc(243) Check failed: !IsConfigurablePoolInitialized()`），
+    进程直接死、日志里只有一行 FATAL。akshare 有多个模块（同花顺板块、sina、
+    cninfo…）各自 import py_mini_racer，所以正常运行时必然出现并发首次调用。
+    实测可复现：不开预热两线程必崩，预热后两线程都正常。
+    """
+    try:
+        from py_mini_racer import MiniRacer
+        globals()["_MINI_RACER_WARM"] = MiniRacer()
+    except Exception as exc:
+        print(f"[warmup] mini-racer 预热失败（不影响主流程）：{exc}", flush=True)
+
+
+_warmup_mini_racer()
+
 # 声明微信客户端在线（iLink notifystart）。
 # **必须在每次服务启动时做**：iLink 侧的「会话」不是持久状态，重启后不重新
 # 声明的话，所有出站推送都会 ret=-2 prepare failed —— 表现为「微信通知突然
@@ -10638,6 +10730,9 @@ _start_daemon(_futures_loop, "sa_futures")
 
 # 汇率抓取线程（新浪外汇；fx.interval_minutes=0 轮内跳过）
 _start_daemon(_fx_loop, "sa_fx")
+
+# 市场温度采样（申万月报 + 中证日线；market_temperature.interval_minutes=0 轮内跳过）
+_start_daemon(_market_temp_loop, "sa_market_temp")
 
 # 币圈 24h 监控线程（gate.io 股票永续；crypto.interval_minutes=0 轮内跳过）
 _start_daemon(_crypto_loop, "sa_crypto")

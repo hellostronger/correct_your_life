@@ -1713,6 +1713,20 @@ def _decide_one(deps, conf, stock, today, slot: str = "", factor_snap=None):
                                             + f"\n[期货/汇率块超长已截断，全文 {_n} 字符]")
         except Exception as exc:  # noqa: BLE001
             print(f"[paper] 期货/汇率注入跳过: {exc}", flush=True)
+        # 市场温度注入（2026-10-28）：PE 十年分位数 → 总仓位约束参考。
+        # **默认关**（paper.market_temp_inject.enabled 默认 false）——它改的是
+        # 决策上下文口径（AGENTS.md §0）。关掉或无数据时上下文逐字节不变
+        #（build_injection 返回 ""，这里不追加）。只读 data/market_temperature/
+        # 的磁盘缓存（read() 自带 5 分钟 TTL），不查库、每只票调用是毫秒级。
+        market_temp_block = ""
+        try:
+            import market_temperature as _mt
+            _mtc = conf.get("market_temp_inject") or {}
+            if _mtc.get("enabled"):
+                _cap = max(300, int(_mtc.get("max_chars") or 1200))
+                market_temp_block = _mt.build_injection(max_chars=_cap)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[paper] 市场温度注入跳过: {exc}", flush=True)
     ctx = _build_context(stock, quote, bars, news, events, market_note,
                          account, positions, past, conf, social,
                          event_news=event_news)
@@ -1736,6 +1750,8 @@ def _decide_one(deps, conf, stock, today, slot: str = "", factor_snap=None):
         ctx += "\n" + macro_block
     if futures_fx_block:
         ctx += "\n" + futures_fx_block
+    if market_temp_block:
+        ctx += "\n" + market_temp_block
     if mp_block:
         ctx += "\n" + mp_block
     # 3. LLM 调用 1：分析师

@@ -5110,3 +5110,61 @@ context_token 非出站必要条件」（2026-09-30 据单次实验下的断言�
 复测推翻，docstring 已改写为上述正确口径。`notifier.py` 内 582 行附近的
 运行时提示早就写着正确处置（「仍失败则需在微信里给 bot 发一条消息」），
 无需改。
+
+---
+
+### 🌡 市场温度计 `stock-advisor/market_temperature.py`（2026-10-28 新增）
+
+用**申万指数 PE 的十年分位数**估算各底层资产的「温度」（0~100，越低越便宜），
+按市场**等权**汇总，给出「低温·可逐步买入 / 常温·持有观察 / 高温·开始卖出」三档。
+
+| 组件 | 位置 | 要点 |
+|---|---|---|
+| 采样 | `market_temperature.refresh()` | 申万月报 `ak.index_analysis_monthly_sw` + 腾讯/东财行情；实测 ~60 次请求、1~3 分钟 |
+| 覆盖 | 37 只 A 股行业/宽基 + 7 只港股 | 恒生系指数**没有公开 PE 源** → 用替代指数并在行上标「替代」（`substitute`/`official`） |
+| 样本闸门 | 历史 < 36 期（约 3 年） | 温度照算，但**不计入综合温度**（`insufficient` + ⚠），避免新指数把均值带偏 |
+| 缓存 | `data/market_temperature.json` | 读侧 `read()` 有进程内缓存，`invalidate_cache()` 由刷新/守护调用 |
+| 端点 | `GET /api/market-temperature`、`POST|GET /api/market-temperature/refresh` | 采样**必须后台跑**（同步会占死请求线程），状态里带 `running/progress` |
+| 守护 | `sa_market_temp` | `market_temperature.interval_minutes`（默认 720）、`enabled` |
+| 注入 | `paper_trading._decide_one`（`paper.market_temp_inject`） | **默认关闭**（`false`）—— 改的是决策上下文口径，按 §0 要先问用户；关闭时上下文**逐字节不变** |
+| 前端 | `market` 页「🌡 市场温度计」卡片 | `loadMarketTemp()` 同时挂 `TAB_LOADERS.market` **和**首屏手写清单（默认页不走 `switchTab`） |
+
+**温度/PE 是比率不是价格**：`mtNum`/`mtPct` 固定 2 位小数，**刻意不用 `fmtPx`**
+（后者给 4 位会把 PE 列撑成 `12.9876`）。实测 44 行里 17 低温 / 12 常温 / 15 高温，
+A股 39.83（上期 43.21，-3.38，常温）、港股 51.92（-2.30，高温）。
+
+#### 🔴 重启后服务「起来了又死」：mini-racer 的 V8 platform 初始化不是线程安全的
+
+**症状**：`import app done, 77.4s` + `Uvicorn running on http://127.0.0.1:8686`
+都打印了，几十秒后进程消失，`app.log` 里**只有一行**：
+
+```
+[FATAL:partition_address_space.cc(243)] Check failed: !IsConfigurablePoolInitialized().
+```
+
+没有 Python traceback（是 native abort，不是异常），全日志 329716 行里只出现 **1 次**。
+
+**真因**：`py_mini_racer` 0.14.1（user-site，2026-09-29 装的）的 V8 platform
+**惰性初始化且非线程安全** —— 两个守护线程同时首次 `MiniRacer()` 就会 abort。
+akshare 有多个模块（同花顺板块、sina、cninfo、PE/PB）各自 `import py_mini_racer`，
+所以正常运行时**必然**出现并发首次调用。
+
+- 复现脚本 `probe_v8_race.py`：两线程裸跑 → FATAL；先主线程预热 → `WARMUP_OK` / `CTX_OK`。
+- 排除项：新加的 `market_temperature.py` **不碰 MiniRacer**（只用
+  `ak.index_analysis_monthly_sw`）；也不是新回归（user-site 那个版本比上一个长寿 PID 更早）。
+
+**修法**（`app.py`，在第一个 `_start_daemon` 之前）：`_warmup_mini_racer()` 在主线程
+建一个 `MiniRacer()` 并 `globals()` 常驻引用，失败只打印不影响主流程。
+
+#### 验证口径（都可重复跑）
+
+| 方式 | 结果 |
+|---|---|
+| `GET /api/market-temperature` | 200，`as_of 2026-10-27`、44 行、2 个市场、A股 39.83 |
+| node V8 渲染（喂真实 payload） | **34/34 PASS**，含「无 undefined/NaN/[object」「PE 2 位 / 价格 4 位」 |
+| 真实浏览器（browser-use 探针） | `#mtemp-body` **44 行 = 表头 10 列**、无空单元格、无 `undefined/NaN`、PE 全 2 位、空占位 `display:none` |
+
+⚠️ **探针必须等 fetch 返回**：第一次探测（页面刚 `readyState=complete`）拿到
+`rows=0 / meta="" / 「加载中...」`，我据此怀疑「首屏清单没调到 `loadMarketTemp()`」——
+其实只是 `/api/market-temperature` 还没回来（同屏 `/api/watchlist` 仍是 `pending`）。
+**「看着像没执行」先查 network 面板里的 pending**，别先怀疑接线。

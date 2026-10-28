@@ -713,6 +713,38 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       </div>
     </div>
 
+    <!-- 市场温度计（PE 十年分位数，2026-10-28 加；数据源 market_temperature.py）-->
+    <div class="card" style="margin-top:14px">
+      <div class="row" style="justify-content:space-between">
+        <b style="font-size:13px">🌡 市场温度计
+          <span class="muted" style="font-weight:normal">PE(TTM) 十年分位数 ×100 · 等权平均</span></b>
+        <span class="row">
+          <span class="muted" id="mtemp-meta" style="font-size:12px"></span>
+          <button class="btn ghost" style="font-size:12px" onclick="refreshMarketTemp(this)">刷新数据</button>
+        </span>
+      </div>
+      <div class="empty" id="mtemp-empty" style="margin-top:8px">加载中...</div>
+      <div id="mtemp-summary" class="row" style="gap:8px;flex-wrap:wrap;margin-top:8px"></div>
+      <div style="overflow-x:auto" id="mtemp-wrap">
+        <table style="margin-top:6px">
+          <thead><tr>
+            <th>市场</th><th>行业名称</th><th>代码</th><th>PE(TTM)</th><th>温度</th><th>档位</th>
+            <th>年初至今</th><th>较 924</th><th>样本</th><th>相关标的</th>
+          </tr></thead>
+          <tbody id="mtemp-body"></tbody>
+        </table>
+      </div>
+      <div class="hint" style="font-size:12px;margin-top:6px">
+        温度 = 最新 PE(TTM) 在<b>近 10 年历史序列</b>中的分位数 ×100；
+        <b>综合温度 = 各标的温度的等权平均</b>（非市值加权）。
+        &lt;30 低温·可逐步买入 / 30~50 常温·持有观察 / &gt;50 高温·开始卖出。
+        历史不足 3 年（样本 &lt;36 期）的标的<b>仍显示温度、但不计入综合温度</b>（样本列带 ⚠）。
+        <b>港股 4 个恒生系指数没有公开 PE 源</b>，温度取自同主题的中证港股通指数
+        （标「替代」，悬停看实际口径）—— 这是数据源限制，不是静默替换。
+        温度是估值位置的情绪刻度，<b>不是点位预测</b>；采样每次约 1~3 分钟，走申万月报 + 中证日线。
+      </div>
+    </div>
+
     <!-- 全球国债收益率（美/中/日/德/英/韩 10Y；日德英韩为 OECD 月频，2026-10-17 加）-->
     <div class="card" style="margin-top:14px">
       <div class="row" style="justify-content:space-between">
@@ -5891,7 +5923,7 @@ const TAB_LOADERS = {
   //   所以这里只做**零成本的**状态探测（探 101 的 /health，约 15ms），
   //   把「有 N 只港股可查」显示出来，让人自己点「查我的港股」。
   //   —— 之前我漏了这个注册，页面永远停在初始的「加载中…」。
-  market:    () => { loadWatch(); loadAlerts(); loadCrypto(); loadDiscover(); loadFutures(); loadFx(); loadMacroGlobal(); loadEtfFlows(); loadHKSupplyStatus(); },
+  market:    () => { loadWatch(); loadAlerts(); loadCrypto(); loadDiscover(); loadFutures(); loadFx(); loadMarketTemp(); loadMacroGlobal(); loadEtfFlows(); loadHKSupplyStatus(); },
   sector:    () => { loadSector(); loadIntraday(); startIntradayAuto(); },
   holdings:  () => { loadHoldings(); refreshTradeStrategyOptions(); },
   strategies:() => { loadStrategies(); refreshTradeStrategyOptions(); },
@@ -9675,6 +9707,103 @@ async function loadFx() {
   } catch (e) { $('fx-meta').textContent = '加载失败: ' + e.message; }
 }
 
+// ---- 市场温度计（PE 十年分位数，2026-10-28 加）----
+// 温度/PE 是**比率**不是价格：2 位小数足够（PE 差 0.01 不影响判断），
+// 但绝不能用 fmtPx（它给 4 位会把 PE 列撑成 12.9876）。
+const mtNum = v => (typeof v === 'number' && isFinite(v)) ? v.toFixed(2) : '—';
+const mtPct = v => (typeof v === 'number' && isFinite(v))
+  ? (v > 0 ? '+' : '') + v.toFixed(2) + '%' : '—';
+const MT_BAND_CLS = { cold: 'b-ok', mid: '', hot: 'b-warn', na: '' };
+let _mtPoll = null;
+
+async function loadMarketTemp() {
+  try {
+    const d = await api('/api/market-temperature');
+    const data = d.data || {};
+    if (data.error) {
+      $('mtemp-empty').classList.remove('hide');
+      $('mtemp-empty').textContent = '读取失败: ' + data.error;
+      $('mtemp-meta').textContent = '';
+      $('mtemp-summary').innerHTML = '';
+      return;
+    }
+    const rows = data.rows || [];
+    const markets = data.markets || [];
+    $('mtemp-empty').classList.toggle('hide', rows.length > 0);
+    if (!rows.length) $('mtemp-empty').textContent = '暂无数据，点「刷新数据」采样（首次约 1~3 分钟）';
+
+    $('mtemp-summary').innerHTML = markets.map(m => {
+      const b = m.band || {};
+      const dlt = (typeof m.delta === 'number')
+        ? ` <span class="${cls(m.delta)}">${(m.delta > 0 ? '+' : '') + m.delta.toFixed(2)}</span>` : '';
+      const exc = (m.excluded || []).length
+        ? `<span class="muted" style="font-size:11px">（${m.excluded.length} 个样本不足未计入）</span>` : '';
+      return `<span class="badge ${MT_BAND_CLS[b.key] || ''}">${esc(m.label)} ${mtNum(m.temp)}${dlt}`
+        + ` <span style="font-weight:normal">· ${esc(b.label || '')} · ${m.count}/${m.universe} 只</span>${exc}</span>`;
+    }).join('');
+
+    $('mtemp-body').innerHTML = rows.map(r => {
+      const sub = r.substitute
+        ? ` <span class="muted" style="font-size:11px;cursor:help"
+             title="恒生系指数没有公开 PE 源，本行温度实际取 ${esc(r.official)}">替代</span>` : '';
+      const warn = r.insufficient
+        ? ` <span class="muted" style="font-size:11px;cursor:help"
+             title="历史样本不足 36 期（约 3 年）：温度仍计算，但不计入综合温度">⚠</span>` : '';
+      const b = r.band || {};
+      return `<tr>
+        <td class="muted">${r.group === 'a' ? 'A股' : '港股'}</td>
+        <td><b>${esc(r.name)}</b>${sub}</td>
+        <td class="muted">${esc(r.code)}</td>
+        <td class="num">${mtNum(r.pe)}</td>
+        <td class="num"><b>${mtNum(r.temp)}</b></td>
+        <td><span class="badge ${MT_BAND_CLS[b.key] || ''}">${esc(b.label || '—')}</span></td>
+        <td class="${cls(r.ytd)}">${mtPct(r.ytd)}</td>
+        <td class="${cls(r.g924)}">${mtPct(r.g924)}</td>
+        <td class="muted num">${r.samples || 0}${warn}</td>
+        <td class="muted">${esc(r.etf || '—')}</td>
+      </tr>`;
+    }).join('');
+
+    $('mtemp-meta').textContent = data.as_of
+      ? `截至 ${data.as_of}（上期 ${data.prev_as_of || '—'}）` : '';
+  } catch (e) { $('mtemp-meta').textContent = '加载失败: ' + e.message; }
+}
+
+// 采样要 1~3 分钟（60+ 次网络请求），**必须后台轮询**，不能让请求线程干等。
+async function refreshMarketTemp(btn) {
+  if (_mtPoll) return;                       // 防重复点击叠两个轮询
+  const label = btn ? btn.textContent : '刷新数据';
+  try {
+    await jsonPost('/api/market-temperature/refresh');
+  } catch (e) { toastErr('触发失败: ' + e.message); return; }
+  if (btn) { btn.disabled = true; btn.textContent = '采样中…'; }
+  let seen = 0;
+  _mtPoll = setInterval(async () => {
+    seen += 1;
+    try {
+      const s = await api('/api/market-temperature/refresh');
+      if (s.running) {
+        if (btn) btn.textContent = '采样中…' + (s.progress ? ' ' + s.progress : '');
+        return;
+      }
+      clearInterval(_mtPoll); _mtPoll = null;
+      if (btn) { btn.disabled = false; btn.textContent = label; }
+      await loadMarketTemp();
+      const r = s.result || {};
+      if (r.error) toastErr('采样失败: ' + r.error);
+      else if (r.refresh) {
+        const rf = r.refresh;
+        toastOk(`采样完成（${rf.as_of || r.as_of || ''}）：新增申万月报 ${rf.sw_new || 0} 份`
+          + (rf.note ? `；${rf.note}` : ''));
+      }
+    } catch (e) {
+      clearInterval(_mtPoll); _mtPoll = null;
+      if (btn) { btn.disabled = false; btn.textContent = label; }
+      toastErr('采样状态读取失败: ' + e.message);
+    }
+  }, 4000);
+}
+
 // ---- 全球国债收益率（FRED；日/德/英/韩为 OECD 月频，行内标滞后天数）----
 async function loadMacroGlobal() {
   try {
@@ -11741,6 +11870,9 @@ async function loadNewsFilter() {
 loadWatch();
 loadAlerts();
 loadCrypto();
+loadFutures();
+loadFx();
+loadMarketTemp();
 loadMacroGlobal();
 loadEtfFlows();
 loadHKSupplyStatus();
