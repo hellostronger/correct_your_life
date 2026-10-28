@@ -13,18 +13,23 @@
     门槛： PE 历史不足 3 年（<36 个采样点）的标的，温度照常算，
            但**不进综合温度**（截图原话：新纳入标的历史不足 3 年不计入当日均值）
 
-数据源（2026-10-28 实测，别再找替代）：
+数据源（2026-10-28 起：**本机不直连 akshare，全部经 101 的 data_service**）：
 
-| 数据 | 接口 | 实测 |
+| 数据 | 101 端点 | 背后的源 |
 |---|---|---|
-| 31 个申万一级行业 PE | `ak.index_analysis_monthly_sw(symbol="一级行业", date=<月末>)` | 一次调用返回**全部 31 行**，2~4s |
-| 创业板指 PE | 同上 `symbol="市场表征"` 里的 **801005 申万创业** | 中证/国证的 399006/399005/399673 在 csindex 全部拿不到 PE，只有申万这套有 |
-| 当日 PE / 收盘 | `ak.index_analysis_daily_sw(symbol, start_date=d, end_date=d)` | **单日范围只要 1 个请求**（2.1s / 31 行）。日期跨度给大了会翻页翻到天上（~1600 页），必须单日 |
-| 5 个宽基 + 7 个港股的 PE 与收盘 | `ak.stock_zh_index_hist_csindex(code, "20161201", today)` | 一次请求 ~2400 日线，含「滚动市盈率」+「收盘」→ 采样点在本地挑，不用逐月发请求 |
+| 申万公布过的月末交易日 | `GET /sw-calendar` | `ak.index_analysis_week_month_sw("month")` |
+| 31 个申万一级行业月末 PE/收盘 | `GET /sw-month?date=YYYY-MM-DD` | `ak.index_analysis_monthly_sw("一级行业"/"市场表征", …)`，一次返回全部 31 行 |
+| 当日 PE/收盘 | `GET /sw-day?date=YYYY-MM-DD` | `ak.index_analysis_daily_sw(…, start=end=单日)`；**必须单日**，跨度大会翻到 ~1600 页 |
+| 5 个宽基 + 7 个港股通的 PE 与收盘 | `GET /index-hist?code=&start=&end=` | `ak.stock_zh_index_hist_csindex`，~2400 日线含「滚动市盈率」+「收盘」，采样点在本地挑 |
 
-已实测**不可用**（不要再试）：`ak.stock_hk_valuation_comparison_em` 是个股估值不是指数；
-`ak.index_value_hist_funddb` 不存在；`ak.stock_hk_index_daily_sina` 的 HSI/HSTECH 只有
-点位没有 PE；`ak.stock_hk_index_daily_em` 本机 `ConnectionError`。
+服务端**不做标的过滤**（过滤权在本文件的 `A_UNIVERSE` / `UNIVERSE`，加标的不用重建镜像）；
+本机仍写 `data/market_temperature/` 下的缓存（`cal.json` / `sw/*.json` / `csi/*.json`），
+所以只有缺失的日期才会发请求。
+
+创业板指 PE 取申万 **801005 申万创业**（中证/国证的 399006/399005/399673 在 csindex
+全部拿不到 PE）。已实测**不可用**（不要再试）：`ak.stock_hk_valuation_comparison_em`
+是个股估值不是指数；`ak.index_value_hist_funddb` 不存在；
+`ak.stock_hk_index_daily_sina` 的 HSI/HSTECH 只有点位没有 PE。
 ⇒ **恒生指数/恒生科技/恒生消费/港股汽车 四个没有任何 PE 源**，只能用中证港股通同主题
 指数**替代**（见 `HK_UNIVERSE` 的 `substitute=True`），替代口径必须显示给用户，不静默换。
 """
@@ -33,12 +38,15 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import threading
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+import requests
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data" / "market_temperature"
@@ -137,6 +145,9 @@ HK_UNIVERSE: list[dict] = [
 ]
 
 UNIVERSE = A_UNIVERSE + HK_UNIVERSE
+
+# 申万口径的代码白名单（含 801005 申万创业）。服务端返回全部行业，过滤在本机做。
+_SW_CODES = {i["code"] for i in A_UNIVERSE} | {"801005"}
 
 
 def conf() -> dict:
@@ -287,33 +298,53 @@ def _read_json(path: Path):
         return None
 
 
-def _ak():
-    import akshare
-    return akshare
+# ---------------------------------------------------------------- 101 数据服务
+# 本机不直连任何行情/估值源（用户 2026-10-28 要求）。出口只有下面两处：
+# `_base_url()` 解析地址，`_get_json()` 发请求。范式与 market_data.py 逐字同构
+# （trust_env=False 绕开本机代理），改一处就要两处一起改。
+_session = requests.Session()
+_session.trust_env = False
 
 
-def fetch_sw_month(date_str: str) -> dict[str, dict]:
-    """一个月末 → 31 个一级行业 + 市场表征（含 801005 申万创业）的 PE/收盘。"""
-    ak = _ak()
-    out: dict[str, dict] = {}
-    for sym in ("一级行业", "市场表征"):
+def _base_url() -> str:
+    url = os.environ.get("SA_DATA_SERVICE_URL", "").strip()
+    if not url:
         try:
-            df = ak.index_analysis_monthly_sw(symbol=sym, date=date_str.replace("-", ""))
-        except Exception:
-            continue
-        if df is None or not len(df):
-            continue
-        for _, r in df.iterrows():
-            code = str(r.get("指数代码") or "")
-            if not re.fullmatch(r"\d{6}", code):
-                continue
-            if code != "801005" and code not in {i["code"] for i in A_UNIVERSE}:
-                continue
-            pe, close = _f(r.get("市盈率")), _f(r.get("收盘指数"))
-            if pe is None and close is None:
-                continue
-            out[code] = {"pe": pe, "close": close, "name": str(r.get("指数名称") or "")}
-    return out
+            import yaml
+            with open(BASE_DIR / "config.yaml", encoding="utf-8") as f:
+                conf = (yaml.safe_load(f) or {}).get("sector") or {}
+            url = str(conf.get("data_service_url") or "").strip()
+        except FileNotFoundError:
+            url = ""
+        except Exception as exc:      # noqa: BLE001
+            raise RuntimeError("读取 config.yaml 的 sector.data_service_url 失败: %s" % exc)
+    if not url:
+        raise RuntimeError("未配置行情服务地址：请设置 SA_DATA_SERVICE_URL 或 config.yaml 的 "
+                           "sector.data_service_url（本机不直连任何行情源）")
+    return url.rstrip("/")
+
+
+def _get_json(path: str, params: dict, timeout: int = 60) -> dict:
+    url = _base_url() + path
+    try:
+        resp = _session.get(url, params=params, timeout=timeout)
+    except requests.RequestException as exc:
+        raise RuntimeError("行情服务不可达 %s: %s" % (url, str(exc)[:140]))
+    if resp.status_code >= 400:
+        raise RuntimeError("行情服务 %s 返回 %s: %s" % (path, resp.status_code, resp.text[:200]))
+    try:
+        payload = resp.json()
+    except ValueError as exc:
+        raise RuntimeError("行情服务 %s 返回非 JSON: %s" % (path, exc))
+    if not isinstance(payload, dict):
+        raise RuntimeError("行情服务 %s 返回结构异常（%s）" % (path, type(payload).__name__))
+    return payload
+
+
+def fetch_calendar() -> list[str]:
+    """申万公布过的月末交易日（ISO 字符串，升序）。"""
+    dates = _get_json("/sw-calendar", {}, timeout=90).get("dates") or []
+    return sorted(str(d)[:10] for d in dates if d)
 
 
 def _f(v) -> float | None:
@@ -324,41 +355,52 @@ def _f(v) -> float | None:
     return x if math.isfinite(x) else None
 
 
-def fetch_sw_day(date_str: str) -> dict[str, dict]:
-    """单个交易日 → 全部一级行业 + 市场表征 801005 的当日 PE 与收盘。"""
-    ak = _ak()
+def _norm_items(items) -> dict[str, dict]:
+    """服务端 items → 本地口径 {code: {pe, close, name}}，并按本文件的标的清单过滤。"""
     out: dict[str, dict] = {}
-    for sym in ("一级行业", "市场表征"):
-        try:
-            df = ak.index_analysis_daily_sw(symbol=sym, start_date=date_str.replace("-", ""),
-                                            end_date=date_str.replace("-", ""))
-        except Exception:
+    if not isinstance(items, dict):
+        return out
+    for code, v in items.items():
+        code = str(code)
+        if not re.fullmatch(r"\d{6}", code) or code not in _SW_CODES:
             continue
-        if df is None or not len(df):
+        if not isinstance(v, dict):
             continue
-        for _, r in df.iterrows():
-            code = str(r.get("指数代码") or "")
-            if code != "801005" and not (code.startswith("801") and len(code) == 6):
-                continue
-            if code != "801005" and code not in {i["code"] for i in A_UNIVERSE}:
-                continue
-            out[code] = {"pe": _f(r.get("市盈率")), "close": _f(r.get("收盘指数")),
-                         "name": str(r.get("指数名称") or "")}
+        pe, close = _f(v.get("pe")), _f(v.get("close"))
+        if pe is None and close is None:
+            continue
+        out[code] = {"pe": pe, "close": close, "name": str(v.get("name") or "")}
     return out
 
 
+def fetch_sw_month(date_str: str) -> dict[str, dict]:
+    """一个月末 → 一级行业 + 801005 申万创业的 PE/收盘（经 101 `/sw-month`）。"""
+    got = _get_json("/sw-month", {"date": date_str}, timeout=120)
+    return _norm_items(got.get("items"))
+
+
+def fetch_sw_day(date_str: str) -> dict[str, dict]:
+    """单个交易日 → 一级行业 + 801005 申万创业的当日 PE/收盘（经 101 `/sw-day`）。"""
+    got = _get_json("/sw-day", {"date": date_str}, timeout=120)
+    return _norm_items(got.get("items"))
+
+
 def fetch_csi(code: str, start: str, end: str) -> list[dict]:
-    ak = _ak()
-    try:
-        df = ak.stock_zh_index_hist_csindex(symbol=code, start_date=start, end_date=end)
-    except Exception:
-        return []
+    """中证指数日线 [{d, close, pe}]（经 101 `/index-hist`）。
+
+    失败**向上抛**而不是返回空列表：空列表与「该指数真的没有数据」无法区分，
+    会把「101 挂了」显示成「这只指数没数据」（静默降级）。调用方 `refresh()`
+    把原因写进 note。
+    """
+    got = _get_json("/index-hist", {"code": code, "start": start, "end": end}, timeout=120)
     rows: list[dict] = []
-    for _, r in df.iterrows():
-        d = str(r.get("日期") or "")[:10]
+    for r in got.get("rows") or []:
+        if not isinstance(r, dict):
+            continue
+        d = str(r.get("d") or "")[:10]
         if not d:
             continue
-        rows.append({"d": d, "close": _f(r.get("收盘")), "pe": _f(r.get("滚动市盈率"))})
+        rows.append({"d": d, "close": _f(r.get("close")), "pe": _f(r.get("pe"))})
     rows.sort(key=lambda x: x["d"])
     return rows
 
@@ -366,7 +408,6 @@ def fetch_csi(code: str, start: str, end: str) -> list[dict]:
 def refresh(progress=None, today: date | None = None) -> dict:
     """采样 → 落盘。每一步立刻写文件，中断后重跑只补没拿到的部分。"""
     today = today or date.today()
-    ak = _ak()
     note = []
 
     def say(msg):
@@ -381,28 +422,45 @@ def refresh(progress=None, today: date | None = None) -> dict:
     cal = _read_json(cal_path)
     if not cal or cal.get("as_of") != today.isoformat():
         try:
-            df = ak.index_analysis_week_month_sw(symbol="month")
-            cal = {"as_of": today.isoformat(),
-                   "dates": sorted(str(v)[:10] for v in df[df.columns[0]].tolist())}
+            cal = {"as_of": today.isoformat(), "dates": fetch_calendar()}
+            if not cal["dates"]:
+                raise RuntimeError("申万月末日历为空")
             _write_json(cal_path, cal)
         except Exception as e:
-            note.append(f"申万月末日历取不到：{type(e).__name__}")
+            note.append(f"申万月末日历取不到：{type(e).__name__}: {str(e)[:80]}")
             cal = cal or {"as_of": "", "dates": []}
     dates = _sampling_dates(cal["dates"], today)
     if not dates:
         return {"ok": False, "note": "; ".join(note) or "采样日历为空", "files": 0}
 
+    def bad(d: str, what: str, err: str) -> None:
+        """单日取不到只记 note，绝不中断整轮。
+
+        当天（`d == today`）尚未发布属于正常态 —— 申万日报要收盘后才出，
+        盘中来刷必然 502，进 note 会变成每天一条噪音。打印出来是为了
+        「静默降级」不至于完全无声。
+        """
+        if d == today.isoformat():
+            print(f"[market_temp] {what} {d} 取不到（当天可能尚未发布）：{err}", flush=True)
+            return
+        note.append(f"{what} {d} 取不到：{err}")
+
     # 2) 每个采样日一个文件（一级行业 + 市场表征 801005）
     todo = [d for d in dates if not (SW_DIR / f"{d}.json").exists()]
     for n, d in enumerate(todo, 1):
-        got = fetch_sw_month(d)
+        err, got = "", {}
+        try:
+            got = fetch_sw_month(d)
+        except RuntimeError as exc:
+            err = str(exc)[:90]
         if got:
             _write_json(SW_DIR / f"{d}.json", got)
+        elif err:
+            bad(d, "申万月报", err)
         else:
             note.append(f"{d} 无数据")
         say(f"申万月报 {n}/{len(todo)} {d}")
         if n % 5 == 0:
-            import time
             time.sleep(0.4)
 
     # 3) 最新交易日 + 前一交易日 + 两个涨幅基期（只走日频，一次拿全 31 行）
@@ -411,9 +469,17 @@ def refresh(progress=None, today: date | None = None) -> dict:
         p = SW_DIR / f"day-{d}.json"
         if p.exists():
             continue
-        got = fetch_sw_day(d)
+        err, got = "", {}
+        try:
+            got = fetch_sw_day(d)
+        except RuntimeError as exc:
+            err = str(exc)[:90]
         if got:
             _write_json(p, got)
+        elif err:
+            bad(d, "申万日报", err)
+        else:
+            note.append(f"{d} 无数据")
         say(f"申万日报 {d}（{len(got)} 行）")
 
     # 4) 中证指数：每个代码一次请求拿全 10 年日线（PE + 收盘都在里面）
@@ -426,14 +492,21 @@ def refresh(progress=None, today: date | None = None) -> dict:
         old = _read_json(p) or {}
         if old.get("fetched") == today.isoformat():
             continue
-        rows = fetch_csi(code, SERIES_START.strftime("%Y%m%d"), end)
+        err = ""
+        try:
+            rows = fetch_csi(code, SERIES_START.strftime("%Y%m%d"), end)
+        except RuntimeError as exc:
+            err = str(exc)[:90]
+            rows = []
         if rows:
             _write_json(p, {"fetched": today.isoformat(), "rows": rows})
+        elif err:
+            note.append(f"{code} 取数失败：{err}")
         else:
             note.append(f"{code} 无数据")
         say(f"中证 {n} {code} {item['display']}（{len(rows)} 根）")
     return {"ok": True, "sampling": len(dates), "sw_new": len(todo),
-            "note": "; ".join(note[:12]), "as_of": today.isoformat()}
+            "note": "; ".join(note[:20]), "as_of": today.isoformat()}
 
 
 def _recent_trading_days(dates: list[str], today: date) -> list[str]:
@@ -662,6 +735,9 @@ def read(fresh: bool = False) -> dict | None:
         return data
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
+
+
+INJECT_DEFAULTS = {"enabled": True, "max_chars": 1200}
 
 
 def build_injection(max_chars: int = 1200) -> str:

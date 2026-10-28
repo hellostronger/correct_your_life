@@ -50,4 +50,4 @@ turnover_rate/main_inflow/up_count/down_count/lead_stock/lead_stock_pct），
 这样 `sector.py` 只需换掉 `fetch_all_boards()` 的实现，其余评分/存库/前端逻辑不动。
 """
 
-__version__ = "1.0.3"
+__version__ = "1.0.4"

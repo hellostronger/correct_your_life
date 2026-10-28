@@ -22,6 +22,12 @@ GET  /quote                  实时行情（A 股腾讯 / 港股新浪）
 GET  /intraday               分时 + 分钟 K（做 T 用）
 GET  /fx                     汇率（新浪 fx_*，一次批量）
 GET  /futures                国际期货（新浪 hf_*，如 XAU / OIL / CL）
+
+估值代理（2026-10-28 新增：市场温度计不再在本机直连 akshare）
+GET  /sw-calendar            申万公布过的月末交易日
+GET  /sw-month               某月末的申万行业 PE/收盘（一级行业 + 市场表征）
+GET  /sw-day                 某个交易日的申万行业 PE/收盘
+GET  /index-hist             中证指数日线（收盘 + 滚动市盈率），精简行
 """
 from __future__ import annotations
 
@@ -80,7 +86,8 @@ def root() -> dict:
             "endpoints": ["/health", "/boards",
                           "/boards/{code}/constituents",
                           "/zt-pool", "/history/{name}", "/collect",
-                          "/kline", "/quote", "/intraday", "/fx", "/futures"]}
+                          "/kline", "/quote", "/intraday", "/fx", "/futures",
+                          "/sw-calendar", "/sw-month", "/sw-day", "/index-hist"]}
 
 
 @app.get("/health")
@@ -295,4 +302,57 @@ def futures(symbols: str = Query(...,
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     except M.UpstreamError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.get("/sw-calendar")
+def sw_calendar() -> dict:
+    """申万公布过的月末交易日。返回 {dates: ['2016-12-30', ...]}。"""
+    from . import valuation as V
+    try:
+        return V.sw_calendar()
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except V.UpstreamError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.get("/sw-month")
+def sw_month(date: str = Query(..., description="月末交易日，YYYY-MM-DD 或 YYYYMMDD")) -> dict:
+    """某月末的申万行业 PE/收盘。返回 {date, items: {code: {pe, close, name}}, notes}。
+
+    不做标的过滤（过滤权在调用方的 UNIVERSE，加标的不用重建镜像）。
+    """
+    from . import valuation as V
+    try:
+        return V.sw_month(date)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except V.UpstreamError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.get("/sw-day")
+def sw_day(date: str = Query(..., description="交易日，YYYY-MM-DD 或 YYYYMMDD")) -> dict:
+    """某个交易日的申万行业 PE/收盘。结构与 /sw-month 一致。"""
+    from . import valuation as V
+    try:
+        return V.sw_day(date)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except V.UpstreamError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.get("/index-hist")
+def index_hist(code: str = Query(..., description="6 位中证指数代码，如 000300 / 931573"),
+               start: str = Query(..., description="起，YYYY-MM-DD 或 YYYYMMDD"),
+               end: str = Query(..., description="止，YYYY-MM-DD 或 YYYYMMDD")) -> dict:
+    """中证指数日线（精简）。返回 {code, start, end, rows: [{d, close, pe}]}。"""
+    from . import valuation as V
+    try:
+        return V.index_hist(code, start, end)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except V.UpstreamError as exc:
         raise HTTPException(502, str(exc)) from exc
