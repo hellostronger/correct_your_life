@@ -488,6 +488,18 @@ market_temperature:
   interval_minutes: 720   # 采样周期（12 小时）；0 = 关闭定时采样，页面刷新仍可用
   max_chars: 1200         # build_injection 输出上限，超出截断并标注
 
+# 财报披露前/后避险预案（持仓 ∩ 预约披露日窗口）
+# 披露前：冻结市场预期 / 估值隐含利润要求 / 同行对比 / 预告缺口 → if / else if / else
+# 披露后：拿实际值匹配分支并给「快跑 / 减仓 / 持有观察」类建议。
+# **只给建议、绝不下单**；预案落盘在 data/event_plans/。
+# pre_days: 提前几天开始推；post_days: 披露后跟踪几天；refresh_hours: 多久重算一次
+event_risk:
+  enabled: true
+  interval_minutes: 30
+  pre_days: 7
+  post_days: 10
+  refresh_hours: 12
+
 # 币圈 24h 趋势参考（gate.io 股票永续；欧易 OKX 本机直连不通，此为平替源）
 # 白名单在「自选行情」页的币圈卡片里加删；interval_minutes: 抓价周期，0=关闭
 # alert_threshold_pct: |24h 涨跌| 超此值推微信；alert_cooldown_hours: 同向推送冷却

@@ -123,6 +123,12 @@ DEFAULT_INTERVALS = {
     # 默认开（用户要求「每天运行」）；enabled 只是「本线程要不要自己跑」
     # 的总闸，手动点「试运行」不受它限制。
     "strategy_daily": {"enabled": True, "interval_minutes": 1440},
+    # 财报披露前/后避险预案（2026-10-29）。**只读建议、绝不下单**：
+    # 披露前冻结预期并给 if / else if / else 分支，披露后拿实际值匹配分支。
+    # 读写的就是顶层 `event_risk:` 段（_load_schedule_conf / schedule_update 对
+    # DEFAULT_INTERVALS 每个键都取顶层同名段），所以「⚙️ 调度」页自动出现开关。
+    # 间隔 30 分钟够了：预案的输入（预期 / 估值 / 同行 PE）按天变，不是分钟级。
+    "event_risk": {"enabled": True, "interval_minutes": 30},
 }
 # ⚠️ news 的周期真身是 `news.fetch_interval_minutes`（_auto_fetch_loop 和
 # news_fetcher 都读它），而 `news.interval_minutes` 是历史遗留的**幽灵键**：
@@ -3188,6 +3194,7 @@ def llm_update_config(body: LLMConfIn):
 
 import econ_calendar
 import earnings_sync
+import event_risk
 
 
 class CalendarEventIn(BaseModel):
@@ -3205,6 +3212,335 @@ def calendar_upcoming(months: int = 3):
         events = econ_calendar.upcoming_events(conn, months=months)
     return {"events": events, "sync": econ_calendar.sync_meta(),
             "earn_sync": earnings_sync.sync_meta()}
+
+
+# ---------------- 事件避险预案（event_risk.py：披露前 if/else + 披露后分支匹配） ----------------
+#
+# 与「日历提醒」是两件事：日历只说「哪天披露」，这里冻结「披露前市场预期 /
+# 估值隐含利润 / 同行对比 / 信息缺口」，并给出披露后按实际值落哪个分支、
+# 该快跑还是减仓。**只读建议，不碰任何交易/资金逻辑。**
+#
+# `build_plan` 首次要打 101 `/financials/bundle`（冷启动实测 229 秒），
+# 所以一律后台跑 + 状态轮询，不能同步占死请求线程。
+
+_er_jobs: dict[str, dict] = {}
+_er_lock = threading.Lock()
+
+
+def _er_key(code: str, period: str) -> str:
+    return "%s|%s" % (code, str(period)[:10])
+
+
+def _er_job_view(key: str) -> dict:
+    j = _er_jobs.get(key) or {}
+    return {"running": bool(j.get("running")),
+            "progress": j.get("progress") or "",
+            "error": j.get("error") or "",
+            "started_at": j.get("started_at") or "",
+            "finished_at": j.get("finished_at") or ""}
+
+
+def _er_snapshot(key: str) -> tuple[dict | None, str]:
+    """后台已产出的 plan 优先，其次读落盘；两者都没有返回 (None, "")。"""
+    j = _er_jobs.get(key) or {}
+    plan = j.get("plan")
+    if plan:
+        return plan, j.get("text") or event_risk.render(plan)
+    code, period = key.split("|", 1)
+    plan = event_risk.load_plan(code, period)
+    return (plan, event_risk.render(plan)) if plan else (None, "")
+
+
+def _er_start(code: str, period: str, disclose_date: str) -> dict:
+    key = _er_key(code, period)
+    with _er_lock:
+        if (_er_jobs.get(key) or {}).get("running"):
+            return _er_job_view(key)
+        _er_jobs[key] = {
+            "running": True, "progress": "取数中（首次冷启动可能 1~4 分钟）",
+            "error": "", "plan": None, "text": "",
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at": "",
+        }
+
+    def _run() -> None:
+        job = _er_jobs.get(key)
+        if job is None:
+            return
+        try:
+            plan = event_risk.build_plan(code, period, disclose_date, save=True)
+            job["plan"] = plan
+            job["text"] = event_risk.render(plan)
+        except Exception as exc:                    # noqa: BLE001
+            job["error"] = "%s: %s" % (type(exc).__name__, exc)
+            print("[event_risk] %s %s 预案生成失败: %s"
+                  % (code, period, job["error"]), flush=True)
+        finally:
+            job["running"] = False
+            job["progress"] = ""
+            job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+
+    threading.Thread(target=_run, name="er_plan", daemon=True).start()
+    return _er_job_view(key)
+
+
+def _er_lookup_event(code: str) -> dict:
+    """本地财报同步缓存里找该股已披露/将披露的报告期与预约日（只读 JSON，不联网）。
+
+    优先取**今天及以后最近的**一次预约披露；都过了就取最近一次已披露的。
+    """
+    try:
+        today = _dt_mod.date.today().isoformat()
+        since = (_dt_mod.date.today() - timedelta(days=200)).isoformat()
+        cand = [e for e in earnings_sync.load_events(from_iso=since)
+                if e.get("code") == "earn:own:%s" % code and e.get("period")]
+        if not cand:
+            return {}
+        upcoming = [e for e in cand if str(e.get("date") or "") >= today]
+        pick = min(upcoming, key=lambda e: str(e.get("date") or "")) if upcoming \
+            else max(cand, key=lambda e: str(e.get("date") or ""))
+        return {"period": str(pick["period"])[:10],
+                "disclose_date": str(pick.get("date") or "")[:10]}
+    except Exception as exc:                        # noqa: BLE001
+        print("[event_risk] 读取财报排期失败（忽略）: %s" % exc, flush=True)
+    return {}
+
+
+def _er_default_period() -> str:
+    """最近一个已结束的季末报告期（今天 2026-10-29 → 2026-09-30）。
+
+    非持仓票（如天孚通信）不在 `earnings_sync` 缓存里，没有预约披露日可查；
+    给个季末默认值总比让页面直接 400 好，取不到报表时预案会如实标缺口。
+    """
+    t = _dt_mod.date.today()
+    for m, d in ((12, 31), (9, 30), (6, 30), (3, 31)):
+        y = t.year if (m, d) <= (t.month, t.day) else t.year - 1
+        try:
+            return _dt_mod.date(y, m, d).isoformat()
+        except ValueError:
+            continue
+    return ""
+
+
+@app.get("/api/event-risk/plans")
+def event_risk_plans():
+    """已落盘的预案清单（不含完整分支，页面列表用）。"""
+    try:
+        return {"ok": True, "items": event_risk.list_plans()}
+    except Exception as exc:                        # noqa: BLE001
+        return {"ok": False, "items": [],
+                "error": "%s: %s" % (type(exc).__name__, exc)}
+
+
+@app.get("/api/event-risk/plan")
+def event_risk_plan(code: str, period: str = "", disclose_date: str = "",
+                    refresh: bool = False):
+    """某只票某报告期的条件式预案。
+
+    - 有落盘/已产出的 plan → 立即返回文本（`refresh=1` 时同时后台重算）；
+    - 没有 → 启动后台任务并返回 `job.running=true`，前端轮询 `/plan/status`。
+    """
+    code = (code or "").strip()
+    if not re.fullmatch(r"\d{5,6}", code):
+        raise HTTPException(400, "code 必须是 5~6 位数字证券代码")
+    lookup = {}
+    period_from = "explicit"
+    if not period:
+        lookup = _er_lookup_event(code)
+        period = lookup.get("period") or ""
+        period_from = "event" if period else ""
+    period = (period or "").strip()[:10]
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", period):
+        period = _er_default_period()
+        period_from = "default"
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", period):
+        raise HTTPException(400, "period 必须是季末报告期（如 2026-09-30）")
+    disclose_date = (disclose_date or lookup.get("disclose_date") or "").strip()[:10]
+    key = _er_key(code, period)
+    if refresh or not (_er_jobs.get(key) or {}).get("plan"):
+        if refresh or not event_risk.load_plan(code, period):
+            _er_start(code, period, disclose_date)
+    plan, text = _er_snapshot(key)
+    return {"ok": True, "code": code, "period": period, "period_from": period_from,
+            "disclose_date": disclose_date, "plan": plan, "text": text,
+            "from_cache": bool(plan), "job": _er_job_view(key)}
+
+
+@app.get("/api/event-risk/plan/status")
+def event_risk_plan_status(code: str, period: str = ""):
+    key = _er_key(code, period)
+    plan, text = _er_snapshot(key)
+    return {"ok": True, "plan": plan, "text": text, "job": _er_job_view(key)}
+
+
+# ---- 财报披露前/后避险预案：守护线程（2026-10-29）----
+# 只读建议、绝不下单：本线程只调 event_risk.build_plan() / render() 与
+# notifier，不碰任何成交路径（event_risk 也不 import paper_trading）。
+_ER_NOTIFY_FILE = DATA_DIR / "event_risk_notified.json"
+_ER_NOTIFY_LOCK = threading.Lock()
+_ER_NOTIFY_KEEP = 500        # 只留最近 N 个已推送键，避免文件无限长
+_ER_PUSH_LIMIT = 1800        # 推送正文上限（预案全文一般 400~900 字符）
+_ER_MAX_BUILDING = 2         # 同时最多几个后台 build_plan（首次冷启动实测 229s）
+_ER_LEVEL_TAG = {"critical": "【关键】", "high": "【高】"}
+
+
+def _er_notified_load() -> list[str]:
+    """已推送键（跨重启去重）。读不到就当空集合 —— 最多重复推一次，不能崩。"""
+    try:
+        with open(_ER_NOTIFY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return []
+    except Exception as exc:                    # noqa: BLE001
+        print("[event-risk] 已推送集合读取失败: %s" % exc, flush=True)
+        return []
+    return [str(x) for x in (data or []) if isinstance(x, str)]
+
+
+def _er_notified_save(keys: list[str]) -> None:
+    """原子写（先 .tmp 再 os.replace），半截 JSON 不会留在盘上。"""
+    try:
+        os.makedirs(str(DATA_DIR), exist_ok=True)
+        tmp = str(_ER_NOTIFY_FILE) + ".tmp"
+        with _ER_NOTIFY_LOCK:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(keys[-_ER_NOTIFY_KEEP:], f, ensure_ascii=False)
+            os.replace(tmp, str(_ER_NOTIFY_FILE))
+    except Exception as exc:                    # noqa: BLE001
+        print("[event-risk] 已推送集合落盘失败: %s" % exc, flush=True)
+
+
+def _er_building() -> int:
+    """正在后台生成预案的数量（`_er_jobs` 会被其它线程插键，必须持锁读）。"""
+    with _er_lock:
+        return sum(1 for j in _er_jobs.values() if j.get("running"))
+
+
+def _er_built_at(plan: dict) -> datetime | None:
+    """plan.generated_at 是**带时区**的 ISO（+08:00），比较前归一到本地朴素时间。"""
+    raw = str((plan or {}).get("generated_at") or "")
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt
+
+
+def _er_plan_text(plan: dict, text: str = "") -> str:
+    """render() 已含全部结论（分支 / 落地建议 / 数据缺口），直接推它。"""
+    body = text or event_risk.render(plan or {})
+    if len(body) > _ER_PUSH_LIMIT:
+        body = body[:_ER_PUSH_LIMIT] + "\n…（已截断，全文见页面「事件避险预案」）"
+    return body
+
+
+def _event_risk_loop() -> None:
+    """披露前冻结预期给 if / else if / else；披露后拿实际值匹配分支并推建议。
+
+    与 `_t_advisory_loop` 刻意不同的是**没有交易时段闸门**：财报可能在周末
+    或盘后披露，错过 pre / post 窗口的提醒就失去了避险意义；本线程只读不
+    成交，非交易时段跑也没有副作用。
+
+    去重键（落盘，跨重启有效）：
+      - 已有实际值：`post|代码|报告期|分支`（分支变化会再推一次）
+      - 只有披露前预案：`pre|代码|报告期`
+    披露后还读不到实际值（正式报表未出）时**不推**，等下一轮补。
+    """
+    time.sleep(90)   # 冷启动让 init_db / 日历先就绪（同 _econ_sync_loop）
+    while True:
+        try:
+            conf = _conf_section("event_risk")
+            if not conf.get("enabled", True):
+                time.sleep(300)
+                continue
+            iv = max(5, int(conf.get("interval_minutes") or 30))
+            pre_days = max(1, min(int(conf.get("pre_days") or 7), 60))
+            post_days = max(1, min(int(conf.get("post_days") or 10), 60))
+            refresh_h = max(1, min(int(conf.get("refresh_hours") or 12), 168))
+
+            held = {str(h.get("code")): (h.get("name") or "")
+                    for h in (_derive_holdings() or [])
+                    if int(h.get("net_shares") or 0) > 0}
+            if not held:                        # 没有持仓就没什么可避险的
+                time.sleep(iv * 60)
+                continue
+
+            today = datetime.now().date()
+            since = (today - timedelta(days=max(pre_days, post_days) + 15)).isoformat()
+            rows = []
+            for ev in earnings_sync.load_events(from_iso=since):
+                code = str(ev.get("code") or "")
+                if not code.startswith("earn:own:"):
+                    continue
+                cd = code.split(":", 2)[2]
+                if cd not in held:
+                    continue
+                period = str(ev.get("period") or "")[:10]
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", period):
+                    continue                # 美股/无报告期的事件不构成 A 股财报预案
+                dd_s = str(ev.get("date") or "")[:10]
+                try:
+                    dd = datetime.strptime(dd_s, "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+                ahead = (dd - today).days
+                if ahead > pre_days or ahead < -post_days:
+                    continue
+                rows.append((dd_s, cd, period, ahead))
+            rows.sort()
+
+            notified = _er_notified_load()
+            done = set(notified)
+            changed = False
+            for dd_s, cd, period, ahead in rows:
+                plan = event_risk.load_plan(cd, period)
+                phase = "post" if ahead < 0 else "pre"
+                built = _er_built_at(plan) if plan else None
+                stale = bool(built) and \
+                    (datetime.now() - built).total_seconds() >= refresh_h * 3600
+                # 披露前冻结的预案只看得到「部署前预期」，永远不会自己长出
+                # advice。披露日当天与之后必须重建一次才可能拿到实际值。
+                # 用 `built.date() < today` 限流，避免报表一直不出时每 30 分钟
+                # 重建一次（冷启动 229s，会把后台槽位占满）。
+                need_fresh = (not (plan or {}).get("advice")
+                              and ahead <= 0
+                              and (built is None or built.date() < today))
+                if plan is None or stale or need_fresh:
+                    if _er_building() < _ER_MAX_BUILDING:
+                        _er_start(cd, period, dd_s)
+                    continue     # 本轮不推半成品，等下一轮用新 plan
+                key = ""
+                if plan.get("advice"):
+                    key = "post|%s|%s|%s" % (cd, period,
+                                             plan["advice"].get("branch") or "")
+                elif phase == "pre":
+                    key = "pre|%s|%s" % (cd, period)
+                if not key or key in done:
+                    continue
+                name = plan.get("name") or held.get(cd) or cd
+                if plan.get("advice"):
+                    adv = plan["advice"]
+                    title = "%s🚨 财报结果 %s %s（%s）" % (
+                        _ER_LEVEL_TAG.get(adv.get("level") or "", ""),
+                        cd, name, period)
+                    event = "event_risk_post"
+                else:
+                    title = "📊 披露前预案 %s %s（%s，%s）" % (cd, name, period, dd_s)
+                    event = "event_risk_pre"
+                _notifier_notify_safe(title, _er_plan_text(plan), event=event)
+                done.add(key)
+                notified.append(key)
+                changed = True
+            if changed:
+                _er_notified_save(notified)
+            time.sleep(iv * 60)
+        except Exception as exc:                # noqa: BLE001
+            print("[event-risk] loop error: %s" % exc, flush=True)
+            time.sleep(120)
 
 
 @app.get("/api/macro/rates")
@@ -10697,6 +11033,10 @@ _start_daemon(_calendar_loop, "sa_calendar")
 
 # CPI 排期同步线程（中/美 CPI 公布时间 → data/econ_sync.json，默认每日一轮）
 _start_daemon(_econ_sync_loop, "sa_econ_sync")
+
+# 财报披露前/后避险预案线程（持仓 ∩ 预约披露日窗口：披露前推 if/else 分支，
+# 披露后推实际值落在哪一支 + 离场建议）。**只给建议、绝不下单**。
+_start_daemon(_event_risk_loop, "sa_event_risk")
 
 # 节假日/交易日历（真源=国务院放假公告，LLM 抽取）。放最后起：它可能触发一次
 # 抓公告+LLM 的慢操作，不该排在其它守护线程前面拖慢它们就绪。

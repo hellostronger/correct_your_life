@@ -1203,6 +1203,19 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       <div id="calendar-list"></div>
       <div id="calendar-empty" class="empty hide">加载中…</div>
     </div>
+
+    <div class="card hide" id="er-panel" style="margin-top:12px">
+      <div class="row" style="justify-content:space-between;margin-bottom:6px">
+        <b style="font-size:13px" id="er-title">📋 财报事件预案</b>
+        <div class="row">
+          <button class="btn ghost" id="er-refresh-btn" onclick="erRefresh()"
+                  title="重新取数并重算（绕过本地缓存，冷启动可能要几分钟）">刷新预案</button>
+          <button class="btn ghost" onclick="erClose()">关闭</button>
+        </div>
+      </div>
+      <div id="er-status" class="muted" style="font-size:12px;margin-bottom:8px"></div>
+      <div id="er-body"></div>
+    </div>
   </section>
 
   <!-- 新闻 -->
@@ -7979,10 +7992,18 @@ async function loadCalendar() {
         ? '<span class="muted" style="font-size:11px"> · 同步</span>'
         : (e.source === 'earnings_sync'
            ? '<span class="muted" style="font-size:11px"> · 财报</span>' : '');
+      // 预案入口：只对 earn:{own|cn|us}:<数字代码> 显示（美股 ticker 走不了 A 股口径）。
+      // 只往 onclick 里拼已校验的日期/代码 —— esc() 不转义单引号，拼标题会断。
+      const erM = /^earn:(?:own|cn|us):(\d{5,6})$/.exec(String(e.code || ''));
+      const erTag = erM
+        ? `<button class="btn ghost" style="font-size:11px;margin-left:4px;padding:2px 8px"
+             onclick="erOpen('${erM[1]}','${/^\d{4}-\d{2}-\d{2}$/.test(e.period || '') ? e.period : ''}','${/^\d{4}-\d{2}-\d{2}$/.test(e.date || '') ? e.date : ''}')"
+             title="披露前 if/else 条件预案 + 披露后分支匹配（只给建议、不下单）">📋 预案</button>`
+        : '';
       return `<div class="row" style="justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--border);${isPast ? 'opacity:.5' : ''}">
         <span><b>${e.date}</b> <span class="muted">周${wd}</span>
           <span class="badge" style="${lv.s}">${lv.t}</span>
-          <span style="margin-left:6px">${esc(e.title)}</span>${link}${ipoTag}${syncTag}
+          <span style="margin-left:6px">${esc(e.title)}</span>${link}${ipoTag}${syncTag}${erTag}
           ${e.time ? `<span class="muted"> · ${esc(e.time)}</span>` : ''}
           ${e.market === 'us' ? '<span class="muted"> · 美</span>' : '<span class="muted"> · A/港</span>'}
           ${e.note ? `<div class="muted" style="margin-top:2px">${esc(e.note)}</div>` : ''}</span>
@@ -7990,6 +8011,153 @@ async function loadCalendar() {
     }).join('');
   } catch (e) { toastErr('加载日历失败: ' + e.message); }
 }
+
+// ---------------- 财报事件预案（披露前 if/else + 披露后分支匹配）----------------
+// 只给建议、不下单。首次取数要拉同行估值 + 财报，冷启动可达数分钟
+// ⇒ 后端跑后台任务，这里轮询 /plan/status（job 字段只有 progress，没有 message）。
+const ER_LEVEL = {
+  critical: { t: '关键', s: 'background:#ffe2e2;color:#b32424' },
+  high: { t: '高', s: 'background:#ffe9d6;color:#b25f00' },
+  info: { t: '参考', s: 'background:#e5f3e2;color:#2e7d32' },
+};
+const ER_BRANCH = {
+  beat: '超预期', inline: '符合预期', miss: '不及预期', deep_miss: '大幅不及预期',
+  'pre_event_de-risk': '披露前避险', valuation_loss: '利润转负',
+  valuation_severe: '远低于估值所需', valuation_weak: '低于估值所需',
+  valuation_fair: '接近估值所需', valuation_ok: '覆盖估值所需',
+  valuation_invalid: '估值口径失效', unknown: '无法判断',
+};
+const ER_PERIOD_SRC = {
+  event: '报告期来自财报排期', explicit: '报告期为显式指定',
+  default: '报告期用默认季末（该股暂无排期）',
+};
+let _er = { code: '', period: '', timer: null, seq: 0, bits: '' };
+
+function _erStop() { if (_er.timer) { clearInterval(_er.timer); _er.timer = null; } }
+function erClose() {
+  _erStop(); _er.seq++; _er.code = ''; _er.period = ''; _er.bits = '';
+  $('er-panel').classList.add('hide');
+}
+function _erPct(v) {
+  const n = Number(v);
+  if (v == null || !isFinite(n)) return '—';
+  return (n > 0 ? '+' : '') + n.toFixed(2) + '%';
+}
+function _erShow() {
+  const p = $('er-panel');
+  p.classList.remove('hide');
+  try { p.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (e) {}
+}
+
+async function erOpen(code, period, discloseDate) {
+  _erStop();
+  _er.seq++;
+  _er.code = code; _er.period = period || ''; _er.bits = '';
+  $('er-title').textContent = '📋 财报事件预案 · ' + code;
+  $('er-status').textContent = '加载中…';
+  $('er-body').innerHTML = '';
+  _erShow();
+  let q = '/api/event-risk/plan?code=' + encodeURIComponent(code);
+  if (period) q += '&period=' + encodeURIComponent(period);
+  if (discloseDate) q += '&disclose_date=' + encodeURIComponent(discloseDate);
+  await _erLoad(q);
+}
+
+async function erRefresh() {
+  if (!_er.code) return;
+  const btn = $('er-refresh-btn');
+  btn.disabled = true;
+  try {
+    let q = '/api/event-risk/plan?code=' + encodeURIComponent(_er.code) + '&refresh=1';
+    if (_er.period) q += '&period=' + encodeURIComponent(_er.period);
+    await _erLoad(q);
+  } finally { btn.disabled = false; }
+}
+
+async function _erLoad(q) {
+  const seq = _er.seq;
+  try {
+    const d = await api(q);
+    if (seq !== _er.seq) return;              // 已经切到别的票/关掉了
+    if (d.period) _er.period = d.period;
+    _erApply(d);
+  } catch (e) {
+    if (seq !== _er.seq) return;
+    $('er-status').textContent = '';
+    $('er-body').innerHTML = `<div class="muted">预案加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+async function _erPoll() {
+  if (!_er.code) { _erStop(); return; }
+  if (document.hidden) return;                // 页面不可见先不查，定时器保留
+  const seq = _er.seq;
+  let q = '/api/event-risk/plan/status?code=' + encodeURIComponent(_er.code);
+  if (_er.period) q += '&period=' + encodeURIComponent(_er.period);
+  try {
+    const d = await api(q);
+    if (seq !== _er.seq) return;
+    _erApply(d);
+  } catch (e) {
+    if (seq !== _er.seq) return;
+    _erStop();
+    $('er-body').innerHTML = `<div class="muted">轮询失败：${esc(e.message)}</div>`;
+  }
+}
+
+function _erApply(d) {
+  const job = d.job || {}, plan = d.plan || null, text = d.text || '';
+  if (d.period || d.period_from) {
+    const bits = [];
+    if (d.period) bits.push('报告期 ' + d.period);
+    if (ER_PERIOD_SRC[d.period_from]) bits.push(ER_PERIOD_SRC[d.period_from]);
+    if (d.disclose_date) bits.push('预约披露 ' + d.disclose_date);
+    if (plan) bits.push(d.from_cache ? '来自本地缓存' : '刚生成');
+    _er.bits = bits.join(' · ');
+    $('er-status').textContent = _er.bits;
+  }
+  if (plan && text) {
+    _erStop();
+    if (plan.name) $('er-title').textContent = '📋 财报事件预案 · ' + plan.code + ' ' + plan.name;
+    $('er-body').innerHTML = _erRender(plan, text);
+    return;
+  }
+  if (job.running) {
+    $('er-body').innerHTML = `<div class="muted">${esc(job.progress || '取数中…')}
+      <div class="muted" style="font-size:11px;margin-top:4px">
+      后台跑，可以先看别的页面：首次冷启动要拉同行估值与财报，通常 1~4 分钟。</div></div>`;
+    if (!_er.timer) _er.timer = setInterval(_erPoll, 3000);
+    return;
+  }
+  _erStop();
+  $('er-body').innerHTML = `<div class="muted">暂无可展示的预案${
+    job.error ? '：' + esc(job.error) : ''}</div>`;
+}
+
+function _erRender(plan, text) {
+  const out = [];
+  const adv = plan.advice;
+  if (adv) {
+    const lv = ER_LEVEL[adv.level] || ER_LEVEL.info;
+    const name = ER_BRANCH[adv.branch] || adv.branch || '—';
+    const basis = adv.basis === 'valuation' ? '按估值隐含利润对比'
+      : (adv.basis === 'guide' ? '按业绩预告中值对比' : '');
+    out.push(`<div style="padding:8px 10px;border-radius:6px;margin-bottom:10px;${lv.s}">
+      <b>【${lv.t}】已出结果，落在「${esc(name)}」分支${basis ? '，' + esc(basis) : ''}</b>
+      <span class="badge" style="${lv.s};margin-left:6px">偏离 ${esc(_erPct(adv.dev_pct))}</span>
+      <div style="margin-top:6px;font-size:13px">${esc(adv.action || '')}</div></div>`);
+  } else {
+    out.push(`<div class="muted" style="font-size:12px;margin-bottom:8px">
+      尚未出结果 —— 下面是披露前冻结的条件预案，实际值公布后会落到对应分支。</div>`);
+  }
+  out.push(`<pre style="white-space:pre-wrap;word-break:break-word;margin:0;padding:10px;
+    background:var(--card-2);border:1px solid var(--border);border-radius:6px;
+    font-size:12px;line-height:1.65;max-height:540px;overflow:auto">${esc(text)}</pre>`);
+  out.push(`<div class="muted" style="font-size:11px;margin-top:6px">
+    只给建议、不自动下单。预案已落盘，之后打开直接读缓存（要重算点「刷新预案」）。</div>`);
+  return out.join('');
+}
+
 async function addCalendarEvent() {
   const date = $('c-date').value, title = $('c-title').value.trim();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) { toast('请选择日期'); return; }

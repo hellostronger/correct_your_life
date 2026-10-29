@@ -87,7 +87,10 @@ def root() -> dict:
                           "/boards/{code}/constituents",
                           "/zt-pool", "/history/{name}", "/collect",
                           "/kline", "/quote", "/intraday", "/fx", "/futures",
-                          "/sw-calendar", "/sw-month", "/sw-day", "/index-hist"]}
+                          "/sw-calendar", "/sw-month", "/sw-day", "/index-hist",
+                          "/financials/report", "/financials/preannounce",
+                          "/financials/express", "/financials/consensus",
+                          "/financials/abstract", "/financials/bundle"]}
 
 
 @app.get("/health")
@@ -355,4 +358,89 @@ def index_hist(code: str = Query(..., description="6 位中证指数代码，如
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     except V.UpstreamError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+# ---------------- 财务代理（event_risk：披露前冻结预期 / 披露后核对实际） ----------------
+
+@app.get("/financials/report")
+def fin_report(period: str = Query(..., description="季末报告期，如 20260930"),
+               codes: str = Query("", description="逗号分隔 6 位代码，留空=全表")) -> dict:
+    """业绩报表（**已披露**的正式值，归母口径，单位元）。
+
+    ⚠️ 只有已披露的公司才在表里：**查不到 = 还没披露，不等于亏损或没利润**。
+    """
+    from . import financials as F
+    try:
+        return F.report(period, codes)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except F.UpstreamError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.get("/financials/preannounce")
+def fin_preannounce(period: str = Query(..., description="季末报告期，如 20260930"),
+                    codes: str = Query("", description="逗号分隔 6 位代码")) -> dict:
+    """业绩预告。`profit_mid` 是**预告区间中值**，不是实际值（也未审计）。"""
+    from . import financials as F
+    try:
+        return F.preannounce(period, codes)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except F.UpstreamError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.get("/financials/express")
+def fin_express(period: str = Query(..., description="季末报告期，如 20260930"),
+                codes: str = Query("", description="逗号分隔 6 位代码")) -> dict:
+    """业绩快报（比正式报表早，**未经审计**）。"""
+    from . import financials as F
+    try:
+        return F.express(period, codes)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except F.UpstreamError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.get("/financials/consensus")
+def fin_consensus(codes: str = Query("", description="逗号分隔 6 位代码")) -> dict:
+    """机构一致预期 —— **只有年度 EPS，没有季度共识**（响应 notes 里也这么说）。"""
+    from . import financials as F
+    try:
+        return F.consensus(codes)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except F.UpstreamError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.get("/financials/abstract")
+def fin_abstract(code: str = Query(..., description="6 位代码，如 300394")) -> dict:
+    """单只票的历史财务序列（常用指标，单位为原始单位）。"""
+    from . import financials as F
+    try:
+        return F.abstract(code)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except F.UpstreamError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.get("/financials/bundle")
+def fin_bundle(code: str = Query(..., description="6 位代码，如 300394"),
+               period: str = Query(..., description="季末报告期，如 20260930")) -> dict:
+    """一次拿齐一只票的 report/preannounce/express/consensus/abstract。
+
+    各子块独立失败：缺的那块是 null，原因在 `errors` 里 —— 一个源挂了不该让
+    整只票的预案变成空白。
+    """
+    from . import financials as F
+    try:
+        return F.bundle(code, period)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except F.UpstreamError as exc:
         raise HTTPException(502, str(exc)) from exc

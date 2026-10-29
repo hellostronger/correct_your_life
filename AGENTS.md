@@ -5595,3 +5595,233 @@ PG 按**会话时区**解释 —— 服务器 `TimeZone = Etc/UTC`，于是北�
 `[FATAL:partition_address_space.cc(243)] Check failed: !IsConfigurablePoolInitialized()`
 **直接杀进程**（不是异常，try/except 接不住）。缓解是**先单线程预热**一次
 （`_warmup_mini_racer()`），再并行；或者干脆用 `node` 真跑（本文件多处已这么做）。
+
+---
+
+### 📊 财报事件避险预案 `stock-advisor/event_risk.py`（2026-10-29 新增）
+
+用户诉求（原话）：「针对关心的要发财报的或者重大时间，必须给出 if else if xxxx出现xxx
+else yyy出现yyy，比如天孚通信…实际没有达标，开盘应该快跑，还有像摩尔线程这种，估值太高的，
+要对比同行的盈利情况，他的财报预期要多少才行，结合没有提前发业绩预告风险是极大的，
+不要博弈，要先离场」。
+
+**先定性**：这不是再加一条日历提醒（日历本来就有 `earnings_sync`），要的是
+**披露前冻结基准 → 写成 if/else → 披露后拿实际值落进某个分支 → 给明确动作**的闭环。
+
+#### 不是什么（都用 AST 断言钉住）
+
+- **不 import `paper_trading`**：`_decide_one` 会跑交易员/辩论/成交（一轮 5~6 次 LLM，
+  还会写 `sa_paper_trades`）。拿它「生成预案」等于把只读建议接进交易链路。
+  测试里断言 `event_risk.py` 不 import `paper_trading`，app 侧守护线程不碰
+  `calendar_gate` / `is_trading_day`。
+- **不下单、不改任何交易或风控口径**：产出只有结构化 dict + 一段文本。
+- **不新增 DB schema**：预案是快照，落 `data/event_plans/{code}_{period}.json`
+  （原子写 `os.replace`）；目录首次 `save_plan` 时才建。
+- 缺数据时**明确说缺**（写进 `gaps`），不让模型编数字。
+
+#### 五类指标不能互相冒充（本功能最容易错的一条）
+
+| 指标 | 来源 | 口径 | 能当什么用 |
+|---|---|---|---|
+| 市场一致预期（季度） | **公开源拿不到** → 自算 `est.ref` | 单季 | 分支基准（优先） |
+| 业绩预告区间 | `preannounce` | 按公告（单季/累计） | 基准（无自算时）+ 风险信号 |
+| 券商评级 / 目标价 | `consensus` | **年度 EPS** | 只当共识温度计，**不进阈值** |
+| 估值隐含利润要求 | 总市值 ÷ 同行 PE 中位 | 年 + 本季累计 | 无预期时的基准 |
+| 正式财报实际值 | `report` > `express` | 累计 | 落分支 |
+
+季度一致预期拿不到 → `estimates()`（L230）用**两条独立推算**：①年度一致 EPS × 股本 ×
+历史同季占比；②去年同期 × 一致增速。`ref = median(两条)`；分歧 ≥ `spread_warn_pct`(30%)
+时 note 里**明写「预期本身不可靠，不应据此单边下注」**。
+
+#### 单位口径（混用会静默产出「0.00 亿」）
+
+| 数据 | 单位 | 格式化函数 |
+|---|---|---|
+| `/quote` 的 `market_cap` | **亿元** | `_amt_txt` |
+| `valuation.required.annual_profit_yi` / `period_profit_yi` | **已是亿元** | `_amt_txt` |
+| `estimates.items[].value` / `est.ref` / `actual.net_profit` / `guide_mid` / `thresholds.*` | **元** | `_yi_txt` / `_yi` |
+
+前端**不重算任何数字**，只渲染后端 `text` 与结构化字段 —— 它没有单位知识。
+
+#### 估值反推（摩尔线程那类）
+
+`valuation()`（L360）：同行 = 同行业 + 同报告期，`peer_cap=60` 取样；
+PE 中位有效样本 < `peer_min_count`(5) → **判不了就不硬算**。
+
+```
+所需年利润     = 总市值 ÷ 同行 PE 中位
+所需本季累计   = 所需年利润 × 历史同季占比
+```
+
+三条 `status != "ok"` 的拒绝理由（原样透传到页面与分支 `reason`，不伪造）：
+缺实时总市值 / 同行样本不足 / **本股 PE ≤ 0（亏损）** —— 最后一条是硬闸：
+负 PE 不能套正 PE 反推，「所需利润 vs 实际利润」不同口径，直接写「计算失效」。
+
+#### 分支（披露前那份 if/else）
+
+- 有自算预期（`basis="estimate"`）：`beat`(≥ +10%) / `inline`(±10%) / `miss`(-10%~-30%) /
+  `deep_miss`(< -30% 或由盈转亏)。
+- 无预期（`basis="valuation"`）：`valuation_loss`(≤0) / `valuation_severe`(<20% 覆盖) /
+  `valuation_weak`(20%~50%) / `valuation_fair`(<100%) / `valuation_ok`(≥100%)。
+- 永远附加两条（与基准无关）：`pre_event_de-risk`（估值贵 → **不在披露前博弈**）、
+  `valuation_invalid`（PE≤0/不可比 → **按最坏情况处理**）。
+- 两套基准都不可用 → `available: False` + 理由，文案直说「不做 if/else —— 请按公告原文
+  与现金流自行判断」。**这是唯一允许的「给不出预案」，且必须写明缺的是什么。**
+  用户点名的两只都**有**基准：天孚通信走 estimate、摩尔线程走 valuation。
+
+#### 披露后落分支
+
+`match_branch`（L613）：`dev = 实际 / 预期 - 1`，阈值与披露前**同源**（不另写一套）。
+`match_valuation_branch`（L630）：**口径必须换算** —— 有 `period_profit_yi` 就比本季累计，
+否则把实际值年化（`_annualize = 累计 × 4 ÷ 季度数`）再比年度要求。
+`build_plan` 的 basis 路由是：有 `est.ref` → estimate；只有 `guide_mid` → 基准是预告中值
+且 `basis` 标 `"guide"`；两者都没有 → valuation。`_ACTION`（L673）把分支映射到动作
+（离场 / 减仓 / 持有观察 / 不加仓），`level` 渲染成 `【关键】` / `【高】`（不用 emoji）。
+
+#### 「无预告」四态（第二态不许编）
+
+| state | 条件 | 含义 |
+|---|---|---|
+| `present` | 本期有预告 | 直接用区间中值当基准 |
+| `missing` | **去年同期有、本期没有** | 强风险信号（公司本来会发） |
+| `overdue` | 已过预约披露日仍无预告/报告 | 异常 |
+| `not_due` | 尚未到披露期 | 正常 |
+
+「**不满足强制预告条件**」在公开数据里没有依据 → 只写进 `gaps`「无法从公开数据判定」，
+**绝不给结论**。这是用户要的三态里唯一无法自动判定的那个，明说比编一个强。
+
+#### 接线（app.py）
+
+| 位置 | 说明 |
+|---|---|
+| L3325 `GET /api/event-risk/plans` | 已落盘预案列表 |
+| L3335 `GET /api/event-risk/plan` | `code`(必填，`re.fullmatch(r"\d{5,6}")` 否则 400)、`period`、`disclose_date`、`refresh` |
+| L3369 `GET /api/event-risk/plan/status` | 后台任务轮询 |
+| L3441 `_event_risk_loop` + **L11039** 注册 | 守护线程 `sa_event_risk` |
+
+**必须后台跑**：`SLOW_TIMEOUT = 600`，首次打 101 `/financials/bundle` 冷启动实测 **229 秒**。
+端点起线程 → 前端 **3 秒轮询** `/plan/status` → 拿到 plan+text 才渲染。
+
+- `period_from` 三值：`explicit`（显式传）/ `event`（来自 `earnings_sync` 排期）/
+  `default`（最近已结束季末）。**只在 `/plan` 响应顶层**，`/plan/status` 不返回它。
+- `_er_job_view` 只有 `running / progress / error / started_at / finished_at` —— **没有 `message`**。
+
+守护线程口径：
+
+- 冷启动 `time.sleep(90)`（等 `earnings_sync` 首轮跑完），之后间隔 `interval_minutes` 默认 30；
+- 只跟**真实持仓**（`_derive_holdings()` 净持仓）+ `earn:own:` 事件，窗口 `ahead ∈ [-post_days, pre_days]`；
+- **先建预案、不推半成品**：`plan is None / stale / need_fresh` 且同时在跑 < `_ER_MAX_BUILDING`(2)
+  → `_er_start` 后 `continue`；
+- `need_fresh = 无 advice 且 ahead<=0 且 (无 plan 或 built.date() < today)` ——
+  **按自然日限流**，否则财报迟迟不出时每 30 分钟重建一次（每次 4 分钟 + 烧一堆同行行情请求）；
+- 去重键落盘 `data/event_risk_notified.json`（`.tmp` + `os.replace`，只留 500 条）：
+  post=`post|code|period|branch`、pre=`pre|code|period`；
+- **不设交易时段闸门**：财报常在周末/盘后披露，而这条链路只读、无成交；
+- 异常只打印 `[event-risk] loop error: %s` 睡 120，不拖垮其它守护线程。
+
+配置：`config_schema.py` 五字段 + `config.example.yaml`
+（`config.yaml` 含密钥、已 gitignore、**未提交**，缺键走代码默认
+`enabled=True / 30 / 7 / 10 / 12`）；`notify_events.py` 登记
+`event_risk_pre` / `event_risk_post`（`default={wx:true,email:true}`，
+`source="app._event_risk_loop()"`）。
+
+#### 踩到的坑（症状 → 真因 → 修法）
+
+1. **`NameError: name 'date' is not defined`** —— `guidance_state` 用了 `date.fromisoformat`，
+   模块却只 import 了 `datetime`（离线断言逮到的，`not_due` 分支根本走不到就抛）。
+2. **非持仓票（天孚通信）打预案直接 400** —— 它不在 `earnings_sync` 缓存里，
+   `_er_lookup_event` 返回空 → 没 period。修法：`_er_default_period()` 按
+   `(12,31)/ (9,30)/ (6,30)/ (3,31)` 取最近已结束季末（docstring 明写「给个季末默认值
+   总比让页面直接 400 好」）。
+3. **前端读 `job.message`** —— 后端 `_er_job_view` 没这个键，页面永远 `undefined`。
+   统一改读 `job.progress`。
+4. **`/plan/status` 拿不到 `period_from`** —— 它只在 `/plan` 顶层返回，轮询里用了错的字段。
+5. **`node --check` 语法错** —— 前端 `ER_BRANCH` 对象的键含连字符（`pre_event_de-risk`）
+   **没加引号**，JS 当减号表达式解析。带连字符的键一律加引号。
+6. **AST 抽守护线程函数测不动** —— `import app` 会起全套 daemon。做法：按 `ast` 抽出
+   `_event_risk_loop` 源码在隔离命名空间 `exec`，其中 `_conf_section` 用 `ConfStub`：
+   **第 2 次调用抛 `SystemExit`** 打断 `while True`（否则测试自己死循环）。
+7. **断言「冷启动 sleep(90)」失败** —— 直接取 `loop_node.body[0]`，而它是 docstring 的
+   `Expr(Constant)`。**必须先跳过前导字符串常量再断言**。
+8. **夹具 `plan_of(gen_at=...)` 崩 `'str' object has no attribute 'isoformat'`** ——
+   传的是 ISO 字符串，函数却假定 datetime。改成同时收 `None`/`str`/`datetime`。
+   又一次「失败的不一定是要修的代码」。
+9. **对 101 探测参数写错**：`/quote?codes=` → 422 `Field required: symbols`。
+   生产 `/quote` 的参数名是 **`symbols`**；`codes` 只属于 `/financials/report`，
+   而 `/financials/report` 的响应键是 **`items`**（不是 `rows`）。
+
+#### 验证
+
+| 脚本（`%LOCALAPPDATA%\Temp\opencode\`） | 结果 |
+|---|---|
+| `test_event_risk.py`（离线） | **245/245** |
+| `test_event_risk_loop.py`（离线，AST 抽守护线程） | **64/0**（A 助手 13 / B 循环 14 / C 静态接线） |
+| `test_er_ui.py`（静态装配） | **246/246** |
+| `test_er_render.mjs`（node 真跑 V8） | **85/85** |
+| `er_e2e.py`（真网络 E2E 基线） | 300394：`est.ref≈26.69 亿`、`state=fair`（PE 66.9 vs 同行 54.7，53 家）、required 年利润 **32.23 亿**、actual 20.83 亿（同比 +42.2%）→ `miss`(-21.9%) →「减仓（先减一半以上）」；688795：`est.ref=None`、`guidance=missing`、`state=expensive`（PE 3123.3 vs 44.6，59 家）、required **35.20 亿**、actual 0.377 亿 → 年化 0.503 亿 → 覆盖 1.4% → `valuation_severe` →「离场」 |
+
+⚠️ **RC 容器那次 E2E 大面积 FAIL 不是代码结论**：容器出向
+`datacenter-web.eastmoney.com` 全 `SSLError: Max retries exceeded`，**连它自己的
+`127.0.0.1:8080/quote` 都 `Read timed out (timeout=40)`** ⇒ 300394 缺 report、688795 缺总市值
+→ `valuation_invalid`；末尾 `IndexError` 是脚本取 `lv2[2]` 时列表被缺数据缩短。
+**网络恢复后要重跑才有可比性。** 同一时段 101 整体也不健康：本机 `/health` 15~25 秒超时、
+SSH 能认证但 `channel 0: send open` 后挂住 —— 那是 101 负载/网络，不是密钥
+（`-i ~/.ssh/sa_deploy_ed25519` 必须显式给）。
+
+#### 🔴 负基准（亏损公司）会让百分比分支符号反转（2026-10-29 修）
+
+**症状（探针实测，不是推理）**：以「业绩预告中值 −10 亿」为基准时──
+
+| 实际值 | 旧结论 | 旧动作 |
+|---|---|---|
+| **−5 亿（亏损减半，其实是好转）** | `deep_miss` | **「开盘先离场（清仓）」** |
+| −10 亿（持平） | `inline` | 持有 |
+| **−20 亿（亏损翻倍，其实是恶化）** | **`beat`** | 「持有观察 / 可分批加仓」 |
+
+**真因**：`dev = value / est_ref - 1`。基准为负时除号把符号翻了过来：
+`-20/-10 - 1 = +100%`（亏得越多越像「超预期」），`-5/-10 - 1 = -50%`（减亏反被判暴雷）。
+用户点名的那类高估值票（摩尔线程等）恰恰最容易处于亏损期，这条错得很危险。
+
+**四处修法（缺一处就仍会漏出假结论）**：
+
+| 位置 | 修法 |
+|---|---|
+| `plan_branches` | `ref_n <= 0` **不做百分比分支**：有估值基准就改走 `valuation_*` 五档（`basis="valuation"`，reason 写明为什换基准）；都没有就 `available=False` 并在 reason 里直说「亏损口径下会反向，请按亏损收窄/扩大与绝对额自行判断」 |
+| `match_branch` | `ref_n < 0` → 返回 `branch="unknown"`、`dev_pct=None`，**绝不编一个增幅** |
+| `build_plan` 的 `ref_for_match` | 预期为负时**优先改用正的预告中值**（`basis="guide"`），都不可用才交给 `match_branch` 返回 `unknown` |
+| `render()` | `available=True` 分支也要打印 `plan.reason`（否则「为什么换了基准」只在结构化字段里，用户看不到） |
+
+阈值**完全复用** `beat_pct/miss_pct/deep_miss_pct`（同源，不新增口径）；`_ACTION`、成交、
+风控、估值反推公式**一个字节没动**；前端无需配合（它只渲染后端 `text`）。
+
+**验证**：`%LOCALAPPDATA%\Temp\opencode\probe_er_negbase.py` **47/0** ——
+A 负基准四种实际值全 → `unknown` 且 reason 含「亏损」「反向」；B 正基准四档
+（+20%/+2%/−15%/−40%）行为与修复前**逐档一致**（对照组）；C `plan_branches` 三组
+（负基准+估值不可得 → 不可用 / 负基准+估值可用 → 五档 `valuation_*` 且 `base=2.5` /
+正基准 → `estimate` 且 `beat≈11e8`）；D `build_plan` 端到端把 `est.ref` 造到 **−14.40 亿**，
+实际 8.5 亿 → `miss`(−15%)、实际 5 亿 → `deep_miss`(−50%) 且动作是「开盘先离场」，
+`basis="guide"`、render 含「业绩预告中值」、无 `NaN/None`。
+回归 `test_event_risk` **245/0** / `test_event_risk_loop` **64/0** / `test_er_ui` **246/0** /
+`test_er_render.mjs` **85/0**。
+
+> 写这个探针时我又把一处期望写错了：以为 `5e8 vs 1e9`（dev=−50%）应该落在 `miss`，
+> 实际 `deep_miss`（阈值 −30% 就切过去了）。**断言必须按源码阈值独立推导**，
+> 不是凭印象填档位。
+
+#### 现状与未做
+
+- 🔴 **101 生产仍是 `sa-data-service:1.0.4`，`/financials/*` 返回 404** ⇒ 本机
+  `event_risk` 的财务/估值链路**无法端到端验证**；上面的真实基线数字来自 RC 容器
+  （`sa-data-service:1.0.5-rc`，`127.0.0.1:18081`）在 101 正常时段跑出来的。
+- **1.0.5 上生产要用户点头**（改的是共享部署）。overlay **只 COPY
+  `api.py` + `financials.py` + `__init__.py`** —— 本地 `sources.py` / `aggregate.py`
+  比 101 上的新（含未验证的降级修复），顺手带上等于把没验过的东西推上线。
+- **`sa_event_risk` 还没在线上跑过**：需重启本机 8686，而 `init_db` 依赖 101
+  PostgreSQL；本轮 101 超时，没重启（AGENTS 记过重启失败导致服务停 20 分钟）。
+- `data/event_plans/` 至今**不存在** ⇒ 没有任何 plan 真正落盘，`/api/event-risk/plans`
+  返回空列表属预期。
+- 前端尚未做真实浏览器验证（等 101 恢复：日历 tab → 点「📋 预案」→ 看轮询与渲染）。
+
+> 补一条**架构上的取舍**：守护线程只跟**真实持仓**，因为「披露前减仓」是实盘动作；
+> 模拟盘（`paper_trading` 那 43 只）已由模拟交易自己的决策链处理，
+> 把两边混进同一条通知会让人分不清「该动真钱还是记流水」。
