@@ -3313,13 +3313,16 @@ def _er_default_period() -> str:
     给个季末默认值总比让页面直接 400 好，取不到报表时预案会如实标缺口。
     """
     t = _dt_mod.date.today()
+    best = None
     for m, d in ((12, 31), (9, 30), (6, 30), (3, 31)):
         y = t.year if (m, d) <= (t.month, t.day) else t.year - 1
         try:
-            return _dt_mod.date(y, m, d).isoformat()
+            cand = _dt_mod.date(y, m, d)
         except ValueError:
             continue
-    return ""
+        if cand <= t and (best is None or cand > best):
+            best = cand
+    return best.isoformat() if best else ""
 
 
 @app.get("/api/event-risk/plans")
