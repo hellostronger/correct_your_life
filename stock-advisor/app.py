@@ -5500,6 +5500,7 @@ import paper_trading
 import paper_strategy
 import t_trading
 import market_data
+import trade_review
 import backtest
 import joinquant_source
 import strategy_crawler
@@ -5768,6 +5769,157 @@ def t_log(days: int = 3, code: str = "", limit_runs: int = 40):
     conf = _conf_section("paper") or {}
     deps = _paper_deps(conf)
     return t_trading.read_log(deps, days=days, code=code, limit_runs=limit_runs)
+
+
+# ---------------- 交易评审（只读建议：支持 / 谨慎 / 劝住 / 无法评审） ----------------
+
+@app.get("/api/trade-review")
+def trade_review_api(code: str, side: str = "", shares: int = 0,
+                     price: float = 0.0, reason: str = ""):
+    """对一次**拟执行**的买卖做只读评审 —— 「这一步该不该走」。
+
+    供 nanobot agent 在用户说「我要买/卖 X」时调用，回答分四档：
+    support / caution / dissuade / unknown（支持 / 谨慎 / 劝住 / 无法评审）。
+
+    ⚠️ **纯只读**：不下单、不记账、不写任何表、不改交易与风控口径。
+    判据全部来自 `trade_review.py` 的纯函数；这里只负责取**真实数据**。
+
+    ⚠️ 三个资金口径（可用现金 / 组合总值 / 该股持仓市值）在 app.py **没有真实
+    来源** ⇒ 一律留 None，由评审如实记进 gaps。**绝不编一个数字** ——
+    「编个像样的金额」比「说不知道」危险得多。
+    """
+    code = (code or "").strip()
+    if not re.fullmatch(r"[0-9a-zA-Z]{5,8}", code):
+        raise HTTPException(400, "代码格式不对（5~8 位数字/字母）")
+    side = (side or "").strip().lower()
+    if side not in ("buy", "sell"):
+        raise HTTPException(400, "side 必须是 buy 或 sell")
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    conf = _conf_section("paper") or {}
+    tc = conf.get("t_trading") if isinstance(conf.get("t_trading"), dict) else None
+    ctx: dict = {"code": code, "side": side,
+                 "shares": max(0, int(shares or 0)),
+                 "price": float(price or 0.0),
+                 "reason": reason or "",
+                 "today": today,
+                 "paper_conf": conf, "t_conf": tc}
+
+    # 1) 实时行情（失败条目自带 error，照样传下去 —— 评审会如实报缺口）
+    try:
+        ctx["quote"] = (fetch_quotes([code]) or {}).get(code) or {}
+    except Exception as exc:                       # noqa: BLE001
+        print("[trade-review] 取行情失败 %s: %s" % (code, exc))
+
+    # 2) 日K —— **无条件 240 根**。只取 60 根会让几周前的旧趋势信号被误判成
+    #    「新鲜」（`fresh_days` 按 bar 序号算），且**不会报错**。必须带 high/low
+    #    （`chase_check` / `stabilizing` 要用），所以只能用 `fetch_kline_ohlcv`。
+    try:
+        bars = paper_trading.fetch_kline_ohlcv(
+            _em_kline_fields, _tx_symbol(code), 240) or []
+        if bars:
+            ctx["bars_daily"] = bars
+    except Exception as exc:                       # noqa: BLE001
+        print("[trade-review] 取日K失败 %s: %s" % (code, exc))
+
+    # 3) 实盘持仓（`_derive_holdings` 返回 list，含已清仓 —— 必须判 net_shares>0）
+    name, held, cost, first_date = "", 0, None, ""
+    try:
+        for h in (_derive_holdings() or []):
+            if h.get("code") != code:
+                continue
+            name = h.get("name") or ""
+            if int(h.get("net_shares") or 0) > 0:
+                held = int(h.get("net_shares") or 0)
+                cost = h.get("avg_cost")
+                first_date = (h.get("first_date") or "")[:10]
+            break
+    except Exception as exc:                       # noqa: BLE001
+        print("[trade-review] 读持仓失败 %s: %s" % (code, exc))
+    if name:
+        ctx["name"] = name
+    if cost is not None:
+        ctx["cost"] = cost
+    if first_date:
+        ctx["first_date"] = first_date
+    if held > 0:
+        ctx["held"] = held
+
+    # 4) T+0/T+1 与可卖份额（**实盘**表 sa_trades 口径；混用模拟盘的表会得到
+    #    毫不相干的数字）。`t_plus_0` 必须回写 ctx —— 评审内部还要拿它算
+    #    趋势减仓与 T+1 阻塞文案。
+    try:
+        t_plus_0 = bool(paper_trading.is_t_plus_0(code, name))
+    except Exception:                              # noqa: BLE001
+        t_plus_0 = False
+    ctx["t_plus_0"] = t_plus_0
+    # 只在卖出时查可卖份额：`trade_review` 的 sellable 只在 sell 分支被读，
+    # 买入时白读一次要付一次远程 PG 往返。`ctx["held"]` 上面仍无条件写入。
+    if held > 0 and side == "sell":
+        try:
+            with get_conn() as conn, conn.cursor() as cur:
+                ctx["sellable"] = t_trading.real_sellable_shares(
+                    cur, code, held, today, t_plus_0=t_plus_0)
+        except Exception as exc:                   # noqa: BLE001
+            print("[trade-review] 读可卖份额失败 %s: %s" % (code, exc))
+
+    # 5) 港股按汇率折人民币（护栏 0.5~1.5 在 `_hkd_cny_rate` 内）
+    if _market_of(code) == "hk":
+        try:
+            rate = _hkd_cny_rate()
+            if rate:
+                ctx["fx_rate"] = rate
+        except Exception as exc:                   # noqa: BLE001
+            print("[trade-review] 取汇率失败: %s" % exc)
+
+    # 6) 市场温度（`read()` 异常时返回 {"error": ...}，必须判 markets 才传）
+    try:
+        mt = market_temperature.read()
+        if isinstance(mt, dict) and mt.get("markets"):
+            ctx["market_temp"] = mt
+    except Exception as exc:                       # noqa: BLE001
+        print("[trade-review] 读市场温度失败: %s" % exc)
+
+    # 7) 财报预案（`list_plans()` 是**升序** ⇒ 自己取最新一份）
+    try:
+        plans = [p for p in (event_risk.list_plans() or []) if p.get("code") == code]
+        if plans:
+            plans.sort(key=lambda p: (p.get("disclose_date") or "",
+                                      p.get("generated_at") or ""))
+            ctx["event_plan"] = plans[-1]
+    except Exception as exc:                       # noqa: BLE001
+        print("[trade-review] 读财报预案失败: %s" % exc)
+
+    # 8) 当日成交（同日反向 = 一天内自我打脸，评审里降权重）
+    try:
+        with get_conn() as conn, conn.cursor(
+                cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT code, side FROM sa_trades WHERE trade_date = %s",
+                        (today,))
+            rows = cur.fetchall() or []
+        sides: dict = {}
+        for r in rows:
+            c = (r.get("code") or "").strip()
+            s = (r.get("side") or "").strip().lower()
+            if c and s:
+                sides.setdefault(c, set()).add(s)
+        if sides:
+            ctx["today_fills"] = {c: {"sides": sorted(v)} for c, v in sides.items()}
+    except Exception as exc:                       # noqa: BLE001
+        print("[trade-review] 读当日成交失败: %s" % exc)
+
+    # 9) 分时（`fetch_intraday` 会抛异常；失败就不传，评审会记缺口）
+    try:
+        intraday = market_data.fetch_intraday(code, "m5", 320)
+        if isinstance(intraday, dict):
+            ctx["intraday"] = intraday
+    except Exception as exc:                       # noqa: BLE001
+        print("[trade-review] 取分时失败 %s: %s" % (code, exc))
+
+    # ⚠️ available_cash / portfolio_value / pos_value **故意不传** ——
+    #    app.py 没有这三个数的真实来源。编一个会让评审算出「仓位超限/现金不足」
+    #    这类假结论，比说「我不知道你的可用现金」危险得多。
+    return trade_review.review(ctx)
 
 
 class TRecordIn(BaseModel):

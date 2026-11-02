@@ -1061,7 +1061,9 @@ SCHEMAS: dict[str, dict[str, Any]] = {
     # ---------------- 微信入站 / 对话 ----------------
     "wx_chat": {
         "label": "💬 微信对话",
-        "help": "在微信里给 bot 发消息，服务会读到并用 Claude 回你。"
+        "help": "在微信里给 bot 发消息，服务会读到并回你。闲聊走本机 nanobot agent"
+                "（能查持仓/行情/新闻等只读数据），它不可用时回退到单轮 LLM；"
+                "打「持仓/复盘」这类指令仍走原来的快路径。"
                 "**入站长轮询不能关**（它同时给 iLink token 保活，关久了 token 会失效，"
                 "出站推送也会跟着挂）。关掉「自动回复」只是不再回话，仍然会收、"
                 "并且照常缓存 context_token。",
@@ -1071,9 +1073,9 @@ SCHEMAS: dict[str, dict[str, Any]] = {
              "help": "关掉后不再长轮询。**除非你在排查问题，否则别关** —— "
                      "token 保活依赖它"},
             {"key": "reply", "t": "bool", "d": True,
-             "label": "自动用 Claude 回复",
+             "label": "自动回复",
              "help": "关掉则只收不回（消息仍会出现在对话记录里，便于排查）。"
-                     "需要 llm 段已配置 api_key"},
+                     "闲聊优先走 agent；agent 未启用时才回退到 llm 段（需已配 api_key）"},
             {"key": "merge_seconds", "t": "int", "d": 60, "lo": 0, "hi": 300,
              "label": "消息合并窗口(秒)",
              "help": "这个窗口内的多条消息合并成一次 LLM 调用再回一条。"
@@ -1081,12 +1083,28 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             {"key": "cooldown_seconds", "t": "int", "d": 20, "lo": 0, "hi": 600,
              "label": "回复最小间隔(秒)", "adv": True, "help": "防刷屏"},
             {"key": "history_turns", "t": "int", "d": 6, "lo": 0, "hi": 30,
-             "label": "带最近几轮历史", "help": "0=不带历史（每条独立回答）"},
+             "label": "带最近几轮历史",
+             "help": "仅回退路径（单轮 LLM）用；agent 自己按 session 存对话，不再重复拼历史"},
             {"key": "max_chars", "t": "int", "d": 2000, "lo": 100, "hi": 20000,
              "label": "单条消息截断(字)", "adv": True},
             {"key": "max_reply_chars", "t": "int", "d": 1200, "lo": 100, "hi": 8000,
              "label": "回复截断(字)", "adv": True,
              "help": "微信不渲染 Markdown，长表格会变成乱码，回复本来就该短"},
+            {"key": "agent_enabled", "t": "bool", "d": True,
+             "label": "闲聊走 agent（nanobot）",
+             "help": "开启后用本机 nanobot 回复闲聊，它能调只读工具查真实数据"
+                     "（持仓/行情/新闻/做T记录/机构信号/事件预案/温度等）。"
+                     "agent 不可用（未启动/超时/报错）时自动回退到单轮 LLM。"
+                     "指令（持仓/复盘…）始终走原快路径，不受此开关影响"},
+            {"key": "agent_url", "t": "str", "d": "http://127.0.0.1:8900",
+             "label": "agent 地址", "adv": True,
+             "help": "nanobot serve 的 OpenAI 兼容接口地址（不带 /v1）"},
+            {"key": "agent_model", "t": "str", "d": "",
+             "label": "agent 模型名", "adv": True,
+             "help": "留空 = 自动问 {agent_url}/v1/models（nanobot 只认它配置里那一个名字）"},
+            {"key": "agent_timeout", "t": "int", "d": 180, "lo": 10, "hi": 900,
+             "label": "agent 超时(秒)", "adv": True,
+             "help": "agent 一轮含多次工具调用，比单轮 LLM 慢；超时即回退单轮 LLM"},
         ],
     },
     # ---------------- 定时任务时间点 ----------------

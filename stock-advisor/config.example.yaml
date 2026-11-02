@@ -695,3 +695,22 @@ factor:
   hk_strong_ratio: 0.20      # 港股置信按「有效算子/可用算子」比例：strong ≥20%
   hk_medium_ratio: 0.10      # 港股 medium ≥10%（A 股仍用绝对 80/40）
 
+# 微信对话（2026-10-31）：闲聊改走本机 nanobot agent，它能调只读工具查真实数据
+# （持仓/自选/新闻/做T记录/机构信号/事件预案/温度/板块/宏观/期货汇率/日历/模拟盘/全球市场）。
+# ⚠️ 打「持仓 / 自选 / 状态 / 帮助 / 复盘 / 盘后 / 简报 / 盘前」仍走原快路径，
+#    不经过 agent —— 这几个字要的是现成数据，让 LLM 去理解既慢又容易答歪。
+# ⚠️ agent 不可用（没启动 / 超时 / 报错 / 空回复）时**自动回退**到单轮 LLM（llm 段）。
+# ⚠️ `enabled`（入站长轮询）不能关：它同时给 iLink token 保活，关久了出站推送一起挂。
+wx_chat:
+  enabled: true              # 入站长轮询总开关（别关，见上）
+  reply: true                # 关掉则只收不回（消息仍进对话记录，便于排查）
+  agent_enabled: true        # 闲聊走 nanobot；false = 全部走单轮 LLM（旧行为）
+  agent_url: "http://127.0.0.1:8900"   # nanobot serve 的 OpenAI 兼容接口（不带 /v1）
+  agent_model: ""            # 留空 = 自动问 {agent_url}/v1/models；nanobot 只认配置里那一个名字
+  agent_timeout: 180         # agent 一轮含多次工具调用，比单轮 LLM 慢得多
+  merge_seconds: 60          # 同一用户 N 秒内的多条消息合并成一次调用（0=不合并）
+  cooldown_seconds: 20       # 同一用户两次回复的最小间隔，防刷屏
+  history_turns: 6           # 仅回退路径用；agent 自己按 session 存对话
+  max_chars: 2000            # 单条入站字数上限（超了截断）
+  max_reply_chars: 1200      # 微信不渲染 Markdown，回复本来就该短
+
