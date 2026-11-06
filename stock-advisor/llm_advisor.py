@@ -13,8 +13,11 @@
 """
 
 import os
+import time
 from datetime import datetime
 from pathlib import Path
+
+import requests
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "config.yaml"
@@ -129,6 +132,10 @@ def _render_llm_block(conf: dict) -> str:
         # **整块替换**模板，少写一行就会把用户在网页上填的 max_tokens 抹掉，
         # 而 GET 回来的还是默认值 —— 症状是「我改了没生效，重启后又变回去」。
         f"  max_tokens: {int(conf.get('max_tokens') or 8000)}",
+        f"  timeout: {int(conf.get('timeout') or 420)}",
+        # tiers 同理：整块替换会把档位配置整段抹掉（2026-11-05 修）。
+        "  tiers:",
+        *[f"    {t}: {q((conf.get('tiers') or {}).get(t) or '')}" for t in TIERS],
     ])
 
 
@@ -346,3 +353,93 @@ def build_context_text(view: dict, held: list[dict], news_titles: list[str],
         lines.extend(f"- {t}" for t in news_titles[:12])
     lines.append(f"（数据时点 {datetime.now().strftime('%Y-%m-%d %H:%M')}，价格为盘中/收盘快照）")
     return "\n".join(lines)
+
+
+# ---------------- 上游模型列表（2026-11-05） ----------------
+# 网页上「模型」字段以前只能手填上游的模型 id，写错一个字就是 404。
+# 这里改成从上游拉一次 /v1/models 让前端做成下拉。
+#
+# 注意：/v1/models 列出的 ≠ 可用（网关里大量 NIM 部署被删 / 已 EOL，
+# GET 列表本身不碰任何付费通道）。列表只做「减少手填错误」，
+# 不做「这个模型一定能调通」的保证 —— 可用性以实跑为准。
+
+_MODELS_CACHE: dict = {"key": None, "ts": 0.0, "value": None}
+_MODELS_CACHE_TTL = 120  # 秒：列表不常变，缓存两分钟免得每次点都打上游
+
+
+def _models_url_and_headers(base_url: str, api_key: str) -> tuple[str, dict]:
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        # Anthropic 官方：/v1/models 需要 x-api-key + anthropic-version
+        return "https://api.anthropic.com/v1/models", {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        }
+    url = base + ("/models" if base.endswith("/v1") else "/v1/models")
+    # OpenAI 风格网关一般只要 Bearer；x-api-key 也带上，兼容只认官方头的代理
+    return url, {"Authorization": f"Bearer {api_key}", "x-api-key": api_key}
+
+
+def list_upstream_models(conf: dict | None = None, refresh: bool = False) -> dict:
+    """拉上游 /v1/models，返回 {ok, models:[{id, owned_by?, endpoint_types?}], ...}。
+
+    失败时 ok=False + error 可读说明（不会 500 / 抛异常），前端据此提示手填。
+    """
+    conf = conf or load_llm_conf()
+    key = (conf.get("api_key") or "").strip()
+    if not key:
+        return {"ok": False, "error": "未配置 API key（config.yaml llm.api_key "
+                "或环境变量 ANTHROPIC_API_KEY）", "models": [], "count": 0}
+    base_url = (conf.get("base_url") or "").strip()
+    cache_key = (base_url, key[-8:])
+    now = time.time()
+    if (not refresh and _MODELS_CACHE["value"] is not None
+            and _MODELS_CACHE["key"] == cache_key
+            and (now - _MODELS_CACHE["ts"]) < _MODELS_CACHE_TTL):
+        return {**_MODELS_CACHE["value"], "cached": True}
+    url, headers = _models_url_and_headers(base_url, key)
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+    except Exception as exc:
+        # 0.0 秒失败 = 网络/代理问题，不是上游挂了（本文件老坑）
+        return {"ok": False, "error": f"请求上游失败：{type(exc).__name__}: {exc}",
+                "models": [], "count": 0, "url": url}
+    if resp.status_code != 200:
+        return {"ok": False, "error": f"上游返回 HTTP {resp.status_code}：{resp.text[:200]}",
+                "models": [], "count": 0, "url": url}
+    try:
+        j = resp.json()
+    except Exception:
+        return {"ok": False, "error": "上游返回的不是 JSON（网关可能改了 /v1/models 的形态）",
+                "models": [], "count": 0, "url": url}
+    raw = j.get("data") if isinstance(j, dict) else None
+    if raw is None and isinstance(j, dict):
+        raw = j.get("models")  # 个别网关用 {models: [...]}
+    if not isinstance(raw, list):
+        return {"ok": False, "error": "上游 JSON 里找不到模型数组（data/models 都不存在）",
+                "models": [], "count": 0, "url": url}
+    models = []
+    for m in raw:
+        if isinstance(m, str):
+            mid = m.strip()
+            entry = {"id": mid}
+        elif isinstance(m, dict):
+            mid = str(m.get("id") or m.get("name") or "").strip()
+            if not mid:
+                continue
+            entry = {"id": mid}
+            own = m.get("owned_by")
+            if own:
+                entry["owned_by"] = str(own)
+            et = m.get("supported_endpoint_types")
+            if isinstance(et, list):
+                entry["endpoint_types"] = [str(x) for x in et]
+        else:
+            continue
+        models.append(entry)
+    models.sort(key=lambda m: m["id"])
+    value = {"ok": True, "models": models, "count": len(models),
+             "cached": False, "url": url,
+             "fetched_at": datetime.now().isoformat(timespec="seconds")}
+    _MODELS_CACHE.update({"key": cache_key, "ts": now, "value": value})
+    return value

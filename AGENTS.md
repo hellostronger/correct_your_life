@@ -6279,3 +6279,244 @@ D:/tmp/nanobot/serve.log   → Tool call: mcp_stock_stock_trade_review({"code": 
    微信侧问题在出站投递，两条独立。
 3. **资金口径缺失**（可用现金/组合总值/持仓市值）：这是有意的，不是没做完。
    要补得先有真实来源（账户快照），属新数据接入，**要先问**。
+
+---
+
+### 🔧 机构信号采集撞重复键 + 事务 aborted 传染（2026-11-03 修）
+
+**症状**（用户报的日志，一轮里连成一片）：
+
+```
+[inst] 持仓采集异常: ON CONFLICT DO UPDATE command cannot affect row a second time
+[inst] 指数 000300 异常: current transaction is aborted, commands ignored until end of transaction block
+（000016 / 000905 / 000852 / 000688 同样报错）
+```
+
+**这其实是两个 bug 叠在一起**：一个是 upsert 撞重复键，另一个是**事务 aborted 传染**。
+只修第一个，日志里那 5 行 `current transaction is aborted` 仍会出现（换别的异常触发）。
+
+#### 根因 ①：一条批次里同一冲突键出现两次 → PG 拒绝整批
+
+`collect_holders` 用 `execute_values` + `ON CONFLICT (code, period, holder) DO UPDATE`
+写 `sa_holder_inst`。**同一批次里同一主键出现两次**时，PG 报
+`ON CONFLICT DO UPDATE command cannot affect row a second time` —— 而 `DO NOTHING`
+**不会**报（这正是 `collect_ratings` 从未中招的原因）。
+
+**真凶是上游给的重复行**（**不是** `'nan'`，见下方「我判错过一次」）：
+
+```
+000723 美锦能源 / 2001-06-30 / 安徽省证券公司
+  行1: 1,853,899 股 @1.33%
+  行2:   233,895 股 @0.17%
+```
+
+**为什么保留「最大」而不是「先出现的」**：渲染层按相邻期算环比，若留下较小那行，
+下一次拿到正常值时会凭空算出一次「大幅减持」—— 假信号比丢一行更糟。
+
+#### 🔴 我判错过一次：`'nan'` 不是原因
+
+第一版探针数出 6 个「重复」代码，看起来与日志吻合。**换了一份忠实探针**
+（走完整的 `classify_holder` + `_date` 过滤链）后推翻：
+
+| 口径 | 结果 |
+|---|---|
+| 原始 `'nan'` 行 | **181 行**（`str(r.get(col) or "")` 对 NaN 得到字面 `'nan'`，因为 NaN 是「真值」）|
+| 经过过滤链之后 | **0 行存活** —— `classify_holder('nan')` → `''`、`_date('nan')` → `None`，两处都会丢 |
+| 真实的重复组 | **1 组**：`000723 / 2001-06-30 / 安徽省证券公司` |
+
+⇒ 老探针把 `'nan'` 行当成了冲突键，**六个「DUP」全是假阳性**。
+（同「失败的不一定是要修的代码」：**能自圆其说的错结论比明显的错更危险**。）
+
+#### 根因 ②（影响更大）：`run_once` 的 `except` 从不 rollback → 共享连接被毒死
+
+`run_once` 的文档写着「任一子步骤失败都不阻断其它步骤（部分可用好过全挂）」，
+但三个 `except` 分支**只 print 不 rollback**。而 `collect_ratings` / `collect_holders`
+的 `conn.commit()` **只在 `if rows:` 里面** ⇒ 失败路径上没有任何人回滚。
+
+PG 语义：同一连接上任何一条语句报错后，后续语句全部返回
+`current transaction is aborted, commands ignored until end of transaction block`。
+三个采集器**共用一条连接**（`run_once` 里 `conn = deps["get_conn"]()`），
+于是「持仓 upsert 撞重复键」把后面 **5 个指数快照**全部带死 ——
+**一次小故障放大成整轮报废**，正好违背它自己的契约。
+
+#### 修法（四处，都不改 schema / 不改阈值 / 不改交易口径）
+
+| # | 位置 | 改动 |
+|---|---|---|
+| 1 | `_dedupe_holder_rows`（新，L275）| 按 `(code, period, holder)` 去重，**保留持股数最大**的一行；返回 `(rows, merged)` |
+| 2 | `collect_holders`（L437 / L450）| 插库前 `rows, stat["merged"] = _dedupe_holder_rows(rows)`；汇总行加「合并重复 %d 行」 |
+| 3 | `_dedupe_index_codes`（新，L302）+ `snapshot_index`（L492）| `sa_index_cons` 的 upsert 也是 `DO UPDATE`，同样有隐患 ⇒ 按主键去重，保留**第一个非空名称**。`new_count` 用去重后的列表（口径一致） |
+| 4 | `_safe_rollback`（新，L734）+ `run_once` 三个 `except` 分支 | 每个 `except` 末尾调 `_safe_rollback(conn)`，只回滚不吞异常（异常照常记进 `out[...]["error"]` 并 print）|
+
+**刻意的不对称**：`collect_ratings` 用 `DO NOTHING`，**本身免疫**，
+所以**没**给它加去重 —— 加了就是无意义代码。这条由测试 H 钉住，
+防止后人「顺手统一一下」把 `DO NOTHING` 改成 `DO UPDATE`。
+
+`_safe_rollback` 自己包 try/except：回滚失败只打印，**绝不能让「清理动作」反过来炸掉整轮**。
+
+#### 前后对比（真实日志，不是构造）
+
+| 指标 | 修前（PID 22360 / 09:34）| 修后（PID 10568 / 14:21）|
+|---|---|---|
+| `cannot affect row a second time` | **1 次** | **0 次** |
+| `current transaction is aborted` | **5 次**（5 个指数全挂）| **0 次** |
+| 持仓落库 | **0 行**（整批回滚）| **13218 行 / 43 只**（合并重复 1 行）|
+| 指数快照 | **0 / 5** | **5 / 5**（000300 300 / 000016 50 / 000905 500 / 000852 1000 / 000688 50）|
+| 合并重复计数 | 无此输出 | `合并重复 1 行` —— 与探针找到的那 1 组**完全吻合** |
+
+修后完整一轮：
+
+```
+[inst] 研报评级：29 只取到 2590 条，最新 2026-11-02，插入 2590 条（跳过港股/ETF 14 只）
+[inst] 机构/社保持仓：43 只取到 13218 行（合并重复 1 行），报告期 ['2026-08-11', '2026-08-14', '2026-09-30']
+[inst] 指数 000300 快照 2026-11-02：300 只（基线 2026-10-27）调入 0 / 调出 0
+…（五个指数全部 ok）
+```
+
+#### 验证（都可重复跑，全 Fake、不联网不碰库）
+
+| 脚本 | 结果 |
+|---|---|
+| `test_inst_dedupe.py`（新）| **55 passed, 0 failed** |
+| `test_inst_signals.py`（原有基线）| **66 / 66**（改完仍全过，且它自己打印出**新的**汇总格式 `合并重复 0 行` ⇒ 改动确实生效）|
+
+新套件里**最关键的是 G 段（反证）**：把 FakeConn 的 `rollback()` 改成「不真正清除
+aborted」，于是**5 个指数全部报 `current transaction is aborted`** ——
+**精确复现了线上症状**，从而证明 `_safe_rollback` 正是收敛影响面的那一步
+（而不是「看起来加了回滚就好了」）。
+
+FakeConn 刻意模拟 PG 的 aborted 语义：`aborted=True` 时 `cursor()` 直接抛
+`current transaction is aborted…` —— 这与真实行为一致（三个采集器在插库前
+**都不会先开游标**），所以「不回滚」的危害能被断言真实地测到。
+
+其余段落：A 去重矩阵（含 shares 为 `None` 的比较）、B 指数去重保留首个非空名称、
+C 正常跑（`merged==1`、5/5 指数 ok、`rollbacks==0`、`page_size==500`）、
+C2 差集路径（`prev_count/new_count` 用去重后的口径）、D 持仓抛错 → `rollbacks==1`
+且 5 个指数照常 ok、E 评级抛错同隔离、F 指数第 3 次抛错 → 4 ok / 1 error。
+
+#### 顺带查清的两件事（都**不是**这次引入的）
+
+1. `[inst] 调用失败 stock_main_stock_holder: '持股数量'` —— 修前 6 次、修后 **6 次**，
+   **完全一致** ⇒ 既有问题、与本次修复无关。`_with_timeout` 会吞掉单只票的异常
+   并返回 `None`（所以它只是丢几只票的持仓行，不会中断整轮）。
+   仍值得单独修（有个席位拿不到 `持股数量` 列），**不在本次范围**。
+2. `stock_research_report_em: 'infoCode'`（4 次）是 AGENTS.md 已记的
+   9 只港股 + 5 只 ETF 无研报，属预期。
+
+#### 运维备忘：`stop8686.ps1` 的 PID 守卫
+
+`D:/tmp/stop8686.ps1` 里硬编码 `if ($own -ne <PID>) { … exit 2 }`，
+本轮重启后监听者变成 **10568**，守卫已同步更新。**下次重启前先看当前监听 PID**，
+否则脚本会以 `PID_MISMATCH … NO_KILL` + `exit 2` 直接拒绝（这是刻意的：
+「宁可不动手，也不要杀错进程」）。
+
+⚠️ 这个文件必须**保持纯 ASCII** —— PS 5.1 在这台中文机器上把无 BOM 的 UTF-8
+当 ANSI 读，一个中文词就能吞掉闭合引号，报 `ParserError: 字符串缺少终止符`
+（**解析期失败，一条语句都不执行**，看起来像脚本没生效）。本文件早先记过同款。
+
+---
+
+### 🔄 上游模型列表 + 网页直接选模型（2026-11-05 用户要求）
+
+用户原话：「项目改一下，支持从上游获取模型列表，配置模型，当前还是手动填模型id的」。
+
+**改了什么**（4 个文件）：
+
+| 组件 | 位置 | 要点 |
+|---|---|---|
+| 拉取 | `llm_advisor.list_upstream_models()` + `GET /api/llm/models` | 按 `base_url` 归一（base 已带 `/v1` 不重复拼）打 `/v1/models`；Bearer + `x-api-key` 双头；官方端点（base 空）走 `api.anthropic.com/v1/models` + `anthropic-version` 头；120s 进程内缓存；失败返回 `{ok:false, error:可读文案}` 不抛异常、不 500；`{models:[...]}` 形态兜底；列表 ≠ 可用（NIM 大量已删/EOL），只减少手填错误 |
+| 保存不再丢配置 | `llm_advisor._render_llm_block` | 原来不写 `timeout` 和 `tiers` → **网页点一次「保存」就把 config.yaml 里的档位/超时整段抹掉**（bug，顺带修）。现已补上 `timeout` + 三行 `tiers`，可被 yaml 重解析（有断言钉住） |
+| 页面 | `static/index.html`「提款计划 → AI 提款建议」卡 | 「🔄 上游模型」按钮现拉 228 个模型填进共享 `<datalist id="llm-model-choices">`；`llm-model` + `llm-tier-fast/standard/deep` 四个输入全接 datalist；`loadLlmConf/saveLlmConf` 读写 `tiers`；`PUT /api/llm/config` 扩展接受 `tiers`(dict)/`timeout`(int≤3600) |
+| 通用配置页 | `config_schema` llm 段 + 渲染器 | `model` 升级为新类型 `model`（text + datalist + 🔄 按钮）；新增 `timeout`/`tiers.fast|standard|deep` 四个字段（fast 非 adv，后三档 adv）；`coerce` 对 `model` 类型按 string 直通（未加特判也安全） |
+
+**验证**（都可重复跑）：
+
+| 方式 | 结果 |
+|---|---|
+| 离线 `test_llm_models.py`（全 Fake，不联网不动 config.yaml） | **37/37**：URL 拼接 3 种 base 形态、双头、缓存命中/refresh、5 类失败路径、排序/去重/非字符串 id/endpoint_types、`_render_llm_block` 保留 timeout+tiers 且 yaml 可解析 |
+| 真上游（读 config.yaml 真实配置） | `GET /api/llm/models` → 200，**228 个模型**、含当前 fast/默认两档配置的 id；第二次调用 `cached=True` |
+| 端到端等值回写（先备份） | `PUT /api/llm/config` 写回**完全相同**的值 → config.yaml 顶层无键增删改、`llm` 段逐字节相同（tiers/timeout/model/max_tokens 全保留）|
+| 前端 | 两个 script 块 `node --check` 全过；`/` 页面含 `llm-model-choices`(7) / tier 输入(各 3) / `fetchLlmModels`(3) |
+| 线上实例 | 重启后 GET 三端点全 200（重启时纸盘 `running=false`；唯一坑：前台 Start-Process + 轮询被**工具超时 100s 杀进程树**，`import app` 需 ~77s，正确做法是 background 模式起服务）|
+
+**没做/注意**：通用配置页的 🔄 按钮复用同一函数（状态写在 AI 卡里的 `llm-models-status`，在另一 tab 不显示，不影响功能）；可选模型超长下拉（228 个）没有虚拟滚动，原生 datalist 足够；列表不代表可用，可用性仍以实跑为准。
+
+---
+
+### 💬 nanobot 实战教训：重启必须带 --home、错误串漏出闸门、会话记忆会复读错答（2026-11-05）
+
+用户报「微信对话不像 AI、不回答实盘建议为什么没用智谱/minimax」。两天前因
+**11-02 后没再运行 nanobot** → 对话一直退回单轮 LLM（无工具），询问系统性
+问题时答「不知道/答非所问」；且 8686 在 ~15:59–16:25 停机期间消息无人读取。
+
+#### 1. 启动时必须带 `--home D:\nanobot`
+
+`nanobot serve` 不带 `--home` 会在默认 `C:\Users\Strong\.nanobot` 新建空实例：
+`providers.custom` 无配置 → 回复「Model is not configured. Open Settings →
+Models」→ 全部走回退（单轮 LLM，无工具）→「不像 AI」。错误实例 26384 已确认
+落点，10-31 就已有 `.nanobot/updates/` 残留，删除前须问用户。
+
+正确起法：
+
+```powershell
+Set-Location 'D:\nanobot'
+& 'D:\nanobot\.venv\Scripts\nanobot.exe' --home 'D:\nanobot' serve   # 8900
+```
+
+判据：`GET 8900/v1/models` 200 且 banner 显示 `Model:
+nvidia/nemotron-3-ultra-550b-a55b`；不带 --home 启动 banner 模型为空。
+
+#### 2. nanobot 上游报错仍回 HTTP 200 —— 错误串会漏给微信
+
+provider 把网关 503 error payload 包成 assistant 内容（`anthropic_provider
+._handle_error`：`msg = f"Error: {payload_text}"`，`finish_reason="error"`），
+usage 可能非 0（prompt tokens 已计费）。10-31 的双条件闸门（`out.startswith
+("Error:") and total_tokens == 0`）在 usage>0 时失效 → 错误串被当回复发给微信
+（11-05 实测泄漏到 dry_run 回复）。
+
+**修法**（`wx_chat._agent_reply`，已提交工作区）：
+`_upstream_err_markers = (new_api_error, system_cpu_overloaded, overloaded,
+Error calling LLM, api_error)`，`out.startswith("Error:") and (total_tokens==0
+or any(marker in out))` → 返回 None 走既有单轮回退。agent 路径失败时微信不再
+收网关报错文本。改后须重启 8686。
+
+#### 3. AGENT_STYLE 缺少「系统内股票语境」→ agent 把智谱/minimax 当 AI 模型
+
+agent 回复「系统里没有查询「实盘建议用什么模型」的接口」——把智谱/MINIMAX 理解成
+**大模型**而不是**持仓股票** 02513/00100。**修法**：在 `AGENT_STYLE` 加「本系统的语境」
+段落：智谱/MINIMAX/快手等在本系统默认按股票理解，实盘建议=做T/趋势减仓判断记录，
+由 `stock_t_advisory` 工具读取。（同步重启 8686 生效。）
+
+#### 4. MCP 工具输出被截断 → agent 看不到后面的票，幻觉「港股没扫描」
+
+`stock_t_advisory` 只返回前 **10 只**（`MAX_CHARS=1800` + `pick = items[:10]`），
+智谱 02513/快手 01024 等港股持仓完全不出现在工具输出里 → agent 推断「做T只扫 A 股」，
+与事实不符（实盘 `_derive_holdings()` 不区分市场，HK 7 只每天 17 轮 full hold）。
+
+**修法**（`D:\nanobot\mcp\stock_mcp.py`）：返回**全部 31 只**行 + `hk_codes` 字段
+（`_fit(rows, 5200)`）；改后 fresh-session 探针 agent 答对（「它们都被扫描了，都在
+`hk_codes` 里」并引用 02513 918.37→476.00、00100 机动仓 90 股不足一手的原因）。
+⚠️ 改了 stock_mcp.py **必须重启 nanobot**；MCP 工具调用不是证据，**回答内容是否
+包含后面的票**才是证据。
+
+#### 5. nanobot 会话记忆会复读错答 —— 换 session 探针验证
+
+dry_run 用 `user_id="manual@local"` 复用 session `wx:manual@local`；nanobot 按
+session 存历史 → 模型把上次错误答案直接复读（「做T建议只扫A股…」），没再调工具。
+**判定/调试时务必用全新 session_id 探针**——否则新人误以为修复没生效。
+
+#### 实测港股做 T 扫描现状（2026-11-05 17:39 一轮）
+
+`_derive_holdings()` 不区分市场，HK **7 只**（00100/00136/01024/01368/02513/
+09696/001979）**每天全量扫描**：n_items=31（A 股 24 + HK 7）。全部 `hold` 的原因：
+
+| 票 | 原因 |
+|---|---|
+| 00100 MINIMAX-W | 持仓 300 股，按 30% 机动仓向下取整 **90 股不足一手（100）** |
+| 00136/02513/01024/09696/01368 | 跌幅过大（现价离锚点 -2%~-48%），未到高抛门槛（0.45%）|
+| 全部 | 浮亏 >25% → 安全降级为 `trend_wait`（只提示不催卖），且历史趋势信号
+       已过 `fresh_days=2` bar，**不重复提示**（2026-10-22 口径：一段下跌只发一次）|
+
+港股在引擎里**本来就是 T+0**（`paper_trading.is_t_plus_0`：港股全部 True →
+`real_sellable_shares` 全量可卖），日内 T 不受限制——缺的是「有利可图的高抛点」，
+不是「能做 T」。

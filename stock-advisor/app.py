@@ -2930,6 +2930,8 @@ class LLMConfIn(BaseModel):
     base_url: str | None = None
     model: str | None = None
     auto_advice: bool | None = None
+    timeout: int | None = None      # 客户端超时（秒）
+    tiers: dict | None = None       # {fast, standard, deep}；空串 = 沿用 model
 
 
 def _plan_market_note() -> str:
@@ -3186,8 +3188,27 @@ def llm_update_config(body: LLMConfIn):
         conf["model"] = body.model.strip()
     if body.auto_advice is not None:
         conf["auto_advice"] = body.auto_advice
+    if body.timeout is not None:
+        try:
+            conf["timeout"] = max(10, min(int(body.timeout), 3600))
+        except (TypeError, ValueError):
+            pass  # 非法值当作未传，不报错、不写坏配置
+    if body.tiers is not None:
+        cur = dict(conf.get("tiers") or {})
+        for t in llm_advisor.TIERS:
+            v = body.tiers.get(t)
+            if v is None:                  # 未传的档位保持原值
+                continue
+            cur[t] = str(v).strip()[:200]   # 空串 = 沿用默认 model，允许
+        conf["tiers"] = cur
     llm_advisor.save_llm_conf(conf)
     return llm_get_config()
+
+
+@app.get("/api/llm/models")
+def llm_list_models(refresh: bool = False):
+    """拉上游 /v1/models 供前端做模型下拉。只读、带 120s 缓存；失败返回 ok:false + 可读原因。"""
+    return llm_advisor.list_upstream_models(refresh=refresh)
 
 
 # ---------------- 财经日历（econ_calendar.py：规则事件 + 手动事件 + 盘前提醒） ----------------
@@ -5265,6 +5286,45 @@ def _t_advisory_loop():
             _nlog = t_trading.persist_advisory(deps, res, "bg", tc)
             if _nlog:
                 print(f"[t-adv] 判断落库 {_nlog} 条", flush=True)
+            # 大跌降本：推送去重**不靠进程内存** —— 重启就清零，会一股脑
+            # 重推 27 条（2026-11-06 实测）。改用最近 24h 已落库的判断记录：
+            # 里面有 (code, level) 就视为已提示过，跳过。失败静默回退；
+            # 宁可漏推，也不要重启后把同一批再推一遍。
+            drop_lines = []
+            seen_today = set()
+            load_ok = True
+            try:
+                with get_conn() as conn, conn.cursor() as cur:
+                    cur.execute("""SELECT code, detail->'big_drop'->'tiers_crossed'
+                                     FROM sa_t_advisory_log
+                                     WHERE created_at < now() - interval '2 minutes'
+                                       AND detail @> '{"big_drop": {"triggered": true}}'::jsonb""")
+                    for _code, _tr in (cur.fetchall() or []):
+                        for _lv in (_tr or []):
+                            seen_today.add((_code, float(_lv)))
+            except Exception as exc:  # noqa: BLE001
+                print(f"[t-adv] 大跌降本去重读取失败（今天不再推大跌降本）: {exc}", flush=True)
+                load_ok = False
+            if load_ok:
+                for i in (res.get("items") or []):
+                    bd = i.get("big_drop") or {}
+                    if not bd.get("triggered") or bd.get("skip_reason"):
+                        continue
+                    crossed = [(i["code"], lv) for lv in bd.get("tiers_crossed") or []]
+                    fresh = [c for c in crossed if c not in seen_today]
+                    if not fresh:
+                        continue
+                    _dd = float(bd.get("drawdown_pct") or 0)
+                    if bd.get("add_shares"):
+                        drop_lines.append(
+                            f"💧 大跌降本 {i['code']} {i.get('name','')}：浮亏 {_dd:.2f}%，"
+                            f"建议加仓 {bd.get('add_shares')} 股，加完成本 {bd.get('new_avg_cost')}"
+                            f"（只给建议，手动下单）")
+            if drop_lines:
+                _notifier_notify_safe(
+                    "💧 实盘大跌降本建议", "\n".join(drop_lines[:8]),
+                    event="t_advisory")
+                print(f"[t-adv] 大跌降本提示推送 {len(drop_lines)} 条", flush=True)
             # 趋势动作（hard_stop / trend_reduce）也是**要你手动下单**的建议，
             # 所以一起推。判据必须带 `shares_suggest > 0` —— 趋势状态可以在
             # 「深亏提示（trend_wait）」或「机动仓不足一手」时给不出股数，

@@ -230,6 +230,9 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
          margin-top: 6px; font-size: 13px; }
 .t-warn { margin-top: 6px; padding: 5px 8px; border-radius: 6px;
           background: var(--up-soft); color: var(--up); font-size: 12px; }
+.t-bigdrop { margin-top: 6px; padding: 5px 8px; border-radius: 6px;
+             background: var(--down-soft, rgba(76,175,80,.14)); color: var(--down, #2e9e52);
+             font-size: 12px; line-height: 1.6; }
 .t-ticket-blocked { border: 1px dashed var(--border-2); border-radius: 8px;
                     padding: 7px 10px; margin-top: 7px; font-size: 12px;
                     line-height: 1.6; }
@@ -1108,8 +1111,17 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
         <input id="llm-key" type="password" placeholder="Anthropic API key（sk-ant-…）" style="width:260px" autocomplete="off">
         <button class="btn ghost" style="flex:0 0 auto"
                 onclick="togglePwd(this,'llm-key')" title="显示/隐藏">👁</button>
-        <input id="llm-model" placeholder="模型（默认 claude-opus-5）" style="width:200px">
+        <button class="btn ghost" id="llm-models-btn" onclick="fetchLlmModels()"
+                style="flex:0 0 auto" title="从上游 base_url/v1/models 拉取模型列表">🔄 上游模型</button>
+        <input id="llm-model" list="llm-model-choices" placeholder="模型（可下拉选；空=沿用 config.yaml）" style="width:250px">
         <input id="llm-base" placeholder="base_url（可选，代理/网关）" style="width:220px">
+      </div>
+      <div class="row" style="margin-top:8px;gap:6px;flex-wrap:wrap">
+        <span class="muted">档位（留空=沿用上面的模型）：</span>
+        <input id="llm-tier-fast" list="llm-model-choices" placeholder="fast 档（新闻过滤/分类）" style="width:235px" title="情绪判定/新闻过滤/技法判定等">
+        <input id="llm-tier-standard" list="llm-model-choices" placeholder="standard 档（交易员）" style="width:235px" title="交易员/提款建议/相关性判定">
+        <input id="llm-tier-deep" list="llm-model-choices" placeholder="deep 档（分析师/辩论）" style="width:235px" title="分析师报告/多空辩论/复盘/日报">
+        <span class="muted" id="llm-models-status" style="font-size:11px"></span>
       </div>
       <div class="row" style="margin-top:8px;align-items:center">
         <label class="muted"><input type="checkbox" id="llm-enabled"> 启用</label>
@@ -1121,7 +1133,10 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
         每个计划卡片直接点「🤖 AI 买卖建议」即可（无需展开详情）：把计划进度、持仓明细、卖出凑钱建议、
         自选观察池、板块轮动、未来解禁/增发事件、近期新闻与大盘量能全部交给 Claude，
         生成一份「卖哪只、买哪只」的操作建议（含理由与风险提示）。
-        API key 存本机 config.yaml（注意调用会产生 API 费用）；留空则读环境变量 ANTHROPIC_API_KEY。</div>
+        API key 存本机 config.yaml（注意调用会产生 API 费用）；留空则读环境变量 ANTHROPIC_API_KEY。
+        <br>档位说明：fast=情绪判定/新闻过滤/技法判定，standard=交易员决策，deep=分析师报告/多空辩论/复盘；点「🔄 上游模型」可把可选模型全量拉进下拉（列表≠逐个可用，实跑为准）。
+      </div>
+      <datalist id="llm-model-choices"></datalist>
     </div>
   </section>
 
@@ -7688,11 +7703,41 @@ async function loadLlmConf() {
     $('llm-auto').checked = !!c.auto_advice;
     $('llm-model').value = c.model || '';
     $('llm-base').value = c.base_url || '';
+    const t = c.tiers || {};
+    $('llm-tier-fast').value = t.fast || '';
+    $('llm-tier-standard').value = t.standard || '';
+    $('llm-tier-deep').value = t.deep || '';
     $('llm-key').value = '';
     $('llm-key').placeholder = c.has_key ? `已配置（…${c.key_tail}），留空=不修改`
                                          : 'Anthropic API key（sk-ant-…）';
     $('llm-status').textContent = c.has_key ? 'key 已配置 ✓' : '未配置 key（可留空用环境变量）';
   } catch (e) { /* 静默 */ }
+}
+// 拉上游 /v1/models 填进共享 datalist —— 四个模型输入（默认 + 三个档位）都用它。
+// 注意：这是「减少手填出错」，列表里的模型≠逐个可用（网关大量 NIM 部署已删/EOL）。
+async function fetchLlmModels() {
+  const btn = $('llm-models-btn');
+  const st = $('llm-models-status');
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = '拉取中…';
+  try {
+    const d = await api('/api/llm/models');
+    if (!d.ok) {
+      if (st) { st.textContent = '拉取失败：' + (d.error || '未知错误'); st.style.color = 'var(--up)'; }
+      return;
+    }
+    const dl = $('llm-model-choices');
+    dl.innerHTML = d.models.map(m =>
+      `<option value="${esc(m.id)}">${esc(m.owned_by || '')}</option>`).join('');
+    if (st) {
+      st.textContent = `已获取 ${d.count} 个模型${d.cached ? '（缓存）' : ''}（列表≠逐个可用，实跑为准）`;
+      st.style.color = '';
+    }
+  } catch (e) {
+    if (st) { st.textContent = '拉取失败：' + e.message; st.style.color = 'var(--up)'; }
+  } finally {
+    btn.disabled = false; btn.textContent = old;
+  }
 }
 async function saveLlmConf() {
   try {
@@ -7701,6 +7746,9 @@ async function saveLlmConf() {
         enabled: $('llm-enabled').checked, auto_advice: $('llm-auto').checked,
         model: $('llm-model').value.trim(), base_url: $('llm-base').value.trim(),
         api_key: $('llm-key').value.trim() || undefined,
+        tiers: { fast: $('llm-tier-fast').value.trim(),
+                 standard: $('llm-tier-standard').value.trim(),
+                 deep: $('llm-tier-deep').value.trim() },
       })});
     toast('AI 配置已保存');
     loadLlmConf();
@@ -9078,6 +9126,7 @@ function renderTAdv() {
     <tr data-tdetail="${esc(i.code || '')}"><td colspan="13" style="padding:0 8px 8px">
       <div style="font-size:12px;line-height:1.65">
         ${i.trend ? `<div><b>趋势规则</b> ${_tTrendLine(i.trend)}</div>` : ''}
+        ${i.big_drop ? `<div class="t-bigdrop"><b>💧 大跌降本</b> ${esc(i.big_drop.summary || '')}</div>` : ''}
         ${i.override_note ? `<div class="t-warn">⚠️ ${esc(i.override_note)}</div>` : ''}
         <div><b>依据</b> ${esc(i.why || '—')}</div>
         <div><b>方向</b> ${esc(i.bias_why || '—')}</div>
@@ -11038,6 +11087,14 @@ function cfgRowHtml(sec, r) {
     const step = r.type === 'int' ? '1' : '0.1';
     ctrl = `<input type="number" id="${id}" value="${esc(r.value)}" step="${step}"
              ${r.min != null ? `min="${r.min}"` : ''} ${r.max != null ? `max="${r.max}"` : ''}>`;
+  } else if (r.type === 'model') {
+    // 模型名：下拉 datalist 由 🔄 按钮现拉上游 /v1/models 填充（列表≠逐个可用）
+    ctrl = `<span class="row tight" style="gap:6px">
+      <input type="text" id="${id}" value="${esc(r.value)}" list="llm-model-choices"
+             placeholder="${esc(ph)}" style="flex:1" autocomplete="off">
+      <button class="btn ghost" style="flex:0 0 auto;padding:2px 8px;font-size:12px"
+              onclick="fetchLlmModels()" title="从上游 /v1/models 拉取可选模型">🔄</button>
+    </span>`;
   } else {
     ctrl = `<input type="text" id="${id}" value="${esc(r.value)}" placeholder="${esc(ph)}">`;
   }

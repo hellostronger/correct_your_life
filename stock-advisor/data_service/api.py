@@ -28,6 +28,9 @@ GET  /sw-calendar            申万公布过的月末交易日
 GET  /sw-month               某月末的申万行业 PE/收盘（一级行业 + 市场表征）
 GET  /sw-day                 某个交易日的申万行业 PE/收盘
 GET  /index-hist             中证指数日线（收盘 + 滚动市盈率），精简行
+
+全球指数代理（2026-11-04 新增：KOSPI 改由 101 取）
+GET  /global-index           批量全球指数现货（东财 ulist.np；含 100.KS11 韩国KOSPI）
 """
 from __future__ import annotations
 

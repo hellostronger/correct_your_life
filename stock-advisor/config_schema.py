@@ -960,6 +960,22 @@ SCHEMAS: dict[str, dict[str, Any]] = {
              "lo": 80, "hi": 800, "label": "趋势回放窗口(交易日)", "adv": True,
              "help": "从**建仓日**起逐日回放用的日K根数（至少需要 60 根才能算 MA60）。"
                      "调大更准但每轮多拉数据"},
+            # ---- 大跌降低成本（2026-11-05）----
+            {"key": "t_trading.big_drop.enabled", "t": "bool", "d": True,
+             "label": "大跌降本提示", "adv": True,
+             "help": "浮亏 ≥ 15% 时，给出降低成本的建议（先卖后买做T回补 + "
+                     "分档加仓摊薄）。**只给建议、不下单**，加仓由你手动执行。"
+                     "ST/*退市 不推加仓。关掉后大跌时不再提示"},
+            {"key": "t_trading.big_drop.min_dd_pct", "t": "float", "d": 15.0,
+             "lo": 5, "hi": 50, "step": 2.5, "label": "大跌提示·浮亏线%", "adv": True,
+             "help": "浮亏达到这个幅度才给建议。15%=智谱(−48%)/MINIMAX(−25%)这类重仓亏损股都能触发"},
+            {"key": "t_trading.big_drop.cap_add_pct", "t": "float", "d": 30,
+             "lo": 5, "hi": 60, "step": 5, "label": "大跌降本·累计加仓上限%", "adv": True,
+             "help": "所有档位合计加仓不超过当前持仓的这个比例（默认 30%）。"
+                     "**别调大**：越跌越买仓位会失控，30% 已经是给重仓亏损股的下限"},
+            {"key": "t_trading.big_drop.skip_star", "t": "bool", "d": True,
+             "label": "大跌降本·ST不加仓", "adv": True,
+             "help": "*ST/*退市 只写风险提示，不推加仓（越跌越买会接刀）"},
             {"key": "fees.a_commission_rate", "t": "float", "d": 0.00025,
              "lo": 0, "hi": 0.01, "step": 0.00005, "label": "佣金费率", "adv": True,
              "help": "A 股/场内基金佣金费率，万2.5 = 0.00025。双向收取"},
@@ -1013,7 +1029,22 @@ SCHEMAS: dict[str, dict[str, Any]] = {
              "label": "API key", "help": "sk-ant-… 存本机 config.yaml，注意保管"},
             {"key": "base_url", "t": "url", "d": "", "label": "base_url",
              "help": "留空 = Anthropic 官方端点；用代理/网关在此填"},
-            {"key": "model", "t": "str", "d": "claude-opus-5", "label": "模型名"},
+            {"key": "model", "t": "model", "d": "", "label": "模型名",
+             "help": "点 🔄 从上游 /v1/models 拉取；模型 id 写错会在调用时 404。"
+                     "留空 = 沿用 config.yaml"},
+            {"key": "timeout", "t": "int", "d": 420, "lo": 10, "hi": 3600,
+             "label": "客户端超时(秒)", "adv": True,
+             "help": "网关高峰单次会退化到 46~360 秒；写死过短会导致"
+                     "决策成片 APITimeoutError（决策失败 = 这只票这轮没有决策）"},
+            {"key": "tiers.fast", "t": "model", "d": "", "label": "档位 · fast",
+             "help": "情绪判定/新闻过滤/技法判定；留空 = 沿用上面的默认模型"},
+            {"key": "tiers.standard", "t": "model", "d": "", "label": "档位 · standard",
+             "adv": True,
+             "help": "交易员/提款建议/相关性判定；留空 = 沿用默认模型"},
+            {"key": "tiers.deep", "t": "model", "d": "", "label": "档位 · deep",
+             "adv": True,
+             "help": "分析师报告/多空辩论/复盘/日报；留空 = 沿用默认模型。"
+                     "**留空 ≠ 自动找替代**（避免静默降级到弱模型）"},
             {"key": "max_tokens", "t": "int", "d": 8000, "lo": 500, "hi": 128000,
              "label": "输出上限 max_tokens",
              "help": "**全局唯一**，模拟盘报告/交易员/辩论/日报/提款建议都读它。"

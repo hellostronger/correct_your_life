@@ -102,6 +102,14 @@ AGENT_STYLE = """\
 7. **还没做的不要假装做到。** 记录心情 / 日记 / 情绪洞察还在规划里，
    直接说没上线，不要编"已经记下了"。
 
+本系统的语境（先读这条再判断他在说什么）：
+  他说「实盘建议 / 做T建议」= 真实持仓的做T与趋势减仓建议记录
+  （工具 stock_t_advisory 是**历史的判断记录**，查它才能说清"为什么某只票没建议"）。
+  「智谱」= 他持有的港股 智谱(02513.HK)；「MINIMAX/MiniMax」= 持股 MiniMax-W(00100.HK)；
+  「快手」= 快手-W(01024.HK)。这几家公司同时也是 AI 公司名 —— **在本系统里默认按
+  股票理解**（他提"建议/没反馈/跌了/买了"都是股票语境）；只有他明确在聊大模型/算力时才算模型。
+  拿不准就先用工具查行情与做T记录，查到了就按股票作答。
+
 买卖评审（硬规则，优先级高于上面所有风格要求）：
   他一提到要买/要卖某只股票，**必须先调工具 mcp_stock_stock_trade_review**
   （code=代码，side=buy/sell；shares 股数、price 报价有就给，reason 转述他自己的
@@ -307,9 +315,19 @@ def _agent_reply(user_id: str, text: str, conf: dict) -> str | None:
         print("[wx-chat] agent 返回空内容", flush=True)
         return None
     # nanobot 在上游网关失败时仍回 HTTP 200，把错误串当 assistant 内容
-    # （实测 503 system_cpu_overloaded 时 usage 全 0）。那种字符串绝不能
-    # 发给微信用户 —— 当失败处理，交给调用方走既有回退。
-    if out.startswith("Error:") and total_tokens == 0:
+    # （anthropic_provider._handle_error 会把网关 payload 原样包成
+    #  "Error: {payload}" 当模型内容返回，finish_reason="error"）。
+    # 那种字符串绝不能发给微信用户 —— 当失败处理，交给调用方走既有回退。
+    # 判据两条：10-31 实测形态（"Error:" 开头 + usage 全 0）；
+    # 11-05 实测形态（"Error:" 开头 + 网关错误 payload 特征，此时 usage
+    # 可能非 0 —— prompt tokens 已被计费）。特征词取自网关(new-api)与
+    # nanobot 自身的错误包装，真回答以此为开头的概率可忽略。
+    _upstream_err_markers = ("new_api_error", "system_cpu_overloaded",
+                             "overloaded", "Error calling LLM",
+                             "api_error")
+    if out.startswith("Error:") and (
+            total_tokens == 0
+            or any(m in out for m in _upstream_err_markers)):
         msg = f"agent 上游报错: {out[:200]}"
         with _state_lock:
             _state["last_error"] = msg

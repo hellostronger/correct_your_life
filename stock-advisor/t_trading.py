@@ -95,6 +95,17 @@ T_DEFAULTS = {
         "deep_dd_pct": 25,       # 浮亏超过 x% 不再催卖，只提示（避免卖在坑里）
         "lookback_days": 180,    # 回放窗口（交易日）
     },
+    # 大跌降低成本（2026-11-05 用户授权新增）。
+    # 只给建议、不成交：`scan_once` / `decide` 一个字节没动，加仓仍由用户本人手动执行。
+    # 浮亏达到分档位时给出「分档加仓降低成本」建议（算好加仓股数与买入后的平均成本）。
+    # **用户场景：深跌 40%+ 的标的「没动作」最憋屈** —— 做 T 在下跌途中帮不上忙，
+    # 剩下唯一合情理的降本手段是按计划分档买入。ST/*退市不推加仓（越跌越买会接刀）。
+    "big_drop": {
+        "enabled": True,         # 默认开（用户授权）——只给建议，绝不下单
+        "min_dd_pct": 15.0,      # 浮亏至少达到这个幅度才提示
+        "cap_add_pct": 30,       # 全部档位加仓合计上限（占当前持仓 %）
+        "skip_star": True,       # *ST/*退市 不推加仓
+    },
 }
 
 # T 操作的标记前缀。用来区分「做 T 的成交」和「普通 LLM 决策的成交」，
@@ -126,6 +137,11 @@ def _conf(raw: dict | None) -> dict:
     if isinstance(sub, dict):
         tr.update(sub)
     c["trend_reduce"] = tr
+    bd = dict(T_DEFAULTS["big_drop"])
+    sub2 = (raw or {}).get("big_drop")
+    if isinstance(sub2, dict):
+        bd.update(sub2)
+    c["big_drop"] = bd
     return c
 
 
@@ -318,6 +334,11 @@ def movable_shares(code: str, held: int, conf: dict) -> int:
     lot = lot_size(code)
     raw = held * float(c.get("t_ratio") or 0) / 100.0
     n = int(raw // lot) * lot
+    # 2026-11-05 用户授权放宽：**差一点不足一手时按至少一手处理** —— 例如
+    # 300 股 × 30% = 90 股，旧口径向下取整直接 0，MINIMAX 这种小仓位永远做不了 T。
+    # 只在「差 20% 以内」才放宽到 1 手（而不是任意小额就跳一手），且一手 ≤ 持仓。
+    if n == 0 and raw >= lot * 0.8 and held >= lot:
+        n = lot
     return max(0, min(n, held - lot if held > lot else 0))
 
 
@@ -444,6 +465,103 @@ def _trend_shares(code: str, held: int, reduce_pct: float,
         n = min(n, cap)
         n = int(n // lot) * lot
     return (n if n >= lot else 0), raw
+
+
+# 大跌降本的分档表：(浮亏档位 %, 该档建议加仓占当前持仓 %)
+# 为什么固定：档位与加仓节奏的调参没有客观真理，给配置项只会让用户瞎调
+# （且每多一个键就是多一处要测的边界）。真正可调的只有「总上限」和「是否启用」。
+_BIG_DROP_TIERS = [(15.0, 8.0), (25.0, 10.0), (35.0, 12.0)]
+
+
+def big_drop_plan(code: str, name: str, held: int, avg_cost: float, price: float,
+                  pnl_pct: float | None, conf: dict | None = None) -> dict | None:
+    """大跌时「降低成本」的建议（**纯函数，只产建议，不成交**）。
+
+    用户 2026-11-05 授权："针对大跌的时候降低成本非常重要，你要帮我实现这个"，
+    并选择：① 机动仓做T（先卖后买回补）② 分档加仓摊薄 ③ 建议只给实盘提示、
+    不改 paper_trading 交易口径。
+
+    机动仓做T 部分已由 `decide()` / `real_sellable_shares()` 实现（且 2026-11-05
+    放宽了 MINIMAX 这类小仓位「差一点不足一手」的情况），本函数补上
+    **分档加仓** —— 深跌途中做T帮不上忙，唯一合情理的降本手段是按计划加仓。
+
+    触发：浮亏 ≥ min_dd_pct（默认 15%）。档位见 _BIG_DROP_TIERS，全部档位加仓合计
+    不超过 cap_add_pct（默认 30% 当前持仓）。*ST/*退市 只提示不加仓。
+
+    返回：
+    | 键 | 含义 |
+    |---|---|
+    | `triggered` | 是否触发（浮亏达档） |
+    | `skip_reason` | 不推加仓的原因（ST 类），触发 True 但不给股数 |
+    | `tiers_crossed` | 已达到的档位列表（[15.0, 25.0, ...]） |
+    | `add_shares` | 全部档位合计建议加仓股数（已按申报单位向上取整、不超 cap） |
+    | `new_avg_cost` | 全部加完后的平均成本（不加时等于 avg_cost） |
+    | `summary` | 可直接展示的中文摘要（含数字） |
+    """
+    c = _conf(conf)
+    bd = c.get("big_drop") or {}
+    if not bd.get("enabled", True):
+        return None
+    held = int(held or 0)
+    if held <= 0 or not avg_cost:
+        return None
+    dd = max(0.0, -(pnl_pct or 0.0))
+    # 用「浮亏」而不用「跌幅」：成本相对当前价的亏损最能反映
+    # 「离摊薄有多远」；连续阴跌但成本平价的票（浮盈中）不算「大跌」。
+    min_dd = float(bd.get("min_dd_pct") or 15.0)
+    if dd < min_dd:
+        return {"triggered": False, "min_dd_pct": min_dd, "drawdown_pct": round(dd, 4),
+                "skip_reason": "", "tiers_crossed": [], "add_shares": 0,
+                "total_add_pct": 0.0, "new_avg_cost": None,
+                "summary": "浮亏 %.2f%% 未达分档提示线（%.2f%%），不建议加仓" % (dd, min_dd)}
+    name_s = str(name or "")
+    is_star = bool(bd.get("skip_star", True)) and (
+        name_s.upper().startswith("*ST") or name_s.startswith("ST")
+        or "退市" in name_s)
+    tiers = [(lv, pct) for (lv, pct) in _BIG_DROP_TIERS if dd >= lv]
+    lot = lot_size(code)
+    if is_star:
+        return {"triggered": True, "min_dd_pct": min_dd, "drawdown_pct": round(dd, 4),
+                "skip_reason": "标的带 ST/退市风险，越跌越买可能接刀 —— 不推加仓，只提示风险",
+                "tiers_crossed": [lv for lv, _ in tiers],
+                "add_shares": 0, "total_add_pct": 0.0, "new_avg_cost": None,
+                "summary": "浮亏 %.2f%%（已达档位 %s），但该标的有 ST/退市风险 —— "
+                           "**不推加仓**，注意退市风险，优先评估是否该止损"
+                           % (dd, "/".join(f"{lv:.0f}%" for lv, _ in tiers))}
+    # 逐档计算加仓股数（**向上取整到申报单位**，至少 1 手 —— 用户明确要「MINIMAX
+    # 不足一手也要给建议」的口径；cap 段再钳制防止超额）。
+    cap_shares = int(held * float(bd.get("cap_add_pct") or 30) / 100.0 // lot) * lot
+    if cap_shares < lot:          # 持仓太小：至少允许 1 手（与机动仓同一口径）
+        cap_shares = lot
+    remaining = cap_shares
+    per_tier, tot = [], 0
+    for lv, pct in tiers:
+        raw = held * pct / 100.0
+        n = max(lot, int(math.ceil(raw / lot)) * lot)   # 至少 1 手
+        n = min(n, remaining)
+        if n <= 0:
+            break
+        remaining -= n
+        per_tier.append({"level": lv, "add_pct": pct, "add_shares": n})
+        tot += n
+    if tot > 0:
+        new_avg = (held * float(avg_cost) + tot * float(price)) / float(held + tot)
+    else:
+        new_avg = float(avg_cost)
+    pct_of_held = round(100.0 * tot / held, 4) if held else 0.0
+    seg = "、".join("≥%.0f%% 加 %d 股" % (lv, n) for lv, n in
+                    [(t["level"], t["add_shares"]) for t in per_tier])
+    note = ("浮亏 %.2f%% 已达 %s 档：%s；合计加仓 %d 股（占持仓 %.2f%%），"
+            "加完平均成本 %s。**只给建议，下单由你手动执行**；如果你还没在这只票上"
+            "高抛过（没有待接回的机动仓），先卖后买无从谈起，降本就只能靠这个分档加仓"
+            % (dd, "/".join(f"{lv:.0f}%" for lv, _ in tiers), seg or "0 股",
+               tot, pct_of_held, fpx(new_avg)))
+    return {"triggered": True, "min_dd_pct": min_dd, "drawdown_pct": round(dd, 4),
+            "skip_reason": "", "tiers_crossed": [lv for lv, _ in tiers],
+            "add_shares": tot, "total_add_pct": pct_of_held,
+            "new_avg_cost": round(new_avg, 6) if held else None,
+            "summary": note,
+            "tiers": per_tier}
 
 
 def trend_reduce_state(bars: list[dict], conf: dict | None = None, *,
@@ -1456,12 +1574,19 @@ def advisory(deps: dict, conf: dict, positions: dict, today: str = "",
             "intraday_src": (intraday or {}).get("source"),
             "intraday_vwap": (intraday or {}).get("vwap"),
         })
+        # 大跌降本：浮亏分档位给「分档加仓」建议（2026-11-05）。
+        # 只给建议、不下单——动作字段保持 hold/未操作；加仓仍由用户手动执行。
+        bd = big_drop_plan(code, name, held, cost, price, it.get("pnl_pct"), c)
+        if bd:
+            it["big_drop"] = bd
         it["action_label"] = {"t_sell": "高抛（先卖）", "t_buy": "低吸（买回）",
                               "hold": "不做"}.get(it["action"], "不做")
         it["invalidate"] = _invalidate(dec, it["bias"], price, (intraday or {}).get("vwap"))
         # 执行单：**两条腿一次给全**。hold 状态也给「差多少才够门槛 / 为什么不做」，
         # 否则用户只看到一句「不做」，无法判断是「快了」还是「差很远」。
         it["ticket"] = _build_ticket(it, dec, c, fees_c, price)
+        if it.get("ticket") and it.get("big_drop"):
+            it["ticket"]["big_drop"] = it["big_drop"]
 
         # 趋势规则**优先于做 T**：已经判「该减仓」的仓位，再拿其中一部分去
         # 高抛低吸是自相矛盾。这里只覆盖**建议与展示** —— decide / _execute_one
@@ -1500,6 +1625,8 @@ def advisory(deps: dict, conf: dict, positions: dict, today: str = "",
                     sellable=sellable)
                 if note:
                     it["ticket"]["note"] = note
+                if it.get("big_drop"):
+                    it["ticket"]["big_drop"] = it["big_drop"]
         items.append(it)
 
         # 方向对错与盈亏**分开报**（借鉴 TradingAgents performance.py 的教训）

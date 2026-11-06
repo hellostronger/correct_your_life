@@ -272,6 +272,53 @@ def universe(cur, limit: int = 120) -> list[tuple[str, str]]:
     return out[:limit]
 
 
+def _dedupe_holder_rows(rows: list[tuple]) -> tuple[list[tuple], int]:
+    """按 (code, period, holder) 去重，保留**持股数最大**的一行。
+
+    东财 `stock_main_stock_holder` 偶尔对同一股东、同一报告期给两行不同持股数
+    （实测 000723 / 2001-06-30 / 安徽省证券公司：1,853,899 股 @1.33% 与
+    233,895 股 @0.17%）。`execute_values` 里同一冲突键出现两次时 PG 报
+    `ON CONFLICT DO UPDATE command cannot affect row a second time`，
+    **整批回滚**，且把共享连接的事务带进 aborted 状态。
+
+    ⚠️ 保留「最大」而不是「先出现的」：渲染层按相邻期算环比，若留下较小那行，
+    下一次拿到正常值时就会凭空算出一次「大幅减持」。
+    """
+    idx: dict[tuple, int] = {}
+    out: list[tuple] = []
+    for r in rows:
+        key = (r[0], r[1], r[2])
+        i = idx.get(key)
+        if i is None:
+            idx[key] = len(out)
+            out.append(r)
+            continue
+        a, b = out[i][4], r[4]                   # [4] = shares（可能是 None）
+        if b is not None and (a is None or b > a):
+            out[i] = r
+    return out, len(rows) - len(out)
+
+
+def _dedupe_index_codes(codes: list[tuple]) -> tuple[list[tuple], int]:
+    """按 (index_code, snap_date, code) 去重 —— 与 sa_index_cons 主键同口径。
+
+    成分表里出现重复代码时，批量 `DO UPDATE` upsert 同样会报
+    `cannot affect row a second time`。保留**第一个非空**的名称。
+    """
+    idx: dict[tuple, int] = {}
+    out: list[tuple] = []
+    for r in codes:
+        key = (r[0], r[1], r[2])
+        i = idx.get(key)
+        if i is None:
+            idx[key] = len(out)
+            out.append(r)
+            continue
+        if not out[i][3] and r[3]:
+            out[i] = r
+    return out, len(codes) - len(out)
+
+
 # ---------------- 采集 ①：券商评级 ----------------
 
 def collect_ratings(conn, codes) -> dict:
@@ -353,7 +400,7 @@ def collect_holders(conn, codes) -> dict:
     `codes` 同 collect_ratings：可以是代码列表或 (code, name) 列表。
     """
     import akshare as ak
-    stat = {"codes": 0, "rows": 0, "periods": set(), "errors": []}
+    stat = {"codes": 0, "rows": 0, "merged": 0, "periods": set(), "errors": []}
     rows: list[tuple] = []
     for item in codes:
         code = item[0] if isinstance(item, (tuple, list)) else item
@@ -387,6 +434,7 @@ def collect_holders(conn, codes) -> dict:
             rows.append((code, d, holder[:120], htype,
                          _num(r.get(s_col)), _num(r.get(r_col))))
             stat["periods"].add(d.isoformat())
+    rows, stat["merged"] = _dedupe_holder_rows(rows)
     stat["rows"] = len(rows)
     if rows:
         import psycopg2.extras as _ex
@@ -399,8 +447,8 @@ def collect_holders(conn, codes) -> dict:
                                "SET htype = EXCLUDED.htype, shares = EXCLUDED.shares, "
                                "    ratio = EXCLUDED.ratio", rows, page_size=500)
         conn.commit()
-    print("[inst] 机构/社保持仓：%d 只取到 %d 行，报告期 %s"
-          % (stat["codes"], stat["rows"],
+    print("[inst] 机构/社保持仓：%d 只取到 %d 行（合并重复 %d 行），报告期 %s"
+          % (stat["codes"], stat["rows"], stat["merged"],
              sorted(stat["periods"])[-3:] or "-"), flush=True)
     return stat
 
@@ -441,6 +489,7 @@ def snapshot_index(conn, index_code: str) -> dict:
         if not c:
             continue
         codes.append((index_code, snap, c, str(r.get(n_col) or "")[:60]))
+    codes, _merged = _dedupe_index_codes(codes)
     out["snap_date"], out["rows"] = snap, len(codes)
     if not codes:
         return out
@@ -682,6 +731,22 @@ def build_injection(cur, code: str, as_of: str | None = None,
 
 # ---------------- 一轮采集（守护线程用） ----------------
 
+def _safe_rollback(conn) -> None:
+    """子步骤失败后回滚 —— 否则共享连接的事务会一直停在 aborted 状态。
+
+    PG 里任何一条语句报错后，**同一连接**上后续语句全部返回
+    `current transaction is aborted, commands ignored until end of transaction
+    block`。实测「持仓 upsert 撞重复键」会把后面 5 个指数快照全部带死，
+    正好违背 `run_once` 文档里「任一子步骤失败都不阻断其它步骤」的约定：
+    `collect_ratings` / `collect_holders` 只在 `if rows:` 里 commit，
+    失败路径上没有人替它回滚。
+    """
+    try:
+        conn.rollback()
+    except Exception as exc:                     # noqa: BLE001
+        print("[inst] 回滚失败: %s" % str(exc)[:150], flush=True)
+
+
 def run_once(deps, conf: dict | None = None) -> dict:
     """一轮采集。任一子步骤失败都不阻断其它步骤（部分可用好过全挂）。"""
     c = {**DEFAULTS, **{k: v for k, v in (conf or {}).items() if v is not None}}
@@ -700,6 +765,7 @@ def run_once(deps, conf: dict | None = None) -> dict:
         except Exception as exc:                 # noqa: BLE001
             out["ratings"] = {"error": str(exc)[:200]}
             print("[inst] 评级采集异常: %s" % str(exc)[:150], flush=True)
+            _safe_rollback(conn)
         if c.get("hold_season", True) and not in_hold_season():
             out["holders"] = {"skipped": "非披露季窗口"}
         else:
@@ -708,12 +774,14 @@ def run_once(deps, conf: dict | None = None) -> dict:
             except Exception as exc:             # noqa: BLE001
                 out["holders"] = {"error": str(exc)[:200]}
                 print("[inst] 持仓采集异常: %s" % str(exc)[:150], flush=True)
+                _safe_rollback(conn)
         for idx in (c.get("indices") or []):
             try:
                 out["indices"].append(snapshot_index(conn, idx))
             except Exception as exc:             # noqa: BLE001
                 out["indices"].append({"index": idx, "error": str(exc)[:200]})
                 print("[inst] 指数 %s 异常: %s" % (idx, str(exc)[:150]), flush=True)
+                _safe_rollback(conn)
     finally:
         conn.close()
     return out

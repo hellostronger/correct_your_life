@@ -456,6 +456,116 @@ def quotes(symbols: list[str]) -> dict:
     return {"quotes": out, "notes": errs}
 
 
+# ---------------- 全球指数（2026-11-04 新增） ----------------
+#
+# 为什么新增这条路（2026-11-04 在 101 上实测后决定）
+# --------------------------------------------------
+# 韩国 KOSPI 在腾讯/新浪**都没有符号**（`s_krKOSPI` 回 `v_pv_none_match="1"`、
+# 新浪 `int_kospi` 回空串），Yahoo 从 101 出口被限流，akshare 1.18.97 也没有
+# 任何 krx/kospi 函数。而东财 `push2/ulist.np` 从 101 **可用**：一次 11 个 secid
+# 的请求 **HTTP 200 / 931 字节 / 0.059 秒** 就把 `100.KS11`（韩国KOSPI）连同美股
+# 三大指数、日经、恒生、国企指数、上证/沪深300/中证500 一次拿全。
+#
+# ⚠️ 只能拿**现货**：`push2his`（日K）从 101 是 `curl: (52) Empty reply`。
+#    与本服务的 `SPOT_ONLY` 口径一致——美/日/韩本来就只取当日，不算历史。
+#
+# 🔴 三个实测到的坑（每条都单独会产出「看起来对的错数据」）
+# ------------------------------------------------------------------
+# 1. **`f13` 不总是 100**：`100.*`（美/日/港）是 100，而 `1.000001/000300/000905`
+#    回来是 **`f13: 1`**。按 `f13 == 100` 过滤会静默丢掉三个 A 股指数。
+#    ⇒ 判据只能用「`f12` 的代码部分在请求集合里」。
+# 2. **`total` 不是成功标志**：实测请求 11 个 secid 回 `rc:0` + `total:10`，
+#    少的那个是 `100.HSTECH`（东财没有恒生科技指数）。`total` 只是「返回了几行」，
+#    拿它判成功会把「少一条」当正常。⇒ 必须 diff 请求集与返回集，缺的显式报错。
+# 3. **不传 `fltt` 时数据是未缩放的**：`f2:568380, f1:2` 表示 5683.80。
+#    传 `fltt=2` 会让字段语义变化，所以这里**刻意不传**，自己按 `f1` 缩放。
+
+EM_ULIST_URL = "https://push2.eastmoney.com/api/qt/ulist.np/get"
+_EM_GI_FIELDS = "f1,f2,f3,f4,f12,f13,f14"
+
+
+def _gi_price(f1, f2):
+    """东财未缩放价：f2 / 10**f1。f1 缺失按 2 位（实测常见值）。"""
+    n = _num(str(f2).replace(",", "") if f2 is not None else None)
+    if n is None:
+        return None
+    d = _num(f1)
+    digits = 2 if d is None else int(max(0, min(8, d)))
+    return n / (10 ** digits)
+
+
+def _gi_ratio(v):
+    """f3(涨跌幅) / f4(涨跌额) 都是 ×100 的整数。"""
+    n = _num(str(v).replace(",", "") if v is not None else None)
+    return None if n is None else n / 100.0
+
+
+def global_index(secids: list[str]) -> dict:
+    """批量全球指数现货。secids 用东财 secid（100.DJIA / 100.KS11 / 1.000001）。
+
+    返回 `{quotes: {secid: {...}}, notes: []}`；请求了但上游没回的那几个
+    会出现在 quotes 里且带 `error`，并在 notes 里点名——
+    **不能用「HTTP 200 + 有返回」推断全部成功**（见上方坑 2）。
+    """
+    seen: list[str] = []
+    for s in secids:
+        s = str(s or "").strip()
+        if s and s not in seen:
+            seen.append(s)
+    if not seen:
+        raise ValueError("secids 不能为空")
+    if len(seen) > 100:
+        raise ValueError("一次最多 100 个 secid")
+    bad = [s for s in seen if not SECID_RE.match(s)]
+    if bad:
+        raise ValueError("secid 格式不对（应为 market.code，如 100.KS11）：%s"
+                         % ", ".join(bad[:5]))
+
+    want = {}
+    for s in seen:
+        want[s.split(".", 1)[1].upper()] = s
+
+    errs: list[str] = []
+    got: dict[str, dict] = {}
+    try:
+        resp = _get(EM_ULIST_URL,
+                    params={"fields": _EM_GI_FIELDS, "secids": ",".join(seen)},
+                    referer="https://quote.eastmoney.com/")
+        payload = resp.json()
+    except Exception as exc:            # noqa: BLE001
+        raise UpstreamError("东财全球指数失败: %s" % str(exc)[:140]) from exc
+
+    data = (payload or {}).get("data") or {}
+    diff = data.get("diff")
+    rows = list(diff.values()) if isinstance(diff, dict) else (diff or [])
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        code = str(row.get("f12") or "").strip().upper()
+        secid = want.get(code)
+        if not secid:
+            continue                    # 不是我们要的（上游可能夹带别的行）
+        got[secid] = {"code": code, "secid": secid,
+                      "name": str(row.get("f14") or "").strip() or code,
+                      "price": _gi_price(row.get("f1"), row.get("f2")),
+                      "pct": _gi_ratio(row.get("f3")),
+                      "change": _gi_ratio(row.get("f4"))}
+
+    if not got:
+        raise UpstreamError("东财全球指数没有解析出任何一行（total=%s）"
+                            % (data.get("total"),))
+
+    missing = [s for s in seen if s not in got]
+    if missing:
+        errs.append("东财未返回 %d/%d 个指数：%s（total=%s）"
+                    % (len(missing), len(seen), ", ".join(missing),
+                       data.get("total")))
+        for s in missing:
+            got[s] = {"code": s.split(".", 1)[1], "secid": s,
+                      "error": "上游未返回该指数"}
+    return {"quotes": {s: got[s] for s in seen}, "notes": errs}
+
+
 # ---------------- 汇率 / 国际期货 ----------------
 #
 # 为什么自己解析而不是用 akshare（2026-10-22 实测后决定）
