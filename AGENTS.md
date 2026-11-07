@@ -4,6 +4,243 @@
 
 ---
 
+### 🎯 个股锚定模式 `stock-advisor/paper_anchor.py`（2026-11-08，用户要求）
+
+用户诉求：「我现在半仓智谱了，我就锚定这个股，目标就是在这个股上赚钱，可以做T降低
+成本、空仓躲开暴跌，但**最后一定要买回来**」。现有引擎按全自选池（43只）决策，
+没有「单票锚定」概念。
+
+**裁决（2026-11-08 用户澄清，覆盖 11-07 的推荐项）**：锚定是**独立轨道、优先级
+最高**，**不影响**原有模拟盘决策与实盘建议 —— 其他自选照常跑，锚定票永远进候选
+且成交排最前；镜像实盘起步（`_derive_holdings()` 从 sa_trades 流水推导成本与
+占比）；回补用「预案注入 + 超期告警」，**不由代码硬执行**。
+
+#### 实现（1 新模块 + 4 处接线）
+
+| 组件 | 要点 |
+|---|---|
+| `paper_anchor.py` | `seed_mirror`（一次性幂等镜像建仓，slot='seed'，实盘无该票记录→**降级 fresh 不编造成本**）/ `build_injection`（只对锚定票输出，其他票精确返回 ""）/ `refill_watch`（空仓起始日落库+交易日计数+超期推送当日去重）/ `status`（绩效聚合，全部从 sa_paper_trades 算，**不新增交易表**） |
+| 表 `sa_paper_anchor_state` | 每锚定票一行：status(anchored/empty)、empty_since/empty_days、seed_done/price/shares、last_alert_date |
+| `paper_trading.py` | `run_decisions`/`_execute_plans`/`_execute_decision` 加可选 `anchor_code`（默认 None→**逐字节不变**）：锚定票豁免「持仓满剔未持仓」+ 豁免持仓上限权威校验（否则空仓回补被其他持仓卡死）；`_execute_plans` 里锚定的卖/买**各自排最前**（稳定排序 tier，非锚定序不变）；追高闸门**不豁免**（风控不撤） |
+| `app.py` | `_paper_run_cycle`：anchor.enabled 时**不收窄 targets**（独立轨道），只加 seed + refill_watch；deps 加 `holdings_fn`；端点 `GET /api/paper/anchor`、`POST /api/paper/anchor/seed` |
+| UI | 「🎯 锚定」tab：状态卡（空仓天数/超期徽标/成本线/已实现盈亏）+ 该票流水表 + 镜像建仓按钮 |
+
+配置 `paper.anchor.{enabled(false),code,seed_mode(mirror|keep|fresh),max_refill_wait_days(5),inject.max_chars(1600)}`，schema 5 字段全进配置页（`unknown=[]` 已验证）。
+
+#### 验证
+
+- 离线 `paper_anchor_test.py` **98/98**（Fake 不联网不烧 LLM：非锚定票精确空串、
+  tuple 游标、镜像幂等绝不二次加仓、现金不足拒绝、告警当日去重、AST 断言豁免
+  条件真实存在——数子串会撞 docstring）；回归 `_t_log_test` 83 / `_gate_test` /
+  `_cost_estimate` 112 / `_feasibility` 59 全过；JS 语法 OK；
+- 线上实测：`/api/paper/anchor` 200 且返回引导文案、`config/all` 5 字段就位、
+  seed 未配置时正确拒绝。
+- **开启方式**：调度 → 模拟交易配置 → 勾「锚定模式总开关」+ 填代码（如 02513）。
+  开启后下一轮决策起 only=[锚定票]；seed_mode=mirror 会在首次开跑时按实盘占比
+  自动建仓（幂等）。
+
+#### 本次踩的坑
+
+1. **测试夹具错 3 次（不是代码错）**：①空仓态用例忘了一起 stub 持仓（POS 里恒有
+   02513 → 永远走持仓分支）；②断言「初始成本 28.0」但 `%g` 输出「28」；③断言
+   「持仓态不含『空仓』」——使命文本本来就该有「空仓躲暴跌」字样，改成断言
+   「当前**空仓**」不出现。
+2. **FakeCur 的朴素 SELECT 列名解析被 COALESCE 括号里的逗号搞错位** → tuple 行
+   的 dict 拼列全错。生产 psycopg2 自带 description，夹具必须显式给
+   description，别自己解析 SELECT 头。
+3. **`_upsert_state` 的列名在 SQL 字符串里、params 只有值** —— 测试去 params 里
+   找列名恒假。判据要落在真实对象上（第 N 次同类）。
+4. 截断分支没被集成测试走到（空仓块 ~350 字符 < cap 下限 400）→ 抽
+   `_truncate()` 助手直接单测；「走不到的分支」集成断言会**静默假通过**。
+
+### 🔴 交易明细单笔盈亏两处错（2026-11-08 用户报，02513 弹窗）
+
+**症状**：持仓 → 交易明细弹窗里每笔亏损金额/百分比「都错了」。
+
+**真因有两个，一个真错一个口径误读**：
+1. **币种**：`_attach_lot_pnl` 的金额 = 现价(行情原币=港元) − 成本(sa_trades 录入
+   原币=港元)，**纯港元**，前端却当人民币渲染 —— 数值差汇率 0.851 倍。
+   用户裁决：**不折算，写清楚是港币**（弹窗顶部 hint + 代码 5 位判定 HK）。
+2. **口径**：买入笔原口径 = 现价 vs **买入时点的摊薄成本** —— 11-06 低位补仓
+   418.6（当时摊薄 730.9）显示 −41.69%，而该笔对现价 426.2 其实**+1.82%**。
+   任何用户都会当错账。用户裁决改成**对该笔买入价**（券商直觉）。
+   两种口径的单笔加总**都等于总浮动**（−243,764 HKD 实测吻合），总账不动。
+   卖出笔保持平均成本法标准实现（vs 卖出时点摊薄成本）不变。
+
+> 数学事实钉住：Σ (P−pᵢ)·nᵢ = P·N − Σ pᵢ·nᵢ = 总浮动 —— 摊薄成本口径与
+> 对该笔价口径**加总恒相等**，选哪种只是单笔归属的展示问题。
+
+### 🔴 锚定 tab「状态读取失败: tuple index out of range」（2026-11-08 用户报）
+
+**真因是 psycopg2 的经典坑**：`_perf` 的 SQL
+`reasoning LIKE '[做T]%'` **带 params 执行**时，字面量 `%` 被 psycopg2 当占位符
+前缀解析（`%'`）→ `IndexError: tuple index out of range`。**带 params 的 SQL 里
+字面量 `%` 必须写 `%%`**；不带 params 的 execute 不受影响。FakeCur 不模拟占位符
+解析，所以离线测试没拦住 —— 加了源码断言钉住（`[做T]%%` 在、未转义的不在）。
+
+**连带逮到第二个 bug**：真库查 `sa_paper_anchor_state` 是**空的** ——
+`_upsert_state` 原来是纯 UPDATE，而 `seed_mirror` 先于 `refill_watch`（建行唯一
+入口）执行 → UPDATE 静默零行，`seed_done/seed_price/seed_note` 从没落库。
+改成真 upsert（`INSERT ... ON CONFLICT (code) DO UPDATE`）。用户已建的仓靠
+positions 检查兜底没有重复建仓（seed 幂等第二道闸门），修复后下一轮自动补记
+seed_done（无需手工修库）。
+
+验证：离线 105/105（夹具同步跟上新 SQL：路由键含 `%%`、断言改为 upsert INSERT）、
+真库 `status()` available=True（400股/733.54/22笔流水）、线上 `/api/paper/anchor`
+200 恢复。**教训**：FakeCur 测不出 psycopg2 的占位符解析层，含 `%` 的 SQL 要有
+源码级断言；「写库前不存在的行」必须用 upsert 而不是 UPDATE。
+
+### 🚀 异常波动减持（2026-11-08 用户要求）+ 利好搜证闸门
+
+用户场景（02513 两周内实测两次）：空头排列里单日 +9%（无实质利好），随后一周
+**-12%~-23%** —— 做 T 高抛看「价高于均线基准」（暴跌后反弹日仍低于 MA20，触发
+不了）、趋势减仓看破位，两者对「暴涨出货机会」都沉默。
+
+**实现（t_trading.py，纯建议绝不自动下单）**：
+- `spike_reduce_state()` 量价判据：单日涨幅 ≥8% **且** 放量（当日量/前5日均量
+  ≥1.2，实测两次 1.24/1.48）**且** 空头排列（trend_gate；多头里的暴涨是趋势
+  本身不劝减）。回放防噪：fire 后 armed=False，**收盘跌回触发日前收盘**（暴涨
+  完全回吐）才重新武装；排列转多重置计数；max_reductions=2 / fresh_days=2。
+- `spike_verify()` 利好搜证闸门（用户原话「消息面必须准确，必须反复确认确实
+  不存在利好的，不然误判我就寄了；AI 全面暴力搜索」）：六源 best-effort
+  （新闻/解禁事件/社媒/公众号语义 Milvus/联网 searxng×2），LLM（task=fast，
+  **max_tokens=3000** —— 800 会被推理模型全花在思考上、正文为空）判
+  verdict∈{positive,none,uncertain}。**保守方向：只有 none 且置信 ≥6 才保留
+  减持建议；positive/uncertain/搜证失败一律撤回** —— 宁可错过出货，不把真
+  反转卖飞。按 (code, spike_date) 缓存；**失败 verdict 不缓存**（缓存住会让
+  15 分钟循环永不重试 —— 真跑 503 逮到的设计缺陷）。
+- advisory 覆盖优先级：趋势减仓 > 异常拉升减持 > 做T（趋势已给单向卖出时
+  不叠加）。ACT_ACTIONS += spike_reduce；UI T_ACT/T_ACT_KEYS/tIsTrend 同步。
+
+**实战验证（02513 / 11-04 事件）**：量价 fires=2（10-27 +8.90% 量比1.24、
+11-04 +9.55% 量比1.48 全抓到）；搜证 6 源全通（联网源配置 searxng url 后实测
+2×6 条）；LLM 判 **none / 置信 8~9** → 保留减持建议（800×20%→整手 100 股）。
+判定质量实录：识别出「50 亿美元融资」传闻只有标题无正文佐证、南向资金净买入
+≠基本面利好、大和利空报告反向印证 11-04 无利好护盘。
+
+**踩坑**：①量字段口径 —— `fetch_kline_ohlcv` 产出 **vol** 而非 volume，spike
+初版只读 volume → 恒 None → 永不触发（AGENTS.md「字段口径不同」坑第 N 次，
+两个键都收）；②bars 长窗只在 trend_reduce 开启时取 240 根 —— spike 也要建仓
+日回放，`bars_days` 条件加了 `or spk_on`；③测试夹具：合成序列 <60 根则 MA60
+缺失、trend_gate 恒拦（生产语义正确）；800×20%=160 股整手取整=100（断言错）；
+④advisory 大跑时 LLM 与 discover/mpret 并发抢网关会偶发 uncertain —— 失败
+不缓存 + 下一轮重试正好兜住，属预期保守行为。
+
+**配置**：`paper.t_trading.spike.{enabled(True),spike_pct(8),vol_mult(1.2),
+trend_gate(True),reduce_pct(20),max_reductions(2),fresh_days(2),
+verify_min_confidence(6)}` 8 字段进 schema。
+
+### 🖥 101 降载实录（2026-11-08 凌晨，网关 503「cpu overloaded」排查）
+
+**症状**：网关 503 `system cpu overloaded (98.9%, threshold 90%)`。101 上跑着
+14 个容器 + BossHunter×2 + 微信 bot 等，3.6G 内存 **swap 100% 满**、load 3.9、
+`dockerd` 单进程 **283~300% CPU 持续三周**（累计 11d20h），OOM killer 昨晚杀了
+bh2-chrome。
+
+**处置**（用户逐项授权）：
+1. `xhs-mcp.service` disable --now（用户点名停；本机侧 `xhs.enabled=false`
+   同步关掉 `_xhs_auto_loop`）；
+2. `avahi-daemon` disable（VPS 上无用）；
+3. `xq-chrome`/`xq-webbridge`（雷球桥 fallback）停 —— **它从未真正产出过数据**
+  （机房 IP 验证码 + 主路在本机桥），需要时 `systemctl enable --now` 拉回；
+4. **`systemctl restart docker`**（关键一击）：重启后 **dockerd 300%→0%**、
+   整机 95.5% idle、load 3.88→1.26，14 容器全部自动拉回 healthy。BossHunter
+   保留（用户裁决）；dify/fastgpt 仅 5-8MB 不动。
+
+**教训**：网关报 503 cpu overloaded 时先上 101 看 `top` —— dockerd 自身 CPU
+异常（其它容器都空闲）= daemon 卡死，重启 docker 是标准解法；Milvus 曾崩溃
+循环 1296 次重启（RestartCount）大概率是 wedge 起点。重启后 new-api/milvus/
+searxng 全部 healthy，milvus 3559 行数据完好。
+
+**连带修复**：`llm.tiers` 整段从 config.yaml 里丢了（10-14 配过）→ fast 档
+静默回退 550B 默认模型。已按当时裁决写回并重探：**6 候选只有 ultra-550b 与
+GLM-5.3-Flash 活着**（super-120b 404、gpt-oss-120b/glm-5.3 410 EOL、其余 404）
+→ 按用户「往能力强切」fast=ultra-550b（健康网关下 6.7~12.4s，判定全对）。
+注意「模型列表里有 ≠ 活着」，探测必须真发请求。searxng 实例地址
+`http://101.43.25.101:8888`（此前从未配置过），已写入 news.channels.searxng.url，
+spike 搜证联网源实测可用。
+
+### 💰 模拟账户加本金 `POST /api/paper/deposit`（2026-11-08 用户要求）
+
+动机：锚定镜像建仓需要「实盘仓位占比 × 模拟盘总资产」的现金，10 万初始资金装不下
+30 万级的持仓 → seed 缩手/拒绝。`paper_trading.deposit()` 三个字段**必须一起动**：
+
+| 字段 | 不同步的后果 |
+|---|---|
+| `cash` | —（入金本体） |
+| `initial_cash` | 收益率分母不同步 → 入金当天算成「暴赚」；`reconcile_account` 用 initial_cash+流水对账 → 永久 drift |
+| `total_value` | `run_decisions` 买入预算按它 × target_value_pct → 不同步加进来的钱下一轮才可用（快照日更） |
+
+审计走侧车 `data/paper_deposits.jsonl`（低频，不值得建表 —— 改 schema 按 §0 要先问）；
+前端走统一 `formDlg()`（原生 prompt 收口规则）。校验：>0、单次上限 1 亿。
+离线 `paper_deposit_test.py` **18/18**；线上 Pydantic 拒绝路径实测（负数/超额）。
+测试踩坑：FakeCur 的 fetchone 必须按 SELECT 次数**依次消费**行 —— UPDATE 后
+要重读账户，永远返回第一行的夹具会把「更新后新值」断言成旧值。
+
+### 🔴 「一直拿着智谱没提示我减仓，亏了一半」（2026-11-08 用户报，血汗钱实亏）
+
+**用户实盘 09-09 建 300 股 @1071.78，一路拿到 426（−60%），全程零减仓提示。**
+
+**真因**：`t_trading.trend_reduce`（趋势减仓/硬止损，2026-10-22 上线）**默认关**
+—— 当时归类「会建议真实减仓，属交易口径变更」。判据本身完全正确，回放实测：
+**09-10（建仓后第 2 天）收盘 819 时趋势确认信号就触发**（close<MA20<MA60 连续
+2 日；当时成本 1071.78 已 −23.6%），硬止损（−10%）同日就是 fresh。按纪律减仓
+1/3 能躲掉 819→426 那段。**功能没跑，不是判据不行 —— 默认值的代价由用户承担。**
+
+**处置（用户痛诉即授权「要它提示」）**：`set_nested_key` 开启
+`paper.t_trading.trend_reduce.enabled=true`（只建议+推微信，绝不自动下单；
+_conf_section 每轮重读文件，无需重启）。真链路验证：advisory 返回
+`trend={enabled:True, last_fire_date:'2026-09-10', last_fire_price:819.0,
+deep_dd:True, streak:41}`。
+
+**必须如实告诉用户的事**：现在开着它，**当下也不会催你割肉** ——
+`deep_dd_pct=25` 深亏保护：浮亏 41.7% > 25% 时只提示不催卖（设计理由：
+一路阴跌 40% 后再叫人割肉多半割在阶段低点）。它的价值在**下一次**：
+趋势破位/硬止损触发后 2 个交易日内 fresh 推送，不会重演「建仓第二天就破位
+却静默 2 个月」。追问过自己：为什么做T建议一直在跑而减仓没有 —— 因为
+做T是「份额置换」默认开，减仓建议被保守默认关了；**「提示」类功能（只读、
+不自动下单）以后默认应开，把「默认关」留给「自动执行」类**。
+
+遗留决定（问了用户没答，下次别擅自改）：代码默认 `T_DEFAULTS[
+"trend_reduce"]["enabled"]` 是否 True —— 属风控阈值默认值，按 §0 要先问。
+
+### 📊 t_bias 方向判定回测：VWAP 必要条件确认有害，已放宽（2026-11-08 用户质疑后回测验证）
+
+用户质疑「第二个条件（收盘<日内 VWAP）太苛刻」。改动（bear/bull 只看均线排列、
+VWAP 降辅助）先实施后回测验证：沪深300 当前成分 300 只 × 20 年原始价日K
+（akshare 不复权 + 成交额；成交量单位是**手**，忘乘 100 会把均价高估 100 倍、
+两规则完全同结果 —— 首跑烟测实测逮到）。日粒度镜像 decide() 门槛链
+（_refill_threshold 趋势转熊 ×2、成本×safety 兜底、stabilizing 复用真函数）。
+
+| 指标（20年×300只，底仓1000股+机动300股口径） | 旧规则 | 新规则 |
+|---|---|---|
+| 下行趋势天被判成「震荡」 | **44.3%（143,785 天）** | 0 |
+| 做T回合数 | 4,933 | 3,922（下跌里少做 1,011 次） |
+| 接刀（补回后 5 日内 -3%） | 1,301 | **994（−24%）** |
+| 已实现净额合计 | +295.7 万 | +302.6 万 |
+| 逐股配对（新-旧） | — | 中位 +6 元（打平）、均值 +292 元；更好 120 / 更差 79 / 打平 101 |
+| 下行中机动仓在现金里的天数 | 300,615 | 308,014（平均每股多躲 25 天） |
+
+**结论：修改成立**。收益中位数打平（不系统性亏钱），均值略正来自肥尾
+（深崩股省上万，如 300896 +2.3 万 / 001280 +1.6 万）；结构性收益是下跌途中
+少接 307 刀、少 1,011 次「鼓励接回」的回合。代价：温和回调股略差（肥尾左侧
+最差 −1 万），属「用小幅效率换深跌保护」的取舍，与锚定使命一致。
+局限（报告已写）：收盘价成交、当日均价=成交额/成交量代理、当前成分幸存者
+偏差、不复权除权跳空（两规则同享）、未模拟涨跌停。脚本可复跑：
+`scripts/bt_tbias_fetch.py`（落盘 data/bt_tbias/ 可续跑）+
+`scripts/bt_tbias_run.py`（结果 data/bt_tbias_results.jsonl + summary）。
+线上验证：02513 advisory → `bias_label=下行`、高抛门槛 0.32%（×0.7），
+why 文案带「当日收在均价上方也只是反弹」。
+
+**修法（单笔盈亏，属「交易明细两处错」一节）**：`_attach_lot_pnl` 买入笔
+`lot_cost=该笔买价`、`lot_pnl=(现价-该笔买价)×股数`（摊薄回放照算，卖出行要用）；
+前端弹窗加 HKD hint。验证 `_lot_pnl_test.py` **12/12**（含「单笔加总=总浮动」
+「卖出已实现不变」「清仓后买入笔 None」「无行情不编造」），线上
+`/api/trades?code=02513` 五笔逐笔与手算一致。写测试又错一次断言：
+`(426.2/563.5−1)×100` round 后是 **−24.37** 不是 −24.36 —— 心算百分比不可信。
+
+---
+
 ### 📅 财经日历自动化：CPI + 持仓/板块龙头财报排期（2026-10-17 用户要求）
 
 用户两条诉求：①「中国/美国 CPI 公布日期和时间自动同步」；②「购买股票所属板块的
@@ -87,6 +324,123 @@ A股+美股龙头财报发布时间也要关注」。两条线同一套模式：
    自己检查了一次 sync_due 并打印 busy（无害，但探测脚本不是纯离线）。
 4. E2E 退出码 1 ≠ 失败：PowerShell 把 py_mini_racer 的 stderr 警告报成
    NativeCommandError；`ALL DONE` 与全部数据完整（老坑）。
+
+---
+
+### 🔴 公众号同步停摆两天 = 10-10 那把「整段替换」的刀还剩一半（2026-11-08）
+
+**症状**：`sa_mp_articles` 11-07/11-08 两天 0 篇入库；13 个源 last_status 全
+`error`，`401 Unauthorized for url: http://101.43.25.101:8001/rss/...`。
+
+**排查链**：本地 `mp.auth` 为空 → 101 nginx `/etc/nginx/conf.d/werss.conf`
+对 `/rss` 要求 `Bearer <token>`（容器内代码 `apis/rss.py` 的鉴权 Depends 是
+**注释掉的**，「RSS requires token」来自 nginx）→ token 在 config.example.yaml
+`mp:` 段注释里写明了取法（ssh 上服务器 grep werss.conf）→ 回填 auth 后单源
+实测 200 → 一轮 15/15 源 ok、144 篇入库、140 篇推 sa_news。
+
+**真正的洞（这次修掉）**：`PUT /api/schedule` 里 mp/x 段走
+`replace_or_append_section(CONFIG_FILE, "mp", _render_mp_block(mp))`，
+而 `_render_mp_block` **只渲染界面上有的 5 个键** —— 10-10 的修复只保护到
+合并层（`_norm_extra` 从现有配置取 base），渲染层照样整段替换抹掉
+`auth/base_url/timeout/...`。**「修合并层不修渲染层 = 白修」**，10-16 配了
+nginx token 后谁都没再保存过调度页，所以一直没暴露。
+修法：mp/x 改成**逐键 `set_section_key`**（缺键追加、嵌套 dict 跳过），
+`_render_mp_block/_render_x_block` 删除（留着会误导）。
+**教训：任何「界面保存配置」的路径，验收标准必须是「保存前后未在界面出现的
+键逐字节不变」，不是「界面上的键写进去了」。**
+
+**顺带修的**：2 个源的 url 被污染成
+`http://101.43.25.101:8001 · MP_WXS_xxx`（copy-paste 时把展示层的分隔符
+`·` 一起粘进去了），401 之外还报 `Failed to parse`。按 ` · ` 拆回
+url + feed_id。
+
+**probe 自坑两连**：① `run_once` 的锁是**进程内**的（`_state["fetching"]`），
+而我每个 probe `import app` 都自带一个 mp 守护线程（no-boot 挡不全，见上面
+坑③），它先抢锁跑完一轮 401 → 我的 `run_once` 永远 busy。② 由此推出来的：
+probe 里看到的 last_run 是**probe 自己的 daemon** 写的，时间线对齐后确认
+401 轮发生在 auth 回填（config.yaml mtime 01:26:27）之前，虚惊一场。
+
+**另**：新文微信推送失败 `IlinkError: sendmessage ret=-2`（与同步无关，
+单独排查）。
+
+---
+
+### 💰 现金/存款机会成本基准注入（2026-11-08 用户要求：「存款 baseline 严重影响判断」）
+
+用户原话：项目没有存款利率作为参考，容易冲动买股，存款 baseline 没接入。
+**用户裁决（勿重开）**：①基准构成 = **完整现金基准**（定存挂牌为主锚 + 货基
+7 日年化 + 中美 10Y + LPR）；②**纯信息注入，不加系统侧硬闸**（与「LLM 是
+交易员」一脉，同策略注入那次裁决）。
+
+#### 数据链路（2026-11-08 用户定：**所有取数统一在 101 data_service**）
+
+| 数据 | 源 | 实测（2026-11-08） |
+|---|---|---|
+| LPR 1Y/5Y | 101 `/cash-baseline` → `ak.macro_china_lpr()` | 本机 1.20.35 + 101 容器 1.18.97 双端通；1Y 3.0 / 5Y 3.5（月频，20 日更新）|
+| 货基 7 日年化 | 同上 → `ak.fund_money_fund_daily_em()` | 545 只；列名 `f"{date}-7日年化%"`（**带 % 的字符串**，`---` 缺）；取**中位数**（1.071%）抗单只噪音 |
+| 存款挂牌利率 | **无可靠在线源** → config `cash_baseline.deposit_1y/3y/updated` 手工维护 | 东财 `RPT_ECONOMY_DEPOSIT_RATE` 是央行**基准**表，**2015-10-24 起冻结在 1.5%**，远高于现行挂牌 ~0.95%，注入会高估无风险收益 → 已否决；`ak.macro_rmb_deposit` 是新增存款**量**不是利率 → 已否决 |
+| 中/美 10Y | 直接读 `sa_macro_rates`（复用 `macro_rates.latest`） | 零网络；E2E 里 10Y 行 = 中国 1.60% / 美国 4.84%（真库数据）|
+
+**已否决（别再试）**：东财央行基准利率表（冻结）、`macro_rmb_deposit`（量）。
+
+#### 落地（data_service 1.0.6 + 主应用两个文件）
+
+| 组件 | 位置 | 要点 |
+|---|---|---|
+| 采集 | `data_service/rates.py` + `GET /cash-baseline` | 两源独立失败（null + errors，对齐 financials.bundle）；服务端 TTL 6h；全失败沿用旧快照，无旧快照才 503；样本 <30 视为源异常 |
+| 消费 | `cash_baseline.py` | `market_data.service_get` 出口复用（**不另建 session**）；磁盘缓存 `data/cash_baseline.json`（tmp+replace 原子写；**写失败必须打印**——hk_supply 那次 25 分钟 0 缓存的教训）；`sync_async` 的锁语义：工作线程持锁进 `_sync_impl`，**不释放后重抢** |
+| 注入 | `build_injection(conn, code, name, recent_ret20, ...)` | `recent_ret20` 由 `_decide_one` 手里现成的 bars 算（≥21 根才算，不额外查库）；对照行明写「低于基准＝承担波动换不来补偿；**空仓持有现金/货基同样是一种理性选择**」；无数据返回 `""`；NaN 过 isfinite 闸门 |
+| 接线 | `paper_trading._decide_one` | macro_block 之后追加，enabled 闸门在调用方，`conf.get("cash_baseline_inject")`（conf 是 paper 段），异常吞掉打印 |
+| 配置 | `paper.cash_baseline_inject.{enabled:true, max_chars:1200}` + 顶层 `cash_baseline:` 段（存款值/间隔） | **默认开**（用户明确要求进决策）；schema 两处默认值 == 模块 DEFAULTS（副本漂移钉死）|
+| 前端 | market tab「💰 现金/存款基准」卡片 | `TAB_LOADERS.market` + **首屏手写清单**两处都注册（港股解禁「一直加载中」同款坑）；同步按钮 busy/沿用旧缓存三态文案 |
+
+#### 挂牌价过期提醒
+
+`deposit_updated` 超 90 天 → 注入文本里写「已 N 天未更新，请核对本行挂牌价」。
+**存款利率没有自动源是已知取舍**：用户要按自己实际存款银行填（默认 = 2026-11
+工行挂牌 1Y 0.95% / 3Y 1.25%）。
+
+#### sa-data-service 仓库（hellostronger/sa-data-service.git）
+
+- **仓库此前停在 2026-10-22**（1.0.2 时代）：financials/valuation 整个缺失、
+  aggregate/market/sources 落后本地。**101 的 `/opt/sa-data-service` 不是 git
+  仓库**（平铺拷贝 + scp 覆盖 + 叠层构建），是三处漂移（本地主仓库 / GitHub /
+  101 目录）中的主从关系：**本地 `stock-advisor/data_service/` 是源码真身**，
+  GitHub 仓库是它的镜像（平铺），101 是部署副本。
+- 本次推了 2 个提交：`ef38b37`（同步存量 + rates 1.0.6）、`403f4a5`（DEPLOY
+  文档）。顺带发现 101 一直跑着**旧版** aggregate/market/sources（缺预算跳过
+  上报、缺 `/global-index`）—— 1.0.6 叠层一并补齐。
+- **部署**：叠层构建（101 磁盘紧，禁全量重建）→ 镜像四道校验（sha256/AST）
+  → 一次性容器（`127.0.0.1:18082`）真请求验证 → 删容器 → `sed` compose 标签
+  → `docker compose up -d`（**不要 --build**）→ 公网验收。旧文件留
+  `.bak.20261108`。灰度容器 `sa-data-service-rc` 已按用户指示**停掉**（7 天
+  9668 次请求 100% 是 healthcheck，零业务流量）。
+
+#### 本次踩到的坑
+
+1. **`paramiko` exec_channel 的 `timeout` 是读管道超时**：`curl /boards`（冷采集
+   60s+）会拖死整条命令链 —— 链式命令在超时处**戛然而止且后续不执行**（这次
+   「切生产」没执行，靠复查 compose 标签才发现）。长命令要么放宽 timeout 要么
+   拆步。
+2. **SFTP `get()` 偶发 ENOENT（首次 stat 撞握手竞态）**，重试即可；真正稳定的
+   套路是 `sftp.open(rpath).read()` + 本地 `write_bytes`。
+3. **Git Bash 的 `/tmp` ≠ Windows Python 的路径**：脚本里写 `/tmp/x` 在 Python
+   里解析成 `C:\tmp\x` —— ENOENT 报错指向的可能是**本地路径**不是远端。
+4. **E2E 断言又写错一次**（不是代码错）：逐字节比对注入块时，本地重建用的
+   `conn=None`（无 10Y 行），而线上块带真库 10Y 行 —— 必然假失败。改成分行
+   断言（标题/货基/LPR/对照/⚠ 各一条）。
+5. **`_decide_one` 在首次 `_llm_call` 前只有读库**（1775~2060 行核对无
+   INSERT/UPDATE）—— 零 token E2E 在首次调用即抛哨兵异常是安全的。
+
+#### 验证（都可重复跑）
+
+| 脚本 | 结果 |
+|---|---|
+| `data_service/tests/test_rates.py`（离线 31 项，全 Fake 不联网）| 全过：`_num` 闸门 / fetch 双源 / TTL 重用 / 单源失败 / 全失败沿用旧快照（逐字节比对）/ 无旧快照 503 / 路由注册 / 版本号 |
+| `data_service/run_tests.py`（本地 216 项）| 全过（含 market_proxy 54 —— 需从仓库补 `tests/test_market_proxy.py`，本地原先没有）|
+| `test_cash_baseline.py`（离线 71 项）| 全过：sync_due / 沿用旧缓存逐字节比对 / 锁 busy / async 锁释放 / 注入各形态（含 NaN 对照、挂牌过期提醒、截断留痕）/ 静态接线（paper_trading + app + schema + 前端 + yaml 默认值一致性）|
+| `verify_cash_in_context.py`（零 token E2E）| 全过：真 deps 跑 `_decide_one`，拦截 `_llm_call` 入参 —— 块 6 行全部逐行命中，对照行用真 K 线算出「五粮液近20日涨幅 +6.8%」|
+| 101 公网验收 | `/health` 报 1.0.6；`/cash-baseline` 真数据（LPR 3.0/3.5 + 货基 1.071%/544 只）；`/quote` 回归正常 |
 
 ---
 
@@ -1722,11 +2076,45 @@ NoneType.__format__`，成果**全部丢失**。真因是 `f"{r.get('price'):.2f
   （22 与 `ssh.github.com:443` 两个端口都能连）。用完 `origin` 仍是 HTTPS，
   **按 URL 推送不会更新 `refs/remotes/origin/main`**，可用
   `git update-ref refs/remotes/origin/main <sha>` 校正跟踪引用（别为此改 remote 配置）。
+  ⚠️ **代理整体不在时（2026-10-24 实测）**：`git fetch` 报
+  `Failed to connect to 127.0.0.1 port 6478`，直连 `github.com:443` 也超时，
+  而 `api.github.com` / `codeload.github.com` 可达。此时可用
+  `git -c http.proxy= -c http.curloptResolve=github.com:443:140.82.112.3 fetch origin main`
+  （git 2.40.0.windows.1 实测可用，`-c` 不落盘）。IP 从
+  `curl -sI --resolve github.com:443:140.82.112.3 https://github.com` 逐个试
+  （备选 `140.82.113.3` / `140.82.114.3` / `20.205.243.166`）。
+  ⚠️ 这不是永久配置：同一天晚些时候代理自己恢复了（`curl -x …` 200/0.43s），
+  **下次失败先重试一次代理**，别直接改 remote 或全局配置。
 - 本机直连出口：**`59.34.155.130`**（2026-10-03 实测更正；AGENTS.md 原记的
   `121.32.254.148` 已失效，疑似运营商动态分配）。**每次做「换 IP 是否影响限流」
   这类实验前先实测出口**，别用文档里的旧值。无系统代理、无 VPN
   （注册表 `ProxyEnable=0`，常用代理端口无监听）。
 - **测试脚本跑 akshare / pip 前也要设**，否则结果全是假失败。
+
+### 🔴 101 `/quote` 单次最多 300 个符号 —— `fetch_quotes` 必须分批（2026-10-24 修）
+
+**症状**：重启日志里
+`[quote] 101 行情失败: 行情服务 /quote 返回 400: {"detail":"一次最多 300 个符号"}`。
+调用方不是自选（只有 43 只），而是启动时的 `stock_discovery` —— 那一轮
+`[discover] 候选 381 只`，`app.fetch_quotes` 把 381 个符号拼进**一个**请求。
+
+**真因**：`fetch_quotes` 原实现把所有代码 `",".join` 后一次打 `/quote`；
+101 侧 `data_service/market.py` 写死 `len(seen) > 300 → ValueError`，HTTP 400。
+后果是**整批行情全丢**（每个 code 只得到 `error` 条目），而调用方大多不报错，
+表现为「今天行情全是 —」。同类上限：`/fx` **50**、`/futures` **20**。
+
+**修法**（`app.py`）：加 `_QUOTE_BATCH = 300`，`fetch_quotes` 先对符号去重，
+再按 300 分批请求并 `got.update(...)` 合并；**某一批失败只影响该批**（继续打
+后面的批次），日志带批次序号与符号数。其余字段映射、`error` 兜底、去重语义不变。
+
+**验证**（`%LOCALAPPDATA%\Temp\opencode\test_quote_chunk.py`，13 项全过）：
+离线 stub 650 个符号 → 切成 `[300,300,50]`、第 2 批失败只让那 300 个带 error、
+其余 350 个字段完好、重复代码只请求一次、空输入不发请求；真实 101 跑 650 个
+符号 **0 个 400**、563 个有真实行情。重启后同一 `discover` 跑 381 只候选，
+**日志 0 次 300 错误**（修复前同一步必报）。
+
+> 判据：看到「某类数据全是 —」且日志有 `/quote 返回 400`，先数调用方的代码数，
+> 不要怀疑 101 挂了。
 
 ### A 股数据源：11 个开源方案实测结论（2026-10-01，**优先用这个别重测**）
 
