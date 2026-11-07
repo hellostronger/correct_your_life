@@ -1,0 +1,25 @@
+# 叠层构建：只覆盖改动的 .py，零 pip/apt 开销。
+#
+# 用途：101 上 / 只剩 2G 时不能全量重建（要重装 akshare/levistock/adata）。
+# 前提：基础镜像已存在，且 requirements.txt 没有变化。
+#
+# 标签记录：
+#   1.0.2（2026-10-22）= 新增 market.py（行情代理 /kline /quote /intraday）
+#                        + api.py 挂新路由 + __init__ 版本号。
+#   1.0.5（2026-10-30）= api.py + financials.py + __init__.py
+#                        （财务代理 /financials/*，2026-10-28）。
+#   1.0.6（2026-11-08）= 新增 rates.py（现金基准 /cash-baseline：LPR + 货基
+#                        7 日年化）+ api.py 挂路由 + 同步 aggregate/market/
+#                        sources 到仓库最新（补上 1.0.3 待建的预算跳过上报
+#                        与 market 的 /global-index，101 此前一直跑旧版）。
+#
+# 构建（在部署目录 /opt/sa-data-service 下，换成你要的标签）：
+#   docker build -f Dockerfile.overlay -t sa-data-service:1.0.6 .
+#   docker run --rm --entrypoint sha256sum sa-data-service:1.0.6 /app/data_service/*.py
+#   docker run --rm -i --entrypoint python3 sa-data-service:1.0.6 - < 校验脚本
+#   sed -i 's|image: sa-data-service:.*|image: sa-data-service:1.0.6|' docker-compose.yml
+#   docker compose up -d          # 不要加 --build
+#
+# ⚠️ 部署目录是**平铺拷贝**（没有 .git），改代码靠 scp 覆盖文件后重建叠层镜像。
+FROM sa-data-service:1.0.5
+COPY --chown=svc:svc api.py aggregate.py market.py rates.py sources.py __init__.py /app/data_service/

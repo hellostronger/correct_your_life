@@ -1508,12 +1508,16 @@ def _query_trades(code: str | None = None) -> list[dict]:
 def _attach_lot_pnl(trades: list[dict]) -> None:
     """给每笔交易单独标注盈亏（就地修改 rows，附带 lot_* 字段）。
 
-    口径（平均成本法，与 calc_position 一致，逐笔回放）：
-    - 买入：该笔成本 = 买入时点的摊薄成本，浮动盈亏 = (现价-成本)*股数，
-      仅当前仍持有（回放结束时净持股 > 0）才有意义；已被后续卖出消耗的
-      不单独拆（流水账不追踪具体哪笔卖哪笔买）。
-    - 卖出：已实现盈亏 = (卖价 - 卖出时点摊薄成本) * 股数，立即锁定。
-    现价取自实时行情；无行情时买入笔 pnl 为 None。
+    口径（逐笔回放）：
+    - 买入（2026-11-08 用户裁决，**对该笔买入价**）：浮动盈亏 =
+      (现价 - 该笔自己的买入价) * 股数。与券商 App 直觉一致 ——
+      低位补仓不会因为「当时全仓摊薄成本高」而显示成巨亏。
+      ⚠️ 币种注意：价格/金额保持**录入原币**（港股 = 港元），前端负责标注；
+      百分比是同币种比值，与汇率无关。
+      摊薄成本回放仍照算（卖出行要用），两种口径的单笔加总都等于总浮动。
+    - 卖出：已实现盈亏 = (卖价 - 卖出时点摊薄成本) * 股数，立即锁定
+      （平均成本法的标准实现，与 calc_position.realized 一致）。
+    现价取自实时行情；已清仓（回放净持股 = 0）或无行情时买入笔 pnl 为 None。
     """
     if not trades:
         return
@@ -1536,7 +1540,10 @@ def _attach_lot_pnl(trades: list[dict]) -> None:
             if t["side"] == "buy":
                 avg_cost = (avg_cost * net_replay + price * n) / (net_replay + n)
                 net_replay += n
-                t["lot_cost"] = round(avg_cost, 4)
+                # lot_cost = 该笔自己的买入价（2026-11-08 口径变更）。
+                # 摊薄成本(avg_cost)只服务于卖出行；若哪天要恢复旧口径，
+                # 这里改回 round(avg_cost, 4) 即可，回放逻辑不受影响。
+                t["lot_cost"] = round(price, 4)
                 t["lot_realized"] = None
             else:
                 if n > net_replay:
@@ -1550,9 +1557,9 @@ def _attach_lot_pnl(trades: list[dict]) -> None:
         t["lot_price"] = q.get("price")
         if t["side"] == "buy":
             held = final_net.get(t["code"], 0) > 0
-            if held and isinstance(t.get("lot_price"), (int, float)) and t.get("lot_cost"):
-                t["lot_pnl"] = round((t["lot_price"] - t["lot_cost"]) * int(t["shares"]), 2)
-                t["lot_pnl_pct"] = round((t["lot_price"] / t["lot_cost"] - 1) * 100, 2)
+            if held and isinstance(t.get("lot_price"), (int, float)) and t.get("price"):
+                t["lot_pnl"] = round((t["lot_price"] - float(t["price"])) * int(t["shares"]), 2)
+                t["lot_pnl_pct"] = round((t["lot_price"] / float(t["price"]) - 1) * 100, 2)
             else:
                 t["lot_pnl"] = None      # 已清仓/无行情：买入笔无浮动可算
                 t["lot_pnl_pct"] = None
@@ -3997,6 +4004,31 @@ def calendar_sync_all():
     return {"cpi": cpi, "earnings": earn}
 
 
+# ---------------- 现金/存款机会成本基准（cash_baseline.py，2026-11-08） ----------------
+
+@app.get("/api/cash-baseline")
+def cash_baseline_get():
+    """页面核对「模型看到了什么」：缓存快照 + config 摘要 + 注入文本示例。
+
+    sample 用假 conn（不读 sa_macro_rates，10Y 行省略）—— 页面只看存款/货基/
+    LPR 的数据新鲜度；10Y 在决策上下文里另有 macro 块覆盖。"""
+    import cash_baseline as cb
+    st = cb.status()
+    try:
+        st["sample"] = cb.build_injection(None, code="000000", name="（示例）",
+                                          recent_ret20=None)
+    except Exception as exc:                              # noqa: BLE001
+        st["sample_error"] = str(exc)[:200]
+    return st
+
+
+@app.post("/api/cash-baseline/sync")
+def cash_baseline_sync():
+    """手动触发同步（拿不到锁立即 busy，不排队）。单次 = 一条 101 HTTP，同步执行。"""
+    import cash_baseline as cb
+    return cb.sync(force=True)
+
+
 def _calendar_loop():
     """财经日历守护线程：交易日 start_time–end_time 窗口（默认 8:00–12:00，可网页改）
     内每 5 分钟查一次（同键只推一次，实际每天只会推一条今明事件/重要预告），盘前及时推微信。"""
@@ -4155,37 +4187,6 @@ def _render_crypto_block(crypto: dict) -> str:
     ])
 
 
-def _render_mp_block(mp: dict) -> str:
-    c = {**wechat_mp.DEFAULT_MP_CONF, **(mp or {})}
-    return "\n".join([
-        "# 微信公众号文章监控：拉上游服务的 RSS 源（推荐 WeRSS，见 README）",
-        "# interval_minutes: 拉取周期，0=关闭；notify_new: 有新文章推微信",
-        "mp:",
-        f"  enabled: {str(bool(c['enabled'])).lower()}",
-        f"  interval_minutes: {int(c['interval_minutes'])}",
-        f"  notify_new: {str(bool(c['notify_new'])).lower()}",
-        f"  max_items: {int(c['max_items'])}",
-        f"  keep_days: {int(c['keep_days'])}",
-    ])
-
-
-def _render_x_block(x: dict) -> str:
-    c = {**x_monitor.DEFAULT_X_CONF, **(x or {})}
-    return "\n".join([
-        "# X(Twitter) 指定用户发言监控（twscrape，需 pip install \"twscrape[curl]\"）",
-        "# interval_minutes: 抓取周期，0=关闭；notify_new: 有新推文推微信",
-        "# include_retweets: 是否收录转发（默认关，噪音大）",
-        "x:",
-        f"  enabled: {str(bool(c['enabled'])).lower()}",
-        f"  interval_minutes: {int(c['interval_minutes'])}",
-        f"  notify_new: {str(bool(c['notify_new'])).lower()}",
-        f"  max_tweets: {int(c['max_tweets'])}",
-        f"  keep_days: {int(c['keep_days'])}",
-        f"  include_retweets: {str(bool(c['include_retweets'])).lower()}",
-        f"  wait_timeout: {int(c['wait_timeout'])}",
-    ])
-
-
 class ScheduleIn(BaseModel):
     schedule: dict | None = None
     intervals: dict | None = None
@@ -4337,10 +4338,23 @@ def schedule_update(body: ScheduleIn):
         if crypto is not None:
             conf_util.replace_or_append_section(
                 CONFIG_FILE, "crypto", _render_crypto_block(crypto))
+        # mp / x：**逐键手术式写，绝不整段替换**。调度页只回传界面上的 5 个键，
+        # 整段替换会把段里其余的键全部抹掉 —— mp.auth 一没，nginx 反代的
+        # `Bearer` 门槛就把 13 个订阅源全打成 401「RSS requires token」，
+        # 公众号同步静默停摆（2026-10-10、2026-11-08 两次事故同一把刀：
+        # 10-10 修了合并层 `_norm_extra`，但渲染层 `_render_mp_block` 只输出
+        # 5 个键，等于白修）。嵌套 dict（relevance_llm/export）不归调度页管，
+        # 跳过不写。
         if mp is not None:
-            conf_util.replace_or_append_section(CONFIG_FILE, "mp", _render_mp_block(mp))
+            for k, v in mp.items():
+                if isinstance(v, dict):
+                    continue
+                conf_util.set_section_key(CONFIG_FILE, "mp", k, v)
         if xconf is not None:
-            conf_util.replace_or_append_section(CONFIG_FILE, "x", _render_x_block(xconf))
+            for k, v in xconf.items():
+                if isinstance(v, dict):
+                    continue
+                conf_util.set_section_key(CONFIG_FILE, "x", k, v)
         for section_key, key, value in ops:
             conf_util.set_section_key(CONFIG_FILE, section_key, key, value)
     return schedule_get()
@@ -5556,9 +5570,10 @@ def _supply_market_loop():
 
 # ---------------- 模拟交易（LLM 决策 + 结算反思沉淀，见 paper_trading.py） ----------------
 
-import paper_trading 
+import paper_trading
 import paper_strategy
 import t_trading
+import paper_anchor
 import market_data
 import trade_review
 import backtest
@@ -5624,6 +5639,9 @@ def _paper_deps(conf: dict | None = None) -> dict:
           "social_keys_fn": _paper_social_keys,
         "market_fn": market_volume_status,
         "trading_days_fn": _trading_days_between,
+        # 实盘持仓（sa_trades 流水回放）：paper_anchor.seed_mirror 镜像建仓用。
+        # 模块不 import app，靠 deps 注入（与 quote_fn 同款约定）。
+        "holdings_fn": _derive_holdings,
         "notify_fn": notifier.notify,
         # 因子暴露：模拟盘每条决策都带「验证算子的横截面位置」（样本内 IC 定向）。
         # snapshot_all 内部按市场各自 30 分钟缓存；一轮只调用一次，失败返回
@@ -6060,6 +6078,35 @@ def paper_t_scan(max_codes: int = 0, execute: bool = False):
                                max_codes=max_codes)
 
 
+@app.get("/api/paper/anchor")
+def paper_anchor_status():
+    """锚定模式状态 + 绩效（🎯 锚定 tab）。
+
+    只读聚合：状态表（空仓天数/超期告警）+ 绩效（成本线/已实现盈亏/做T次数）
+    + 最近 50 笔该票流水。锚定未启用/未填代码时返回 enabled=false 与原因，
+    前端据此显示引导，而不是空白。
+    """
+    conf = _conf_section("paper") or {}
+    return paper_anchor.status(_paper_deps(conf),
+                               paper_anchor.load_conf(conf.get("anchor") or {}))
+
+
+@app.post("/api/paper/anchor/seed")
+def paper_anchor_seed():
+    """手动触发镜像建仓（幂等；已 seed 过直接返回原因，绝不二次加仓）。
+
+    之所以单独给一个端点：seed 需要读实盘持仓与模拟盘账户，页面开启锚定后
+    点一下即可完成起步，不用等下一轮决策周期才隐式触发。
+    """
+    conf = _conf_section("paper") or {}
+    ac = paper_anchor.load_conf(conf.get("anchor") or {})
+    if not ac.get("enabled") or not ac.get("code"):
+        return {"ok": False,
+                "reason": "锚定未启用或未填代码（config.yaml -> paper.anchor）"}
+    res = paper_anchor.seed_mirror(_paper_deps(conf), ac)
+    return res
+
+
 @app.get("/api/paper/overview")
 def paper_overview():
     """账户 + 持仓估值 + 近30日快照 + 胜率统计（tab 打开即调）。"""
@@ -6139,6 +6186,11 @@ def paper_lessons(code: str = "", limit: int = 50):
 class PaperResetIn(BaseModel):
     confirm: bool = False
     initial_cash: float = Field(default=100000.0, gt=0, le=100000000)
+
+
+class PaperDepositIn(BaseModel):
+    amount: float = Field(gt=0, le=100000000, description="加本金金额（元）")
+    note: str = Field(default="", max_length=255, description="备注（进审计侧车）")
 
 
 @app.post("/api/paper/run")
@@ -8037,6 +8089,17 @@ def paper_reset(body: PaperResetIn):
     return paper_trading.reset_account(_paper_deps(), body.initial_cash)
 
 
+@app.post("/api/paper/deposit")
+def paper_deposit(body: PaperDepositIn):
+    """加本金（入金）：cash / initial_cash / total_value 三项同步增加。
+
+    initial_cash 同步加是关键 —— 它是收益率分母，不同步会把入金算成
+    「当天暴赚」；total_value 同步加让买入预算立即可用（不等日更快照）。
+    审计流水在 data/paper_deposits.jsonl。
+    """
+    return paper_trading.deposit(_paper_deps(), body.amount, body.note)
+
+
 @app.get("/api/paper/goal")
 def paper_goal_get():
     """当前生效的目标 + 进度（进度按收盘价口径，与结算快照一致）。
@@ -8464,8 +8527,21 @@ def _paper_run_cycle(conf: dict, slot: str, kind: str = "intraday",
             from paper_trading import _derive_paper_positions
             with deps["get_conn"]() as conn:
                 targets = set(_derive_paper_positions(conn.cursor()).keys()) & wset
+        # 锚定模式（2026-11-08 用户澄清：锚定是**独立轨道、优先级最高**，
+        # 不收窄其他票 —— 其他自选照常决策，锚定票由 run_decisions 的
+        # anchor_code 保证永远在候选（空仓回补也不被挤掉）、成交排最前。
+        # 止损照常对全部持仓生效（第 1 步，不受锚定影响）。
+        # 镜像建仓走 seed_mirror（幂等，一次性种子，失败不拖住决策轮）。
+        _anchor = paper_anchor.load_conf(conf.get("anchor") or {})
+        _anchor_code = ""
+        if _anchor.get("enabled") and _anchor.get("code"):
+            _anchor_code = str(_anchor["code"]).strip()
+            seed_res = paper_anchor.seed_mirror(deps, _anchor)
+            print(f"[paper] 锚定 {_anchor_code}: {seed_res.get('reason')}",
+                  flush=True)
         res = paper_trading.run_decisions(deps, slot=slot, only=targets,
-                                          progress_fn=_tick)
+                                          progress_fn=_tick,
+                                          anchor_code=_anchor_code or None)
         decided = res.get("decided", [])
         for d in decided:
             if d.get("executed"):
@@ -8494,6 +8570,16 @@ def _paper_run_cycle(conf: dict, slot: str, kind: str = "intraday",
                 print(f"[paper] 做T扫描失败（不影响本轮其它决策）: {exc}", flush=True)
                 t_res = {"error": str(exc)[:160]}
             _paper_state["last_t"] = t_res
+        # 2.6) 锚定回补监控（2026-11-07）：空仓起始日落库 + 超期告警。
+        # **只监控不下单** —— 回补时机仍由 LLM 结合注入的预案决定。
+        if _anchor.get("enabled") and _anchor.get("code"):
+            try:
+                _rw = paper_anchor.refill_watch(deps, _anchor)
+                if _rw.get("alerted"):
+                    print(f"[paper] 锚定 {_anchor['code']} 回补超期告警已推送",
+                          flush=True)
+            except Exception as exc:      # noqa: BLE001
+                print(f"[paper] 锚定回补监控失败（不影响本轮）: {exc}", flush=True)
         _paper_state["last_decision"] = res
         # 🔴 未成交的逐条理由落进台账 note（见 paper_trading.build_miss_note 的
         #   docstring —— 为什么原来查不到、为什么不插 sa_paper_trades 行）。
@@ -11031,6 +11117,16 @@ def _macro_loop():
                         notify_fn=_notifier_notify_safe)
                 except Exception as exc:
                     print(f"[holiday] 休市提醒失败: {exc}", flush=True)
+
+            # ④ 现金/存款基准同步（2026-11-08）：LPR + 货基 7 日年化，从 101
+            # /cash-baseline 拉一条 HTTP。自带 sync_due（默认一周一次），
+            # 缓存新鲜时这里是纯 no-op；失败沿用旧缓存，不影响其它 ③ 步。
+            try:
+                import cash_baseline as _cb
+                if _cb.load_conf().get("enabled", True) and _cb.sync_due():
+                    _cb.sync()
+            except Exception as exc:
+                print(f"[cash_baseline] loop 同步失败: {exc}", flush=True)
         except Exception as exc:
             print(f"[macro] loop error: {exc}", flush=True)
         time.sleep(1800)

@@ -1158,7 +1158,8 @@ def position_limit_status(cur, conf: dict) -> dict:
 
 
 def run_decisions(deps: dict, slot: str = "", only: set | None = None,
-                  progress_fn=None, concurrency: int = 0) -> dict:
+                  progress_fn=None, concurrency: int = 0,
+                  anchor_code: str | None = None) -> dict:
     """为每只自选股生成买卖决策并按当前价成交（盘中每 30 分钟一轮）。
 
     两阶段（2026-10-05 改）：**先收集齐全部决策，再决定谁拿到现金**。
@@ -1179,6 +1180,10 @@ def run_decisions(deps: dict, slot: str = "", only: set | None = None,
     为什么需要它：一轮 43 只、每只 4~10 分钟（辩论开着）→ 整轮要好几小时，
     而 `record_cycle` 只在整轮结束的 finally 里写，于是「今日各轮记录」在
     轮次进行中**一直是空的**（用户 2026-10-14 报的现象）。
+
+    anchor_code（2026-11-07 锚定模式）：传入时该票**永远进候选** —— 即使持仓
+    已满、它又空仓（躲暴跌后要回补），也不会被「省 LLM 调用」的剔除逻辑挤掉；
+    对应的成交层豁免见 `_execute_decision`。默认 None 时行为逐字节不变。
 
     **阶段一已并发化**（`decision_concurrency`，默认 6、上限 12；
     也可用 `concurrency=` 单独覆盖，主要给测试/临时调参用）。
@@ -1232,7 +1237,12 @@ def run_decisions(deps: dict, slot: str = "", only: set | None = None,
         limit = position_limit_status(cur, conf)
         blocked_by_limit = set()
         if limit["full"]:
-            blocked_by_limit = {s["code"] for s in stocks if s["code"] not in positions}
+            # 锚定票豁免（paper_anchor）：空仓躲暴跌后回补是锚定使命的必须动作，
+            # 不能被「持仓满剔未持仓」挤掉 —— 否则锚定票一旦空仓就永远回不来。
+            # anchor_code=None（默认）时条件恒真，行为与从前逐字节一致。
+            blocked_by_limit = {s["code"] for s in stocks
+                                if s["code"] not in positions
+                                and s["code"] != anchor_code}
             if blocked_by_limit:
                 stocks = [s for s in stocks if s["code"] not in blocked_by_limit]
                 print(f"[paper] 持仓已满 {limit['held']}/{limit['cap']}，"
@@ -1342,7 +1352,8 @@ def run_decisions(deps: dict, slot: str = "", only: set | None = None,
     _collected.sort(key=lambda x: x[0])
     plans = [p for _, p in _collected]
     # ---- 阶段二：先卖后买，买入按 ROI 从高到低分配现金 ----
-    results = _execute_plans(deps, conf, plans, today, slot)
+    results = _execute_plans(deps, conf, plans, today, slot,
+                             anchor_code=anchor_code)
     return {"date": today, "slot": slot, "decided": results,
             "position_limit": limit, "skipped_by_limit": sorted(blocked_by_limit)}
 
@@ -1400,7 +1411,8 @@ def _same_day_fills(deps, today: str) -> dict:
     return out
 
 
-def _execute_plans(deps, conf, plans: list, today: str, slot: str) -> list[dict]:
+def _execute_plans(deps, conf, plans: list, today: str, slot: str,
+                   anchor_code: str | None = None) -> list[dict]:
     """按「先卖后买、买入按风险收益率比降序」逐笔成交。返回结果列表（成交顺序）。
 
     为什么卖要先执行：卖出释放的现金本轮就该能用于买入，先买后卖会让好机会
@@ -1419,10 +1431,17 @@ def _execute_plans(deps, conf, plans: list, today: str, slot: str) -> list[dict]
     """
     sells = [p for p in plans if p["decision"]["action"] == "sell"]
     buys = [p for p in plans if p["decision"]["action"] == "buy"]
+    # 锚定票优先（2026-11-08 用户裁决：锚定是独立轨道、**优先级最高**）：
+    # 卖出先于买入执行释放现金，锚定的卖/买各自排最前。
+    # anchor_code=None（默认）时 tier 恒为 1，稳定排序不改变任何顺序
+    # —— 行为与从前逐字节一致。
+    _anch = (lambda p: 0 if p["stock"]["code"] == anchor_code else 1)
+    sells.sort(key=_anch)                     # 稳定排序：非锚定保持原序
     # 同分时按 confidence 再按 code 兜底：纯 Python 的 sort 是稳定排序，
     # 补上确定性 key 才保证同样输入永远得到同样的成交顺序（否则无法复现对账）。
-    buys.sort(key=lambda p: (-p["roi"], -float(p["decision"]["confidence"]),
-                            p["stock"]["code"]))
+    buys.sort(key=lambda p: (_anch(p), -p["roi"],
+                             -float(p["decision"]["confidence"]),
+                             p["stock"]["code"]))
     if len(buys) > 1:
         print(f"[paper] 本轮 {len(buys)} 个买入候选，按风险收益率比排序："
               + " > ".join(f"{p['stock']['name']}({p['roi']:.2f})" for p in buys),
@@ -1467,7 +1486,8 @@ def _execute_plans(deps, conf, plans: list, today: str, slot: str) -> list[dict]
                 continue
         try:
             executed, note = _execute_decision(deps, conf, stock, today, decision,
-                                               p["quote"], slot, bars=p["bars"])
+                                               p["quote"], slot, bars=p["bars"],
+                                               anchor_code=anchor_code)
         except Exception as exc:
             traceback.print_exc()
             executed, note = False, f"成交异常（已隔离，不影响其余）: {exc}"
@@ -1860,6 +1880,18 @@ def _decide_one(deps, conf, stock, today, slot: str = "", factor_snap=None):
                                                      conf=_sc)
         except Exception as exc:  # noqa: BLE001
             print(f"[paper] 策略信号注入跳过: {exc}", flush=True)
+        # 锚定模式注入（2026-11-07 用户要求「锚定一只票赚钱」）：使命声明 +
+        # 进度（成本线/已实现盈亏/做T次数/空仓天数）+ 回补预案。
+        # 只对锚定票输出，其他票返回 ""（上下文逐字节不变）。
+        # 同样必须在 with get_conn() 块内查询；异常一律吞掉并打印，
+        # 不让锚定块的读取失败中断这一只票的决策。
+        anchor_block = ""
+        try:
+            import paper_anchor as _pa
+            anchor_block = _pa.build_injection(cur, code,
+                                               conf.get("anchor") or {})
+        except Exception as exc:  # noqa: BLE001
+            print(f"[paper] 锚定注入跳过: {exc}", flush=True)
         # 宏观背景注入（2026-10-17 加，**默认关闭**）：全球利率（FRED 6 序列 +
         # 中国 10Y 从 sa_macro_rates 合并）+ 核心宽基 ETF 资金流（净申赎估算）。
         # 两块共用 paper.macro_inject 一个开关；两块都空时上下文逐字节不变；
@@ -1890,6 +1922,31 @@ def _decide_one(deps, conf, stock, today, slot: str = "", factor_snap=None):
                                        + f"\n[宏观块超长已截断，全文 {_n} 字符]")
         except Exception as exc:  # noqa: BLE001
             print(f"[paper] 宏观注入跳过: {exc}", flush=True)
+        # 现金/存款机会成本基准注入（2026-11-08 用户要求「存款 baseline 影响
+        # 判断」）：定存挂牌（config 手工维护，无在线源）+ 货基 7 日年化 +
+        # 中美 10Y + LPR，**纯信息注入**（用户裁决：不加系统侧硬闸）。
+        # LPR/货基读 data/cash_baseline.json（101 /cash-baseline 经同步落盘）；
+        # 10Y 读 sa_macro_rates（build_injection 内部，零网络）；
+        # recent_ret20 用本函数手里现成的 bars 算，不额外查库。
+        # enabled 闸门在调用方；块为空时上下文逐字节不变；异常一律吞掉。
+        cash_block = ""
+        try:
+            import cash_baseline as _cb
+            _cbc = {**_cb.INJECT_DEFAULTS, **(conf.get("cash_baseline_inject") or {})}
+            if _cbc.get("enabled"):
+                _r20 = None
+                try:
+                    if len(bars) >= 21 and bars[-1].get("close") \
+                            and bars[-21].get("close"):
+                        _r20 = (float(bars[-1]["close"])
+                                / float(bars[-21]["close"]) - 1) * 100
+                except Exception:      # noqa: BLE001
+                    _r20 = None       # bars 形状异常时省掉对照行，不中断决策
+                cash_block = _cb.build_injection(
+                    conn, code=code, name=(stock or {}).get("name", ""),
+                    recent_ret20=_r20, max_chars=_cbc.get("max_chars"))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[paper] 现金基准注入跳过: {exc}", flush=True)
         # 国际期货 + 汇率注入（2026-10-22 用户要求）：布伦特/WTI/黄金/白银/
         # 天然气/铜 + 6 组汇率。两块共用 paper.futures_fx_inject 一个开关，
         # **默认开**（用户明确要求进决策）。两块都空时上下文逐字节不变；
@@ -1951,6 +2008,8 @@ def _decide_one(deps, conf, stock, today, slot: str = "", factor_snap=None):
         ctx += "\n" + inst_block
     if strategy_block:
         ctx += "\n" + strategy_block
+    if anchor_block:
+        ctx += "\n" + anchor_block
     # 因子暴露（2026-10-26）：与「策略信号」并列的第二种独立证据。
     # 用 try 包住：某只票的 theme_scores 形状异常不能中断这一只的决策。
     if factor_snap:
@@ -1963,6 +2022,8 @@ def _decide_one(deps, conf, stock, today, slot: str = "", factor_snap=None):
             ctx += "\n" + factor_block
     if macro_block:
         ctx += "\n" + macro_block
+    if cash_block:
+        ctx += "\n" + cash_block
     if futures_fx_block:
         ctx += "\n" + futures_fx_block
     if market_temp_block:
@@ -2120,7 +2181,8 @@ def _decide_one(deps, conf, stock, today, slot: str = "", factor_snap=None):
 
 def _execute_decision(deps, conf, stock, today, decision, quote,
                       slot: str = "", bars: list | None = None,
-                      shares_override: int | None = None) -> tuple[bool, str]:
+                      shares_override: int | None = None,
+                      anchor_code: str | None = None) -> tuple[bool, str]:
     """按当前价成交（盘中原价，不再是收盘价）。返回 (是否成交, 备注)。资金约束全部代码强制。
 
     bars：近 60 日 OHLCV，供追高闸门与 ATR 止损用（_decide_one 已有，不重复拉）。
@@ -2178,8 +2240,11 @@ def _execute_decision(deps, conf, stock, today, decision, quote,
             # （为了省 LLM 调用），但手动触发 / 止损自动卖出后的加仓 / 未来新增
             # 的调用路径都只到这里，所以真正的闸门必须落在这里。
             # 加仓（me 已存在）不占新名额，不受限制。
+            # 锚定票豁免（anchor_code 传入时）：空仓躲暴跌后的回补不能被其他
+            # 持仓占满卡死 —— 「必须买回」是锚定使命的硬要求。默认 None 时
+            # 条件与从前完全一致，非锚定路径行为逐字节不变。
             limit = position_limit_status(cur, conf)
-            if not me and limit["full"]:
+            if not me and limit["full"] and code != anchor_code:
                 cur.execute(
                     _insert_trade_sql(),
                     (code, stock["name"], today, slot, "buy", 0, price, 0,
@@ -3386,6 +3451,63 @@ def reset_account(deps: dict, initial_cash: float) -> dict:
                     "VALUES (1, %s, %s, %s)", (initial_cash,) * 3)
         conn.commit()
     return {"ok": True, "initial_cash": initial_cash}
+
+
+def deposit(deps: dict, amount: float, note: str = "") -> dict:
+    """加本金（入金，2026-11-08 用户要求）：现金、初始资金、总资产三项同步增加。
+
+    三个字段**必须一起动**，少一个都是坑：
+    - `cash`：可用现金多了（锚定镜像建仓等要花钱的地方直接受益）；
+    - `initial_cash`：收益率分母（total_return = total/initial - 1）。
+      只加 cash 不加它，入金当天会被算成「暴赚」；`reconcile_account`
+      用 initial_cash + 流水对账，不同步会永久报 drift；
+    - `total_value`：`run_decisions` 的买入预算按它 × target_value_pct 算，
+      不同步则加进来的钱下一轮才可用（快照是日更的）。
+
+    审计走侧车 `data/paper_deposits.jsonl`（加本金低频，不值得为它建表；
+    决策侧车同款套路，写失败只打印不影响入金）。
+    """
+    get_conn = deps["get_conn"]
+    try:
+        amt = round(float(amount), 2)
+    except (TypeError, ValueError):
+        return {"ok": False, "reason": "金额无效"}
+    if amt <= 0:
+        return {"ok": False, "reason": "加本金金额必须 > 0"}
+    if amt > 100_000_000:
+        return {"ok": False, "reason": "单次加本金超过上限 1 亿（防误触）"}
+    with get_conn() as conn:
+        cur = conn.cursor()
+        acc = _account_row(cur)
+        if acc is None:
+            return {"ok": False, "reason": "模拟账户未初始化（先跑一轮或重置账户）"}
+        cur.execute("UPDATE sa_paper_account SET cash = cash + %s, "
+                    "initial_cash = initial_cash + %s, total_value = total_value + %s, "
+                    "updated_at = now() WHERE id = 1", (amt, amt, amt))
+        acc2 = _account_row(cur)
+        conn.commit()
+    _deposit_sidecar(amt, note, acc2)
+    print(f"[paper] 加本金 {amt:g}（备注 {note or '无'}），"
+          f"现金 {acc2['cash']:g} / 总资产 {acc2['total_value']:g}", flush=True)
+    return {"ok": True, "amount": amt, "cash": acc2["cash"],
+            "initial_cash": acc2["initial_cash"],
+            "total_value": acc2["total_value"]}
+
+
+def _deposit_sidecar(amount: float, note: str, acc: dict) -> None:
+    """入金审计侧车（追加 JSONL；失败只打印）。"""
+    try:
+        data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+        os.makedirs(data_dir, exist_ok=True)
+        p = os.path.join(data_dir, "paper_deposits.jsonl")
+        rec = {"ts": datetime.now().isoformat(timespec="seconds"),
+               "amount": amount, "note": note,
+               "cash_after": acc.get("cash"), "initial_after": acc.get("initial_cash"),
+               "total_after": acc.get("total_value")}
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        print(f"[paper] 入金侧车写入失败（不影响入金）: {exc}", flush=True)
 
 
 # ---------------- 回合配对（页面「每笔交易」列表用） ----------------

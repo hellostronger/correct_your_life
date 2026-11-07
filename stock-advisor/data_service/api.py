@@ -31,6 +31,10 @@ GET  /index-hist             中证指数日线（收盘 + 滚动市盈率），
 
 全球指数代理（2026-11-04 新增：KOSPI 改由 101 取）
 GET  /global-index           批量全球指数现货（东财 ulist.np；含 100.KS11 韩国KOSPI）
+
+现金基准代理（2026-11-08 新增：决策的「无风险机会成本」数据源）
+GET  /cash-baseline          LPR 1Y/5Y + 货基 7 日年化中位数（存款挂牌利率无
+                             可靠在线源，由主应用 config 手工维护，不在本服务）
 """
 from __future__ import annotations
 
@@ -93,7 +97,8 @@ def root() -> dict:
                           "/sw-calendar", "/sw-month", "/sw-day", "/index-hist",
                           "/financials/report", "/financials/preannounce",
                           "/financials/express", "/financials/consensus",
-                          "/financials/abstract", "/financials/bundle"]}
+                          "/financials/abstract", "/financials/bundle",
+                          "/cash-baseline"]}
 
 
 @app.get("/health")
@@ -447,3 +452,19 @@ def fin_bundle(code: str = Query(..., description="6 位代码，如 300394"),
         raise HTTPException(400, str(exc)) from exc
     except F.UpstreamError as exc:
         raise HTTPException(502, str(exc)) from exc
+
+
+# ---------------- 现金基准代理（决策的「无风险机会成本」） ----------------
+
+@app.get("/cash-baseline")
+def cash_baseline(force: bool = Query(False)) -> dict:
+    """LPR 1Y/5Y + 货基 7 日年化中位数（服务端 TTL 缓存，默认 6 小时）。
+
+    存款挂牌利率没有可靠在线源，由主应用 config 手工维护，不在本服务 ——
+    见 rates.py 文件头的「已否决」清单，别回头去接东财那张冻结的基准表。
+    """
+    from . import rates as R
+    try:
+        return R.snapshot(force=force)
+    except R.UpstreamError as exc:
+        raise HTTPException(503, str(exc)) from exc

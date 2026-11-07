@@ -481,6 +481,7 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       <button data-tab="reports">分析报告</button>
       <button data-tab="paper">🧪 模拟交易</button>
       <button data-tab="tdesk">🔁 做T<span id="t-tab-badge" class="tab-badge hide">0</span></button>
+      <button data-tab="anchor">🎯 锚定</button>
       <button data-tab="jq">📚 策略库/沙箱<span id="jq-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="analysis">🧠 分析技法<span id="anal-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="skills">🧩 Skills</button>
@@ -499,6 +500,14 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       </div>
       <div id="market-vol" class="pnl-summary" style="margin-top:8px"></div>
       <div id="market-vol-intraday" class="muted" style="margin-top:6px;font-size:12px"></div>
+      <div class="muted" style="margin-top:6px;font-size:11.5px;border-top:1px dashed var(--border);padding-top:6px">
+        上面是<b>日K均量比</b>（最新日K成交量 ÷ 前5日均量，收盘口径、一天一个值，随日K更新）。
+        <span id="mv-hint-intraday" class="hide">下面绿字是<b>盘中实时量比</b>
+        （当日每分钟均量 ÷ 过去5日每分钟均量，交易时段每 5 分钟采样一次，
+        驱动放量/缩量异动告警——盘中看日K累计量会天然偏小，分钟均量比才随时可比）；
+        两处口径不同，数字略有差异属正常。</span>
+        恒生指数只在上面的日K口径出现，不参与整体量比均值。
+      </div>
     </div>
     <div class="card">
       <div class="row" style="align-items:flex-start">
@@ -771,6 +780,33 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
         美债 10Y/2Y 为日频（FRED）；日/德/英/韩 10Y 为 <b>OECD 月频</b>
         —— 天然滞后约 1 个月（行内标滞后天数），只当背景。中国 10Y 为中债口径（日频）。
         引用时务必带数据日。
+      </div>
+    </div>
+
+    <!-- 现金/存款机会成本基准（2026-11-08）：决策的「无风险 baseline」-->
+    <div class="card" style="margin-top:14px">
+      <div class="row" style="justify-content:space-between">
+        <b style="font-size:13px">💰 现金/存款基准
+          <span class="muted" style="font-weight:normal">定存挂牌 + 货基 + LPR（机会成本）</span></b>
+        <span class="row">
+          <span class="muted" id="cb-meta" style="font-size:12px"></span>
+          <button class="btn ghost" style="font-size:12px" onclick="syncCashBaseline(this)">同步</button>
+        </span>
+      </div>
+      <div class="empty" id="cb-empty" style="margin-top:8px">加载中...</div>
+      <div style="overflow-x:auto" id="cb-wrap">
+        <table style="margin-top:6px">
+          <thead><tr>
+            <th>基准项</th><th>年化</th><th>数据日</th><th>口径</th>
+          </tr></thead>
+          <tbody id="cb-body"></tbody>
+        </table>
+      </div>
+      <div class="hint" id="cb-note" style="font-size:12px;margin-top:6px">
+        定存挂牌利率**手工维护**（无可靠在线源——东财那张央行基准表 2015 年起冻结），
+        请在配置页「💰 现金/存款基准」按本行实际挂牌价更新；货基/LPR 从 101
+        数据服务自动同步。这些值会注入 LLM 决策上下文（「不买股票也能稳赚 X%」
+        的机会成本口径），纯信息、不是交易指令。
       </div>
     </div>
 
@@ -2471,6 +2507,43 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
     </div>
   </section>
 
+  <!-- 锚定模式（paper_anchor.py）：锚定一只票做下去，唯一目标是在这只票上赚钱 -->
+  <section id="tab-anchor" class="hide">
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <b style="font-size:13px">🎯 锚定模式 · 单票使命</b>
+        <span class="row">
+          <span class="muted" id="an-meta" style="font-size:12px"></span>
+          <button class="btn ghost" style="font-size:12px" onclick="loadAnchor()">刷新</button>
+          <button class="btn ghost" style="font-size:12px" onclick="anchorSeed()">镜像建仓</button>
+        </span>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:4px">
+        锚定一只票（如实盘半仓的智谱 02513）：<b>独立轨道、优先级最高</b> ——
+        其他自选照常决策不受影响，锚定票永远进候选、成交排最前（止损照常全持仓生效）。
+        可以做T降成本、空仓躲暴跌，但<b>空仓后必须择机买回</b> ——
+        超过 <span id="an-wait">—</span> 个交易日未回补会推送告警（只告警，不自动下单）。
+        开关与代码在 <b>调度 → 模拟交易配置</b>（paper.anchor.*）。
+      </div>
+    </div>
+    <div class="card">
+      <div id="an-status" class="muted" style="font-size:12px">加载中…</div>
+    </div>
+    <div class="card">
+      <b style="font-size:13px">📋 该票最近流水（模拟盘）</b>
+      <div style="overflow-x:auto;margin-top:6px">
+        <table class="tbl" style="width:100%">
+          <thead><tr>
+            <th>日期</th><th>轮次</th><th>方向</th><th>股数</th><th>价格</th>
+            <th>金额</th><th>状态</th><th>结算价</th><th>说明</th>
+          </tr></thead>
+          <tbody id="an-body"></tbody>
+        </table>
+      </div>
+      <div id="an-empty" class="empty hide">暂无该票流水</div>
+    </div>
+  </section>
+
   <!-- 报告 -->
   <!-- 模拟交易（Paper Trading）：盘中每 N 分钟判断 → 免LLM止损 → 收盘后 5交易日结算 → 反思沉淀 -->
   <section id="tab-paper" class="hide">
@@ -2480,6 +2553,7 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
         <span class="row">
           <button class="btn ghost" style="font-size:12px" onclick="paperRun()">立即决策一轮</button>
           <button class="btn ghost" style="font-size:12px" onclick="paperSettle()">立即结算复盘</button>
+          <button class="btn ghost" style="font-size:12px" onclick="paperDeposit()">➕ 加本金</button>
           <button class="btn ghost" style="font-size:12px" onclick="paperReset()">重置账户</button>
         </span>
       </div>
@@ -5942,7 +6016,8 @@ curl -H "Authorization: Bearer $VIBE_API_KEY" http://101.43.25.101/vibe/health</
 
 // ---- 标签页 ----
 const TABS = ['market', 'sector', 'holdings', 'strategies', 'plans', 'calendar', 'news',
-              'bili', 'wb', 'xhs', 'mp', 'x', 'reports', 'paper', 'tdesk', 'notify', 'schedule',
+              'bili', 'wb', 'xhs', 'mp', 'x', 'reports', 'paper', 'tdesk', 'anchor',
+              'notify', 'schedule',
               'jq', 'analysis', 'skills', 'research'];
 const TAB_LOADERS = {
   // ⚠️ 港股解禁**不**挂在 market 的自动加载里（2026-10-13 用户报「一直加载中」）：
@@ -5951,7 +6026,7 @@ const TAB_LOADERS = {
   //   所以这里只做**零成本的**状态探测（探 101 的 /health，约 15ms），
   //   把「有 N 只港股可查」显示出来，让人自己点「查我的港股」。
   //   —— 之前我漏了这个注册，页面永远停在初始的「加载中…」。
-  market:    () => { loadWatch(); loadAlerts(); loadCrypto(); loadDiscover(); loadFutures(); loadFx(); loadMarketTemp(); loadMacroGlobal(); loadEtfFlows(); loadHKSupplyStatus(); },
+  market:    () => { loadWatch(); loadAlerts(); loadCrypto(); loadDiscover(); loadFutures(); loadFx(); loadMarketTemp(); loadMacroGlobal(); loadEtfFlows(); loadCashBaseline(); loadHKSupplyStatus(); },
   sector:    () => { loadSector(); loadIntraday(); startIntradayAuto(); },
   holdings:  () => { loadHoldings(); refreshTradeStrategyOptions(); },
   strategies:() => { loadStrategies(); refreshTradeStrategyOptions(); },
@@ -5966,6 +6041,7 @@ const TAB_LOADERS = {
   reports:   loadReports,
   paper:     loadPaper,
   tdesk:     loadTDesk,
+  anchor:    loadAnchor,
   notify:    () => { loadNotifyConf(); loadNotifyMatrix(); refreshWxChat(); },
   jq:        () => { loadJqLib(); loadJqList(); loadAdopted(); loadStrategyScorecard(); loadStrategyDaily(); },
   analysis:  loadTechniques,
@@ -6724,9 +6800,16 @@ async function loadMarketVolume() {
 async function loadMarketVolIntraday() {
   const box = $('market-vol-intraday');
   if (!box) return;
+  // 实时行没数据时，说明里「下面绿字」那句一并隐藏，别让提示指向不存在的东西
+  const hint = $('mv-hint-intraday');
   try {
     const d = await api('/api/volume/intraday');
-    if (!d.items || !d.items.length) { box.innerHTML = ''; return; }
+    if (!d.items || !d.items.length) {
+      box.innerHTML = '';
+      if (hint) hint.classList.add('hide');
+      return;
+    }
+    if (hint) hint.classList.remove('hide');
     // 成交额也摆出来：盘中「缩量」只有配上绝对额才知道是正常还是枯竭
     const parts = d.items.map(i => `<span class="muted">${i.name}</span>` +
       (i.amount != null ? `<b>${amtText(i.amount)}</b>` : '') +
@@ -7285,9 +7368,14 @@ async function showTrades(code) {
     if (mask.classList.contains('hide')) Modal.lockScroll(true);
     mask.classList.remove('hide');
     const box = $('trades-detail');
+    // 港股判定：代码 5 位（与 /api/trades 校验「A股 6 位；港股 4-5 位」一致，
+    // 实际港股代码恒为 5 位带前导零）。金额是录入原币 = 港元，必须写清楚，
+    // 否则会被当成人民币读 —— 数值上港元≈0.85 人民币，差 15%（2026-11-08 用户报）。
+    const isHK = /^\d{5}$/.test(code);
     box.innerHTML = `<div id="pos-strat-${code}" style="margin-bottom:8px"></div>
+      ${isHK ? `<div class="hint" style="margin-bottom:6px">💱 本股价格与金额均为<b>港币（HKD）</b>，未折算人民币；买入笔盈亏 = 现价 vs <b>该笔买入价</b>（单笔口径，加总=总浮动）</div>` : ''}
       <table><tbody>${rows.map(t => {
-        // 每笔盈亏：卖出=已实现；买入=现价对买入时点成本的浮动（已清仓则为空）
+        // 每笔盈亏：卖出=已实现（vs 当时摊薄成本）；买入=现价对该笔买入价（2026-11-08 用户裁决）
         let pnlCell = '<span class="muted">—</span>';
         if (t.side === 'sell' && typeof t.lot_realized === 'number')
           pnlCell = `<span class="${cls(t.lot_realized)}">${signed(t.lot_realized)}</span>`;
@@ -8924,17 +9012,120 @@ const T_ACT = {
   t_buy:        { t: '⬇ 低吸（买回）', c: 'b-info' },
   hard_stop:    { t: '🛑 止损（卖可卖）', c: 'b-bad' },
   trend_reduce: { t: '📉 趋势减仓',     c: 'b-warn' },
+  spike_reduce: { t: '🚀 异常拉升减持', c: 'b-warn' },
   trend_wait:   { t: '⏳ 深亏提示',     c: 'b-mute' },
   hold:         { t: '— 不做',          c: 'b-mute' },
 };
 // 「有操作」的判定必须与后端 `t_trading.ACT_ACTIONS` 同集合 —— 少了
-// hard_stop/trend_reduce 会让趋势建议被判成「没有操作」，而它恰恰是**要你
-// 手动卖出**的建议；trend_wait 只是提示，不算操作。
-const T_ACT_KEYS = ['t_sell', 't_buy', 'hard_stop', 'trend_reduce'];
+// hard_stop/trend_reduce/spike_reduce 会让单向减仓建议被判成「没有操作」，
+// 而它恰恰是**要你手动卖出**的建议；trend_wait 只是提示，不算操作。
+const T_ACT_KEYS = ['t_sell', 't_buy', 'hard_stop', 'trend_reduce', 'spike_reduce'];
 
 async function loadTDesk() {
   $('t-paper-body').innerHTML = skeletonBox(2);
   await Promise.all([loadTAdvisory(), loadTPaper(), loadTLog()]);
+}
+
+// ---------- 锚定模式（paper_anchor.py，2026-11-07） ----------
+// 只读展示：使命进度 + 空仓超期 + 该票流水。开关/代码在调度页 paper.anchor.*。
+const _AN = { last: null };
+
+async function loadAnchor() {
+  const box = $('an-status');
+  if (!box) return;
+  box.innerHTML = '<span class="muted">加载中…</span>';
+  try {
+    const d = await api('/api/paper/anchor');
+    _AN.last = d;
+    renderAnchor(d);
+  } catch (e) {
+    box.innerHTML = `<span class="down">加载失败：${esc(e.message || e)}</span>`;
+  }
+}
+
+function renderAnchor(d) {
+  const box = $('an-status');
+  if (!d) { box.textContent = ''; return; }
+  $('an-wait').textContent = d.max_refill_wait_days ?? '—';
+  $('an-meta').textContent = d.code ? `锚定 ${d.code}` : '未配置';
+  if (!d.enabled) {
+    box.innerHTML = `<span class="muted">锚定模式未开启。到 <b>调度 → 模拟交易配置</b> 勾选
+      「锚定模式总开关」并填入代码（paper.anchor.enabled / paper.anchor.code）。</span>`
+      + (d.reason ? `<div class="muted" style="margin-top:4px">${esc(d.reason)}</div>` : '');
+    $('an-body').innerHTML = '';
+    $('an-empty').classList.add('hide');
+    return;
+  }
+  if (!d.available) {
+    box.innerHTML = `<span class="down">状态读取失败：${esc(d.reason || '未知原因')}</span>`;
+    return;
+  }
+  const st = d.state || {};
+  const pos = d.position;
+  const perf = d.perf || {};
+  const empty = st.status === 'empty';
+  const stBadge = empty
+    ? `<span class="badge b-bad">空仓第 ${fmt(st.empty_days)} 个交易日${st.empty_since ? '（自 ' + esc(st.empty_since) + '）' : ''}</span>`
+    : `<span class="badge b-ok">持仓中</span>`;
+  const over = empty && (st.empty_days || 0) > (d.max_refill_wait_days || 5)
+    ? ` <span class="badge b-bad">已超期，必须尽快回补</span>` : '';
+  const posLine = pos
+    ? `当前持仓 <b>${fmt(pos.shares)}</b> 股 · 成本 <b>${fmtPx(pos.cost)}</b>` +
+      (perf.first_cost ? `（初始 ${fmtPx(perf.first_cost)}）` : '')
+    : `当前<b class="down">空仓</b>`;
+  const pnlLine = perf.realized_pnl != null
+    ? `已实现盈亏 <b class="${cls(perf.realized_pnl)}">${signed(+perf.realized_pnl.toFixed(2))}</b> 元`
+    : '已实现盈亏 —（暂无结算样本）';
+  box.innerHTML =
+    `<div class="row" style="gap:8px;align-items:center;flex-wrap:wrap">
+       <span class="badge b-info">🎯 ${esc(d.code)}</span> ${stBadge}${over}
+       <span class="badge ${d.enabled ? 'b-ok' : 'b-mute'}">${d.enabled ? '启用中' : '未启用'}</span>
+     </div>
+     <div style="margin-top:8px;font-size:13px;line-height:1.9">
+       ${posLine} ｜ ${pnlLine} ｜ 做T <b>${fmt(perf.t_count)}</b> 次 ｜
+       结算样本 ${fmt(perf.settled_count)} 笔
+     </div>
+     <div class="muted" style="margin-top:4px;font-size:12px">
+       使命：在本票上累计赚钱。空仓只是避险手段，<b>择机买回是必须完成的动作</b>；
+       已实现盈亏按买入行结算价估算（卖出腿手续费未逐笔对应），只作趋势参考。
+       ${st.seed_note ? '种子：' + esc(st.seed_note) : ''}
+     </div>`;
+  renderAnchorRecent(d.recent || []);
+}
+
+function renderAnchorRecent(rows) {
+  const tb = $('an-body');
+  $('an-empty').classList.toggle('hide', rows.length > 0);
+  tb.innerHTML = rows.map(r => {
+    const side = r.side === 'buy' ? '<span class="up">买入</span>'
+      : r.side === 'sell' ? '<span class="down">卖出</span>' : esc(r.side);
+    const isT = (r.reasoning || '').startsWith('[做T]');
+    const isSeed = (r.reasoning || '').startsWith('[锚定镜像]');
+    const tag = isT ? ' <span class="badge b-info">做T</span>'
+      : isSeed ? ' <span class="badge b-info">镜像</span>' : '';
+    return `<tr>
+      <td>${esc(r.trade_date)}</td><td class="muted">${esc(r.slot) || '—'}</td>
+      <td>${side}${tag}</td><td>${fmt(r.shares)}</td><td>${fmtPx(r.price)}</td>
+      <td>${fmt(r.value)}</td>
+      <td>${r.status === 'open' ? '<span class="badge b-ok">持仓</span>'
+        : r.status === 'resolved' ? '<span class="badge b-mute">已结算</span>'
+        : esc(r.status)}</td>
+      <td>${fmtPx(r.settle_price)}</td>
+      <td class="muted" style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+          title="${esc(r.reasoning)}">${esc((r.reasoning || '').slice(0, 60))}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function anchorSeed() {
+  if (!confirm('按实盘仓位占比在模拟盘镜像建仓？幂等：已建过不会重复加仓。')) return;
+  try {
+    const d = await api('/api/paper/anchor/seed', { method: 'POST' });
+    alert(d.reason || (d.ok ? '完成' : '失败'));
+    loadAnchor();
+  } catch (e) {
+    alert('镜像建仓失败：' + (e.message || e));
+  }
 }
 
 function tFilter(k) {
@@ -9065,8 +9256,22 @@ function _tTrendLine(tr) {
   return out.join(' · ') || '—';
 }
 
-/** 趋势动作是**单向减仓**，不是一次做T往返 —— 不能弹「记一次做T」。 */
-const tIsTrend = a => a === 'hard_stop' || a === 'trend_reduce' || a === 'trend_wait';
+/** 趋势/异常波动动作都是**单向减仓**，不是一次做T往返 —— 不能弹「记一次做T」。 */
+const tIsTrend = a => a === 'hard_stop' || a === 'trend_reduce' || a === 'trend_wait'
+  || a === 'spike_reduce';
+
+function _tSpikeLine(sp) {
+  if (!sp) return '';
+  if (!sp.enabled) return '未启用';
+  const out = [];
+  if (sp.spike_pct != null) out.push(`阈值 ${tInt(sp.spike_pct)}%`);
+  if (sp.vol_mult != null && sp.vol_mult > 0) out.push(`量比 ≥${sp.vol_mult}`);
+  if (sp.last_spike_date) out.push(`上次 ${esc(sp.last_spike_date)} +${tPx(sp.last_spike_pct)}%`);
+  if (sp.last_vol_ratio != null) out.push(`量比 ${sp.last_vol_ratio}`);
+  if (sp.fires != null) out.push(`已触发 ${tInt(sp.fires)}/${tInt(sp.max_reductions)} 次`);
+  if (sp.days_since_fired != null) out.push(sp.fresh ? '有效期内' : `已过 ${tInt(sp.days_since_fired)} 日`);
+  return out.join(' · ') || '—';
+}
 
 function renderTAdv() {
   const tb = $('t-adv-body'), em = $('t-adv-empty');
@@ -9126,6 +9331,7 @@ function renderTAdv() {
     <tr data-tdetail="${esc(i.code || '')}"><td colspan="13" style="padding:0 8px 8px">
       <div style="font-size:12px;line-height:1.65">
         ${i.trend ? `<div><b>趋势规则</b> ${_tTrendLine(i.trend)}</div>` : ''}
+        ${i.spike ? `<div><b>🚀 异常波动</b> ${_tSpikeLine(i.spike)}</div>` : ''}
         ${i.big_drop ? `<div class="t-bigdrop"><b>💧 大跌降本</b> ${esc(i.big_drop.summary || '')}</div>` : ''}
         ${i.override_note ? `<div class="t-warn">⚠️ ${esc(i.override_note)}</div>` : ''}
         <div><b>依据</b> ${esc(i.why || '—')}</div>
@@ -9689,6 +9895,26 @@ async function loadPaperStatus() {
     } else { loadPaper(); }
   } catch (e) { /* 静默 */ }
 }
+async function paperDeposit() {
+  // 加本金（2026-11-08）：锚定镜像建仓需要现金 ≥ 实盘仓位占比 × 总资产，
+  // 10 万初始资金装不下 30 万级的持仓 —— 入金后 seed_mirror 下次开跑自动用上。
+  const v = await formDlg('➕ 模拟账户加本金', [
+    { key: 'amount', label: '金额（元）', type: 'number', step: '1000',
+      value: '', required: true, placeholder: '如 200000',
+      hint: '现金、初始资金、总资产三项同步增加；收益率分母同步，入金不会被算成「当天暴赚」' },
+    { key: 'note', label: '备注（可选）', value: '', placeholder: '如：锚定智谱同步入金' },
+  ], { okText: '确认入金' });
+  if (!v) return;
+  const amount = Number(v.amount);
+  if (!isFinite(amount) || amount <= 0) { toastErr('金额必须是正数'); return; }
+  try {
+    const r = await api('/api/paper/deposit', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ amount, note: v.note || '' }) });
+    toastOk(`已入金 ${fmt(r.amount)}，可用现金 ${fmt(r.cash)}`);
+    loadPaper();
+  } catch (e) { toastErr('加本金失败: ' + e.message); }
+}
 async function paperReset() {
   if (!await confirmDlg('重置模拟账户？\n将清空全部模拟交易、经验库和资产快照，初始资金恢复 10 万。',
                         { title: '重置模拟账户', okText: '确认重置', danger: true })) return;
@@ -10102,6 +10328,59 @@ async function syncEtfFlows(btn) {
     btn.textContent = (r && r.ok) ? '已同步' : '部分失败';
     await loadEtfFlows();
   } catch (e) { btn.textContent = '失败'; toastErr('ETF 资金流同步失败: ' + e.message); }
+  setTimeout(() => { btn.textContent = old; btn.disabled = false; }, 2500);
+}
+
+// ---- 现金/存款机会成本基准（2026-11-08）----
+function loadCashBaseline() {
+  const body = $('cb-body'), meta = $('cb-meta');
+  api('/api/cash-baseline').then(d => {
+    const rows = [];
+    const dep = d.deposit || {};
+    const upd = dep.updated || '—';
+    const depStale = (() => {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(upd)) return null;
+      const days = Math.floor((Date.now() - new Date(upd + 'T00:00:00')) / 86400000);
+      return days > 90 ? days : null;
+    })();
+    if (dep['1y'] != null) rows.push(['1年期定存挂牌' + (depStale ? `（已${depStale}天未更新⚠）` : ''),
+      dep['1y'], upd, 'config 手工维护']);
+    if (dep['3y'] != null) rows.push(['3年期定存挂牌', dep['3y'], upd, 'config 手工维护']);
+    const mf = d.money_fund || {};
+    if (mf.median != null) rows.push(['货基 7 日年化中位数', mf.median, mf.date || '—',
+      `${mf.count || '?'} 只中位数`]);
+    const lpr = d.lpr || {};
+    if (lpr.lpr1y != null) rows.push(['LPR 1年（贷款端）', lpr.lpr1y, lpr.date || '—', '101 自动同步']);
+    if (lpr.lpr5y != null) rows.push(['LPR 5年（贷款端）', lpr.lpr5y, lpr.date || '—', '101 自动同步']);
+    const ok = rows.length > 0;
+    $('cb-empty').classList.toggle('hide', ok);
+    if (!ok) $('cb-empty').textContent = d.due ? '暂无缓存，点「同步」拉取' : '加载中...';
+    body.innerHTML = rows.map(r => `<tr>
+      <td><b>${esc(r[0])}</b></td>
+      <td class="num">${r[1] != null ? Number(r[1]).toFixed(2) + '%' : '—'}</td>
+      <td class="muted">${esc(r[2])}</td>
+      <td class="muted">${esc(r[3])}</td>
+    </tr>`).join('');
+    meta.textContent = d.synced_at ? `缓存更新于 ${d.synced_at}` : (d.due ? '未同步' : '—');
+    const notes = (d.errors && Object.keys(d.errors).length)
+      ? ['同步部分失败: ' + Object.entries(d.errors).map(([k, v]) => `${k}=${v}`).join('；')]
+      : (d.notes || []);
+    if (notes.length) $('cb-note').innerHTML =
+      '定存挂牌利率**手工维护**（无可靠在线源——东财那张央行基准表 2015 年起冻结），' +
+      '请在配置页「💰 现金/存款基准」按本行实际挂牌价更新。<br>' + notes.map(esc).join('<br>');
+  }).catch(e => { meta.textContent = '加载失败: ' + e.message; });
+}
+
+async function syncCashBaseline(btn) {
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = '同步中…';
+  try {
+    const r = await jsonPost('/api/cash-baseline/sync');
+    if (r && r.busy) btn.textContent = '正在跑';
+    else if (r && (r.ok || r.kept_old)) btn.textContent = r.kept_old ? '沿用旧缓存' : '已同步';
+    else btn.textContent = '失败';
+    await loadCashBaseline();
+  } catch (e) { btn.textContent = '失败'; toastErr('现金基准同步失败: ' + e.message); }
   setTimeout(() => { btn.textContent = old; btn.disabled = false; }, 2500);
 }
 
@@ -12100,6 +12379,7 @@ loadFx();
 loadMarketTemp();
 loadMacroGlobal();
 loadEtfFlows();
+loadCashBaseline();
 loadHKSupplyStatus();
 loadNewsFilter();
 loadUnreadBadge();

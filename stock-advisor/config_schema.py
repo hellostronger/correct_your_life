@@ -587,6 +587,32 @@ SCHEMAS: dict[str, dict[str, Any]] = {
     },
 
     # ---------------- 核心宽基 ETF 资金流 ----------------
+    "cash_baseline": {
+        "label": "💰 现金/存款基准（机会成本）",
+        "help": "决策的「无风险 baseline」：定存挂牌利率（**手工维护**，没有可靠"
+                "在线源——东财那张是央行基准表，2015 年起冻结）+ 货基 7 日年化与 "
+                "LPR（101 数据服务 /cash-baseline 自动同步）+ 中美 10Y（复用宏观"
+                "利率表）。请按你实际存款银行的挂牌价更新下面的值。",
+        "fields": [
+            {"key": "enabled", "t": "bool", "d": True,
+             "label": "启用自动同步",
+             "help": "从 101 /cash-baseline 拉货基 7 日年化中位数与 LPR，"
+                     "失败沿用旧缓存不清空"},
+            {"key": "sync_interval_hours", "t": "int", "d": 168, "lo": 24, "hi": 720,
+             "label": "同步间隔(小时)",
+             "help": "存款/LPR 是月级慢变量，默认一周一次足够"},
+            {"key": "deposit_1y", "t": "float", "d": 0.95, "lo": 0, "hi": 10,
+             "label": "1年期定存挂牌(%)",
+             "help": "按你实际存款银行填写（默认=2026-11 大行挂牌 0.95%）；"
+                     "超过 90 天没更新「更新日期」会在注入文本里提醒核对"},
+            {"key": "deposit_3y", "t": "float", "d": 1.25, "lo": 0, "hi": 10,
+             "label": "3年期定存挂牌(%)",
+             "help": "同上（默认=2026-11 大行挂牌 1.25%）"},
+            {"key": "deposit_updated", "t": "string", "d": "2026-11-08",
+             "label": "挂牌价更新日期",
+             "help": "YYYY-MM-DD；用于计算挂牌价是否过期（>90 天提示核对）"},
+        ],
+    },
     "etf_flows": {
         "label": "🏦 宽基 ETF 资金流",
         "help": "15 只国家队常买的宽基 ETF（沪深300/上证50/中证500/中证1000/"
@@ -821,6 +847,18 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             {"key": "market_temp_inject.max_chars", "t": "int", "d": 1200, "lo": 300,
              "hi": 4000, "label": "市场温度块字数上限", "adv": True,
              "help": "超出截断并标注；下限 300（决策上下文其余块已占大量预算）"},
+            # ---- 现金/存款机会成本基准进决策（2026-11-08 用户要求）----
+            # 默认开（用户明确要求「存款 baseline 影响判断」）。纯信息注入，
+            # 不加系统侧硬闸（2026-11-08 用户裁决）。
+            {"key": "cash_baseline_inject.enabled", "t": "bool", "d": True,
+             "label": "现金基准进决策",
+             "help": "把「1/3年期定存挂牌利率（主锚，config 手工维护）+ 货基 7 日"
+                     "年化中位数 + 中美 10Y 国债 + LPR」注入 LLM 决策上下文，并附"
+                     "逐票对照（该股近20日涨幅 vs 无风险基准）。纯信息口径，"
+                     "不是交易指令。关掉后上下文逐字节不变。"},
+            {"key": "cash_baseline_inject.max_chars", "t": "int", "d": 1200, "lo": 300,
+             "hi": 4000, "label": "现金基准块字数上限", "adv": True,
+             "help": "超出截断并标注；下限 300（决策上下文其余块已占大量预算）"},
             # ---- 分析师裁决对照 + 同日反向闸门 + 裁决稳定性（2026-10-28）----
             # 都是「可观测性 / 自我打脸防护」，不改任何成交金额与仓位口径。
             {"key": "analyst_track", "t": "bool", "d": True, "adv": True,
@@ -976,6 +1014,65 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             {"key": "t_trading.big_drop.skip_star", "t": "bool", "d": True,
              "label": "大跌降本·ST不加仓", "adv": True,
              "help": "*ST/*退市 只写风险提示，不推加仓（越跌越买会接刀）"},
+            # ---- 异常波动减持（2026-11-08）----
+            {"key": "t_trading.spike.enabled", "t": "bool", "d": True,
+             "label": "异常拉升减持提示",
+             "help": "空头排列里突然单日暴涨（实测智谱两周内两次 +9%，随后一周"
+                     "-12%~-23%），建议减持底仓一部分。判据纯量价；「是否有实质"
+                     "利好」AI 不代判，建议文案会要求你自行核对当日公告/新闻。"
+                     "只给建议绝不自动下单。多头排列里的暴涨不劝减（那是趋势本身）"},
+            {"key": "t_trading.spike.spike_pct", "t": "float", "d": 8.0,
+             "lo": 3, "hi": 20, "step": 0.5, "label": "异常拉升·单日涨幅%",
+             "adv": True,
+             "help": "相对前收盘的单日涨幅阈值。港股无涨跌停建议 8；A股可放宽到 6"},
+            {"key": "t_trading.spike.vol_mult", "t": "float", "d": 1.2,
+             "lo": 0, "hi": 5, "step": 0.1, "label": "异常拉升·量比下限",
+             "adv": True,
+             "help": "当日成交量 / 前 5 日均量 ≥ 此值才算「异常」（排除缩量假拉）"
+                     "。实测智谱两次 1.24/1.48，默认 1.2 别挡真信号；0 = 不看量"},
+            {"key": "t_trading.spike.trend_gate", "t": "bool", "d": True,
+             "label": "仅空头排列触发", "adv": True,
+             "help": "只在收盘<MA20<MA60 时触发。多头排列里的暴涨是趋势本身，"
+                     "劝减会让你踏空"},
+            {"key": "t_trading.spike.reduce_pct", "t": "int", "d": 20,
+             "lo": 5, "hi": 50, "label": "每次减持底仓%",
+             "adv": True, "help": "按整手向下取整且至少保留 1 手"},
+            {"key": "t_trading.spike.max_reductions", "t": "int", "d": 2,
+             "lo": 1, "hi": 10, "label": "一段趋势最多提示几次", "adv": True,
+             "help": "均线排列转多后计数重置；防止反复催卖"},
+            {"key": "t_trading.spike.fresh_days", "t": "int", "d": 2,
+             "lo": 1, "hi": 10, "label": "信号有效期(交易日)", "adv": True,
+             "help": "触发后 N 个交易日内有效，过期不再催（避免拿旧信号劝人卖）"},
+            {"key": "t_trading.spike.verify_min_confidence", "t": "int", "d": 6,
+             "lo": 1, "hi": 10, "label": "利好核查·置信下限", "adv": True,
+             "help": "AI 全面搜证（新闻/事件/公众号语义/联网/社媒）后判定利好有无："
+                     "只有 verdict=none 且置信 ≥ 此值才保留减持建议；疑似利好/拿不准/"
+                     "搜证失败一律**撤回建议**——宁可错过出货，不把真反转卖飞。"
+                     "同一事件只搜证一次（缓存）"},
+            # ---- 个股锚定模式（2026-11-07，paper_anchor.py）----
+            {"key": "anchor.enabled", "t": "bool", "d": False,
+             "label": "锚定模式总开关",
+             "help": "锚定一只票做下去：锚定是**独立轨道、优先级最高** —— 其他"
+                     "自选照常决策不受影响，锚定票永远进候选且成交排最前（空仓"
+                     "回补不被持仓上限卡死，止损照常全持仓生效）。目标是在这只票"
+                     "上赚钱：可以做T降成本、空仓躲暴跌，但空仓后**必须择机买回**"
+                     "（注入回补预案 + 超期告警，超期不由代码自动下单）。"
+                     "默认关：改的是决策口径"},
+            {"key": "anchor.code", "t": "str", "d": "",
+             "label": "锚定股票代码",
+             "help": "要锚定的代码，如 02513（港股）或 600519。留空 = 未锚定"},
+            {"key": "anchor.seed_mode", "t": "str", "d": "mirror",
+             "label": "初始建仓方式",
+             "help": "mirror=镜像实盘（按实盘仓位占比 × 模拟盘总资产建仓，成本价"
+                     "取实盘 avg_cost，一次性幂等）；keep=沿用模拟盘现有持仓；"
+                     "fresh=空仓起步由策略自建仓。实盘无该票记录时自动降级 fresh"},
+            {"key": "anchor.max_refill_wait_days", "t": "int", "d": 5,
+             "lo": 1, "hi": 30, "label": "回补超期上限(交易日)",
+             "help": "空仓超过 N 个交易日未回补就推送告警（每交易日最多一条）。"
+                     "只告警不自动下单 —— 回补时机由决策结合预案判断"},
+            {"key": "anchor.inject.max_chars", "t": "int", "d": 1600,
+             "lo": 400, "hi": 4000, "label": "锚定注入块长度上限", "adv": True,
+             "help": "锚定使命块（使命/进度/回补预案）的最大字符数，超长截断留痕"},
             {"key": "fees.a_commission_rate", "t": "float", "d": 0.00025,
              "lo": 0, "hi": 0.01, "step": 0.00005, "label": "佣金费率", "adv": True,
              "help": "A 股/场内基金佣金费率，万2.5 = 0.00025。双向收取"},
