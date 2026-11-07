@@ -106,6 +106,27 @@ T_DEFAULTS = {
         "cap_add_pct": 30,       # 全部档位加仓合计上限（占当前持仓 %）
         "skip_star": True,       # *ST/*退市 不推加仓
     },
+    # 异常波动减持（2026-11-08 用户要求）。
+    # 场景（02513 实测两次）：空头排列里突然单日 +9%（无实质利好），随后一周
+    # -12%~-23%。判据**纯量价**：「是否有实质利好」AI 不代判，建议文案里
+    # 明确要求用户自行核对当日公告/新闻；多头排列里的暴涨是趋势本身，不劝减。
+    "spike": {
+        "enabled": True,         # 默认开——只给建议绝不自动下单（提示类默认开）
+        "spike_pct": 8.0,        # 单日涨幅阈值 %（相对前收盘）
+        "vol_mult": 1.2,         # 当日量 / 前 5 日均量 ≥ 此值（0 = 不看量）。
+                                 # 实测 02513 两次异常拉升量比 1.24 / 1.48，
+                                 # 取 1.2 别把真信号挡在门外
+        "trend_gate": True,      # 仅空头排列（收盘<MA20<MA60）时触发
+        "reduce_pct": 20,        # 建议减掉底仓 %
+        "max_reductions": 2,     # 一段趋势里最多建议几次（排列转多后重置）
+        "fresh_days": 2,         # 触发后 N 个交易日内有效（过期不催）
+        # 利好搜证闸门（2026-11-08 用户要求「消息面必须准确，误判我就寄了」）：
+        # AI 全面检索（新闻/事件/公众号语义/联网/社媒）判定利好有无，只有
+        # 「确信无利好」（verdict=none 且置信 ≥ verify_min_confidence）才保留
+        # 减持建议；positive/uncertain/搜证失败一律撤回 —— 保守方向：宁可错过
+        # 一次出货，不把真反转卖飞。同一事件只搜证一次（按 code+spike日 缓存）。
+        "verify_min_confidence": 6,
+    },
 }
 
 # T 操作的标记前缀。用来区分「做 T 的成交」和「普通 LLM 决策的成交」，
@@ -117,11 +138,15 @@ T_TAG = "[做T]"
 # 任何「只要 t_sell/t_buy」的地方都必须同时问一句趋势动作算不算（漏了会静默少计）。
 T_ACTIONS = ("t_sell", "t_buy")
 TREND_ACTIONS = ("hard_stop", "trend_reduce")
-ACT_ACTIONS = T_ACTIONS + TREND_ACTIONS
+# 异常波动减持（2026-11-08）：单向卖出，与趋势减仓同族，但触发条件独立
+#（空头排列中的单日暴涨 + 放量），见 spike_reduce_state。
+SPIKE_ACTIONS = ("spike_reduce",)
+ACT_ACTIONS = T_ACTIONS + TREND_ACTIONS + SPIKE_ACTIONS
 # trend_wait 只提示不催卖（深亏时割肉容易卖在坑里），不算可执行动作。
 TREND_LABELS = {"hard_stop": "止损（卖可卖份额）",
                 "trend_reduce": "趋势减仓（单向卖出）",
                 "trend_wait": "深亏提示（只提示不催卖）"}
+SPIKE_LABEL = {"spike_reduce": "异常拉升减持（单向卖出）"}
 
 
 def _conf(raw: dict | None) -> dict:
@@ -562,6 +587,319 @@ def big_drop_plan(code: str, name: str, held: int, avg_cost: float, price: float
             "new_avg_cost": round(new_avg, 6) if held else None,
             "summary": note,
             "tiers": per_tier}
+
+
+def spike_reduce_state(bars: list[dict], conf: dict | None = None, *,
+                       code: str = "", cost: float = 0.0, held: int = 0,
+                       sellable: int | None = None, price: float = 0.0,
+                       first_date: str = "", today: str = "",
+                       quote_date: str = "", t_plus_0: bool = False) -> dict:
+    """异常波动减持（2026-11-08 用户要求，**纯函数，只产建议，不成交**）。
+
+    场景（02513 两周内实测两次）：空头排列里突然单日 +9%（无实质利好），
+    随后一周 -12%~-23%。做T高抛只看「价格高于均线基准」（暴跌后的反弹日
+    价格仍低于 MA20，触发不了），趋势减仓看破位 —— 两者对「暴涨出货机会」
+    都沉默。本函数补的是**空头排列中的单日异常拉升 → 建议减持底仓一部分**。
+
+    判据**纯量价**：「是否有实质利好」AI 不代判 —— 建议文案里明确要求用户
+    自行核对当日公告/新闻（无利好 = 情绪/资金驱动，按反弹减持纪律处理）。
+    - 触发：单日涨幅 ≥ spike_pct **且** 放量（当日量/前5日均量 ≥ vol_mult，
+      0=不看量）**且** 空头排列（trend_gate）
+    - 单向：**多头排列里的暴涨不劝减**（那是趋势本身，减了就接不回来）
+    - 回放防噪：fire 后 armed=False，**收盘跌回触发日前收盘之下**（暴涨完全
+      回吐 = 反弹失败）才重新武装；排列转多重置计数。一段趋势最多
+      max_reductions 次，fresh_days 内有效（过期不催 —— 与 trend_reduce 同款）
+    """
+    c = {**(T_DEFAULTS.get("spike") or {}), **(conf or {})}
+    out = {"enabled": bool(c.get("enabled")), "code": code, "price": price,
+           "held": int(held or 0), "action": "none", "shares": 0, "shares_raw": 0,
+           "spike_pct": float(c.get("spike_pct") or 8),
+           "vol_mult": float(c.get("vol_mult") or 0),
+           "fresh_days": int(c.get("fresh_days") or 2),
+           "max_reductions": int(c.get("max_reductions") or 2),
+           "fires": 0, "last_spike_date": None, "last_spike_pct": None,
+           "last_vol_ratio": None, "last_fire_price": None,
+           "days_since_fired": None, "fresh": False,
+           "why": "", "invalidate": ""}
+    if not out["enabled"]:
+        out["why"] = "异常波动减持未启用（paper.t_trading.spike.enabled）"
+        return out
+    # 归一（与 _clean_daily_bars 同思路，但**保留成交量**——放量判据要用）。
+    # ⚠️ 量字段两套口径并存：paper_trading.fetch_kline_ohlcv 产出 **vol**，
+    # 我方测试夹具用 volume —— 两个键都收（AGENTS.md「字段口径不同」坑）。
+    rows = []
+    for b in bars or []:
+        try:
+            cl = float(b.get("close")) if b.get("close") is not None else None
+        except (TypeError, ValueError):
+            cl = None
+        if cl is None or not cl:
+            continue
+        d = str(b.get("date") or "")[:10]
+        v_raw = b.get("vol") if b.get("vol") is not None else b.get("volume")
+        try:
+            v = float(v_raw) if v_raw is not None else None
+        except (TypeError, ValueError):
+            v = None
+        rows.append((d, cl, v))
+    rows.sort(key=lambda x: x[0])
+    seen: set[str] = set()
+    uniq = []
+    for d, cl, v in rows:
+        if d and d in seen:
+            uniq[-1] = (d, cl, v)        # 同日取后一条（与 _clean_daily_bars 一致）
+            continue
+        seen.add(d)
+        uniq.append((d, cl, v))
+    dates = [r[0] for r in uniq]
+    closes = [r[1] for r in uniq]
+    vols = [r[2] for r in uniq]
+    n = len(closes)
+    if n < 21:
+        out["why"] = f"日K 不足 21 根（{n}），判不了趋势与异常拉升"
+        return out
+    start_i = 1
+    if first_date:
+        fd = str(first_date)[:10]
+        start_i = max(1, next((i for i, d in enumerate(dates) if d >= fd), 1))
+
+    def _vol_ratio(i: int):
+        if out["vol_mult"] <= 0:
+            return None
+        if not vols[i]:
+            return None
+        pv = [v for v in vols[max(0, i - 5):i] if v]
+        if len(pv) < 3:
+            return None
+        return vols[i] / (sum(pv) / len(pv))
+
+    armed = True
+    fires = 0
+    last_fire_i = None
+    last_fire = None            # (date, close, pct, volr, pre_close)
+    for i in range(start_i, n):
+        pc = closes[i - 1] if i >= 1 else None
+        if not pc:
+            continue
+        m20 = sum(closes[i - 19:i + 1]) / 20.0
+        m60 = sum(closes[i - 59:i + 1]) / 60.0 if i >= 59 else None
+        # 排列转多：暴涨成了趋势本身，重置计数重新武装
+        if m60 and closes[i] > m20 > m60:
+            fires = 0
+            armed = True
+        gated = bool(c.get("trend_gate")) and not (
+            m60 and closes[i] < m20 < m60)
+        pct = (closes[i] / pc - 1) * 100.0
+        volr = _vol_ratio(i)
+        hit = pct >= out["spike_pct"] and (
+            out["vol_mult"] <= 0 or (volr is not None and volr >= out["vol_mult"]))
+        if (armed and not gated and hit
+                and fires < out["max_reductions"]):
+            fires += 1
+            armed = False
+            last_fire_i = i
+            last_fire = (dates[i], closes[i], pct, volr, pc)
+        # 暴涨完全回吐（收盘跌回触发日前收盘）→ 反弹失败，重新武装
+        if not armed and last_fire and closes[i] < last_fire[4]:
+            armed = True
+    out["fires"] = fires
+    shares, raw = _trend_shares(code, held, float(c.get("reduce_pct") or 20),
+                                sellable, lot_size(code))
+    out["shares"], out["shares_raw"] = shares, raw
+    if last_fire:
+        out["last_spike_date"], out["last_fire_price"], out["last_spike_pct"], \
+            out["last_vol_ratio"], _ = last_fire
+        out["days_since_fired"] = (n - 1 - last_fire_i) if last_fire_i is not None else None
+        out["fresh"] = (out["days_since_fired"] is not None
+                        and out["days_since_fired"] <= out["fresh_days"])
+    if out["fresh"] and shares > 0:
+        out["action"] = "spike_reduce"
+        vr = (f"、量比 {out['last_vol_ratio']:.2f}"
+              if out["last_vol_ratio"] else "")
+        out["why"] = (
+            f"{out['last_spike_date']} 单日 +{out['last_spike_pct']:.2f}%{vr}，"
+            f"空头排列中的异常拉升：建议减持底仓 {c.get('reduce_pct'):g}%"
+            f"（{shares} 股，现价 {price:g}）。纪律：反弹减持**不接回**"
+            f"（除非趋势反转）。⚠ 利好核查：")
+        out["invalidate"] = "收盘重新站稳 MA20 且 MA20 上穿 MA60（趋势反转，减持建议作废）"
+    elif fires:
+        out["why"] = (f"异常拉升曾在 {out['last_spike_date']} 触发（第 {fires} 次），"
+                      "已超出有效期或处于「待回吐确认」，本轮不重复提示")
+    else:
+        out["why"] = "建仓以来无达标异常拉升（单日涨幅/放量/趋势闸门未同时满足）"
+    return out
+
+
+# 异常拉升「利好搜证」结果缓存：{(code, spike_date): verdict dict}。
+# 同一事件只搜证一次 —— 建议线程 15 分钟一轮，不缓存会每轮烧一次 LLM；
+# spike 换了日期（新事件）自然换 key。
+_SPIKE_VERIFY_CACHE: dict = {}
+
+
+def spike_verify(deps: dict, code: str, name: str, spike: dict,
+                 conf: dict | None = None) -> dict:
+    """异常拉升的「利好全面搜证 + AI 判定」（2026-11-08 用户要求）。
+
+    用户原话：「消息面必须准确，必须反复确认确实不存在利好的，不然误判我就
+    寄了 —— AI 全面暴力搜索，联网搜索、公众号搜索、B站评论等一切办法验证」。
+
+    证据源（全部 best-effort，单源失败记入 errs 不中断）：
+      ① news_fn      权威新闻（sa_news 近 7 天，多渠道）
+      ② event_news_fn 解禁/禁售/股份事件（180 天窗口）
+      ③ mp_retrieval 公众号语义检索（Milvus，可选，挂了就跳过）
+      ④ searxng      联网搜索 2 条 query（101 自建；url 未配则跳过）
+      ⑤ social_fn    社媒热度/情绪（公众号/B站/微博/X 三层）
+    判定：llm_advisor（task=fast）。**判定纪律（保守方向）**：
+    - positive 需要可溯源的具体事件（公告级/权威媒体确认）；
+    - 证据不足、源全挂、LLM 失败 → 一律 **uncertain**；
+    - **verdict != none（含 uncertain）→ 减持建议撤回**：宁可错过一次出货，
+      不把真反转卖飞。只有「确信无利好」才保留减持建议。
+
+    返回 verdict dict（就地写入 spike["verify"]），并按 (code, spike_date) 缓存。
+    """
+    c = {**T_DEFAULTS.get("spike", {}), **(conf or {})}
+    spike_date = str(spike.get("last_spike_date") or "")
+    key = (code, spike_date)
+    cached = _SPIKE_VERIFY_CACHE.get(key)
+    if cached is not None:
+        return cached
+    out = {"verdict": "uncertain", "confidence": 0, "reason": "",
+           "key_evidence": [], "sources": [], "errs": [],
+           "searched_at": datetime.now().isoformat(timespec="seconds")}
+    get_conn = (deps or {}).get("get_conn")
+
+    def _add(src_note: str, items: list[str]):
+        out["sources"].append(src_note)
+        ev.extend(items[:15])
+
+    ev: list[str] = []
+    news_fn = (deps or {}).get("news_fn")
+    if callable(news_fn):
+        try:
+            rows = news_fn(code) or []
+            titles = []
+            for r in rows[:15]:
+                t = (r.get("title") or "").strip() if isinstance(r, dict) else str(r)
+                src = (r.get("source") or "") if isinstance(r, dict) else ""
+                pt = str((r.get("publish_time") or ""))[:16] if isinstance(r, dict) else ""
+                if t:
+                    titles.append(f"[{pt}]({src}) {t}")
+            _add(f"权威新闻 {len(rows)} 条", titles)
+        except Exception as exc:                        # noqa: BLE001
+            out["errs"].append(f"新闻: {str(exc)[:80]}")
+    else:
+        out["errs"].append("deps 缺 news_fn")
+
+    evn_fn = (deps or {}).get("event_news_fn")
+    if callable(evn_fn):
+        try:
+            lines = evn_fn(code) or []
+            _add(f"解禁/股份事件 {len(lines)} 条",
+                 [str(x)[:120] for x in lines[:8]])
+        except Exception as exc:                        # noqa: BLE001
+            out["errs"].append(f"事件: {str(exc)[:80]}")
+
+    soc_fn = (deps or {}).get("social_fn")
+    if callable(soc_fn):
+        try:
+            soc = soc_fn(code, name) or {}
+            brief = json.dumps(soc, ensure_ascii=False, default=str)[:900]
+            _add("社媒热度/情绪（公众号/B站/微博/X）", [brief])
+        except Exception as exc:                        # noqa: BLE001
+            out["errs"].append(f"社媒: {str(exc)[:80]}")
+
+    if get_conn is not None:
+        try:
+            import mp_retrieval as _mpr
+            mc = _mpr.load_conf({})
+            if mc.get("enabled"):
+                with get_conn() as conn:
+                    cur = conn.cursor()
+                    ctx = _mpr.build_context(cur, code, name, conf=mc)
+                if ctx:
+                    _add("公众号语义检索（Milvus）", [str(ctx)[:1200]])
+                else:
+                    out["sources"].append("公众号语义检索：无相关文章")
+        except Exception as exc:                        # noqa: BLE001
+            out["errs"].append(f"公众号检索: {str(exc)[:80]}")
+
+    try:
+        import news_fetcher as _nf
+        nf_conf = _nf.load_config()
+        base = (((nf_conf.get("channels") or {}).get("searxng") or {}).get("url") or "").strip()
+        if base:
+            for kw in (f"{name} 公告", f"{name} 利好 OR 业绩 OR 中标 OR 回购 OR 签约"):
+                try:
+                    hits = _nf.fetch_searxng(code, name, 6, nf_conf, keyword=kw)
+                    _add(f"联网搜索「{kw}」{len(hits)} 条",
+                         [f"{h.get('title', '')} {h.get('url', '')}"[:140]
+                          for h in hits[:6]])
+                except Exception as exc:                # noqa: BLE001
+                    out["errs"].append(f"联网「{kw}」: {str(exc)[:60]}")
+        else:
+            out["sources"].append("联网搜索：未配置 searxng url，跳过")
+    except Exception as exc:                            # noqa: BLE001
+        out["errs"].append(f"联网搜索: {str(exc)[:80]}")
+
+    # ---- LLM 判定（fast 档；失败重试一次；失败 → uncertain）----
+    evidence = "\n".join(ev)[:6000] or "（各证据源均未取得内容）"
+    sys_p = ("你是上市公司的消息面核查员。任务：判断某只股票在指定日期的突然大涨"
+             "**是否有实质性利好支撑**。实质性利好 = 公告级/权威媒体确认的具体事件"
+             "（业绩预增、大额订单、回购、重组、政策落地、获批等）。"
+             "股价波动本身、技术面、情绪面、自媒体猜测**都不算**。"
+             "判定纪律：证据不足或互相矛盾 → uncertain；绝不脑补。"
+             "只输出 JSON：{\"verdict\":\"positive|none|uncertain\","
+             "\"confidence\":0-10,\"reason\":\"...\","
+             "\"key_evidence\":[\"最关键的证据，逐条\"]}")
+    user_p = (f"股票：{name}（{code}）。异常拉升日：{spike_date}"
+              f"（单日 +{spike.get('last_spike_pct')}%，量比 "
+              f"{spike.get('last_vol_ratio')}）。该股处于下行趋势中。\n"
+              f"以下是多渠道检索到的近 7 天信息：\n{evidence}\n\n"
+              "请判定这次大涨有无实质性利好。")
+    try:
+        import llm_advisor as _la
+        raw = ""
+        llm_ok = False
+        # max_tokens=3000：fast 档是推理模型，思考要花 token —— 800 会全花在
+        # 思考上、正文为空（AGENTS.md「stop_reason=max_tokens + 空内容」坑）。
+        for attempt in (1, 2):                          # 网关偶发失败重试一次
+            try:
+                raw = _la.ask(sys_p, user_p, task="fast",
+                              max_tokens=3000) or ""
+                break
+            except Exception as exc:                    # noqa: BLE001
+                out["errs"].append(f"LLM#{attempt}: {str(exc)[:80]}")
+        parsed = (PT._extract_json(raw) if raw else None) or {}
+        v = str(parsed.get("verdict") or "").lower()
+        if v in ("positive", "none", "uncertain"):
+            llm_ok = True
+            out["verdict"] = v
+            try:
+                out["confidence"] = int(parsed.get("confidence") or 0)
+            except (TypeError, ValueError):
+                pass
+            out["reason"] = str(parsed.get("reason") or "")[:300]
+            ke = parsed.get("key_evidence") or []
+            out["key_evidence"] = [str(x)[:160] for x in ke[:5]]
+        else:
+            out["errs"].append(f"LLM 输出不可解析: {raw[:120]}")
+    except Exception as exc:                            # noqa: BLE001
+        out["errs"].append(f"LLM 调用: {str(exc)[:80]}")
+    out["llm_ok"] = llm_ok
+
+    # ---- 闸门（保守方向）----
+    min_conf = int(c.get("verify_min_confidence") or 6)
+    if out["verdict"] != "none" or out["confidence"] < min_conf:
+        # 非「确信无利好」→ 撤回减持建议（uncertain/positive/低置信同罚）
+        out["suppress"] = True
+    else:
+        out["suppress"] = False
+    # 只有 LLM **成功**才缓存 —— 失败的 verdict 缓存住会让 15 分钟循环永远
+    # 拿到 uncertain、再也不重试（2026-11-08 真跑 503 逮到的设计缺陷）。
+    # 失败 → 不缓存，下一轮建议自动重试。
+    if llm_ok:
+        _SPIKE_VERIFY_CACHE[key] = out
+    return out
 
 
 def trend_reduce_state(bars: list[dict], conf: dict | None = None, *,
@@ -1221,16 +1559,21 @@ BIAS_LABEL = {
 def t_bias(trend: str, intraday: dict | None, price: float) -> dict:
     """判定做T方向。**这是「方向对不对」的落点。**
 
-    只用均线排列（日频）+ 现价相对日内 VWAP（日频+日内）两个**已实测可得**的
-    量，不引入无法验证的指标。四档：
+    **方向档位以日频均线排列为准**（2026-11-08 用户裁决），VWAP 从「必要条件」
+    降为辅助信息 —— 旧逻辑要求 bear=空头排列**且**跌破日内 VWAP，结果单边
+    下跌股收盘恰好略高于当日均价（实测 02513 只差 0.08%）就整档落进「震荡」，
+    给出经典高抛低吸（买回无止跌确认）= 鼓励下跌途中接回。对深跌持仓是
+    实打实的伤害。四档：
 
-    - **bull  上行**：多头排列且价在 VWAP 之上。→ 高抛门槛 ×2（**别急着卖**，
-      上涨途中的第一次回落通常很浅）、买回门槛 ×0.7（**尽快接回**，顺势持仓）
-    - **bear  下行**：空头排列且价在 VWAP 之下。→ 高抛门槛 ×0.7（反弹就减）、
-      买回门槛 ×2 **且强制要止跌确认**（不接下跌途中的下跌）
-    - **range 震荡**：双向都按原门槛（经典高抛低吸）
-    - **flat  方向不明**：**什么都不做**。理由说不清的时候不动手，
-      这比「总要选个方向」安全
+    - **bull  上行**：均线多头排列。→ 高抛门槛 ×2（**别急着卖**，上涨途中的
+      第一次回落通常很浅）、买回门槛 ×0.7（**尽快接回**，顺势持仓）
+    - **bear  下行**：均线空头排列。→ 高抛门槛 ×0.7（**反弹就减** —— 哪怕当日
+      收在日内均价上方，收在均线上方的下跌股那一天也是反弹）、买回门槛 ×2
+      **且强制要止跌确认**（不接下跌途中的下跌）
+    - **range 震荡**：均线无方向（flat 排列）且**有**日内 VWAP。双向原门槛
+      （经典高抛低吸）
+    - **flat  方向不明**：均线 flat 且无日内数据。**什么都不做** ——
+      理由说不清的时候不动手，比「总要选个方向」安全
 
     ⚠️ 这不是「预测涨跌」。它决定的是**先做哪一步**：同样是涨，
     上行时先买回、震荡时先卖出。方向判错 → 步骤反了 → 就是做反T。
@@ -1239,26 +1582,27 @@ def t_bias(trend: str, intraday: dict | None, price: float) -> dict:
     vwap = it.get("vwap")
     above_vwap = (vwap and price and price > float(vwap))
     below_vwap = (vwap and price and price < float(vwap))
-    if trend == "up" and above_vwap:
+    if trend == "up":
         b = "bull"
-    elif trend == "down" and below_vwap:
+    elif trend == "down":
         b = "bear"
-    elif trend == "flat" and not (vwap and price):
+    elif not (vwap and price):
         b = "flat"
     else:
         b = "range"
     sm, bm, need_stab = BIAS_RULES.get(b, BIAS_RULES["range"])
+    _vw = "%.4f" % float(vwap) if vwap else "无"
+    _pos = "站上" if above_vwap else ("跌破" if below_vwap else "缺")
     why = {
-        "bull": "均线多头排列且现价 %s 日内均价（%.4f vs %.4f）——顺势做：先买回、涨透再抛" % (
-            "站上", price, float(vwap) if vwap else 0),
-        "bear": "均线空头排列且现价 %s 日内均价（%.4f vs %.4f）——逆势做：反弹就减、跌透且止跌才接" % (
-            "跌破", price, float(vwap) if vwap else 0),
-        "range": "无明显单边（%s，%s VWAP %.4f）——经典高抛低吸：先卖后买" % (
-            BIAS_LABEL.get(trend, trend),
-            "站上" if above_vwap else ("跌破" if below_vwap else "缺"), float(vwap) if vwap else 0),
-        "flat": "方向判不出来（均线排列 %s、%s VWAP）——**宁可不做**" % (
-            BIAS_LABEL.get(trend, trend),
-            "有" if vwap else "无"),
+        "bull": "均线多头排列（日频为准；现价%s日内均价 %.4f）——顺势做：先买回、涨透再抛" % (
+            _pos, float(vwap) if vwap else 0),
+        "bear": "均线空头排列（日频为准；现价%s日内均价 %.4f）——逆势做：反弹就减"
+                "（当日收在均价上方也只是反弹，不是反转）、跌透且止跌确认才接" % (
+            _pos, float(vwap) if vwap else 0),
+        "range": "均线无方向（flat 排列）且日内 VWAP %.4f 可用——经典高抛低吸：先卖后买" % (
+            float(vwap) if vwap else 0),
+        "flat": "方向判不出来（均线排列 %s 且缺日内 VWAP）——**宁可不做**" % (
+            BIAS_LABEL.get(trend, trend)),
     }[b]
     return {"bias": b, "label": BIAS_LABEL.get(b, b), "sell_mult": sm,
             "buy_mult": bm, "need_stab": need_stab, "why": why,
@@ -1448,7 +1792,9 @@ def advisory(deps: dict, conf: dict, positions: dict, today: str = "",
         _lb = max(80, min(800, int(tr.get("lookback_days") or 180)))
     except (TypeError, ValueError):
         _lb = 180
-    bars_days = min(800, _lb + 60) if tr_on else 60
+    # spike（异常波动减持，2026-11-08）也要长窗：从建仓日回放找历史异常拉升。
+    spk_on = bool((c.get("spike") or {}).get("enabled"))
+    bars_days = min(800, _lb + 60) if (tr_on or spk_on) else 60
     em_kline_fn = deps.get("em_kline_fn")
     tx_symbol_fn = deps.get("tx_symbol_fn") or MD.tx_symbol
     fetch_quotes = _quotes_fn(deps)
@@ -1551,6 +1897,60 @@ def advisory(deps: dict, conf: dict, positions: dict, today: str = "",
                 quote_date=str(q.get("updated_at") or q.get("date") or ""),
                 t_plus_0=t_plus_0)
             it["trend"] = trend_adv
+        # 异常波动减持（2026-11-08）：空头排列里的单日暴涨+放量 → 建议减持底仓。
+        # 只给建议；与 trend_adv 并列计算，覆盖优先级**低于**趋势减仓。
+        # （spk_on 在 bars_days 计算处已定义 —— spike 也要长窗）
+        spike_adv = None
+        if spk_on:
+            try:
+                spike_adv = spike_reduce_state(
+                    bars_daily, c.get("spike") or {}, code=code, cost=cost,
+                    held=held, sellable=sellable, price=price,
+                    first_date=first_date, today=today,
+                    quote_date=str(q.get("updated_at") or q.get("date") or ""),
+                    t_plus_0=t_plus_0)
+                it["spike"] = spike_adv
+                # 利好搜证闸门（2026-11-08 用户要求「消息面必须准确」）：
+                # AI 全面检索（新闻/事件/公众号语义/联网/社媒）后判定，
+                # **只有「确信无利好」才保留减持建议** —— positive/uncertain/
+                # 搜证失败一律撤回：宁可错过一次出货，不把真反转卖飞。
+                if spike_adv.get("action") == "spike_reduce":
+                    try:
+                        vd = spike_verify(deps, code, name, spike_adv,
+                                          c.get("spike") or {})
+                        spike_adv["verify"] = {
+                            k: vd.get(k) for k in
+                            ("verdict", "confidence", "reason", "key_evidence",
+                             "sources", "errs")}
+                        if vd.get("suppress"):
+                            spike_adv["action"] = "none"
+                            _pos = vd.get("verdict") == "positive"
+                            spike_adv["why"] = (
+                                (f"检测到疑似**实质利好**（AI 判定 positive，"
+                                 f"置信 {vd.get('confidence')}/10）：{vd.get('reason')}"
+                                 if _pos else
+                                 f"利好核查**无法确认「无利好」**（判定 "
+                                 f"{vd.get('verdict')}，置信 {vd.get('confidence')}/10；"
+                                 f"已检源：{'; '.join(vd.get('sources') or []) or '无'}；"
+                                 f"失败源：{'; '.join(vd.get('errs') or []) or '无'}）")
+                                + " —— 异常拉升减持建议**已撤回**：宁可错过出货，"
+                                  "不把真反转卖飞。请人工核对当日公告。")
+                        else:
+                            spike_adv["why"] = (
+                                spike_adv["why"].split("⚠ 利好核查：")[0]
+                                + f"AI 已检索 {len(vd.get('sources') or [])} 类"
+                                f"证据源（{'; '.join(vd.get('sources') or [])}），"
+                                f"未发现实质利好（置信 {vd.get('confidence')}/10）："
+                                f"{vd.get('reason')}")
+                    except Exception as exc:            # noqa: BLE001
+                        spike_adv["action"] = "none"
+                        spike_adv["verify"] = {"verdict": "uncertain",
+                                               "errs": [str(exc)[:120]]}
+                        spike_adv["why"] = (f"利好搜证失败（{str(exc)[:80]}），"
+                                            "无法确认「无利好」，减持建议**已撤回**"
+                                            "——请人工核对当日公告")
+            except Exception as exc:                # noqa: BLE001
+                print(f"[做T] {code} 异常波动判定失败（忽略）: {exc}", flush=True)
         if not anchor_info and cost:
             anchors = {"L0_cost": {"anchor": round(cost, 4), "now": round(price, 4),
                                    "edge_pct": round((price / cost - 1) * 100, 4),
@@ -1627,6 +2027,41 @@ def advisory(deps: dict, conf: dict, positions: dict, today: str = "",
                     it["ticket"]["note"] = note
                 if it.get("big_drop"):
                     it["ticket"]["big_drop"] = it["big_drop"]
+
+        # 异常拉升减持覆盖：优先级**低于**趋势减仓（趋势已给出单向卖出时不再
+        # 叠加，同一个仓位收到两个「卖」的建议只会让人反复下单）。同样只覆盖
+        # 建议与展示，decide/_execute_one 一个字节没动。
+        if (spk_on and spike_adv and spike_adv.get("action") == "spike_reduce"
+                and int(spike_adv.get("shares") or 0) > 0
+                and not (tr_on and trend_adv
+                         and trend_adv.get("action") in TREND_ACTIONS)):
+            old_act = it["action"]
+            old_why = it.get("why") or ""
+            s_shares = int(spike_adv["shares"])
+            it["t_action"] = old_act
+            it.update({
+                "action": "spike_reduce", "shares_suggest": s_shares,
+                "why": spike_adv.get("why", ""),
+                "action_label": SPIKE_LABEL.get("spike_reduce", "异常拉升减持"),
+                "invalidate": spike_adv.get("invalidate", ""),
+                # 做T专有字段清掉（与趋势覆盖同理：拿做T门槛解释单向减仓会撒谎）
+                "edge_pct": None, "threshold": None, "anchor_price": None,
+                "layer": "", "movable": 0, "base_shares": held,
+                "pending": False, "stabilizing": None,
+            })
+            it["override_note"] = (
+                f"做T 本轮本来要接回，已被异常波动规则覆盖：暴涨出货优先，"
+                f"减了不接回（原判：{old_why[:60]}）" if old_act == "t_buy" else
+                (f"做T 本轮也判了高抛（{old_why[:60]}）—— **只执行这一条**，"
+                 "区别是异常波动减持不接回，仓位永久降低" if old_act == "t_sell" else ""))
+            it["ticket"] = trend_ticket(
+                code, name, "spike_reduce", price, s_shares, c, fees_c,
+                invalidate=it["invalidate"], t_plus_0=t_plus_0,
+                sellable=sellable)
+            if it.get("override_note"):
+                it["ticket"]["note"] = it["override_note"]
+            if it.get("big_drop"):
+                it["ticket"]["big_drop"] = it["big_drop"]
         items.append(it)
 
         # 方向对错与盈亏**分开报**（借鉴 TradingAgents performance.py 的教训）

@@ -360,3 +360,185 @@ if FAILS:
         print("  -", f)
     sys.exit(1)
 print("ALL DONE")
+
+
+# ---------------- t_bias 方向判定（2026-11-08 用户裁决后的口径） ----------------
+
+def test_t_bias():
+    print("\n== t_bias：方向档位以日频均线排列为准，VWAP 降为辅助 ==")
+    intraday = {"vwap": 425.84}
+    # 单边下跌 + 收盘恰高于 VWAP（实测 02513 案例：426.2 vs 425.84 差 0.08%）
+    b = TT.t_bias("down", intraday, 426.2)
+    ok(b["bias"] == "bear" and b["sell_mult"] == 0.7 and b["buy_mult"] == 2.0,
+       f"空头排列即 bear（旧逻辑此处是 range；实际 {b['bias']}）")
+    ok(b["need_stab"] is True, "bear 买回需止跌确认")
+    ok("反弹" in b["why"] and "不是反转" in b["why"],
+       "why 文案说明「收在均价上方也只是反弹」")
+    # 强反弹日（价远超 VWAP）仍是 bear —— 反弹就减
+    b2 = TT.t_bias("down", intraday, 440.0)
+    ok(b2["bias"] == "bear", "下跌趋势中强反弹日仍 bear（不鼓励接回）")
+    # VWAP 缺失时 down 不再落进 range（旧逻辑的边缘坑）
+    b3 = TT.t_bias("down", None, 426.2)
+    ok(b3["bias"] == "bear" and "缺" in b3["why"], "down + 无 VWAP → bear（不再误判震荡）")
+    # 对称：bull 只看多头排列
+    b4 = TT.t_bias("up", {"vwap": 500.0}, 480.0)   # 价低于 VWAP 的上行回踩日
+    ok(b4["bias"] == "bull" and b4["sell_mult"] == 2.0 and b4["buy_mult"] == 0.7,
+       "多头排列即 bull（对称放宽，上行回踩日不再降档）")
+    # range 只在 flat 排列且有 VWAP 时出现
+    b5 = TT.t_bias("flat", {"vwap": 100.0}, 100.5)
+    ok(b5["bias"] == "range" and b5["sell_mult"] == 1.0, "flat 排列 + 有 VWAP → range 原门槛")
+    b6 = TT.t_bias("flat", None, 100.0)
+    ok(b6["bias"] == "flat", "flat 排列 + 无 VWAP → 宁可不做")
+
+
+test_t_bias()
+
+
+# ---------------- 异常波动减持 spike_reduce_state（2026-11-08） ----------------
+
+def _mkbars(closes_vols):
+    """[('2026-01-02', close, vol), ...] -> bars dict 列表（含 low=close*0.99）。"""
+    return [{"date": d, "close": c, "low": c * 0.99, "volume": v}
+            for d, c, v in closes_vols]
+
+
+def _downtrend_then_spike(spike_pct=9.55, spike_vol=14800, n_pre=70):
+    """前 70 日阴跌（空头排列，必须有 ≥60 根否则 MA60 缺失、trend_gate 恒拦），
+    最后一天异常拉升。"""
+    from datetime import date, timedelta
+    bars = []
+    price = 1000.0
+    for i in range(n_pre):
+        d = (date(2026, 1, 1) + timedelta(days=i)).isoformat()
+        price = price * 0.985          # 阴跌 → close<MA20<MA60
+        bars.append((d, round(price, 2), 10000))
+    last = bars[-1]
+    spike_close = round(last[1] * (1 + spike_pct / 100), 2)
+    bars.append(("2026-12-31", spike_close, spike_vol))
+    return _mkbars(bars)
+
+
+def test_spike_reduce():
+    print("\n== spike_reduce_state：异常拉升减持 ==")
+    SPK = {k: v for k, v in TT.T_DEFAULTS["spike"].items()}
+    bars = _downtrend_then_spike()
+    r = TT.spike_reduce_state(bars, SPK, code="600001", cost=900.0, held=800,
+                              price=bars[-1]["close"],
+                              first_date="2026-01-05", today="2026-12-31")
+    ok(r["fires"] == 1 and r["action"] == "spike_reduce" and r["fresh"] is True,
+       f"空头排列 + 单日{SPK['spike_pct']}% + 放量 → 触发（fires={r['fires']} action={r['action']}）")
+    ok(r["shares"] == 100 and r["shares_raw"] == 160,
+       f"减持 800×20%=160 股 → 整手取整 100 股（实际 {r['shares']}，名义 {r['shares_raw']}）")
+    ok("自行核对" not in r["why"] and r["why"].endswith("利好核查："),
+       "why 尾部是核查占位（advisory 拼接核查结论）")
+    # 量比不足 → 不触发（vol_mult=1.2，spike_vol 10500 ≈ 1.05 倍）
+    bars2 = _downtrend_then_spike(spike_vol=10500)
+    r2 = TT.spike_reduce_state(bars2, SPK, code="600001", held=800,
+                               first_date="2026-01-05")
+    ok(r2["fires"] == 0 and r2["action"] == "none",
+       "缩量假拉升（量比 <1.2）不触发")
+    # vol_mult=0 → 不看量，缩量也触发
+    r2b = TT.spike_reduce_state(bars2, {**SPK, "vol_mult": 0}, code="600001",
+                                held=800, first_date="2026-01-05")
+    ok(r2b["fires"] == 1, "vol_mult=0 关闭量过滤后触发")
+    # 多头排列里暴涨不劝减（trend_gate）
+    up = []
+    p = 10.0
+    for i in range(41):
+        p = p * 1.004
+        up.append((f"2026-{(i % 12) + 1:02d}-{(i % 28) + 1:02d}", round(p, 2), 10000))
+    up.append(("2026-12-31", round(p * 1.10, 2), 20000))   # 多头 + 10%
+    r3 = TT.spike_reduce_state(_mkbars(up), SPK, code="600001", held=800,
+                               first_date="2026-01-05")
+    ok(r3["fires"] == 0, "多头排列里的暴涨不劝减（trend_gate）")
+    # 回吐后重新武装：fire → 暴跌回吐 → 再暴涨 → 第二次 fire
+    bars3 = _downtrend_then_spike()
+    pre_close = bars3[-2]["close"]
+    bars3.append({"date": "2027-01-05", "close": pre_close * 0.9,   # 完全回吐+继续跌
+                  "low": pre_close * 0.88, "volume": 10000})
+    bars3.append({"date": "2027-01-06", "close": pre_close * 0.9 * 1.09,
+                  "low": pre_close * 0.85, "volume": 15000})        # 再次异常拉升
+    r4 = TT.spike_reduce_state(bars3, {**SPK, "max_reductions": 3},
+                               code="600001", held=800, first_date="2026-01-05")
+    ok(r4["fires"] == 2, f"回吐后重新武装，第二次拉升再触发（fires={r4['fires']}）")
+    # max_reductions 上限
+    r5 = TT.spike_reduce_state(bars3, SPK, code="600001", held=800,
+                               first_date="2026-01-05")   # max=2 → 已达上限
+    ok(r5["fires"] <= 2, f"max_reductions=2 封顶（fires={r5['fires']}）")
+    # 未启用
+    r6 = TT.spike_reduce_state(bars, {**SPK, "enabled": False}, code="x",
+                               held=800, first_date="2026-01-05")
+    ok(r6["action"] == "none" and "未启用" in r6["why"], "开关关闭 → 不触发")
+
+
+def test_spike_verify_gate():
+    print("\n== spike_verify：利好搜证闸门（保守方向） ==")
+    deps = {
+        "get_conn": None,
+        "news_fn": lambda code: [
+            {"title": "技术性反弹", "source": "东财", "publish_time": "2026-12-31 10:00"},
+            {"title": "板块轮动", "source": "新浪", "publish_time": "2026-12-30 09:00"},
+        ],
+        "event_news_fn": lambda code: [],
+        "social_fn": lambda code, name: {"direct": 0, "hot": []},
+    }
+    spike = {"last_spike_date": "2026-12-31", "last_spike_pct": 9.55,
+             "last_vol_ratio": 1.48}
+    # LLM 判 none + 置信 7 → 不撤回
+    import llm_advisor as LA
+    saved_ask = LA.ask
+    TT._SPIKE_VERIFY_CACHE.clear()
+    try:
+        LA.ask = lambda s, u, **kw: json.dumps(
+            {"verdict": "none", "confidence": 7,
+             "reason": "均为技术性反弹讨论，无公告级利好",
+             "key_evidence": ["无业绩预告", "无回购公告"]})
+        vd = TT.spike_verify(deps, "600001", "测试股", spike)
+        ok(vd["verdict"] == "none" and vd["suppress"] is False,
+           "确信无利好（置信7≥6）→ 保留减持建议")
+        ok("权威新闻 2 条" in "; ".join(vd["sources"]), "证据源计数可见")
+        # LLM 判 positive → 撤回
+        TT._SPIKE_VERIFY_CACHE.clear()
+        LA.ask = lambda s, u, **kw: json.dumps(
+            {"verdict": "positive", "confidence": 8,
+             "reason": "公司公告签订大额订单", "key_evidence": ["公告"]})
+        vd2 = TT.spike_verify(deps, "600001", "测试股", spike)
+        ok(vd2["suppress"] is True, "疑似实质利好 → 撤回减持建议")
+        # LLM uncertain → 撤回（保守）
+        TT._SPIKE_VERIFY_CACHE.clear()
+        LA.ask = lambda s, u, **kw: json.dumps(
+            {"verdict": "uncertain", "confidence": 3, "reason": "证据不足"})
+        vd3 = TT.spike_verify(deps, "600001", "测试股", spike)
+        ok(vd3["suppress"] is True, "拿不准 → 撤回（宁可错过出货不卖飞真反转）")
+        # LLM none 但置信低于门槛 → 撤回
+        TT._SPIKE_VERIFY_CACHE.clear()
+        LA.ask = lambda s, u, **kw: json.dumps(
+            {"verdict": "none", "confidence": 4, "reason": "似乎没有"})
+        vd4 = TT.spike_verify(deps, "600001", "测试股", spike,
+                              {"verify_min_confidence": 6})
+        ok(vd4["suppress"] is True, "低置信 none（4<6）→ 撤回")
+        # LLM 挂了 → 撤回
+        TT._SPIKE_VERIFY_CACHE.clear()
+        LA.ask = lambda s, u, **kw: (_ for _ in ()).throw(RuntimeError("网关超时"))
+        vd5 = TT.spike_verify(deps, "600001", "测试股", spike)
+        ok(vd5["suppress"] is True and vd5["errs"], "搜证/判定失败 → 撤回（保守方向）")
+        ok(not any(k == ("600001", "2026-12-31")
+                   for k in TT._SPIKE_VERIFY_CACHE),
+           "失败 verdict **不缓存** —— 下一轮自动重试（503 真跑逮到的设计缺陷）")
+        # 缓存：同事件第二次不再调 LLM
+        TT._SPIKE_VERIFY_CACHE.clear()
+        calls = {"n": 0}
+        def _ask(s, u, **kw):
+            calls["n"] += 1
+            return json.dumps({"verdict": "none", "confidence": 7, "reason": "ok"})
+        LA.ask = _ask
+        TT.spike_verify(deps, "600002", "缓存股", spike)
+        TT.spike_verify(deps, "600002", "缓存股", spike)
+        ok(calls["n"] == 1, "同 (code, spike_date) 只搜证一次（缓存）")
+    finally:
+        LA.ask = saved_ask
+        TT._SPIKE_VERIFY_CACHE.clear()
+
+
+test_spike_reduce()
+test_spike_verify_gate()
