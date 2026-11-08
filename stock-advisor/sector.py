@@ -461,7 +461,7 @@ def fetch_board_constituents(bk_code: str, limit: int = 20) -> list[dict]:
     """板块成分股（按涨幅降序前 limit 只）。bk_code 如 BK1515 或 881142。
 
     优先走 data_service（东财 clist 已于 2026-10-01 实测被 WAF 全封）。
-    服务端只给 code/name，没有涨跌幅 —— 涨跌幅用腾讯行情按 code 批量补，
+    服务端只给 code/name，没有涨跌幅 —— 涨跌幅用 101 行情按 code 批量补，
     这样「点板块行看成分股 + 红绿标注」的功能不丢。
     """
     if _data_service_url():
@@ -489,7 +489,7 @@ def fetch_board_constituents(bk_code: str, limit: int = 20) -> list[dict]:
 def _attach_quotes(items: list[dict]) -> list[dict]:
     """给只有 code/name 的成分股补涨跌幅。
 
-    用 `app.fetch_quotes`（腾讯 qt.gtimg.cn，**一次请求拿全部代码**）。
+    用 `app.fetch_quotes`（经 101 `/quote` 批量，超过 300 个符号会自动分批）。
     不要写成「循环里逐只拉 K 线」—— 那就是 20 只 = 20 个请求打同一 host，
     正是把东财烧死的那种模式（见 _sector_intraday_loop 的注释）。
 
@@ -511,7 +511,7 @@ def _attach_quotes(items: list[dict]) -> list[dict]:
             continue                          # 保持 None
         it["price"] = q.get("price")
         it["pct"] = q.get("change_pct")
-        it["main_inflow"] = q.get("main_inflow")   # 腾讯快照无此字段，恒 None
+        it["main_inflow"] = q.get("main_inflow")   # 101 快照无此字段，恒 None
     return items
 
 
