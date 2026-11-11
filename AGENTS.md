@@ -21,7 +21,7 @@
 |---|---|
 | `paper_anchor.py` | `seed_mirror`（一次性幂等镜像建仓，slot='seed'，实盘无该票记录→**降级 fresh 不编造成本**）/ `build_injection`（只对锚定票输出，其他票精确返回 ""）/ `refill_watch`（空仓起始日落库+交易日计数+超期推送当日去重）/ `status`（绩效聚合，全部从 sa_paper_trades 算，**不新增交易表**） |
 | 表 `sa_paper_anchor_state` | 每锚定票一行：status(anchored/empty)、empty_since/empty_days、seed_done/price/shares、last_alert_date |
-| `paper_trading.py` | `run_decisions`/`_execute_plans`/`_execute_decision` 加可选 `anchor_code`（默认 None→**逐字节不变**）：锚定票豁免「持仓满剔未持仓」+ 豁免持仓上限权威校验（否则空仓回补被其他持仓卡死）；`_execute_plans` 里锚定的卖/买**各自排最前**（稳定排序 tier，非锚定序不变）；追高闸门**不豁免**（风控不撤） |
+| `paper_trading.py` | `run_decisions`/`_execute_plans`/`_execute_decision` 加可选 `anchor_code`（默认 None→**逐字节不变**）：锚定票豁免「持仓满剔未持仓」+ 豁免持仓上限权威校验（否则空仓回补被其他持仓卡死）+ **豁免严格止损**（`check_stop_loss(..., anchor_code=)`，2026-11-09）；`_execute_plans` 里锚定的卖/买**各自排最前**（稳定排序 tier，非锚定序不变）；追高闸门**不豁免**（风控不撤） |
 | `app.py` | `_paper_run_cycle`：anchor.enabled 时**不收窄 targets**（独立轨道），只加 seed + refill_watch；deps 加 `holdings_fn`；端点 `GET /api/paper/anchor`、`POST /api/paper/anchor/seed` |
 | UI | 「🎯 锚定」tab：状态卡（空仓天数/超期徽标/成本线/已实现盈亏）+ 该票流水表 + 镜像建仓按钮 |
 
@@ -52,6 +52,132 @@
    找列名恒假。判据要落在真实对象上（第 N 次同类）。
 4. 截断分支没被集成测试走到（空仓块 ~350 字符 < cap 下限 400）→ 抽
    `_truncate()` 助手直接单测；「走不到的分支」集成断言会**静默假通过**。
+
+### 🔴 锚定股豁免严格止损（2026-11-09 用户明确要求）
+
+**用户原话**：**「锚定策略的股，不适用严格止损　盘中止损：现价 447.4 较成本 733.5388
+跌 -39.01%，触发止损线 -5%（免 LLM 自动执行）智谱这个策略错了，回撤，并且看看做他」**。
+
+**真因（不是判据写错，是规则用错对象）**：`check_stop_loss` 是「严格止损」，
+对 02513 这条锚定轨道是**反的**。锚定的使命（2026-11-08 用户原话「可以做 T 降低成本、
+空仓躲开暴跌，但**最后一定要买回来**」）里，「空仓躲暴跌」是**主动择时**，
+不是「跌到 -5% 就被强制清仓」。更具体地：
+
+- `sl = min(stop_loss_pct, cap)` 把 LLM 的止损收紧到 **5%**，而锚定票是**镜像实盘成本**
+  建仓的（`seed_price=730.905`）—— 建仓那一刻账面就已经在 −39%
+  （现价 447.4），**第一轮必然触发**，这不是「止损」，是「把既已存在的亏损落实成已实现亏损」。
+- 对比 `t_trading.trend_reduce` 的 `deep_dd_pct=25`：深亏时只提示不催卖
+  （「一路阴跌 40% 后再催割肉，多半割在阶段低点」）。**`check_stop_loss` 缺这一层**。
+- 实测后果（真库 `sa_paper_trades`）：2026-11-09 **两次**清仓
+  —— `id=1046` 10:00:14 @447.40、`id=1049` 10:30:22 @449.40，各 400 股。
+  中间还夹了一次**重新镜像建仓**（`seed` 买入 `id=1047`）→ 止损 → 再镜像 → 再止损，
+  一天打掉两轮手续费与滑点。
+
+#### 修法（可选参数，默认 `None` → 行为逐字节不变）
+
+| 位置 | 改动 |
+|---|---|
+| `paper_trading.check_stop_loss` 签名 | 加 `anchor_code: str \| None = None`（docstring 写明为什么锚定要豁免、以及「逐股 try/except 隔离」不变） |
+| 豁免位置 | **`for code in tradable:` 循环内、`try:` 之前**：命中锚定票就 `skipped.append({code,name,reason:"锚定股豁免严格止损，本轮不自动卖出"})` 并 `continue` —— 锚定票**根本不进**报价解析 / 止损数学 / T+1 / `_execute_decision` |
+| `app._paper_run_cycle` | `check_stop_loss(...)` 之前先归一化锚定配置：`_anchor = paper_anchor.load_conf(conf.get("anchor") or {})`，`_anchor_code = str(_anchor["code"]).strip() if enabled and code else ""`，然后 `check_stop_loss(deps, slot, anchor_code=_anchor_code or None)`；同一轮的 `run_decisions(..., anchor_code=_anchor_code or None)` 复用这个值 |
+
+**`seed_mirror` 必须留在止损之后**（这条是实发事故定的）：它原来和止损的顺序被写反过一次
+—— 同一轮刚播的镜像仓（`seed` 买入）会被紧接着的止损卖掉。现在顺序是
+**先止损 → 再 seed_mirror → 再 refill_watch**，`app.py` 里有注释钉住原因。
+
+**不豁免的东西**：追高闸门（`chase_check`）照旧对锚定票生效 —— 风控不撤；
+`trend_reduce` / 做 T 的建议逻辑一个字节没动（它们本来就只建议、不下单）。
+
+#### 可见性的诚实边界（别当成已覆盖）
+
+`build_miss_note(decided, sl=None)` **只读** `decided`（无 `executed` 且 action≠hold 的）
+与 `sl["failed"]`，**从不读 `sl["skipped"]`** ⇒ 锚定豁免那一条 `skipped` 记录
+**不会**进 `sa_paper_cycles.note`。它只出现在 `check_stop_loss` 的返回值与
+`[paper]` 日志里。前端也没有任何渲染（`:8450` 只渲染 `免 LLM 自动执行，无分析报告`）。
+要让它上页面属于交互口径，未做。
+
+#### 验证
+
+- 离线 `D:/tmp/probe_sl_anchor_offline.py` **18/18**（全 stub，不碰库不联网不真下单：
+  锚定票不进 `sold`、同轮其他票照常止损、锚定恰好出现一次 `skipped` 且理由精确、
+  **无 `FAILED`** ⇒ 不会误发 `paper_stoploss_failed` 告警、`quote_fn` 仍收到锚定代码
+  （豁免的是卖出，不是取数）、`checked==2` 两轮一致、`build_miss_note([], res) == ""`）；
+  基线对照组 `sold==['000001','02513']` 证明默认路径没变。
+- 重启后三次独立校验：监听 PID `21508`（created 11:35:58 > 改动 mtime 10:21:55）、
+  `GET /api/paper/status` 200、日志 marker `launcher start` / `import app done, 66.3s` /
+  `Uvicorn running`。
+- 真库只读复查：重启后 02513 **零**新增卖出；全天卖出恰好 2 笔（10:00 / 10:30）；
+  当前 **0** 条 open 买入行 ⇒ 锚定票在模拟盘里是空仓，豁免当下没有可拦的对象。
+- 周期台账 `sa_paper_cycles`：今天 10:00 / 10:30 / 11:00 / 11:30 四轮全部
+  `err=-`、`sk=0`，**最后一轮 11:30:32 早于 11:35:58 重启** ⇒ `[paper]` 零输出是正常的，
+  **新代码的真实链路要等 13:00 那一轮**（11:30–13:00 午休）。
+
+#### 踩的坑
+
+1. 🔴 **探针夹具的 `quote_fn` 返回形态写错**：`check_stop_loss` 里是
+   `price = q.get("price")` ⇒ 必须 `{code: {"price": float, ...}}`，写成
+   `{code: float}` 会 `AttributeError: 'float' object has no attribute 'get'`，
+   被逐股 `except` 吞成 `skipped` —— 首发 `pass=11 fail=7`，改夹具后 **18/18**。
+2. 🔴 **第 4 次「夹具/查询与生产 schema 不一致」**（前三次：60 根 vs 240 根、`t_action`、
+   `quote_fn` 形态）：抹查周期台账时按 `run_date` 查 `sa_paper_cycles` 直接崩 ——
+   真表 13 列、日期列叫 **`trade_date`**（没有 `run_date`）。**报错前先 `information_schema`
+   把列名列出来**，别按印象写 SQL。
+3. 我口头预估「共 17 项断言」，实际 **18**（13 A + 4 B + 1 C）—— 是数错不是漏测。
+4. 一处**概念判断错**并已更正：我一度说「锚定豁免会经 `build_miss_note` 写进
+   `sa_paper_cycles.note`」—— 错，`build_miss_note` 只读 `decided` + `failed`。
+
+#### ✅ 已按用户授权手工回撤（2026-11-09，用户原话「你帮我补买回吧，实在不行，手动帮我改数据库」）
+
+锚定票当时是**空仓且不会自动回补**：`sa_paper_anchor_state`
+`status='empty' / empty_since=2026-11-09 / seed_done=True`，而 `seed_mirror`
+在 `seed_done=True` 时**硬短路**，`refill_watch` **只推提醒、不下单**。
+
+**做法不是「再买一笔」，而是把误清仓那三笔按 `skipped` 回撤**（写数据的口径见
+`paper_trading` 既有语义：`skipped` = 未执行，**positions / sellable_shares /
+reconcile_account / rounds / 胜率统计全部按 `status <> 'skipped'` 过滤**，所以一处
+标记全链路一致）：
+
+| # | 动作 | 值 |
+|---|---|---|
+| 1 | `UPDATE sa_paper_trades SET status='skipped'` | `id=1046`（10:00 卖 400@447.40）、`id=1047`（重新镜像买 400@730.905）、`id=1049`（10:30 卖 400@449.40）|
+| 2 | `UPDATE sa_paper_trades SET status='open', settle_date/price/raw_return/alpha_return=NULL` | `id=1045`（11-08 原始镜像买 400@730.905）|
+| 3 | 现金按流水重算（**不去手填**） | `cash = initial_cash − Σ(买+费) + Σ(卖−费)`，`status<>'skipped'` ⇒ **137,174.35**（改前 201,186.08）|
+| 4 | `sa_paper_anchor_state` | `status='anchored' / empty_since=NULL / empty_days=0 / seed_done=True / seed_price=730.905 / seed_shares=400`，`seed_note` 写明本次回撤 |
+
+**为什么不用「重新 seed 一笔」**：① `(2026-11-09,'seed','02513','buy')` 已被
+`id=1047` 占着（唯一索引 `(trade_date, slot, code, side)` **与 status 无关**）；
+② `seed_mirror` 的 `price` 取**实盘 avg_cost**，今日再买必须编一个「不是市价的
+成交价」；③ 回撤后 02513 当日**没有任何已执行行**，`_same_day_fills` 不会把
+「今天买过」记成事实去拦反向决策。
+
+验证（`D:/tmp/restore_anchor_02513.py` 自带 post-commit 复查 + `verify_restore_final.py`
+**15/0**）：净持仓 **400 股 / 成本 733.53881625**（= 730.905 + 买入费 1053.5265÷400，
+与止损文案里的「成本 733.5388」一致）、open 买行 **1**、closed 卖行 **0**、
+`GET /api/paper/reconcile` **drift 0.00**、`/api/paper/anchor` 返回
+`available=true / status=anchored / 400 股`。改前整行备份
+`D:/tmp/anchor_restore_backup.json`（4,785 B，含 4 行全字段 + 账户 + 锚定状态）。
+
+#### 🔴 但「到期复核」会在 ~2026-11-13 再清一次（新发现，未改，要用户定）
+
+`settle_and_reflect` 挑 `status='open' AND trade_date < today` 的买单，持有满
+`holding_days`（默认 **5 个交易日**）就市价平仓。它**只豁免做T票**
+（`_t_exempt_codes`：`paper.t_exempt_codes` 名单 或 `reasoning LIKE '[做T]%'`），
+**没有锚定豁免**；而 `_thesis_intact` 要求「到期末仍有浮盈」，锚定票 −39% 必然返回
+空 ⇒ **不会滚动，直接平仓**。
+
+`id=1045` 的 `trade_date=2026-11-08`（周日），11-09 起数 5 个交易日 ≈ **11-13（周五）**
+就会被到期复核卖掉 —— 也就是说回撤只争取到 4 个交易日。两条互斥的修法都属
+「改交易规则」，**按 §0 没动**：
+
+1. **零代码**：把 `02513` 写进 `paper.t_exempt_codes`（配置页有该字段、`adv`，
+   语义就是「底仓不动、不做到期强平」）—— 但这等于让它永不结算；
+2. **改代码**：给 `settle_and_reflect` 加 `anchor_code` 豁免（与刚做的
+   `check_stop_loss(..., anchor_code=)` 同款、同理由：锚定使命是「最后一定要买回来」，
+   到期强平直接违背它）。
+
+⚠️ **别把回撤当成「已经一劳永逸」**：它只解决了「现在没仓位」，
+没有解决「5 个交易日后又被卖」。用户若不在 11-13 前定这两条之一，
+锚定轨会第二次变空仓（这次是**到期**而非止损，且 `seed_done=True` 仍会挡住重新镜像）。
 
 ### 🔴 交易明细单笔盈亏两处错（2026-11-08 用户报，02513 弹窗）
 
@@ -6908,3 +7034,131 @@ session 存历史 → 模型把上次错误答案直接复读（「做T建议只
 港股在引擎里**本来就是 T+0**（`paper_trading.is_t_plus_0`：港股全部 True →
 `real_sellable_shares` 全量可卖），日内 T 不受限制——缺的是「有利可图的高抛点」，
 不是「能做 T」。
+
+### 🔴 Bash（Git Bash / MSYS）会吃掉 PowerShell 命令里的四种东西（2026-11-10，四个变体全实测）
+
+在 harness 的 `bash -c` 里调 PowerShell 时，`|`、`$`、`$(...)`、**以及未加引号 Windows 路径里的反斜杠**都会被 bash 先处理掉。四种变体：
+
+| 写法 | 实际发生 | 现象 |
+|---|---|---|
+| `powershell ... \| Out-String` | bash 把 `\|` 当**自己的管道** | `Out-String: command not found`，exit 127 |
+| `powershell -Command "..."`（双引号） | bash 先展开 `$f`/`$m` 成空串、把 `$($p.Id)` 当**命令替换执行** | PowerShell 收到残缺语法 → `ParserError: ExpectedValueExpression / MissingExpressionAfterOperator` |
+| 内嵌 `$($x.Y)` | 被 bash 当成命令执行 | `.Id: command not found` |
+| `powershell ... -File D:\tmp\x.ps1`（**未加引号**） | bash 把 `\t`/`\c` 当**转义字符**吃掉 | PowerShell 收到 `D:tmpx.ps1`（无分隔符）→ exit 127「-File 格式参数无法与实际参数匹配，请提供带 .ps1 文件的路径」 |
+
+**正确做法**：纯 ASCII 的 `.ps1` 文件 + `-File` + 路径用**正斜杠**（`D:/tmp/x.ps1`）或**单引号包裹**，外部**不接任何管道**。
+
+```bash
+powershell -NoProfile -ExecutionPolicy Bypass -File 'D:/tmp/chklog8686.ps1'
+```
+
+⚠️ 排错时容易误判：先用 `ls -l /d/tmp/chklog8686.ps1` 确认文件**确实存在**（本轮 `520` 字节），才能排除「文件不存在」，锁定「调用时路径被吃」。
+
+#### 「解析期失败」不等于「零执行」
+
+`-Command` 双引号那次 PowerShell 语法残缺、一条语句都没跑，但 **bash 侧的命令替换已经执行了** —— 进程被创建出来。所以「PowerShell 报 ParserError」不能当作「什么都没发生」，要另外查进程与端口。
+
+#### 一次空结果不能证明「没有同类进程」
+
+`Get-CimInstance -Filter "ProcessId=X or ProcessId=Y ..."` 只证明**那几个具体 PID 不存在**，查不出别的 PID 上的同类进程。本轮据此一度断言「没有残留实例」，随后宽查询查出 **4 个存活进程**。
+
+判据：`Where-Object { $_.CommandLine -like "*run_local.py*" }` 宽查询 + `netstat -ano` 端口 + 日志最新启动标记，**三证交叉**。任何一次快照都不能当历史结论。
+
+#### `Get-NetTCPConnection` 可能静默返回空
+
+它偶发拿不到监听记录（本轮同一时刻手动跑一次就能查到）。判据要**交叉 `netstat -ano`**，不要单凭它判「服务没起来」—— AGENTS.md 已记过「脚本说 False 时先手动查，别据此杀进程重启」。
+
+#### `run_local.py` 的 dup2 让启动器重定向文件必然为空
+
+`run_local.py` 内部 `os.dup2` 把 stdout/stderr 全写 `%LOCALAPPDATA%\Temp\opencode\app.log`（append + `buffering=1`），所以 `Start-Process -RedirectStandardOutput/-Error` 指定的文件**一定是空的**，**不代表启动失败**。日志是累积追加的，定位本轮从**最后一个** `launcher start` 行往下切。
+
+#### 重启验收三条（本轮全绿）
+
+1. 监听 8686 的 PID `CreationDate` **晚于**所有改动文件 mtime 峰值；
+2. `GET /api/paper/status` 返回 **200**；
+3. 日志三 marker 齐全且块内无 `Traceback` / `[Errno 10048]`：
+   `=== launcher start cwd=... pid=N ===` / `=== import app done, Ns ===` /
+   `Uvicorn running on http://127.0.0.1:8686`。
+
+⚠️ `import app` 真实耗时 60~82 秒（本轮 **68.5s**），端口在 **65s** 时已监听 —— 前台轮询会被工具 100s 超时杀掉整棵进程树，必须放进 `.ps1` 里 `Start-Process` + 同命令内轮询，或把 harness timeout 放到 ≥600000ms。
+
+### 🔁 实盘做T建议改成「跑完就接下一轮」（2026-11-11 用户要求）
+
+**用户原话**：**「频率加大，改成上一次跑完就接着跑，中间没有空闲时间」**。
+
+**原行为**：`_t_advisory_loop` 每轮结束后 `time.sleep(iv * 60)`，`iv` 来自
+`t_adv.interval_minutes`（默认 **15**，代码硬下限 5）⇒ 约 **17 轮/天**
+（只在交易日 09:30–11:35 / 13:00–15:20 两窗口跑）。
+
+**性质判定**：`t_trading.advisory` 是**只读 + 通知**链路（取 240 根日 K + 分时 + 趋势/
+异常拉升/做 T 判定，`persist_advisory` 写判断日志，**绝不下单、不改任何交易口径**）
+⇒ 节奏调整不越过 §0 的「改交易/钱的逻辑」红线，直接实施。
+
+#### 5 处改动（`app.py`，唯一被改的生产文件）
+
+| # | 位置 | 改动 |
+|---|---|---|
+| 1 | `_t_advisory_loop` docstring 第 2 条纪律 | 明写「连续跑时每轮都重算，记上一次的可执行代码集合，集合没变就不推 —— 这是连续跑**唯一**的防刷屏屏障（2026-11-11 起不再靠 sleep 限流）」 |
+| 2 | **5295** 空仓早退 | **保留** `time.sleep(iv * 60)`，注释写明：主路径已连续跑，早退若也 0 sleep 就是 **busy loop**（空仓也持续空转 CPU + 反复读配置/持仓表）|
+| 3 | **5302** 判定失败早退 | **保留** `time.sleep(iv * 60)`：失败多半是 101 行情或配置问题，连续重试只会把上游打得更惨 |
+| 4 | **5327** 大跌降本落库去重窗口 | `interval '2 minutes'` → **`interval '30 seconds'`**（见下方 🔴）|
+| 5 | **5412** 主成功路径（`last_sig = sig` 之后）| **删掉** `time.sleep(iv * 60)`，本轮结束立即进下一轮 |
+
+**保持不变**：三个 gating 分支 `time.sleep(300)`（5264 `t_adv.enabled` 关 / 5272 日历闸门 /
+5278 非交易窗口）、外层 `except` 的 `time.sleep(120)`（5420）。
+
+`iv = max(5, int(iv_conf.get("interval_minutes") or 15))` **也没删** —— 它仍被两个早退
+分支使用，语义从「轮次间隔」降级为「**早退重试间隔**」。所以
+`config_schema.py` / `config.example.yaml` / `config.yaml` 一个字节没动。
+
+#### 🔴 连续跑打破了大跌降本的时间假设
+
+那个 SQL 时间窗**唯一目的**是排除「本轮自己刚写的行」，不是去重范围（30 秒前落库的
+一律算历史，含几天前的，照样参与去重）。`2 minutes` 是「15 分钟一轮」时拍的值 ——
+改成连续跑后**轮次间隔可能只有几十秒**，2 分钟窗口会把**上一轮刚写的行**也排除掉，
+于是 `seen_today` 漏掉它 → **大跌降本几乎每轮重推一遍**。缩到 30 秒后仍能排除本轮
+自己在写库前的行，又不会误排上一轮。
+
+#### 负载后果（如实写明，别再当 bug 排查）
+
+- 101 行情服务被调用量（31 只 × `/quote` `/kline` `/intraday`）与
+  `sa_t_advisory_log` 写入量**随「轮次/天」线性放大**；
+- 防刷屏只剩两道：① 进程内 `last_sig` 集合比对（`{(code, action)}`）；② 大跌降本的
+  **落库反查**（不靠内存 —— 纯内存去重会导致重启后一股脑重推，2026-11-06 实测 27 条）。
+  `load_ok=False` 时该轮**完全不推**；
+- 早退分支（空仓 / 判定失败）**必须**保留退避，否则是 busy loop；
+- 若 101 网关或行情服务吃不住，第一反应应是**调回 `interval_minutes`**（那会同时
+  影响早退退避），而不是去改 `last_sig`。
+
+#### 验证（可重复跑，零 LLM、零网络）
+
+`%LOCALAPPDATA%\Temp\opencode\test_tadv_continuous.py`（`ast` 静态分析，
+**不 import app** —— 会起全套 daemon 并真跑结算）**21/21 ALL PASS**：
+
+| 段 | 断言 |
+|---|---|
+| A | 主成功路径 `last_sig = sig` **之后无** `time.sleep`；且 `last_sig=sig` 是 `try` 体**最后一条**语句 |
+| B/C/D | 早退分支恰好 **2** 处 `time.sleep(iv * 60)`；gating 分支恰好 **3** 处 `time.sleep(300)`；外层 `except` 恰好 **1** 处 `time.sleep(120)`（且在 `handler` 体内）|
+| — | 全函数共 **6** 处 sleep（2×iv + 3×300 + 1×120）|
+| E | `interval '30 seconds'` **在**、`'2 minutes'` **不在**、仍查 `sa_t_advisory_log` 与 `big_drop` |
+| F | `fn.end_lineno=5420` **<** `_strategy_daily_loop.lineno=5423`；6 处 sleep 全在该函数内（不会串到隔壁循环）|
+| G | `interval_minutes` / `t_adv` / `last_sig` 都还在（早退语义 + 去重屏障未丢）|
+
+**写这个脚本时踩了两处自身错误（都是脚本错，不是 app.py 错）**：
+
+1. 断言 `body[0]` 是 `While` —— 实际 `5241` 有 `last_sig: set = set()`（`ast.AnnAssign`），
+   `while True:` 在 5242。改成遍历 `body` 找 `ast.While` 且 `test` 为 `Constant(value=True)`。
+2. `chk("last_sig" in blob)` 恒假 —— `blob` 只由 `ast.Constant` 字符串拼成，而
+   `last_sig` 在函数里**只以标识符出现**（AnnAssign 目标 / Assign 目标 / 比对时 `Name` 读取），
+   docstring、SQL、通知文案里都没有这个字面量。改成
+   `names = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}`。
+
+> 又一次「失败的不一定是要修的代码」：这两条假失败一度看起来像「改动没落地」。
+
+⚠️ `app.py` 文件头有 **UTF-8 BOM** ⇒ `ast.parse` / 抽函数**必须** `encoding="utf-8-sig"`。
+
+#### 生效方式
+
+`_conf_section` 每轮重读配置（改 `config.yaml` 不用重启），但**代码**改动**必须重启 8686**。
+重启验收仍是三条：① 监听 8686 的 PID `CreationDate` **晚于** `app.py` mtime 峰值；
+② `GET /api/paper/status` 200；③ 日志三 marker 齐全且块内无 `Traceback` / `[Errno 10048]`。

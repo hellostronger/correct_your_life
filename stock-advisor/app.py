@@ -5233,8 +5233,10 @@ def _t_advisory_loop():
     两条纪律：
     1. **不成交**。本线程只调 `t_trading.advisory`（纯读），实盘操作永远由
        本人手动执行。这不是「还没接券商」，是刻意的 —— 建议与执行分离。
-    2. **只在信号集合变化时推**。每 N 分钟推一次同样的内容 = 噪音，噪音等于
-       没报警。所以记上一次的「可执行代码集合」，集合没变就不推。
+    2. **只在信号集合变化时推**。连续跑时每轮都会重算一遍，若每轮都推同样的
+       内容 = 噪音，噪音等于没报警。所以记上一次的「可执行代码集合」，集合
+       没变就不推 —— 这是连续跑唯一的防刷屏屏障（2026-11-11 起不再靠 sleep
+       限流，上一轮跑完立刻接下一轮）。
     """
     last_sig: set = set()
     while True:
@@ -5287,11 +5289,16 @@ def _t_advisory_loop():
                          if int(h.get("net_shares") or 0) > 0}
             if not positions:
                 last_sig = set()
+                # 早退分支**必须退避**：主路径已经连续跑，这里若也 0 sleep 就是
+                # busy loop —— 空仓时也会持续空转 CPU、反复读配置与持仓表。
+                # `interval_minutes` 因此保留，语义从「轮次间隔」变成「早退重试间隔」。
                 time.sleep(iv * 60)
                 continue
             res = t_trading.advisory(deps, tc, positions)
             if res.get("error"):
                 print(f"[t-adv] 判定失败: {res['error']}", flush=True)
+                # 同空仓分支：判定失败要退避，不能立刻重试 —— 失败多半是 101 行情
+                # 或配置问题，连续重试只会把上游打得更惨。
                 time.sleep(iv * 60)
                 continue
             # 全量判断落库（含 hold/不做的）——「为什么其他股票不适合做T」
@@ -5301,9 +5308,15 @@ def _t_advisory_loop():
             if _nlog:
                 print(f"[t-adv] 判断落库 {_nlog} 条", flush=True)
             # 大跌降本：推送去重**不靠进程内存** —— 重启就清零，会一股脑
-            # 重推 27 条（2026-11-06 实测）。改用最近 24h 已落库的判断记录：
+            # 重推 27 条（2026-11-06 实测）。改用已落库的判断记录：
             # 里面有 (code, level) 就视为已提示过，跳过。失败静默回退；
             # 宁可漏推，也不要重启后把同一批再推一遍。
+            #
+            # ⚠️ 下面那个时间窗**只用来排除「本轮自己刚写的行」**，不是去重范围：
+            # 30 秒前落库的一律算历史（含几天前的），照样参与去重。原来写的是
+            # `2 minutes` —— 那是「15 分钟一轮」时拍的值；2026-11-11 改成连续跑后，
+            # 轮次间隔可能只有几十秒，2 分钟的窗口会把**上一轮刚写的行**也排除掉，
+            # 于是 `seen_today` 漏掉它、大跌降本每轮重推一遍。
             drop_lines = []
             seen_today = set()
             load_ok = True
@@ -5311,7 +5324,7 @@ def _t_advisory_loop():
                 with get_conn() as conn, conn.cursor() as cur:
                     cur.execute("""SELECT code, detail->'big_drop'->'tiers_crossed'
                                      FROM sa_t_advisory_log
-                                     WHERE created_at < now() - interval '2 minutes'
+                                     WHERE created_at < now() - interval '30 seconds'
                                        AND detail @> '{"big_drop": {"triggered": true}}'::jsonb""")
                     for _code, _tr in (cur.fetchall() or []):
                         for _lv in (_tr or []):
@@ -5397,7 +5410,11 @@ def _t_advisory_loop():
                     _title, f"{_n_codes} 只达到门槛：\n" + "\n".join(lines),
                     event="t_advisory")
             last_sig = sig
-            time.sleep(iv * 60)
+            # 连续跑（2026-11-11 用户要求「上一次跑完就接着跑，中间没有空闲时间」）：
+            # 主路径**不再 sleep**，本轮结束立即进入下一轮。防刷屏靠上面的
+            # `last_sig` 集合比对 + 大跌降本的落库去重，不靠 sleep 限流。
+            # 代价：101 行情服务（31 只 × /quote /kline /intraday）与
+            # `sa_t_advisory_log` 的增速随「轮次/天」线性放大。
         except Exception as exc:      # noqa: BLE001
             print(f"[t-adv] loop error: {exc}", flush=True)
             time.sleep(120)
@@ -8514,7 +8531,15 @@ def _paper_run_cycle(conf: dict, slot: str, kind: str = "intraday",
         _tick_code = ""
         _tick()
         # 1) 止损：不需要 LLM，先做，保证该跑的止损不会被 LLM 延迟/解析失败拖掉
-        sl = paper_trading.check_stop_loss(deps, slot)
+        # 锚定股豁免严格止损（2026-11-09 用户要求：「锚定策略的股，不适用严格止损」）。
+        # 这里只取锚定配置（纯字典归一化、无副作用）；seed_mirror 必须留在止损
+        # 之后 —— 否则同一轮刚播的镜像仓会立刻被止损卖掉（2026-11-09 实发两次）。
+        _anchor = paper_anchor.load_conf(conf.get("anchor") or {})
+        _anchor_code = ""
+        if _anchor.get("enabled") and _anchor.get("code"):
+            _anchor_code = str(_anchor["code"]).strip()
+        sl = paper_trading.check_stop_loss(deps, slot,
+                                          anchor_code=_anchor_code or None)
         acted += len(sl.get("sold", []))
         _tick()
         # 2) 重新决策
@@ -8530,12 +8555,9 @@ def _paper_run_cycle(conf: dict, slot: str, kind: str = "intraday",
         # 锚定模式（2026-11-08 用户澄清：锚定是**独立轨道、优先级最高**，
         # 不收窄其他票 —— 其他自选照常决策，锚定票由 run_decisions 的
         # anchor_code 保证永远在候选（空仓回补也不被挤掉）、成交排最前。
-        # 止损照常对全部持仓生效（第 1 步，不受锚定影响）。
+        # 锚定股豁免严格止损（2026-11-09 用户要求），其余持仓照常止损。
         # 镜像建仓走 seed_mirror（幂等，一次性种子，失败不拖住决策轮）。
-        _anchor = paper_anchor.load_conf(conf.get("anchor") or {})
-        _anchor_code = ""
         if _anchor.get("enabled") and _anchor.get("code"):
-            _anchor_code = str(_anchor["code"]).strip()
             seed_res = paper_anchor.seed_mirror(deps, _anchor)
             print(f"[paper] 锚定 {_anchor_code}: {seed_res.get('reason')}",
                   flush=True)
