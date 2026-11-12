@@ -4,6 +4,111 @@
 
 ---
 
+### 🤖 nanobot agent 进项目子模块 + 启动依赖化（2026-11-12，用户要求）
+
+用户要求：把 `D:\nanobot` 的 nanobot 加进本项目 submodule，`start_stock_advisor.bat`
+启动服务时把 agent 一起拉起。
+
+#### 排查链上钉死的四个事实（每个都改了结论，别再反着走）
+
+1. **`D:\nanobot` 的 git 克隆（HKUDS/nanobot，fork=hellostronger）没有 HTTP 服务**。
+   它的 `gateway` 命令只有消息总线/渠道/cron/心跳，**根本不监听 8900**。
+   AGENTS.md 10-31 记的 `nanobot/api/server.py`（OpenAI 兼容 `/v1/chat/completions`）
+   属于当年 pip 装的 `nanobot-ai`，**后来 venv 被重装成 editable 的 HKUDS 克隆，serve 就没了**
+   —— 即 agent 主路在那之后一直是静默失败的，聊天一直在走单轮 LLM 回退。
+2. **带 `serve` 的是 v0.4.1**（tag `3404fe83`）：OpenAI 兼容端点 + body 里的
+   `session_id` 字段 + 单条 user 消息校验，与 `wx_chat` 的调用契约**逐字段吻合**。
+   更新的上游已删 serve（`220d5e697` "remove the standalone API server"，
+   官方原话 "The old /v1 endpoints have no drop-in replacement"），**不能追新**。
+3. **101 网关的 OpenAI `/v1/chat/completions` 转发层对 NIM 推理模型是坏的**：
+   `reasoning_content` 正常流出（流式/非流式都这样），**content 恒空/乱码**
+   （`enable_thinking:false` / `thinking:disabled` / `reasoning_split` 全试过无效）。
+   而主应用 `llm_advisor` 走的是 **Anthropic 协议**（`client.messages.create` →
+   `/v1/messages`）—— 我曾据此以为 Anthropic 通道是好的，**错**：故障当晚
+   `ask()` 直接实测同样空内容。是上游部署实例坏了，与协议无关。
+4. **`~/.nanobot/config.json` 早已退化**：只剩 providers + model，**没有 mcpServers**，
+   `stock_mcp.py`（13 个只读工具）在磁盘上也找不到了 → 现在的 agent 是**无工具的
+   纯对话**（有会话记忆）。要恢复工具得重建 MCP 脚本 + 配 mcpServers，另行立项。
+
+#### 落地
+
+| 项 | 值 |
+|---|---|
+| 子模块 | `nanobot` → fork `hellostronger/nanobot.git`，分支 `sa/v0.4.1`（= v0.4.1 + 补丁 `96ac0ece`），已推 fork |
+| 补丁 | `providers/base.py` `chat_stream_with_retry`：流式收完 content 空 且无 tool_calls → **退一次非流式重试**（~28 行）。nanobot 的 runner **写死走流式**（`runner.py:952`），无开关可关 |
+| venv | `D:\nanobot\.venv`（依赖已按 v0.4.1 的 42 项补齐，uv 装的；**没装 pip**，用 `uv pip install --python`）。跑子模块代码靠 cwd 前置 sys.path，无需重装 |
+| bat | `start_stock_advisor.bat` 新增 nanobot 块：检查 8900 → `set NO_PROXY=*&& <venv>python -m nanobot serve --port 8900`（**必须 serve 不是 gateway；必须 NO_PROXY=* 否则出向 502**）→ 轮询 60s |
+| 模型 | `~/.nanobot/config.json` 用 **v0.4.1 的 `modelPresets` 格式**（provider=custom + 真实模型名），不是旧 `agents.defaults.model="custom/xxx"` 字符串（v0.4.1 会把 `custom/` 前缀原样发给上游 → model_not_found）。当前配 **GLM-5.3-Flash**（故障夜唯一活的渠道）；nemotron-ultra 的上游实例当晚吐乱码+空 content，**恢复后改一行 `modelPresets.Custom.model` 即切回** |
+| E2E | 8900 `/v1/models` 200 + 真实对话返回「收到」（5438 tokens）；`agent -m` 同通 |
+
+#### 本次踩的坑
+
+1. **`head -c 60` 截断把 key 截短了**（51→38 字符），拿截断 key 去测鉴权得出
+   「Invalid token」的假结论，还写进了 nanobot 配置 —— 与「心算百分比不可信」同款：
+   **任何从终端输出复制的密钥/长串，必须程序化传递，不能肉眼转抄**。
+2. `cmd /c "set NO_PROXY=*&& ..."` 的 `*` 与 `&&` 之间**不能有空格**
+   （`set NO_PROXY=* &&` 会把空格算进变量值）。
+3. 误用 `gateway` 启动的残留进程不占端口但**占着日志文件**，让 `serve` 起不来
+   （「另一个程序正在使用此文件」）—— 排查靠 `Get-CimInstance ... CommandLine -match nanobot`，
+   netstat 查不到无 HTTP 的进程。
+4. **鉴权失败 ≠ key 坏**：先对比「同一 key 走主应用自己那条路」再下结论；
+   而「主应用能用」也不能想当然——直接 `llm_advisor.ask()` 一发便知（这次它也空）。
+
+---
+
+### 📸 实盘快照 + 操作胜率 `stock-advisor/trade_snapshot.py`（2026-11-11，用户要求）
+
+用户诉求：把「11 月躺平 vs 实际操作」那次一次性分析做成代码功能，「相当于一个快照的
+功能，总结一下自己的操作的胜率」。
+
+**裁决**：不建表、不改 `sa_trades` 写入路径、不动交易/风控口径。快照是低频数据，走侧车
+`data/trade_snapshots.json`（模块级锁 + tmp 原子 replace，同日 upsert 幂等）—— 改 schema
+按 §0 要先问用户，这里绕开；模块不 import app（数据全经参数注入），纯计算可离线测。
+
+| 组件 | 要点 |
+|---|---|
+| `trade_snapshot.py` | `parse_close_on`（日K取 <= 基准日最后一根）/ `replay_positions` / `build_snapshot` / `score_trades`（每笔操作打分）/ `build_report`（躺平 vs 实际）/ 侧车 CRUD + `store_status` |
+| `app.py` | 5 个端点：list / create(可补打历史) / delete / summary(全历史胜率) / report(某快照对照)；历史日逐票并发取日K，今日直接用 `/quote`；fx 走 `_hkd_cny_rate()`，兜底值标 `fx_source` |
+| `static/index.html` | 「📸 快照/胜率」tab，四处注册（按钮/section/TABS/TAB_LOADERS）；`formDlg` 打快照、`confirmDlg` 删除；胜率总览 + 快照列表 + 对照报告 + 按股票贡献表 |
+
+**口径（务必别改）**：择时胜率以「不动」为对手盘 —— 买入 `n×(现价−买价)`、卖出
+`n×(卖价−现价)`，>0 赢、<0 输、缺价/平手不进分母；另列**已实现胜率**（卖出按当时
+摊薄成本，与 `calc_position` 同平均成本法）。差额恒等式
+`实际期末−躺平期末 = Σ买 n×(P_now−P_buy) + Σ卖 n×(P_sell−P_now)`，**与基准日价格、
+外部入金、现金利息无关**。港股 5 位代码=HKD，分币种算完再按当前汇率折 CNY 合计。
+
+**验证**：`trade_snapshot_test.py` **84/84**（含差额恒等式、跨币种、缺价不猜、
+侧车损坏容错、静态接线、与 `data/_nov_compare_result.json` 交叉校验）；
+JS 两 script 块 `node --check` 通过；真机重启 8686 后 5 端点验证：
+补打 10/30 快照 31 只票无缺价、基准 ¥678,132，报告躺平 +40,522 / 实际 +58,656 /
+差额 **+18,133**（与一次性分析 +18,128 差 5 元 = 汇率 0.8503 vs 0.8501）；
+全历史择时胜率 **23/83 = 27.71%**，已实现 21.21%，按月 9月 8.33% → 10月 25% → 11月 44.19%。
+
+**本次踩的坑**（都是真机/夹具层，不是判据错）：
+1. `/kline` 返回 `"日期,收盘价"`，端点里自己 split 按 `(price, date)` 解包 →
+   31 只票基准价全成日期字符串、`baseline=0` 却 200 成功。抽成
+   `parse_close_on()` 纯函数 + 5 条离线断言钉住；**「返回顺序」必须有单测**。
+2. `incomplete_count` 把「基准日无持仓、区间内新建仓」的 3 只票误报成数据不全 →
+   改为 `(p0 is not None or s0 == 0) and px is not None`。
+3. 测试夹具按 `positions` 列表顺序断言币种 —— 实际按 code 排序（02513 在 600406 前），
+   改成按 code 取字典；每日「夹具错不是代码错」第 N 次。
+
+**同日追加（用户：「可以选择日期打个快照，然后可以选择这个快照仓位不动到现在与现在相比」）**：
+后端能力上一轮已有，但入口藏在「弹窗填日期 + 列表点查看」里，用户要的是**看得见的两步**。
+改成 ① 内联 `<input type="date" id="snap-date">` + 今天/上月末快捷 + 备注 +
+「按此日期打快照」；② `<select id="snap-pick">` +「对比到现在」，选中即出报告；
+列表「查看」与下拉框双向同步（`loadSnapshotReport` 回写 `sel.value`）。
+报告加**结论条**：某日仓位不动到现在的期末资产/这段收益 vs 实际操作到现在，
+直接写「谁更赚、多赚多少、领先几个百分点」；顺手把端点外层 `asof` / `fx_source`
+合进 report（原来汇率兜底提示永远不显示）。
+- 「上月末」快捷必须把落在周末的月末回填到周五：否则用户选 10/31 会存出
+  「日期 10/31、价格其实是 10/30」的重复快照（后端只兜底取价，日期仍记用户选的）。
+- `/` 是 `FileResponse(... Cache-Control: no-cache)`，**改前端不用重启服务**；
+  但浏览器里已打开的旧标签页要 Ctrl+F5 才会拿到新 HTML。
+- 真机链路：补打 9/30 快照（30 只票、基准 ¥836,869）→ 选中它对比 →
+  躺平期末 ¥718,806 / 实际 ¥737,161 / 差额 +¥18,355、区间胜率 42.55%；
+  未来日期 400。`trade_snapshot_test.py` **96/96**、JS 两 script 块 `node --check` OK。
+
 ### 🎯 个股锚定模式 `stock-advisor/paper_anchor.py`（2026-11-08，用户要求）
 
 用户诉求：「我现在半仓智谱了，我就锚定这个股，目标就是在这个股上赚钱，可以做T降低
