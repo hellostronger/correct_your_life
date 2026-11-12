@@ -752,3 +752,16 @@ wx_chat:
   max_chars: 2000            # 单条入站字数上限（超了截断）
   max_reply_chars: 1200      # 微信不渲染 Markdown，回复本来就该短
 
+# 网页「对话」tab（ChatGPT 风格：多会话 + 图片上传）
+# 与微信侧只共用 nanobot agent 与数据，会话隔离（网页 session = web: 前缀）。
+web_chat:
+  enabled: true              # 对话 tab 总开关；false 时 /api/chat/* 返回可读原因
+  max_reply_chars: 8000      # 网页可长回答（比微信宽松：网页能渲染 Markdown）
+  history_limit: 200         # 每会话最多拉多少条历史渲染（仅页面回看，不影响 agent 记忆）
+  max_upload_mb: 10          # 单张图片上限
+  vision_models: "nvidia/nemotron-3.5-super-vl-120b-a12b,nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+                             # 逗号分隔；留空 = 不看图。实测 2026-11-08 只有这两个可用
+                             # （其余候选 410 EOL / NIM 404 / >200s 超时）。
+                             # 都是推理模型，内部固定 max_tokens=3000（小预算会被思考花光）。
+  img_note_chars: 1200       # 图片描述截断长度
+

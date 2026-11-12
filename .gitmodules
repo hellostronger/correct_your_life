@@ -4,3 +4,6 @@
 [submodule "TradingAgents-astock"]
 	path = TradingAgents-astock
 	url = https://github.com/hellostronger/TradingAgents-astock.git
+[submodule "nanobot"]
+	path = nanobot
+	url = https://github.com/hellostronger/nanobot.git

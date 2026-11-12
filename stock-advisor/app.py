@@ -80,7 +80,9 @@ import market_temperature
 import notify_events
 import project_api
 import skill_api
+import trade_snapshot
 import wechat_mp
+import web_chat
 import wx_chat
 import wx_commands
 import wx_inbound
@@ -732,6 +734,13 @@ def init_db():
         ddl += _tt_mod.DDL
     except Exception as exc:
         print(f"[init_db] 做T判断日志 DDL 跳过: {exc}", flush=True)
+    # 网页对话留档（2026-11-08 用户裁决：与微信侧只共用 agent 与数据，
+    # session 以 `web:` 前缀隔离；历史表只服务页面回看）：
+    # sa_chat_messages，web_chat.py 自带 DDL（幂等）。
+    try:
+        ddl += web_chat.DDL
+    except Exception as exc:
+        print(f"[init_db] 网页对话 DDL 跳过: {exc}", flush=True)
     last_exc: Exception | None = None
     _conn_fail = 0  # 连接级失败计数（跨语句累计；连接级熔断判定见下方循环）
     # 旧版 sa_strategies 是「按股票建行」的，列结构与现在完全不同，
@@ -1474,7 +1483,8 @@ def calc_position(trades: list[dict]) -> dict:
             "first_date": first_date, "last_date": last_date}
 
 
-def _query_trades(code: str | None = None) -> list[dict]:
+def _query_trades(code: str | None = None, start: str | None = None,
+                  end: str | None = None) -> list[dict]:
     sql = ("SELECT t.id, t.code, t.trade_date, t.side, t.shares, t.price, t.note, "
            "t.created_at, t.strategy_id, t.strategy_triggered_at, t.strategy_peak_price, "
            "t.strategy_ladder_step, "
@@ -1483,10 +1493,19 @@ def _query_trades(code: str | None = None) -> list[dict]:
            "s.config AS strategy_config "
            "FROM sa_trades t "
            "LEFT JOIN sa_strategies s ON s.id = t.strategy_id")
+    conds: list[str] = []
     params: list = []
     if code:
-        sql += " WHERE t.code = %s"
+        conds.append("t.code = %s")
         params.append(code)
+    if start:
+        conds.append("t.trade_date >= %s::date")
+        params.append(start)
+    if end:
+        conds.append("t.trade_date <= %s::date")
+        params.append(end)
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
     sql += " ORDER BY t.trade_date, t.id"
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(sql, params)
@@ -1505,7 +1524,7 @@ def _query_trades(code: str | None = None) -> list[dict]:
     return rows
 
 
-def _attach_lot_pnl(trades: list[dict]) -> None:
+def _attach_lot_pnl(trades: list[dict], history: list[dict] | None = None) -> None:
     """给每笔交易单独标注盈亏（就地修改 rows，附带 lot_* 字段）。
 
     口径（逐笔回放）：
@@ -1768,6 +1787,164 @@ def remove_holding(code: str):
         if cur.rowcount == 0:
             raise HTTPException(404, f"{normalized} 无交易流水")
     return {"ok": True, "removed": normalized, "trades_deleted": cur.rowcount}
+
+
+# ---------------- 实盘快照 & 操作胜率（trade_snapshot.py，只读复盘） ----------------
+# 快照走侧车 data/trade_snapshots.json，不改 schema、不碰 sa_trades 写入路径。
+# 完整口径（差额公式 / 胜率定义 / 币种）见 trade_snapshot.py 的模块 docstring。
+
+class SnapshotIn(BaseModel):
+    date: str = Field(default="", description="YYYY-MM-DD；留空=今天，可补打历史")
+    label: str = Field(default="", max_length=40)
+
+
+def _ts_fx() -> tuple[float, str]:
+    rate = _hkd_cny_rate()
+    return (float(rate), "quote") if rate else (0.851, "fallback")
+
+
+def _ts_now_prices(codes) -> dict[str, float]:
+    """批量实时/收盘价（一次 /quote；缺价的不进字典，报告会点名）。"""
+    codes = sorted({c for c in codes if c})
+    if not codes:
+        return {}
+    quotes = fetch_quotes(codes)
+    out = {}
+    for c, q in quotes.items():
+        try:
+            p = float(q.get("price"))
+            if p > 0:
+                out[c] = p
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _ts_close_on(code: str, date: str, days: int = 400):
+    """取 <= date 的最后一根日K收盘（前复权，经 101 /kline）→ (price, price_date)。"""
+    try:
+        # 解析交给 trade_snapshot.parse_close_on（有离线单测）：101 的行是
+        # 「日期,收盘价」，自己 split 手滑按「价格,日期」解包会让基准价全空。
+        return trade_snapshot.parse_close_on(
+            _em_kline_fields(_tx_symbol(code), days, "f51,f53"), date)
+    except Exception as exc:
+        print(f"[snapshot] {code} 历史收盘价失败: {exc}", flush=True)
+        return (None, None)
+
+
+def _ts_snapshot_prices(codes: list[str], date: str):
+    """补打历史快照时并发取各票当日（或前一交易日）收盘价。"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    prices, pdates = {}, {}
+    pool = ThreadPoolExecutor(max_workers=8)
+    try:
+        futs = {pool.submit(_ts_close_on, c, date): c for c in codes}
+        done = set()
+        try:
+            for fut in as_completed(futs, timeout=75):
+                c = futs[fut]
+                done.add(c)
+                try:
+                    p, d = fut.result()
+                except Exception:
+                    p, d = None, None
+                if p:
+                    prices[c], pdates[c] = p, d
+        except Exception as exc:
+            print(f"[snapshot] 历史收盘价批量超时/异常: {exc}", flush=True)
+        for c in codes:
+            if c not in done:
+                print(f"[snapshot] {c} 未取到 {date} 收盘价（超时）", flush=True)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return prices, pdates
+
+
+def _ts_pick_snapshot(date: str) -> dict | None:
+    return next((s for s in trade_snapshot.list_snapshots() if s.get("date") == date), None)
+
+
+@app.get("/api/trade-snapshots")
+def trade_snapshots_list():
+    snaps = trade_snapshot.list_snapshots()
+    return {"ok": True, "status": trade_snapshot.store_status(),
+            "latest": snaps[0]["date"] if snaps else None,
+            "snapshots": [{"date": s.get("date"), "label": s.get("label"),
+                           "created_at": s.get("created_at"), "fx": s.get("fx"),
+                           "baseline_value_cny": s.get("baseline_value_cny"),
+                           "positions_count": len(s.get("positions") or []),
+                           "missing_prices": s.get("missing_prices") or []}
+                          for s in snaps],
+            "hint": "快照记录某日收盘的持仓与价格；之后随时可对比「不动」与「实际操作」。"}
+
+
+@app.post("/api/trade-snapshots")
+def trade_snapshots_create(body: SnapshotIn):
+    date = (body.date or datetime.now().strftime("%Y-%m-%d")).strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        raise HTTPException(400, "日期格式应为 YYYY-MM-DD")
+    today = datetime.now().strftime("%Y-%m-%d")
+    if date > today:
+        raise HTTPException(400, "不能给未来日期打快照")
+    trades = _query_trades()
+    positions = trade_snapshot.replay_positions(trades, date)
+    if not positions:
+        raise HTTPException(400, f"{date} 收盘无持仓（该日之前没有任何流水）")
+    codes = sorted(positions)
+    if date == today:
+        # 今天直接用实时/收盘快照，1 次请求；历史日才逐票翻日K
+        prices = _ts_now_prices(codes)
+        pdates = {c: today for c in prices}
+    else:
+        prices, pdates = _ts_snapshot_prices(codes, date)
+    fx, fx_source = _ts_fx()
+    snap = trade_snapshot.build_snapshot(
+        date, positions, prices, fx, _stock_names(codes),
+        label=body.label.strip(), price_dates=pdates)
+    return {"ok": True, "snapshot": snap, "fx_source": fx_source,
+            "price_dates": pdates,
+            "hint": ("缺价代码已记在 missing_prices，报告不会把它们当 0 算赢；"
+                     "同一天重复打会覆盖，不会堆重复快照。")}
+
+
+@app.delete("/api/trade-snapshots")
+def trade_snapshots_delete(date: str = ""):
+    date = date.strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        raise HTTPException(400, "date 应为 YYYY-MM-DD")
+    if not trade_snapshot.delete_snapshot(date):
+        raise HTTPException(404, f"没有 {date} 的快照")
+    return {"ok": True, "removed": date}
+
+
+@app.get("/api/trade-snapshots/summary")
+def trade_snapshots_summary():
+    """全历史操作胜率：不依赖任何快照，以「不动」为对手盘给每笔买卖打分。"""
+    trades = _query_trades()
+    codes = {t["code"] for t in trades}
+    prices = _ts_now_prices(codes)
+    fx, fx_source = _ts_fx()
+    score = trade_snapshot.score_trades(trades, prices, fx, _stock_names(sorted(codes)))
+    return {"ok": True, "asof": datetime.now().isoformat(timespec="seconds"),
+            "fx": round(fx, 4), "fx_source": fx_source, **score}
+
+
+@app.get("/api/trade-snapshots/report")
+def trade_snapshots_report(date: str = ""):
+    """某份快照的「躺平 vs 实际」对照 + 该区间操作胜率。date 留空取最新快照。"""
+    date = date.strip()
+    snap = _ts_pick_snapshot(date) if date else (
+        trade_snapshot.list_snapshots() or [None])[0]
+    if not snap:
+        raise HTTPException(404, "没有快照，请先打一份（可补打历史日期）")
+    trades = _query_trades()
+    after = [t for t in trades if t["trade_date"] > snap["date"]]
+    codes = {r["code"] for r in snap.get("positions", [])} | {t["code"] for t in after}
+    prices = _ts_now_prices(codes)
+    fx, fx_source = _ts_fx()
+    rep = trade_snapshot.build_report(snap, trades, prices, fx, _stock_names(sorted(codes)))
+    return {"ok": True, "report": rep, "fx_source": fx_source,
+            "asof": datetime.now().isoformat(timespec="seconds")}
 
 
 # ---------------- 加仓摊薄成本预估（买入前试算，不写库） ----------------
@@ -9385,7 +9562,192 @@ def notify_wx_chat_send(body: NotifyChatIn):
     return {"reply": reply}
 
 
-# ---------------- 自动抓取后台线程 ----------------
+# ---------------- 网页对话（web_chat；2026-11-08 用户裁决：与微信侧只共用 agent 与数据） ----------------
+
+class ChatUploadIn(BaseModel):
+    data_b64: str = Field(description="图片内容的 base64（前端 FileReader 读出）")
+    ext: str = Field(description="扩展名 png/jpg/jpeg/gif/webp/bmp")
+
+
+class ChatSendIn(BaseModel):
+    sid: str = Field(min_length=6, max_length=64)
+    text: str = ""   # 可为空：只发图片可以让 agent 先看图
+    img_name: str = ""
+
+
+_IMG_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+             ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp"}
+
+
+def _chat_conf() -> dict:
+    """网页对话配置（每请求现读 config.yaml，与 load_config 同口径：不重启生效）。"""
+    return web_chat.load_conf()
+
+
+@app.post("/api/chat/sessions")
+def chat_session_new():
+    """发一个新会话 id（web:<hex>）。前端马上用它开聊，也可以先不聊（不出现在列表）。"""
+    return {"sid": web_chat.new_session_id(), "ok": True}
+
+
+@app.get("/api/chat/sessions")
+def chat_session_list(limit: int = 50):
+    """会话侧栏：每组一条（最后一条消息 + 消息数），按最近活动排序。"""
+    deps = {"get_conn": get_conn}
+    if not _chat_conf().get("enabled", True):
+        return {"items": [], "disabled": True}
+    return {"items": web_chat.list_sessions(deps, limit=limit)}
+
+
+@app.get("/api/chat/status")
+def chat_status():
+    """对话 tab 的健康态：开关、视觉模型列表、agent 是否配置、最近 agent 状态。"""
+    conf = _chat_conf()
+    st = {}
+    try:
+        st = wx_chat.get_status()
+    except Exception:
+        st = {}
+    return {"enabled": bool(conf.get("enabled", True)),
+            "vision_models": web_chat.vision_list(conf),
+            "max_reply_chars": conf.get("max_reply_chars"),
+            "agent_status": st}
+
+
+@app.post("/api/chat/upload")
+def chat_upload(body: ChatUploadIn):
+    """上传一张图片（base64 走 JSON，不引 multipart 依赖）。返回 url=/api/chat/img/{name}。"""
+    conf = _chat_conf()
+    if not conf.get("enabled", True):
+        raise HTTPException(409, "对话功能已关闭（web_chat.enabled=false）")
+    import base64 as _b64
+    try:
+        data = _b64.b64decode(body.data_b64, validate=False)
+    except Exception as exc:
+        raise HTTPException(400, f"base64 解析失败：{exc}")
+    try:
+        name = web_chat.save_upload(bytes(data), body.ext, conf)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    return {"name": name, "url": f"/api/chat/img/{name}"}
+
+
+@app.get("/api/chat/img/{name}")
+def chat_img(name: str):
+    p = web_chat.upload_path(name)
+    if p is None:
+        raise HTTPException(404, "图片不存在")
+    ext = p.suffix.lower()
+    return FileResponse(p, media_type=_IMG_MIME.get(ext, "application/octet-stream"))
+
+
+@app.post("/api/chat/send")
+def chat_send(body: ChatSendIn):
+    """网页对话主链路（同步返回，前端在等待时显示 typing）：
+
+    存 user 行 → 有图先让视觉模型看图（尽力看，失败如实说）→
+    拼进文本交给 nanobot agent（session 隔离 `web:<sid>`，同 agent 同工具）→
+    失败回退单轮 LLM → 存 assistant 行 → **双行返回**（前端不用再拉 history）。
+    """
+    import base64 as _b64mod
+    conf = _chat_conf()
+    if not conf.get("enabled", True):
+        raise HTTPException(409, "对话功能已关闭（web_chat.enabled=false）")
+    if not web_chat.check_sid(body.sid):
+        raise HTTPException(400, "会话 id 不合法（须为 web:<hex>，请点「新开会话」重新获取）")
+    text = (body.text or "").strip()[:2000]
+    if not text and not body.img_name:
+        raise HTTPException(400, "输入为空——写点什么，或先上传图片")
+
+    deps = {"get_conn": get_conn}
+    # agent_text = 拼了图片描述后的完整输入；user_text = 界面上显示的原文。
+    agent_text, user_text = text, text
+    if body.img_name:
+        p = web_chat.upload_path(body.img_name)
+        if p is None:
+            raise HTTPException(404, f"图片不存在：{body.img_name}")
+        try:
+            raw = p.read_bytes()
+        except OSError as exc:
+            raise HTTPException(502, f"图片读取失败：{exc}")
+        note, vmodel = web_chat.describe_image(raw, conf)
+        if note:
+            agent_text = (f"[用户同时上传了一张图片「{body.img_name}」，"
+                          f"由视觉模型 {vmodel} 识别如下（可能看错，仅供你参考，不要复述为事实）]:\n"
+                          f"{note}\n\n用户的话：{text or '（用户只发了图片，请描述你看到的内容）'}")
+            if not text:
+                user_text = f"[图片：{body.img_name}]"
+        elif text:
+            agent_text = (f"[用户上传了一张图片「{body.img_name}」，但自动识别这次没有成功。"
+                          f"请基于文字回答，并可向用户口头确认图片内容。]\n\n用户的话：{text}")
+        else:
+            agent_text = ("用户上传了一张图片，但自动识别这次没有成功。"
+                          "你无法看到图片——请如实告诉用户识别失败，"
+                          "可请他用文字描述，或稍后再发一次。")
+            user_text = f"[图片：{body.img_name}]"
+
+    # 1) agent（本机 nanobot，工具有罩子，session 与微信隔离）。
+    #    ⚠️ 不传 conf：agent 的 agent_url/timeout/model 在 wx_chat 段（或其默认值），
+    #    传 web_chat 的 conf 会拿不到 agent_url → 连试都不试就回退 LLM（2026-11-09 修）。
+    reply, src = None, "agent"
+    try:
+        reply = wx_chat.agent_chat(agent_text, body.sid)
+    except Exception as exc:
+        print(f"[web-chat] agent 调用异常: {type(exc).__name__}: {exc}", flush=True)
+        reply = None
+    # 2) 回退：单轮 LLM（无工具；同 wx_chat.build_reply 的回退层级）
+    if not reply:
+        src = "llm"
+        try:
+            import llm_advisor as _la
+            llm_conf = _la.load_llm_conf()
+            if not (llm_conf.get("enabled") and llm_conf.get("api_key")):
+                reply = ("（LLM 没配好，所以我暂时没法说话。请在「AI 配置」里填 llm.api_key。）")
+            else:
+                reply = _la.ask(wx_chat.SYSTEM, agent_text, conf=llm_conf)
+        except Exception as exc:
+            print(f"[web-chat] 单轮回退失败: {type(exc).__name__}: {exc}", flush=True)
+            reply = None
+    if not reply:
+        raise HTTPException(502, "agent 与单轮 LLM 都没能生成回复（多半是上游网关过载，稍后重试）")
+
+    # 3) 落库：先 user 行（含正文若有），再 assistant 行。崩在 agent 后不能丢 user 行
+    #    —— agent 已经看到这条消息了。
+    try:
+        web_chat.save_message(deps, body.sid, "user", user_text, body.img_name)
+        _c = int(conf.get("max_reply_chars") or 8000)
+        web_chat.save_message(deps, body.sid, "assistant", str(reply)[:_c], "", src)
+    except Exception as exc:
+        # 存库失败不吞字：仍然把回复给到前端（agent 侧 nanobot sessions 有它自己的历史）
+        print(f"[web-chat] 对话落库失败: {type(exc).__name__}: {exc}", flush=True)
+        return {"user_message": {"role": "user", "text": user_text,
+                                 "img_name": body.img_name, "created_at": None},
+                "assistant_message": {"role": "assistant", "text": str(reply)
+                                      [:int(conf.get("max_reply_chars") or 8000)],
+                                      "src": src, "created_at": None}}
+    hist = web_chat.history(deps, body.sid, limit=2)
+    ums = [m for m in hist if m.get("role") == "user"][-1:]
+    asst = [m for m in hist if m.get("role") == "assistant"][-1:]
+    return {"user_message": ums[0] if ums else None,
+            "assistant_message": asst[0] if asst else None}
+
+
+@app.get("/api/chat/history")
+def chat_history(sid: str, limit: int = 0):
+    if not web_chat.check_sid(sid):
+        raise HTTPException(400, "会话 id 不合法")
+    return {"items": web_chat.history({"get_conn": get_conn}, sid, limit=limit)}
+
+
+@app.delete("/api/chat/session/{sid}")
+def chat_session_delete(sid: str):
+    """删一个网页会话（页面记录）。agent 侧 nanobot sessions 是它自己的存储，
+    本接口只清页面镜像 —— 真要把 agent 的记忆也清掉需要动 nanobot 目录，
+    不在只读红线内，先不做。"""
+    if not web_chat.check_sid(sid):
+        raise HTTPException(400, "会话 id 不合法")
+    n = web_chat.delete_session({"get_conn": get_conn}, sid)
+    return {"ok": True, "deleted": n}
 
 def _auto_fetch_loop():
     """按 config.yaml 的 fetch_interval_minutes 周期抓新闻；0 = 关闭。"""

@@ -454,6 +454,68 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
                 margin-top: 6px; }
   .skill-cite a { display: block; font-size: 12px; overflow-wrap: anywhere;
                   margin-top: 4px; }
+
+  /* ---------- 💬 对话（chatgpt 风格；共用微信侧的 nanobot agent） ---------- */
+  .chat-shell { display: flex; flex-direction: column; height: min(74vh, 760px);
+                padding: 0; overflow: hidden; }
+  .chat-body { display: flex; flex: 1; min-height: 0; }
+  .chat-side { flex: 0 0 216px; border-right: 1px solid var(--border);
+               padding: 10px 9px; overflow-y: auto; display: flex;
+               flex-direction: column; gap: 10px; }
+  .chat-sessions { display: flex; flex-direction: column; gap: 3px; }
+  .chat-sess { text-align: left; width: 100%; border: 1px solid transparent;
+               background: none; color: var(--text-2); cursor: pointer;
+               border-radius: var(--r-sm); padding: 6px 9px; font-size: 12.5px;
+               line-height: 1.45; }
+  .chat-sess:hover { background: var(--bg-2); color: var(--text); }
+  .chat-sess.on { background: var(--accent-soft); color: var(--accent-ink);
+                  border-color: transparent; }
+  .chat-sess-t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .chat-sess-m { font-size: 11px; color: var(--text-3); white-space: nowrap;
+                 overflow: hidden; text-overflow: ellipsis; }
+  .chat-sess-x { float: right; font-size: 11px; color: var(--text-3); }
+  .chat-sess:hover .chat-sess-x { color: var(--warn); }
+  .chat-main { flex: 1; min-width: 0; display: flex; flex-direction: column;
+               padding: 10px 12px; }
+  .chat-meta { font-size: 11.5px; margin-bottom: 6px; }
+  .chat-stream { flex: 1; overflow-y: auto; padding: 6px 2px;
+                 display: flex; flex-direction: column; gap: 10px; }
+  .chat-welcome { margin: auto; text-align: center; font-size: 12.5px;
+                  max-width: 420px; padding: 24px 10px; }
+  .chat-msg { display: flex; gap: 8px; align-items: flex-start; }
+  .chat-msg.user { flex-direction: row-reverse; }
+  .chat-bubble { max-width: 80%; border-radius: 14px; padding: 8px 12px;
+                 font-size: 13.5px; white-space: pre-wrap; word-break: break-word;
+                 box-shadow: var(--shadow-1); border: 1px solid var(--border);
+                 background: var(--card-2); }
+  .chat-msg.user .chat-bubble { background: var(--accent-soft);
+                                border-color: transparent;
+                                color: var(--accent-ink); }
+  .chat-msg img.chat-img { max-width: 230px; max-height: 170px; border-radius: 10px;
+                           display: block; margin-top: 7px; cursor: zoom-in;
+                           border: 1px solid var(--border); }
+  .chat-src { font-size: 10.5px; color: var(--text-3); margin-top: 4px; }
+  .chat-typing .chat-bubble { display: flex; gap: 4px; align-items: center; }
+  .chat-typing .chat-dots span { width: 6px; height: 6px; border-radius: 50%;
+                                 background: var(--text-3); display: inline-block;
+                                 animation: chatBlink 1.2s infinite; }
+  .chat-typing .chat-dots span:nth-child(2) { animation-delay: .2s; }
+  .chat-typing .chat-dots span:nth-child(3) { animation-delay: .4s; }
+  @keyframes chatBlink { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
+  .chat-inputbar { display: flex; align-items: flex-end; gap: 8px;
+                   border-top: 1px solid var(--border); padding-top: 10px; }
+  .chat-inputbar textarea { flex: 1; min-height: 46px; max-height: 140px;
+                            resize: vertical; }
+  .chat-attach { flex: 0 0 auto; position: relative; }
+  .chat-attach img { width: 36px; height: 36px; object-fit: cover;
+                     border-radius: 8px; border: 1px solid var(--border-2); }
+  .chat-attach button { position: absolute; top: -8px; right: -8px; width: 20px;
+                        height: 20px; padding: 0; font-size: 11px; line-height: 1;
+                        border-radius: 50%; }
+  @media (max-width: 720px) {
+    .chat-side { flex-basis: 148px; }
+    .chat-bubble { max-width: 88%; }
+  }
 </style>
 </head>
 <body>
@@ -469,6 +531,7 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       <button data-tab="market" class="active">自选行情</button>
       <button data-tab="sector">🔄 板块轮动</button>
       <button data-tab="holdings">我的持仓</button>
+      <button data-tab="snapshot">📸 快照/胜率</button>
       <button data-tab="strategies">🎯 止盈策略<span id="strategy-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="plans">🏧 提款计划</button>
       <button data-tab="calendar">📅 财经日历</button>
@@ -486,6 +549,7 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       <button data-tab="analysis">🧠 分析技法<span id="anal-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="skills">🧩 Skills</button>
       <button data-tab="research">🔬 研究</button>
+      <button data-tab="chat">💬 对话</button>
       <button data-tab="notify">🔔 通知</button>
       <button data-tab="schedule">⚙️ 调度</button>
     </div>
@@ -1072,6 +1136,56 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
   </div>
 
   <!-- 止盈策略 -->
+  <!-- 实盘快照 / 操作胜率（trade_snapshot.py）：存某日收盘持仓，之后对比不动 vs 实际操作 -->
+  <section id="tab-snapshot" class="hide">
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <b style="font-size:13px">📸 实盘快照 · 操作胜率</b>
+        <span class="row">
+          <span class="muted" id="snap-meta" style="font-size:12px"></span>
+          <button class="btn ghost" style="font-size:12px" onclick="loadSnapshotTab()">刷新</button>
+        </span>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:4px">
+        ① 选一个日期，把那天收盘的持仓和价格存成快照；② 选中这份快照，对比
+        「<b>这份仓位一动不动拿到现在</b>」与「<b>现在的实际操作结果</b>」哪个赚得多。
+        操作胜率以「不动」为对手盘：买入看买完涨没涨、卖出看卖完跌没跌；另列<b>已实现盈亏胜率</b>。
+        快照只存本地 JSON，不写数据库、不改任何交易记录；港股按当前汇率折人民币，未计手续费税费。
+      </div>
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:flex-end;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+        <div>
+          <label for="snap-date" style="display:block;font-size:12px;color:var(--text-2)">① 选择基准日</label>
+          <input type="date" id="snap-date" style="padding:6px 8px;border:1px solid var(--border);border-radius:7px;margin-top:4px;background:var(--card);color:var(--text)">
+        </div>
+        <button class="btn ghost" style="font-size:12px" onclick="snapshotQuickDate('today')">今天</button>
+        <button class="btn ghost" style="font-size:12px" onclick="snapshotQuickDate('prev')">上月末</button>
+        <input id="snap-label" placeholder="备注（可选）" style="padding:7px 8px;border:1px solid var(--border);border-radius:7px;background:var(--card);color:var(--text);width:140px">
+        <button class="btn" style="font-size:12px" onclick="snapshotCreate()">按此日期打快照</button>
+        <span class="faint">周末/节假日自动取前一交易日收盘；同一天重打会覆盖</span>
+      </div>
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:flex-end;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+        <div>
+          <label for="snap-pick" style="display:block;font-size:12px;color:var(--text-2)">② 选择快照</label>
+          <select id="snap-pick" style="padding:7px 8px;border:1px solid var(--border);border-radius:7px;margin-top:4px;min-width:270px;background:var(--card);color:var(--text)"></select>
+        </div>
+        <button class="btn" style="font-size:12px" onclick="snapshotCompareSelected()">对比到现在</button>
+        <span class="faint">终点恒为最新收盘价；换一份快照即可换起点</span>
+      </div>
+    </div>
+    <div class="card">
+      <b style="font-size:13px">📊 我的操作胜率（全部历史流水）</b>
+      <div id="snap-summary" class="muted" style="font-size:12px;margin-top:6px">加载中…</div>
+    </div>
+    <div class="card">
+      <b style="font-size:13px">🗂 快照列表</b>
+      <div id="snap-list" class="muted" style="font-size:12px;margin-top:6px">加载中…</div>
+    </div>
+    <div class="card">
+      <b style="font-size:13px" id="snap-report-title">⚖️ 快照对照：躺平 vs 实际</b>
+      <div id="snap-report" class="muted" style="font-size:12px;margin-top:6px">请先打一份快照</div>
+    </div>
+  </section>
+
   <section id="tab-strategies" class="hide">
     <div class="card">
       <b style="font-size:13px">新建退出策略（通用模板，与具体股票无关）</b>
@@ -2078,6 +2192,42 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
         本站只展示模板与变量，<b>不在本地启动 swarm</b>——运行走 101 上的 sidecar，会消耗 token。
       </div>
       <div id="vibe-presets" style="margin-top:10px"></div>
+    </div>
+  </section>
+  <!-- 💬 对话（与微信侧共用同一个 nanobot agent 与数据；session 前缀 web: 隔离） -->
+  <section id="tab-chat" class="hide">
+    <div class="chat-shell card">
+      <div class="chat-body">
+        <aside class="chat-side">
+          <button class="btn" style="width:100%" onclick="newChatSession()">＋ 新开会话</button>
+          <div class="muted" style="font-size:11px">会话（按最近消息排序）</div>
+          <div id="chat-sessions" class="chat-sessions">
+            <div class="muted" style="font-size:12px">加载中…</div>
+          </div>
+        </aside>
+        <div class="chat-main">
+          <div class="chat-meta muted" id="chat-meta"></div>
+          <div class="chat-stream" id="chat-stream">
+            <div class="chat-welcome muted">左侧选会话，或点「＋ 新开会话」。<br>
+              可直接发文字，也可点 🖼 附一张图片让 agent 先看图。<br>
+              问行情、持仓、做T判断、财报预案都可以——agent 用的是系统全文数据。</div>
+          </div>
+          <div class="chat-inputbar">
+            <div class="chat-attach hide" id="chat-attach">
+              <img id="chat-attach-img" alt="待发送图片" title="点击查看"
+                   onclick="window.open($('chat-attach-img').src)">
+              <button onclick="chatClearImg()" title="移除附件">✕</button>
+            </div>
+            <input id="chat-file" type="file" class="hide" accept="image/png,image/jpeg,image/gif,image/webp,image/bmp"
+                   onchange="chatPickImage(event)">
+            <button class="btn ghost" style="padding:7px 9px" onclick="$('chat-file').click()"
+                    title="附一张图片（视觉模型先看图）">🖼</button>
+            <textarea id="chat-text" rows="2" placeholder="问点什么…（Enter 发送，Shift+Enter 换行）"
+                      onkeydown="chatKeydown(event)"></textarea>
+            <button class="btn" id="chat-send-btn" onclick="chatSend()">发送</button>
+          </div>
+        </div>
+      </div>
     </div>
   </section>
   <!-- 通知 -->
@@ -6014,11 +6164,486 @@ curl -H "Authorization: Bearer $VIBE_API_KEY" http://101.43.25.101/vibe/health</
     </div>`);
 }
 
+// ---- 💬 对话（2026-11-08；后端契约见 app.py /api/chat/* 与 web_chat.py） ----
+// 与微信侧只共用 agent 与数据：这里 session 用 web:<hex>（web_chat 给的），
+// SEND 返回双行因此成功后不需要再拉 history。失败（502）时乐观渲染的 user 行保留。
+let chatSid = '';          // 当前会话 id（web:<hex>；'' 表示还没开）
+let chatImg = '';          // 已上传待发送的附件名（POST /api/chat/upload 返回的 name）
+let chatURL = '';          // 待发送附件的预览 url
+let chatDemo = false;      // status.enabled=false 时的降级提示，避免重复写
+let chatSending = false;
+
+function loadChat() {
+  loadChatStatus();
+  loadChatSessions();
+}
+
+async function loadChatStatus() {
+  const meta = $('chat-meta');
+  try {
+    const st = await api('/api/chat/status');
+    if (!st.enabled && !chatDemo) {
+      chatDemo = true;
+      meta.textContent = '对话功能当前关闭（web_chat.enabled=false），可在「调度」页开启。';
+      return;
+    }
+    const v = (st.vision_models || []).length;
+    const as = st.agent_status || {};
+    let s = `会话 ${chatSid ? chatSid.replace('web:', '') : '—'}`
+      + ` · 看图模型 ${v ? v : '—'} 个 · 单轮回退 LLM`;
+    if (as.last_error) s = `⚠ agent 最近异常：${String(as.last_error).slice(0, 80)}` + s;
+    meta.textContent = s;
+  } catch (e) { meta.textContent = '状态读取失败：' + e.message; }
+}
+
+async function loadChatSessions() {
+  const box = $('chat-sessions');
+  try {
+    const d = await api('/api/chat/sessions');
+    if (d.disabled) {
+      box.innerHTML = '<div class="muted" style="font-size:12px">对话已关闭</div>';
+      return;
+    }
+    if (!d.items.length) {
+      box.innerHTML = '<div class="muted" style="font-size:12px">还没有会话</div>';
+      return;
+    }
+    box.innerHTML = d.items.map(it => {
+      const t = esc(String(it.text || '').slice(0, 60) || '（空）');
+      const n = Number(it.n) || 0;
+      return `<div class="chat-sess${it.sid === chatSid ? ' on' : ''}" data-sid="${esc(it.sid)}"
+        title="${t}">
+        <span class="chat-sess-x">🗑</span>
+        <div class="chat-sess-t">${n} 条 · ${t}</div>
+        <div class="chat-sess-m">${it.sid ? esc(it.sid) : ''}</div>
+      </div>`;
+    }).join('');
+    box.querySelectorAll('.chat-sess').forEach(el => {
+      el.onclick = (ev) => {
+        const sid = el.dataset.sid;
+        if (ev.target.classList.contains('chat-sess-x')) { deleteChatSession(sid); return; }
+        openChatSession(sid, el.querySelector('.chat-sess-t').textContent);
+      };
+    });
+  } catch (e) {
+    box.innerHTML = `<div class="muted" style="font-size:12px">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+async function newChatSession() {
+  try {
+    const d = await jsonPost('/api/chat/sessions');
+    chatSid = d.sid; chatImg = ''; setChatAttach();
+    $('chat-stream').innerHTML = '<div class="chat-welcome muted">新会话已建立（'
+      + esc(d.sid) + '）——直接发第一条消息吧。</div>';
+    loadChatSessions();
+  } catch (e) { toastErr('建立会话失败：' + e.message); }
+}
+
+async function openChatSession(sid, fallbackHdr) {
+  chatSid = sid; chatImg = ''; setChatAttach();
+  const stream = $('chat-stream');
+  stream.innerHTML = skeletonBox(4);
+  $('chat-meta').textContent = '会话 ' + sid + ' · ' + (fallbackHdr || '');
+  try {
+    const d = await api('/api/chat/history?sid=' + encodeURIComponent(sid));
+    renderChatMessages(d.items || []);
+    if (!(d.items || []).length) {
+      stream.innerHTML = '<div class="chat-welcome muted">这个会话还没有消息。</div>';
+    }
+    loadChatSessions();
+  } catch (e) {
+    stream.innerHTML = '<div class="chat-welcome muted">历史读取失败：' + esc(e.message) + '</div>';
+  }
+}
+
+async function deleteChatSession(sid) {
+  if (!await confirmDlg('删除这个网页会话？（只删页面记录，agent 侧记忆不清理）',
+                        { danger: true, okText: '删除' })) return;
+  try {
+    await jsonDelete_('/api/chat/session/' + encodeURIComponent(sid));
+    if (sid === chatSid) {
+      chatSid = '';
+      $('chat-stream').innerHTML = '<div class="chat-welcome muted">会话已删除。点「＋ 新开会话」继续。</div>';
+    }
+    loadChatSessions();
+  } catch (e) { toastErr('删除失败：' + e.message); }
+}
+
+// 手工实现 JSON DELETE（项目里没有现成的 jsonDelete helper）
+async function jsonDelete_(url) {
+  return api(url, { method: 'DELETE', headers: { 'Content-Type': 'application/json' } });
+}
+
+function chatMsgHTML(m) {
+  const user = m.role === 'user';
+  let inner = esc(m.text || '') || '<span class="muted">（无文字）</span>';
+  if (m.img_name) {
+    const u = '/api/chat/img/' + encodeURIComponent(m.img_name);
+    inner += `<img class="chat-img" alt="附件" src="${u}" data-img="${u}">`;
+  }
+  if (!user && m.src === 'llm') inner += '<div class="chat-src">（agent 不可用，单轮 LLM 回答）</div>';
+  if (m.created_at) inner += '<div class="chat-src">' + fmtLocalTs(m.created_at) + '</div>';
+  return `<div class="chat-msg ${user ? 'user' : 'ai'}" data-msg="1">
+    <div class="chat-bubble">${inner}</div>
+  </div>`;
+}
+
+function renderChatMessages(items) {
+  const stream = $('chat-stream');
+  stream.innerHTML = items.length
+    ? items.map(m => chatMsgHTML(m)).join('')
+    : '<div class="chat-welcome muted">还没有消息。</div>';
+  stream.querySelectorAll('img.chat-img').forEach(im => {
+    im.onclick = () => window.open(im.dataset.img);
+  });
+  stream.scrollTop = stream.scrollHeight;
+}
+
+function setChatAttach() {
+  const box = $('chat-attach');
+  if (chatImg) {
+    box.classList.remove('hide');
+    $('chat-attach-img').src = chatURL;
+  } else { box.classList.add('hide'); }
+}
+
+function chatClearImg() { chatImg = ''; chatURL = ''; setChatAttach(); }
+
+async function chatPickImage(ev) {
+  const f = ev.target.files && ev.target.files[0];
+  if (!f) return;
+  ev.target.value = '';
+  if (!/image\/(png|jpeg|gif|webp|bmp)/.test(f.type)) { toastErr('仅支持 png/jpg/gif/webp/bmp'); return; }
+  const buf = await f.arrayBuffer();
+  let bin = '';
+  const bytes = new Uint8Array(buf);
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  const ext = (f.name.split('.').pop() || '').toLowerCase();
+  toast('上传中…', '');
+  try {
+    const r = await jsonPost('/api/chat/upload', { data_b64: btoa(bin), ext });
+    chatImg = r.name; chatURL = r.url; setChatAttach();
+    toast('图片已附上，发送时一并发', 'ok');
+  } catch (e) { toastErr('图片上传失败：' + e.message); }
+}
+
+function chatTyping() {
+  const stream = $('chat-stream');
+  document.querySelectorAll('#chat-stream .chat-typing').forEach(e => e.remove());
+  stream.insertAdjacentHTML('beforeend', '<div class="chat-msg ai chat-typing" id="chat-typing">' +
+    `<div class="chat-bubble"><span class="chat-dots"><span></span><span></span><span></span></span></div></div>`);
+  stream.scrollTop = stream.scrollHeight;
+}
+
+async function chatSend() {
+  if (chatSending) return;
+  if (chatDemo) { toastErr('对话功能已关闭（web_chat.enabled=false）'); return; }
+  const ta = $('chat-text');
+  const text = (ta.value || '').trim();
+  if (!text && !chatImg) { toast('输入为空——写点什么，或先上传图片', 'err'); return; }
+  if (!chatSid) await newChatSession();
+
+  // 乐观渲染：先显示发送出去的样子，失败也保留 user 行
+  const optimistic = { role: 'user', text: text || `[图片：${chatImg}]`,
+                       img_name: chatImg, created_at: null };
+  ta.value = '';
+  const stream = $('chat-stream');
+  const welcome = stream.querySelector('.chat-welcome');
+  if (welcome) welcome.remove();
+  stream.insertAdjacentHTML('beforeend', chatMsgHTML(optimistic));
+  stream.querySelectorAll('img.chat-img').forEach(im => {
+    im.onclick = () => window.open(im.dataset.img);
+  });
+  stream.scrollTop = stream.scrollHeight;
+  chatTyping();
+  chatSending = true;
+  $('chat-send-btn').disabled = true;
+  const sentImg = chatImg, sentURL = chatURL;
+  chatClearImg();
+  try {
+    const r = await jsonPost('/api/chat/send',
+                             { sid: chatSid, text, img_name: sentImg });
+    // 用返回的正式行（含 created_at/src）替换乐观行
+    const parts = [];
+    if (r.user_message) parts.push(chatMsgHTML(r.user_message));
+    if (r.assistant_message) parts.push(chatMsgHTML(r.assistant_message));
+    chatTyping();   // 先清 typing 再替换
+    const typing = $('chat-typing');
+    if (typing) typing.remove();
+    const opt = [...stream.querySelectorAll('.chat-msg')].find(e =>
+      e.classList.contains('user'));
+    if (opt && r.user_message) opt.outerHTML = parts.join('');
+    else stream.insertAdjacentHTML('beforeend', parts.join(''));
+    stream.querySelectorAll('img.chat-img').forEach(im => {
+      im.onclick = () => window.open(im.dataset.img);
+    });
+    stream.scrollTop = stream.scrollHeight;
+    loadChatSessions();
+  } catch (e) {
+    toastErr('发送失败：' + e.message + (sentImg ? '（图片已保留，可重发）' : ''));
+    if (sentImg) { chatImg = sentImg; chatURL = sentURL; setChatAttach(); }
+    const typing = $('chat-typing');
+    if (typing) typing.remove();
+  } finally {
+    chatSending = false;
+    $('chat-send-btn').disabled = false;
+  }
+}
+
+function chatKeydown(ev) {
+  if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); chatSend(); }
+}
+
+// ---------- 实盘快照 / 操作胜率（trade_snapshot.py，2026-11-11） ----------
+// 只读复盘。快照存在本地侧车 JSON；报告每次用最新行情重算，所以数字会随行情变。
+// 涨跌配色跟随主题变量：--up 红=赚，--down 绿=亏（A 股口径）。
+const _SNAP = { latest: null, reportDate: null };
+
+function _snMoney(v, signed) {
+  if (v === null || v === undefined || v === '') return '—';
+  const n = Number(v);
+  if (!isFinite(n)) return '—';
+  const s = Math.abs(n).toLocaleString('zh-CN', { maximumFractionDigits: 0 });
+  return (n < 0 ? '-' : (signed && n > 0 ? '+' : '')) + '¥' + s;
+}
+function _snPct(v) {
+  return (v === null || v === undefined) ? '—'
+    : (Number(v) > 0 ? '+' : '') + Number(v).toFixed(2) + '%';
+}
+function _snHkd(v) {
+  if (v === null || v === undefined || v === '') return '—';
+  const n = Number(v);
+  return (n > 0 ? '+' : n < 0 ? '-' : '') + 'HK$'
+    + Math.abs(n).toLocaleString('zh-CN', { maximumFractionDigits: 0 });
+}
+function _snRate(v) { return (v === null || v === undefined) ? '—' : Number(v).toFixed(1) + '%'; }
+function _snColor(v) {
+  return Number(v) > 0 ? 'var(--up)' : Number(v) < 0 ? 'var(--down)' : 'var(--text-3)';
+}
+function _snTodayStr() {
+  const d = new Date();
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0')
+    + '-' + String(d.getDate()).padStart(2, '0');
+}
+function _snPrevMonthEnd() {
+  const d = new Date(), p = new Date(d.getFullYear(), d.getMonth(), 0);
+  // 月末落在周末时回填到周五：否则会存一份「日期 10/31、价格却是 10/30」的
+  // 重复快照（后端兜底取前一交易日，日期仍记用户选的那天，列表就多一笔）。
+  const wd = p.getDay();
+  if (wd === 6) p.setDate(p.getDate() - 1);
+  else if (wd === 0) p.setDate(p.getDate() - 2);
+  return p.getFullYear() + '-' + String(p.getMonth() + 1).padStart(2, '0')
+    + '-' + String(p.getDate()).padStart(2, '0');
+}
+function _snWinLine(w) {
+  if (!w || w.win_rate == null) return '—（没有可判定的交易）';
+  return `${_snRate(w.win_rate)} <span class="muted">(${w.wins} 胜 / ${w.losses} 负 / ${w.flat} 平)</span>`;
+}
+
+async function loadSnapshotTab() {
+  $('snap-meta').textContent = '加载中…';
+  if ($('snap-date') && !$('snap-date').value) $('snap-date').value = _snPrevMonthEnd();
+  await Promise.all([loadSnapshotSummary(), loadSnapshotList()]);
+}
+
+function snapshotQuickDate(kind) {
+  const el = $('snap-date');
+  if (el) el.value = kind === 'today' ? _snTodayStr() : _snPrevMonthEnd();
+}
+
+function snapshotCompareSelected() {
+  const sel = $('snap-pick');
+  if (!sel || !sel.value) { toastErr('请先打一份快照，再从下拉框里选'); return; }
+  _SNAP.reportDate = sel.value;
+  loadSnapshotReport(sel.value);
+}
+
+async function loadSnapshotSummary() {
+  const box = $('snap-summary');
+  if (!box) return;
+  box.innerHTML = '<span class="muted">加载中…</span>';
+  try {
+    const d = await api('/api/trade-snapshots/summary');
+    const w = d.win_rate || {}, rz = d.realized || {}, b = w.buy || {}, s = w.sell || {};
+    const months = (d.by_month || []).map(m => `<tr>
+      <td>${esc(m.month)}</td><td>${m.count}</td><td>${_snRate(m.win_rate)}</td>
+      <td style="color:${_snColor(m.contribution_cny)}">${_snMoney(m.contribution_cny, true)}</td></tr>`).join('');
+    const tops = (arr, title) => (arr || []).length ? `<div style="margin-top:6px"><b>${title}</b> ` +
+      arr.slice(0, 3).map(x => `${esc(x.date.slice(5))} ${esc(x.code)} ${x.side === 'buy' ? '买' : '卖'}
+        <span style="color:${_snColor(x.contribution_cny)}">${_snMoney(x.contribution_cny, true)}</span>`).join('　') + '</div>' : '';
+    box.innerHTML = `
+      <div class="jq-metrics" style="margin:8px 0 10px">
+        <div class="jq-metric"><div class="jq-metric-v" style="color:var(--accent)">${_snRate(w.win_rate)}</div><div class="jq-metric-k">择时胜率（比不动好）</div></div>
+        <div class="jq-metric"><div class="jq-metric-v" style="color:${_snColor(rz.win_rate == null ? 0 : rz.win_rate - 50)}">${_snRate(rz.win_rate)}</div><div class="jq-metric-k">已实现胜率（卖出 ${rz.count || 0} 笔）</div></div>
+        <div class="jq-metric"><div class="jq-metric-v" style="color:${_snColor(w.contribution_cny)}">${_snMoney(w.contribution_cny, true)}</div><div class="jq-metric-k">全部操作净贡献</div></div>
+        <div class="jq-metric"><div class="jq-metric-v" style="color:${_snColor(rz.pnl_cny)}">${_snMoney(rz.pnl_cny, true)}</div><div class="jq-metric-k">已实现盈亏</div></div>
+        <div class="jq-metric"><div class="jq-metric-v">${w.total || 0}</div><div class="jq-metric-k">流水笔数</div></div>
+      </div>
+      <div>买入 <b>${_snWinLine(b)}</b>　·　卖出 <b>${_snWinLine(s)}</b>
+        　<span class="faint">（现价 ${esc(d.asof || '')}；HKD/CNY ${d.fx}${d.fx_source === 'fallback' ? ' 兜底' : ''}）</span></div>
+      ${(d.missing_prices || []).length ? `<div style="color:var(--warn);margin-top:4px">⚠ 缺现价、未计胜率：${esc((d.missing_prices || []).join(', '))}</div>` : ''}
+      ${tops(d.top_winners, '最赚的几笔')}${tops(d.top_losers, '最亏的几笔')}
+      ${months ? `<div style="overflow-x:auto;margin-top:8px"><table class="tbl" style="width:100%"><thead><tr>
+        <th>月份</th><th>笔数</th><th>胜率</th><th>净贡献</th></tr></thead><tbody>${months}</tbody></table></div>` : ''}`;
+  } catch (e) {
+    box.innerHTML = `<span style="color:var(--up)">加载失败：${esc(e.message || e)}</span>`;
+  }
+}
+
+async function loadSnapshotList() {
+  const box = $('snap-list');
+  if (!box) return;
+  box.innerHTML = '<span class="muted">加载中…</span>';
+  try {
+    const d = await api('/api/trade-snapshots');
+    const snaps = d.snapshots || [];
+    _SNAP.latest = d.latest || null;
+    $('snap-meta').textContent = `${snaps.length} 份快照 · 侧车 ${d.status && d.status.file ? d.status.file : '—'}`;
+    const sel = $('snap-pick');
+    if (sel) {
+      sel.innerHTML = snaps.map(x => `<option value="${esc(x.date)}">${esc(x.date)} · ${esc(x.label || '手动快照')} · 基准 ${_snMoney(x.baseline_value_cny)}</option>`).join('');
+      const want = (_SNAP.reportDate && snaps.some(x => x.date === _SNAP.reportDate))
+        ? _SNAP.reportDate : _SNAP.latest;
+      if (want) sel.value = want;
+    }
+    if (d.status && d.status.error) {
+      box.innerHTML = `<span style="color:var(--up)">侧车读取异常：${esc(d.status.error)}</span>`;
+      return;
+    }
+    if (!snaps.length) {
+      box.innerHTML = `<div class="empty">还没有快照。在上方选好基准日，点「按此日期打快照」即可。</div>`;
+      $('snap-report').innerHTML = '<span class="muted">请先打一份快照</span>';
+      $('snap-report-title').textContent = '⚖️ 快照对照：躺平 vs 实际';
+      return;
+    }
+    const rows = snaps.map(x => `<tr>
+      <td>${esc(x.date)}</td><td>${esc(x.label || '')}</td>
+      <td>${_snMoney(x.baseline_value_cny)}</td><td>${x.positions_count}</td>
+      <td>${(x.missing_prices || []).length
+        ? `<span style="color:var(--warn)" title="${esc((x.missing_prices || []).join(', '))}">${x.missing_prices.length} 只缺价</span>` : '—'}</td>
+      <td><button class="btn ghost" style="font-size:11px;padding:2px 7px" onclick="loadSnapshotReport('${esc(x.date)}')">查看</button>
+          <button class="btn ghost" style="font-size:11px;padding:2px 7px" onclick="snapshotDelete('${esc(x.date)}')">删除</button></td>
+    </tr>`).join('');
+    box.innerHTML = `<div style="overflow-x:auto"><table class="tbl" style="width:100%"><thead><tr>
+      <th>基准日</th><th>备注</th><th>基准市值</th><th>持仓数</th><th>数据</th><th>操作</th>
+      </tr></thead><tbody>${rows}</tbody></table></div>`;
+    await loadSnapshotReport(sel && sel.value ? sel.value : _SNAP.latest);
+  } catch (e) {
+    box.innerHTML = `<span style="color:var(--up)">加载失败：${esc(e.message || e)}</span>`;
+  }
+}
+
+async function loadSnapshotReport(date) {
+  const box = $('snap-report');
+  if (!box) return;
+  if (!date) { box.innerHTML = '<span class="muted">请先打一份快照</span>'; return; }
+  box.innerHTML = '<span class="muted">加载中…</span>';
+  try {
+    const d = await api('/api/trade-snapshots/report?date=' + encodeURIComponent(date));
+    const rep = d.report || d;
+    rep.asof = rep.asof || d.asof;              // 端点外层的计算时间，别丢
+    rep.fx_source = rep.fx_source || d.fx_source;
+    _SNAP.reportDate = date;
+    const sel = $('snap-pick');
+    if (sel) sel.value = date;                  // 列表里点「查看」也要同步下拉框
+    renderSnapshotReport(rep);
+  } catch (e) {
+    box.innerHTML = `<span style="color:var(--up)">加载失败：${esc(e.message || e)}</span>`;
+    if (date !== _SNAP.latest && _SNAP.latest) await loadSnapshotReport(_SNAP.latest);
+  }
+}
+
+function renderSnapshotReport(r) {
+  const box = $('snap-report');
+  const t = r.totals || {}, sn = r.snapshot || {}, w = r.win_rate || {}, rz = r.realized || {};
+  const delta = Number(t.delta_cny || 0);
+  const title = $('snap-report-title');
+  if (title) title.textContent = `⚖️ ${sn.date || '—'} 的仓位不动到现在 vs 现在的实际操作`;
+  const better = delta >= 0 ? '实际操作更赚' : '不动更赚';
+  const verdict = `<div style="background:var(--bg-2);border-radius:8px;padding:9px 11px;margin:6px 0 10px;font-size:12px;line-height:1.9">
+      <div>按 <b>${esc(sn.date || '')}</b> 的仓位<b>一动不动拿到现在</b>：期末资产 <b>${_snMoney(t.flat_end_cny)}</b>，
+        这段 <span style="color:${_snColor(t.flat_gain_cny)}">${_snMoney(t.flat_gain_cny, true)}（${_snPct(t.flat_pct)}）</span></div>
+      <div><b>实际操作到现在</b>：期末资产 <b>${_snMoney(t.real_end_cny)}</b>，
+        这段 <span style="color:${_snColor(t.real_gain_cny)}">${_snMoney(t.real_gain_cny, true)}（${_snPct(t.real_pct)}）</span></div>
+      <div style="color:${_snColor(delta)}">→ <b>${better}</b>，${delta >= 0 ? '多' : '少'}赚 ${_snMoney(Math.abs(delta))}
+        （领先 ${_snPct(Math.abs(t.delta_pct_point || 0))} 个百分点）</div>
+      ${r.asof ? `<div class="faint">按 ${esc(r.asof)} 的最新收盘价计算；换一天再看数字会变</div>` : ''}
+    </div>`;
+  const cc = r.by_currency || {}, cny = cc.CNY || {}, hkd = cc.HKD || {};
+  const rows = (r.by_code || []).slice(0, 15).map(x => `<tr>
+    <td>${esc(x.code)} <span class="faint">${esc(x.name || '')}</span></td>
+    <td>${x.shares_base} → ${x.shares_now}</td>
+    <td>${fmtPx(x.price_base)} → ${fmtPx(x.price_now)}</td>
+    <td style="color:${_snColor(x.flat_gain_cny)}">${_snMoney(x.flat_gain_cny, true)}</td>
+    <td style="color:${_snColor(x.real_gain_cny)}">${_snMoney(x.real_gain_cny, true)}</td>
+    <td style="color:${_snColor(x.delta_cny)}"><b>${_snMoney(x.delta_cny, true)}</b></td></tr>`).join('');
+  box.innerHTML = verdict + `
+    <div class="muted" style="margin:6px 0 8px">基准 ${esc(sn.date || '')}
+      ${sn.label ? '· ' + esc(sn.label) : ''} · 基准市值 ${_snMoney(t.baseline_cny)}
+      · 之后 ${r.trade_count || 0} 笔操作 · HKD/CNY ${r.fx}
+      ${r.fx_source === 'fallback' ? '<span style="color:var(--warn)">（汇率兜底值）</span>' : ''}</div>
+    <div class="jq-metrics" style="margin-bottom:10px">
+      <div class="jq-metric"><div class="jq-metric-v" style="color:${_snColor(t.flat_gain_cny)}">${_snMoney(t.flat_gain_cny, true)}</div>
+        <div class="jq-metric-k">躺平不动 ${_snPct(t.flat_pct)}</div></div>
+      <div class="jq-metric"><div class="jq-metric-v" style="color:${_snColor(t.real_gain_cny)}">${_snMoney(t.real_gain_cny, true)}</div>
+        <div class="jq-metric-k">实际操作 ${_snPct(t.real_pct)}</div></div>
+      <div class="jq-metric"><div class="jq-metric-v" style="color:${_snColor(delta)}">${_snMoney(delta, true)}</div>
+        <div class="jq-metric-k">${delta >= 0 ? '操作多赚' : '操作少赚'} ${_snPct(t.delta_pct_point)}</div></div>
+      <div class="jq-metric"><div class="jq-metric-v" style="color:var(--accent)">${_snRate(w.win_rate)}</div>
+        <div class="jq-metric-k">区间择时胜率 ${w.wins || 0}/${(w.wins || 0) + (w.losses || 0)}</div></div>
+      <div class="jq-metric"><div class="jq-metric-v">${_snRate(rz.win_rate)}</div>
+        <div class="jq-metric-k">已实现胜率 ${rz.wins || 0}/${rz.count || 0}</div></div>
+    </div>
+    <div class="faint" style="margin-bottom:8px">
+      期末资产：躺平 ${_snMoney(t.flat_end_cny)} / 实际 ${_snMoney(t.real_end_cny)}（持仓市值 + 卖出所得 − 买入支出）；
+      分币种差额：A股 ${_snMoney(cny.delta, true)} · 港股 ${_snHkd(hkd.delta)}；
+      买入 ${_snWinLine(w.buy)} / 卖出 ${_snWinLine(w.sell)}
+    </div>
+    ${(r.missing_prices || []).length || r.incomplete_count
+      ? `<div style="color:var(--warn);margin-bottom:6px">⚠ ${r.incomplete_count || 0} 只票价格不全（${esc((r.missing_prices || []).join(', '))}），相关金额按可得价格计算，未编造 0 价。</div>` : ''}
+    ${rows ? `<div style="overflow-x:auto"><table class="tbl" style="width:100%"><thead><tr>
+      <th>股票</th><th>股数 基准→现在</th><th>价格 基准→现在</th><th>躺平收益</th><th>实际收益</th><th>差额</th>
+      </tr></thead><tbody>${rows}</tbody></table></div>`
+      : '<div class="empty">该快照之后还没有交易流水</div>'}
+    <div class="faint" style="margin-top:8px">${(r.caveats || []).map(esc).join('<br>')}</div>`;
+}
+
+async function snapshotCreate() {
+  // 日期由页面上那个可选的 <input type="date"> 给，不再藏进弹窗 ——
+  // 用户要的就是「先选日期，再按这个日期打」，两步都得看得见。
+  const date = ($('snap-date')?.value || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) { toastErr('请先选择基准日'); return; }
+  const label = ($('snap-label')?.value || '').trim();
+  try {
+    toastOk(`正在按 ${date} 逐票取收盘价，约 10~30 秒…`);
+    const r = await jsonPost('/api/trade-snapshots', { date, label });
+    const s = r.snapshot || {};
+    toastOk(`快照 ${s.date} 已保存：${(s.positions || []).length} 只持仓，基准 ${_snMoney(s.baseline_value_cny)}`);
+    _SNAP.reportDate = s.date;
+    if ($('snap-label')) $('snap-label').value = '';
+    await loadSnapshotList();          // 会填下拉框、自动选中新快照并出对照报告
+  } catch (e) { toastErr('打快照失败: ' + (e.message || e)); }
+}
+
+async function snapshotDelete(date) {
+  if (!await confirmDlg(`删除 ${date} 的快照？只删本地快照文件，不影响任何交易流水。`,
+                        { title: '删除快照', okText: '删除', danger: true })) return;
+  try {
+    await api('/api/trade-snapshots?date=' + encodeURIComponent(date), { method: 'DELETE' });
+    toastOk('已删除 ' + date);
+    _SNAP.reportDate = null;
+    await loadSnapshotTab();
+  } catch (e) { toastErr('删除失败: ' + (e.message || e)); }
+}
+
 // ---- 标签页 ----
-const TABS = ['market', 'sector', 'holdings', 'strategies', 'plans', 'calendar', 'news',
+const TABS = ['market', 'sector', 'holdings', 'snapshot', 'strategies', 'plans', 'calendar', 'news',
               'bili', 'wb', 'xhs', 'mp', 'x', 'reports', 'paper', 'tdesk', 'anchor',
               'notify', 'schedule',
-              'jq', 'analysis', 'skills', 'research'];
+              'jq', 'analysis', 'skills', 'research', 'chat'];
 const TAB_LOADERS = {
   // ⚠️ 港股解禁**不**挂在 market 的自动加载里（2026-10-13 用户报「一直加载中」）：
   //   ① 真解析每份公告约 40 秒 × N 只，会把整个自选页拖住几��钟；
@@ -6029,6 +6654,7 @@ const TAB_LOADERS = {
   market:    () => { loadWatch(); loadAlerts(); loadCrypto(); loadDiscover(); loadFutures(); loadFx(); loadMarketTemp(); loadMacroGlobal(); loadEtfFlows(); loadCashBaseline(); loadHKSupplyStatus(); },
   sector:    () => { loadSector(); loadIntraday(); startIntradayAuto(); },
   holdings:  () => { loadHoldings(); refreshTradeStrategyOptions(); },
+  snapshot:  loadSnapshotTab,
   strategies:() => { loadStrategies(); refreshTradeStrategyOptions(); },
   plans:     () => { loadPlans(); loadLlmConf(); },
   calendar:  () => { loadCalendar(); loadIpoStrategy(); },
@@ -6047,6 +6673,7 @@ const TAB_LOADERS = {
   analysis:  loadTechniques,
   skills:    loadSkills,
   research:  () => { loadProjects(); loadFactors(); loadResearch(); },
+  chat:      loadChat,
   schedule:  () => { loadSchedule(); loadConfigAll(); },
 };
 function switchTab(name) {

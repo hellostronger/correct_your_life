@@ -1235,6 +1235,39 @@ SCHEMAS: dict[str, dict[str, Any]] = {
              "help": "agent 一轮含多次工具调用，比单轮 LLM 慢；超时即回退单轮 LLM"},
         ],
     },
+    # ---------------- 网页对话（ChatGPT 风格 tab） ----------------
+    "web_chat": {
+        "label": "💬 网页对话",
+        "help": "网页「对话」tab（ChatGPT 风格：多会话 + 图片上传）。与微信侧"
+                "**只共用 agent 与数据**：走同一个本机 nanobot（能查持仓/行情/"
+                "新闻等只读数据），但会话完全隔离（网页会话 id = `web:` 前缀，"
+                "互不干扰）。历史存 `sa_chat_messages` 只用于页面回看，"
+                "不塞进 agent 请求（agent 自己按 session 存对话）。"
+                "图片走网关视觉模型转写成文字再交给 agent，识别失败会如实说明。",
+        "fields": [
+            {"key": "enabled", "t": "bool", "d": True,
+             "label": "启用对话 tab",
+             "help": "关掉后 /api/chat/* 端点返回可读原因，前端提示「功能未开启」。"},
+            {"key": "max_reply_chars", "t": "int", "d": 8000, "lo": 100, "hi": 20000,
+             "label": "回复截断(字)",
+             "help": "网页可长回答（与微信 1200 的口径不同：网页渲染 Markdown 表格没问题）。"},
+            {"key": "history_limit", "t": "int", "d": 200, "lo": 10, "hi": 1000,
+             "label": "每会话最多拉几条历史", "adv": True,
+             "help": "仅用于页面渲染历史，不影响 agent 记忆。"},
+            {"key": "max_upload_mb", "t": "int", "d": 10, "lo": 1, "hi": 50,
+             "label": "单张图片上限(MB)", "adv": True},
+            {"key": "vision_models", "t": "str",
+             "d": "nvidia/nemotron-3.5-super-vl-120b-a12b,nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+             "label": "视觉模型（逗号分隔）", "adv": True,
+             "help": "留空 = 不看图（上传仍可，agent 提示里会写「无法自动识别」）。"
+                     "实测（2026-11-08）：nvidia/nemotron-3.5-super-vl-120b-a12b（3.6s）"
+                     "与 nvidia/nemotron-3-nano-omni-30b-a3b-reasoning（6.2s）可用，"
+                     "其余候选全部 410/404/超时 —— 这些是推理模型，内部固定给 "
+                     "max_tokens=3000，小预算会被思考花光返回空。"},
+            {"key": "img_note_chars", "t": "int", "d": 1200, "lo": 100, "hi": 8000,
+             "label": "图片描述截断(字)", "adv": True},
+        ],
+    },
     # ---------------- 定时任务时间点 ----------------
     "schedule": {
         "label": "⏰ 定时任务时间点",

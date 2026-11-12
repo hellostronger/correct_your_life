@@ -258,11 +258,13 @@ def _agent_model(conf: dict) -> str:
     return model
 
 
-def _agent_reply(user_id: str, text: str, conf: dict) -> str | None:
+def _agent_call(text: str, session_id: str, conf: dict) -> str | None:
     """问本机 nanobot（agent，可调只读工具）要一条回复。失败返回 None 由调用方回退。
 
-    ⚠️ 不拼历史：nanobot 自己按 session 存对话（agents.defaults.idleCompact...），
-    再把 _history 塞进 prompt 会让同一句话出现两遍，模型还会以为在强调它。
+    session_id 由调用方拼（微信 `wx:<uid>`、网页 `web:<sid>`）—— nanobot 自己按
+    session 存对话，**不拼历史**：再把 _history 塞进 prompt 会让同一句话出现两遍，
+    模型还会以为在强调它。网页对话共用同一个 agent 与同一批只读工具，只是 session
+    隔离（2026-11-08 用户裁决：只共用 agent 与数据，不绑定微信会话）。
     """
     url = str(conf.get("agent_url") or "").rstrip("/")
     if not url:
@@ -275,7 +277,7 @@ def _agent_reply(user_id: str, text: str, conf: dict) -> str | None:
         return None
     payload = {
         "model": model,
-        "session_id": f"wx:{user_id}",
+        "session_id": session_id,
         "stream": False,
         "messages": [{"role": "user",
                       "content": AGENT_STYLE + "\n\n他现在说：\n" + text}],
@@ -334,6 +336,20 @@ def _agent_reply(user_id: str, text: str, conf: dict) -> str | None:
         print(f"[wx-chat] {msg}", flush=True)
         return None
     return out
+
+
+def agent_chat(text: str, session_id: str, conf: dict | None = None) -> str | None:
+    """网页侧复用 agent 的公开入口（同 one 把工具、同一份数据，session 隔离）。
+
+    conf 不传则现场读 config.yaml。返回 None = agent 不可用/上游报错，调用方回退。
+    **不写 sa_wx_chat**：网页对话落 sa_chat_messages（web_chat），互不污染。
+    """
+    return _agent_call(text, session_id, conf or load_chat_conf())
+
+
+def _agent_reply(user_id: str, text: str, conf: dict) -> str | None:
+    """微信路径：往 _agent_call 传 `wx:<uid>` session。行为与抽出前逐字节一致。"""
+    return _agent_call(text, f"wx:{user_id}", conf)
 
 
 def build_reply(deps, user_id: str, text: str) -> str | None:
