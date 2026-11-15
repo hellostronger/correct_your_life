@@ -70,6 +70,12 @@ entry-client 的 `ac()` 签名算法（工作量大、X 再改就废，未做）
 **验证**：cookies 有效（签名阶段曾通过一次 = 真实 app HTML 而非挑战页）；页面分析存档
 `D:/x_page.html`；账号池 `data/x_accounts.db` 现为 proxy+JSON cookies 正确状态。
 
+**2026-11-16 追加监控对象**（用户要求）：`sa_x_watch` 加 **Zai_org**（智谱 Z.ai 官方）
++ **jietang**（唐杰，清华教授、Z.ai 创始人个人号）—— 经 `POST /api/x/watch` 添加（id=1/2），
+user_id 待管线恢复后首抓自动解析缓存（新 x-web 页面把用户数据全改为客户端水合，
+HTML 里没有 rest_id，syndication 老端点也已死，无法预解析——不影响恢复）。
+恢复后新推文走 `notify_new` 推微信 + `digest_lines` 进日报（app.py:10997 的 x_fn）。
+
 ---
 
 ### 🧮 账户真实锚点 `account_anchors.py`（2026-11-14 用户要求）
