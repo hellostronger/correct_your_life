@@ -616,6 +616,7 @@ model_watch:
   notify_new: true
   per_source_limit: 8
   proxy: "http://127.0.0.1:6478"   # HF 本机直连超时 → 自动走代理重试一次（代理不常驻，只做回退）
+  github_bridge: "auto"            # auto=403 时经 webbridge 用浏览器登录态抓 atom；always=全程走桥；off=不用
 
 zai:
   github_org: "zai-org"

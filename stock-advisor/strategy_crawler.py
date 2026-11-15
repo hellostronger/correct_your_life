@@ -355,3 +355,61 @@ def stats(deps: dict) -> dict:
             "digested": digs, "need_extract": need,
             "fetch_rate": round((arts / q.get("fetched", 1) * 100), 1)
             if q.get("fetched") else 0.0}
+
+
+def backfill_source(deps: dict, limit: int = 60) -> dict:
+    """给「content_md 有代码块但没有 source 行」的文章补抽源码（纯本地，不联网）。
+
+    背景（2026-11-16 诊断）：307 篇文章 21 篇含 ``` 代码块，但 sa_strategy_source
+    只有 13 行——10 篇漏抽（它们的详情抓取发生在源码抽取功能上线之前）。
+    extract_source(md, replies) 是纯本地函数，回复表 sa_strategy_reply 里就有
+    评论区原文，不需要重爬。返回统计。"""
+    import json as _json
+    import joinquant_source as JS
+    get_conn = deps["get_conn"]
+    checked = backfilled = 0
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """SELECT a.post_id, a.content_md
+               FROM sa_strategy_article a
+               WHERE a.content_md LIKE '%%```%%'
+                 AND NOT EXISTS (SELECT 1 FROM sa_strategy_source s
+                                 WHERE s.post_id = a.post_id)
+               LIMIT %s""", (int(limit),))
+        rows = cur.fetchall()
+        for post_id, md in rows:
+            checked += 1
+            cur.execute(
+                """SELECT author, content, reply_id FROM sa_strategy_reply
+                   WHERE article_id = %s ORDER BY add_time""", (post_id,))
+            replies = [{"author": r[0], "content": r[1] or "",
+                        "reply_id": r[2]} for r in cur.fetchall()]
+            try:
+                src = JS.extract_source(md or "", replies)
+            except Exception as exc:
+                print(f"[jq-backfill] {post_id[:8]} 抽取失败: {exc}", flush=True)
+                continue
+            if not src.get("has_code"):
+                continue
+            slim = [{k: v for k, v in b.items() if k != "code"} | {"chars": b["chars"]}
+                    for b in (src.get("blocks") or [])]
+            cur.execute("DELETE FROM sa_strategy_source WHERE post_id=%s", (post_id,))
+            cur.execute(
+                """INSERT INTO sa_strategy_source
+                   (post_id, lang, code, lines, origin, origin_author,
+                    origin_reply_id, redacted, stub_sites, stub_reasons,
+                    n_blocks, blocks, other_blocks)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (post_id, src.get("lang", ""), src.get("code", ""),
+                 int(src.get("lines") or 0), src.get("origin", ""),
+                 src.get("author", ""), src.get("reply_id", ""),
+                 bool(src.get("redacted")), int(src.get("stub_sites") or 0),
+                 _json.dumps(src.get("stub_reasons") or [], ensure_ascii=False),
+                 int(src.get("n_blocks") or 1),
+                 _json.dumps(slim, ensure_ascii=False),
+                 _json.dumps([{k: v for k, v in b.items() if k != "code"}
+                              for b in (src.get("other_blocks") or [])],
+                             ensure_ascii=False)))
+            backfilled += 1
+        conn.commit()
+    return {"checked": checked, "backfilled": backfilled}

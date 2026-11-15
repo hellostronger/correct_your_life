@@ -977,7 +977,10 @@ def _load_candidates(deps, conf, only=None):
     if only:
         sql += " AND d.article_id = ANY(%s)"
         args.append(list(only))
-    sql += " ORDER BY d.portable_score DESC, d.title_zh LIMIT %s"
+    # 有源码的排前：no_code 是诚实结论，但 portable_score 不感知源码有无，
+    # 按分数排会让「只抽到摘要」的候选占据队列头部（2026-11-16 真机：top9 里 6 条
+    # no_code，而有源码的 3 条排后面——管线每天在跑却 0 可用结论的第一环）。
+    sql += " ORDER BY (s.code IS NOT NULL) DESC, d.portable_score DESC, d.title_zh LIMIT %s"
     args.append(int(conf["max_strategies"]))
     return _fetch(deps, sql, tuple(args))
 
@@ -1102,6 +1105,11 @@ def run_all(deps, conf=None, only=None):
                 traceback.print_exc()
                 r = _result(d, "run_failed",
                             "%s: %s" % (type(exc).__name__, str(exc)[:400]))
+            # 非 ok 行也要带交易日：原来只有 ok 才写，失败行 trade_date=NULL，
+            # MAX(trade_date) 停在第一次成功那天，按日期查会误判「管线死了」
+            # （2026-11-16 真机：MAX 停在 9-30，实际 10-23 起天天在跑）。
+            if not r.get("trade_date"):
+                r["trade_date"] = datetime.now().strftime("%Y-%m-%d")
             try:
                 _save_one(deps, run_id, r)
             except Exception as exc:             # noqa: BLE001

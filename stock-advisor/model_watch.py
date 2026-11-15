@@ -71,6 +71,11 @@ DEFAULT_CONF = {
     # HF 本机直连超时（2026-11-16 真机实测：github.com 直连 OK，huggingface.co 不通），
     # 直连失败自动走这个代理重试一次。代理不常驻（会挂），所以只做回退不做主路。
     "proxy": "http://127.0.0.1:6478",
+    # GitHub 免鉴权 60 次/时/IP 被打爆时的救援通道（2026-11-16 用户要求）：
+    #   auto   = 直连优先，403 rate-limit 时经 kimi-webbridge 用登录态抓 releases.atom
+    #   always = 直接走桥（浏览器登录态会话鉴权，不吃 API 配额）
+    #   off    = 不用桥
+    "github_bridge": "auto",
 }
 
 # 量化/再打包后缀：同一份权重的变体，不是新发布（大小写不敏感，贴在 basename 尾部）
@@ -218,21 +223,110 @@ def _within_days(pub_iso: str | None, days: int = 7) -> bool:
         return False
 
 
+# ---------------- GitHub 会话鉴权（kimi-webbridge） ----------------
+
+def gh_bridge_fetch_atoms(repos: list[str], pace_ms: int = 300) -> dict[str, str | None]:
+    """经 kimi-webbridge 在用户**已登录**的 github.com 页面里批量抓 releases.atom。
+
+    鉴权原理（与雪球桥 xq_bridge._JS 同模式）：GitHub 会话 cookie 是 HttpOnly，
+    JS 读不到、也**不该**提取落盘；但在 github.com 页面上下文里
+    `fetch(..., {credentials:'include'})` 会自动带上会话 —— 登录态本身就是鉴权配置，
+    永远新鲜、零存储。返回 {full_name: atom_xml 或 None}。"""
+    if not repos:
+        return {}
+    try:
+        import xq_bridge
+    except Exception as exc:
+        print(f"[model-watch] xq_bridge 不可用: {exc}", flush=True)
+        return {}
+    conf = dict(xq_bridge.DEFAULTS)
+    conf.update({"session": "github", "seed_url": "https://github.com/", "timeout": 90})
+    js = """(async () => {
+      const repos = %s;
+      const pace = %d;
+      const out = {};
+      for (const r of repos) {
+        try {
+          const resp = await fetch('/' + r + '/releases.atom', {credentials: 'include'});
+          out[r] = {http: resp.status, body: resp.ok ? (await resp.text()) : null};
+        } catch (e) { out[r] = {http: 0, error: String(e).slice(0, 120)}; }
+        await new Promise(s => setTimeout(s, pace));
+      }
+      return JSON.stringify(out);
+    })()""" % (json.dumps(repos, ensure_ascii=False), pace_ms)
+    bases = [str(conf["base_url"])]
+    if conf.get("fallback_url"):
+        bases.append(str(conf["fallback_url"]))
+    last: xq_bridge.BridgeError | None = None
+    for base in bases:
+        for attempt in range(int(conf["retries"]) + 1):
+            try:
+                xq_bridge.ensure_page(base, conf)
+                data = xq_bridge._post(base, {"action": "evaluate",
+                                              "args": {"code": js},
+                                              "session": conf["session"]},
+                                       conf["timeout"])
+                rows = json.loads(data.get("value") or "{}")
+                return {r: (rows.get(r) or {}).get("body")
+                        if (rows.get(r) or {}).get("http") == 200 else None
+                        for r in repos}
+            except xq_bridge.BridgeError as exc:
+                last = exc
+                xq_bridge.reset_page(base, conf["session"])
+                if exc.reason in ("bridge_down", "captcha"):
+                    break      # 换下一个端点 / 重试无用
+        if last is None:
+            break
+    if last:
+        print(f"[model-watch] github bridge 拉取失败: {last}", flush=True)
+    return {}
+
+
+def _parse_releases_atom(xml: str, repo: str, code: str,
+                         limit: int = 8) -> list[dict]:
+    """releases.atom → items（entry 的 title/link/updated）。解析失败返回 []。"""
+    import xml.etree.ElementTree as ET
+    ns = "{http://www.w3.org/2005/Atom}"
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError as exc:
+        print(f"[model-watch] {repo} atom 解析失败: {exc}", flush=True)
+        return []
+    items = []
+    base = _basename(repo)
+    for entry in root.findall(ns + "entry")[:max(1, limit)]:
+        title = (entry.findtext(ns + "title") or "").strip()
+        url = ""
+        for link in entry.findall(ns + "link"):
+            if (link.get("rel") or "alternate") == "alternate":
+                url = link.get("href") or ""
+                break
+        pub = _norm_pub(entry.findtext(ns + "updated"))
+        if not url or not pub:
+            continue
+        items.append({"code": code,
+                      "title": f"[GitHub] {base} {title}".strip()[:200],
+                      "url": url, "source": "model", "media": "GitHub",
+                      "publish_time": pub})
+    return items
+
+
 # ---------------- 三道痕迹（按主体） ----------------
 
-def fetch_github_releases(subject: dict, org_repos: list[dict]) -> list[dict]:
+def fetch_github_releases(subject: dict, org_repos: list[dict],
+                          bridge: str = "auto") -> list[dict]:
     """模型仓最近 releases → items。org_repos 由 run_once 传入（org 调用共用）。
 
     配额纪律（2026-11-16 真机 403 逮到）：免鉴权 GitHub API = 60 次/小时/IP，
     zai-org 的 GLM* 仓库比预想多（GLM-4/5/TTS/ASR/Image/OCR/skills...），
-    全轮询一发就顶到墙。两道闸：
-    ① 只轮询 **pushed_at ≤90 天** 的仓库（三个月没动静的仓不会突然出 release，
-       新 release 必然伴随 push）；
-    ② 403 rate-limit → 走代理重试（不同 IP 配额）+ 单行日志，不打爆控制台。"""
+    全轮询一发就顶到墙。三道闸：
+    ① 只轮询 **pushed_at ≤90 天** 的仓库（三个月没动静的仓不会突然出 release）；
+    ② 403 rate-limit → `github_bridge != "off"` 时经 kimi-webbridge 用登录态抓
+       releases.atom（web 端点不吃 API 配额，会话鉴权），"always" 则全程走桥；
+    ③ 其余 HTTP 错误软跳过（单行日志 + 计数）。"""
     code = str(subject.get("code") or "").strip()
     limit = max(1, int(subject.get("per_source_limit") or 8))
-    items = []
-    skipped_403 = 0
+    pending = []
     for repo in org_repos or []:
         full = repo.get("full_name") or ""
         if not _is_model_trace(full, subject):
@@ -241,16 +335,36 @@ def fetch_github_releases(subject: dict, org_repos: list[dict]) -> list[dict]:
         pushed = _norm_pub(repo.get("pushed_at"))
         if pushed and not _within_days(pushed, 90):
             continue
+        pending.append(full)
+    if not pending:
+        return []
+    bridge = str(bridge or "auto").lower()
+    if bridge == "always":
+        atoms = gh_bridge_fetch_atoms(pending)
+        out = []
+        for full, xml in atoms.items():
+            out += _parse_releases_atom(xml or "", full, code, limit)
+        return out
+
+    items = []
+    rate_limited = False
+    failed = 0
+    done: list[str] = []
+    for full in pending:
         try:
             rels = _http_json(
                 f"https://api.github.com/repos/{full}/releases?per_page={limit}",
                 proxy=str(subject.get("proxy") or ""))
         except Exception as exc:
-            skipped_403 += 1
-            if skipped_403 == 1:
+            if "rate limit" in str(exc).lower():
+                rate_limited = True
+                break                      # 换桥把剩余仓库一次拉完
+            failed += 1
+            if failed == 1:
                 print(f"[model-watch] {full} releases 拉取失败（后续同类只计数）: "
                       f"{type(exc).__name__}: {exc}", flush=True)
             continue
+        done.append(full)
         if not isinstance(rels, list):
             continue
         base = _basename(full)
@@ -268,8 +382,15 @@ def fetch_github_releases(subject: dict, org_repos: list[dict]) -> list[dict]:
                 items.append({"code": code, "title": " ".join(title_bits)[:200],
                               "url": url, "source": "model", "media": "GitHub",
                               "publish_time": pub})
-    if skipped_403 > 1:
-        print(f"[model-watch] 另有 {skipped_403 - 1} 个仓库 releases 拉取失败", flush=True)
+    if failed > 1:
+        print(f"[model-watch] 另有 {failed - 1} 个仓库 releases 拉取失败", flush=True)
+    if rate_limited and bridge == "auto":
+        remaining = [r for r in pending if r not in done]
+        print(f"[model-watch] GitHub API 403 rate limit → 经 webbridge 登录态抓 "
+              f"{len(remaining)} 个仓库的 releases.atom", flush=True)
+        atoms = gh_bridge_fetch_atoms(remaining)
+        for full, xml in atoms.items():
+            items += _parse_releases_atom(xml or "", full, code, limit)
     return items
 
 
@@ -365,7 +486,8 @@ def run_once(deps: dict) -> dict:
                 print(f"[model-watch] {org} repos 拉取失败: {type(exc).__name__}: {exc}",
                       flush=True)
 
-        items = fetch_github_releases(s, org_repos) + \
+        items = fetch_github_releases(s, org_repos,
+                                      bridge=str(g.get("github_bridge") or "auto")) + \
             fetch_github_new_repos(s, org_repos)
         hf_items, new_seen, hf_err = fetch_hf_models(
             s, (state.get("seen_hf") or {}).get(key) or {})

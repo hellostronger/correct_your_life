@@ -76,6 +76,30 @@ BOM，`ast.parse` 要 `utf-8-sig`；④ 测试夹具又错两次：stub 对 4 �
 
 ---
 
+### 🔧 聚宽每日结论管线诊断：no_code 96 条 = 诚实结论，真断点在第三环（2026-11-16，用户要求）
+
+用户问「研究下面多少真用起来」→ 全链路诊断 → **「把 ① 的管线修了（先诊断 no_code
+的 96 条断在哪一环）」**。三层各有独立结论：
+
+| 环 | 诊断 | 处置 |
+|---|---|---|
+| **①源码抽取覆盖** | 307 篇文章 21 篇含 ``` 代码块，13 篇有 source 行；写了 `backfill_source()`（纯本地回填：content_md + sa_strategy_reply → `joinquant_source.extract_source`）验证「漏抽」假设——**backfilled=0**：那 10 篇的代码块是 5~14 行无标注说明片段，`is_code_block` 正确排除 | 判据正常，no_code 是诚实结论；backfill 函数保留为诊断工具 |
+| **②候选排序** | `_load_candidates` 按 portable_score 排、不感知源码 → 有源码的 3 条排 4/8/9 位 | ✅ 已修：`ORDER BY (s.code IS NOT NULL) DESC, portable_score DESC`——真机验证有源码 3 条排前 3 |
+| **③trade_date NULL** | 非 ok 行不写 trade_date → `MAX(trade_date)` 停在 9-30，按日期查误判「管线死了」（实际 10-23 起天天在跑） | ✅ 已修：run_all 对所有结果行补 `trade_date`；零 LLM E2E 验证（跑一条 no_code 候选，落库行带 2026-11-16） |
+| **④真断点：契约失败** | 有源码的 3 条全灭：沪深300ETF/微盘反转是**研究型代码**（无 `initialize(context)`、import os/matplotlib 越白名单）→ contract_failed；万得微盘 → run_failed「沙箱没有输出 #RESULT 行」 | **未修**——需要 LLM 契约改写环节（把研究型代码包装成聚宽骨架重试），属新功能（每条一次 LLM 调用 + 改写可能变语义），**待用户裁决** |
+
+**口径结论**：no_code 的 96 条 = 24 天 × 4 条 top 候选（307 篇里 284 篇文章本身没有
+代码——公众号策略文多是思路描述）。「管线每天在跑却 0 可用结论」的因果链是
+**③掩盖了④**：不是管线死了，是有源码候选全灭于聚宽契约。
+
+**踩坑**：①带 params 的 SQL 里 LIKE 字面量 `%` 必须 `%%`（AGENTS.md 第 3 次撞，
+backfill 首跑 IndexError 即此）；②sa_strategy_article 主键叫 post_id 不是 id；
+③诊断期只跑 no_code 候选验证（run_one 对 no_code 零 LLM），不烧钱验证。
+
+---
+
+---
+
 ### 🧠 监控扩到 MiniMax：zai_watch → model_watch 多主体（2026-11-16，用户要求）
 
 用户：「minimax的也加上监控」→ 监控对象从智谱单主体泛化为多主体。

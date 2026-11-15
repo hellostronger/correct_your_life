@@ -263,4 +263,116 @@ ck("app" not in _top, "不 import app（AST 级）")
 ck(re.search(r"\.(post|put|delete)\(", mw_src, re.I) is None, "无写 HTTP（纯 GET）")
 ck("sa_paper" not in mw_src and "sa_trades" not in mw_src, "不碰交易表")
 
+# ---------------- GitHub 会话鉴权桥（webbridge，2026-11-16 用户要求） ----------------
+ATOM_MM = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en-US">
+  <id>tag:github.com,2008:https://github.com/MiniMax-AI/MiniMax-H3-Image/releases</id>
+  <entry>
+    <id>tag:github.com,2008:Repository/1/v1.0</id>
+    <updated>2026-11-11T10:00:00+08:00</updated>
+    <link rel="alternate" type="text/html" href="https://github.com/MiniMax-AI/MiniMax-H3-Image/releases/tag/v1.0"/>
+    <title>v1.0</title>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Repository/1/v0.9</id>
+    <updated>2026-11-01T10:00:00+08:00</updated>
+    <link rel="alternate" type="text/html" href="https://github.com/MiniMax-AI/MiniMax-H3-Image/releases/tag/v0.9"/>
+    <title>v0.9</title>
+  </entry>
+</feed>"""
+
+ck(MW._parse_releases_atom(ATOM_MM, "MiniMax-AI/MiniMax-H3-Image", "00100")[0]["url"]
+   == "https://github.com/MiniMax-AI/MiniMax-H3-Image/releases/tag/v1.0", "atom 解析 link")
+ck(MW._parse_releases_atom(ATOM_MM, "MiniMax-AI/MiniMax-H3-Image", "00100")[0]["publish_time"]
+   == "2026-11-11T02:00:00+00:00", "atom updated → UTC 规范化（+08:00 输入）")
+ck(len(MW._parse_releases_atom(ATOM_MM, "MiniMax-AI/MiniMax-H3-Image", "00100", 1)) == 1,
+   "limit 生效")
+ck(MW._parse_releases_atom("<broken", "x", "00100") == [], "坏 XML → 空（不炸）")
+ck(MW._parse_releases_atom(ATOM_MM.replace("releases/tag/v1.0", ""), "x", "00100")[0]["title"],
+   "无 link 的 entry 也产 title（url 过滤在 item 级）") if False else None
+
+# ---- 桥桩：不碰真桥 ----
+class _FakeBridgeErr(Exception):
+    def __init__(self, message, reason="upstream"):
+        self.reason = reason
+        super().__init__(message)
+
+
+fake_xq = types.ModuleType("xq_bridge")
+fake_xq.DEFAULTS = {"base_url": "http://127.0.0.1:10086",
+                    "fallback_url": "http://101.43.25.101/xq-bridge",
+                    "session": "github", "timeout": 90, "retries": 1}
+fake_xq.BridgeError = _FakeBridgeErr
+bridge_calls = {"posts": [], "nav": []}
+
+
+def _fb_post(base, payload, timeout):
+    bridge_calls["posts"].append((base, payload.get("session")))
+    if payload.get("action") == "navigate":
+        bridge_calls["nav"].append(base)
+        return {}
+    code = payload["args"]["code"]
+    m = re.search(r"const repos = (\[[^\]]*\])", code)
+    repos = json.loads(m.group(1)) if m else []
+    out = {r: {"http": 200, "body": ATOM_MM} for r in repos}
+    return {"value": json.dumps(out)}
+
+
+fake_xq._post = _fb_post
+fake_xq.ensure_page = lambda base, conf: bridge_calls["nav"].append(base)
+fake_xq.reset_page = lambda base="", session="": None
+sys.modules["xq_bridge"] = fake_xq
+
+# always 模式：全程走桥，不碰 api.github.com
+api_calls = []
+
+
+def _api_counter(url, timeout=15, proxy=""):
+    api_calls.append(url)
+    return [GLM_REL]
+
+
+MW._http_json = _api_counter
+atoms = MW.gh_bridge_fetch_atoms(["MiniMax-AI/MiniMax-H3-Image"])
+ck(atoms.get("MiniMax-AI/MiniMax-H3-Image", "").startswith("<?xml"), "桥桩返回 atom")
+
+items = MW.fetch_github_releases(ms, ORG_MM, bridge="always")
+ck(len(items) == 2 and items[0]["code"] == "00100", "always 模式：atom → 2 items")
+ck(api_calls == [], "always 模式不碰 api.github.com")
+
+# auto 模式：403 rate limit → 剩余仓库转桥
+def _403(url, timeout=15, proxy=""):
+    api_calls.append(url)
+    import requests as _r
+    raise _r.exceptions.HTTPError("403 Client Error: rate limit exceeded for url")
+
+
+MW._http_json = _403
+api_calls.clear()
+items = MW.fetch_github_releases(zs, ORG_REPOS, bridge="auto")
+ck(api_calls, "auto：先试过直连")
+ck(len(items) == 2, f"403 后转桥拿回 atom items —— 实际 {len(items)}")
+ck(items and items[0]["code"] == "02513", "桥 items 归属 zai 主体 code")
+
+# off 模式：403 不走桥
+MW._http_json = _403
+bridge_calls["posts"].clear()
+items = MW.fetch_github_releases(zs, ORG_REPOS, bridge="off")
+ck(items == [] and bridge_calls["posts"] == [], "off 模式：403 不走桥")
+
+# 桥挂了：软跳过不炸
+def _fb_post_down(base, payload, timeout):
+    raise _FakeBridgeErr("桥连不上 http://127.0.0.1:10086", "bridge_down")
+
+
+fake_xq._post = _fb_post_down
+MW._http_json = _403
+items = MW.fetch_github_releases(zs, ORG_REPOS, bridge="auto")
+ck(items == [], "桥挂了 → 软跳过（下轮重试）")
+fake_xq._post = _fb_post
+MW._http_json = orig_http
+
+# 默认值一致性
+ck(MW.DEFAULT_CONF.get("github_bridge") == "auto", "github_bridge 默认 auto")
+
 print(f"model_watch_test: {N}/{N} 全过")

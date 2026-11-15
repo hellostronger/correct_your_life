@@ -458,6 +458,9 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             {"key": "proxy", "t": "url", "d": "http://127.0.0.1:6478",
              "label": "直连失败时的代理", "adv": True,
              "help": "HF 本机直连超时 → 自动走此代理重试一次；代理不常驻，只做回退"},
+            {"key": "github_bridge", "t": "str", "d": "auto", "label": "GitHub 403 救援通道",
+             "help": "auto=403 时经 webbridge 用浏览器登录态抓 releases.atom；"
+                     "always=全程走桥（不吃 API 配额）；off=不用桥"},
         ],
     },
     "zai": {
