@@ -441,6 +441,35 @@ SCHEMAS: dict[str, dict[str, Any]] = {
              "label": "正文入库截断长度", "adv": True},
         ],
     },
+    # ---------------- 智谱动态（只抓新模型发布痕迹） ----------------
+    "zai": {
+        "label": "🤖 智谱动态（只抓新模型发布痕迹）",
+        "help": "zai-org 的「模型发布痕迹」→ sa_news（关联到下方股票代码）："
+                "①GLM* 模型仓新 release ②GLM* 新仓库上线（发布前兆）③HuggingFace 新模型"
+                "上传（量化变体按 base 去重）。ZCode 等工具仓 release 不算。"
+                "X 管线恢复前的稳定替代源，见 zai_watch.py。",
+        "fields": [
+            {"key": "enabled", "t": "bool", "d": True, "label": "启用"},
+            {"key": "interval_minutes", "t": "int", "d": 60, "lo": 0, "hi": 1440,
+             "label": "轮询周期(分钟)", "help": "0 = 关闭"},
+            {"key": "github_org", "t": "str", "d": "zai-org", "label": "GitHub org",
+             "help": "org 仓库发现 + 各模型仓 release，每轮共 ~N+1 次调用（免鉴权 60 次/时）"},
+            {"key": "hf_author", "t": "str", "d": "zai-org", "label": "HuggingFace 作者",
+             "help": "一次调用覆盖该作者全部模型上传"},
+            {"key": "model_name_re", "t": "str", "d": "GLM[-_A-Za-z0-9.]*",
+             "label": "模型命名 pattern", "help": "匹配 basename，大小写不敏感；"
+             "决定什么算「模型痕迹」——ZCode 等工具仓不匹配就不收"},
+            {"key": "code", "t": "str", "d": "02513", "label": "关联股票代码",
+             "help": "新闻落到哪只票的决策上下文（_paper_news_rows 按 code 关联）"},
+            {"key": "notify_new", "t": "bool", "d": True, "label": "新痕迹推微信",
+             "help": "过滤后剩下的都是高信号（新模型发布/前兆），默认推"},
+            {"key": "per_source_limit", "t": "int", "d": 8, "lo": 1, "hi": 30,
+             "label": "每源单轮取条数", "adv": True},
+            {"key": "proxy", "t": "url", "d": "http://127.0.0.1:6478",
+             "label": "直连失败时的代理", "adv": True,
+             "help": "HF 本机直连超时 → 自动走此代理重试一次；代理不常驻，只做回退"},
+        ],
+    },
     # ---------------- 币圈 ----------------
     "crypto": {
         "label": "🪙 币圈 24h（gate.io 股票永续）",

@@ -81,12 +81,17 @@ import notify_events
 import project_api
 import skill_api
 import trade_snapshot
+import broker_cash
+import holding_metrics
+import account_anchors
+import advice_followup
 import wechat_mp
 import web_chat
 import wx_chat
 import wx_commands
 import wx_inbound
 import x_monitor
+import zai_watch
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"          # 兼容保留：迁移前旧 JSON 数据所在目录
@@ -1678,9 +1683,17 @@ def _holdings_with_pnl(positions: list[dict]) -> list[dict]:
             p["pnl"] = 0.0                                                    # 已清仓无浮动
             p["pnl_pct"] = None
         p["total_pnl"] = round(p["pnl"] + p["realized_pnl"], 2)               # 累计总盈亏
+        # 币种按代码判定，不依赖行情/汇率是否取到（汇率失败时港股仍要标 HKD）
+        p["currency"] = "HKD" if _market_of(p["code"]) == "hk" else "CNY"
         # 只有港股才折算：rate 是全局汇率（组合里有港股时非空），
         # 不能拿给 A 股用——曾把 A 股盈亏也乘 0.855，688795 一笔 -71546 显示成 -61165
         k = rate if is_hk else 1.0
+        # 累计回本价：把已实现盈亏也摊进股价，不只是摊薄成本
+        be = holding_metrics.breakeven(p.get("avg_cost"), p["realized_pnl"],
+                                       p["net_shares"], p.get("price"), k)
+        p["breakeven_price"] = be["price"]
+        p["breakeven_price_cny"] = be["price_cny"]
+        p["breakeven_pct"] = be["pct"]
         p["price_cny"] = round(price * k, 4) if p.get("price") else p.get("price")
         p["market_value_cny"] = round(p["market_value"] * k, 2)
         p["cost_value_cny"] = round(p["cost_value"] * k, 2) if p.get("cost_value") is not None else None
@@ -1712,9 +1725,179 @@ def list_holdings():
             by_code.setdefault(ps["code"], []).append(ps)
     except Exception:
         pass
+    # 建议操作（2026-11-14 用户要求持仓加「建议操作」列）：
+    # 直接读 sa_t_advisory_log 每只票**最新一条**判断——后台 _t_advisory_loop
+    # 每 15 分钟把全部持仓判一遍落库（含 hold/被拦的），判据与实盘做T同源
+    # （t_trading.decide）。这里不现场重算：重算要逐票拉 K 线/行情，持仓页
+    # 会从毫秒级变成十几秒；而日志里的判断最多滞后 15 分钟，对「建议」够了。
+    # 表不存在/查询失败 → advice=None，前端显示「—」，绝不阻塞持仓页。
+    advice_by_code: dict[str, dict] = {}
+    try:
+        with get_conn() as conn, conn.cursor(
+                cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""SELECT DISTINCT ON (code) code, action, why, bias,
+                                  price, edge_pct, threshold_pct, pending,
+                                  trade_date, created_at
+                             FROM sa_t_advisory_log
+                            ORDER BY code, created_at DESC""")
+            for r in cur.fetchall():
+                advice_by_code[r["code"]] = {
+                    "action": r["action"],
+                    "why": r["why"],
+                    "bias": r["bias"],
+                    "price": float(r["price"]) if r["price"] is not None else None,
+                    "edge_pct": (round(float(r["edge_pct"]), 2)
+                                 if r["edge_pct"] is not None else None),
+                    "threshold_pct": (round(float(r["threshold_pct"]), 2)
+                                      if r["threshold_pct"] is not None else None),
+                    "pending": bool(r["pending"]),
+                    "trade_date": str(r["trade_date"] or ""),
+                    "time": r["created_at"].isoformat(timespec="minutes")
+                            if r["created_at"] else "",
+                }
+    except Exception as exc:                       # noqa: BLE001
+        print("[holdings] 取建议操作失败: %s" % str(exc)[:120])
     for r in rows:
         r["position_strategies"] = by_code.get(r["code"], [])
+        r["advice"] = advice_by_code.get(r["code"])
     return rows
+
+
+@app.get("/api/advice-followup")
+def advice_followup_report(days: int = 60):
+    """建议 vs 实际操作统计（2026-11-15 用户需求）。
+
+    三步（纯逻辑在 advice_followup.py，有单测）：
+      1. 近 N 天「动作类」建议（高抛/买回/减仓/止损）聚合成**信号**——
+         引擎连续刷，同一条件落库上百行，必须先归并；
+      2. 信号日 +3 自然日内有同方向实盘成交 = 已采纳（一笔成交只算一次）；
+      3. 差额：已采纳按**实际成交价**算「照做 vs 不做」，未采纳按**信号价×
+         建议股数**算反事实；评估基准 = 最新现价。港股 HKD 折 CNY 汇总。
+    """
+    import datetime as _dt
+    days = max(1, min(int(days), 180))
+    try:
+        with get_conn() as conn, conn.cursor(
+                cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""SELECT code, name, action, price, movable, base_shares,
+                                  detail, why, trade_date, created_at
+                             FROM sa_t_advisory_log
+                            WHERE action = ANY(%s)
+                              AND created_at > now() - (%s || ' days')::interval
+                            ORDER BY created_at""",
+                        (list(advice_followup.ACTIONABLE), str(days)))
+            adv_rows = [dict(r) for r in cur.fetchall()]
+            cur.execute("""SELECT code, side, shares, price, trade_date
+                             FROM sa_trades
+                            WHERE trade_date > current_date - %s
+                            ORDER BY trade_date, id""", (days + 10,))
+            trades = [dict(r) for r in cur.fetchall()]
+    except Exception as exc:                       # noqa: BLE001
+        return {"error": "查询失败: %s" % str(exc)[:160],
+                "summary": None, "signals": []}
+    signals = advice_followup.group_signals(adv_rows)
+    advice_followup.match_followed(signals, trades)
+    # 现价 + 币种：走 101 行情（与持仓页同源）；港股乘汇率折 CNY
+    codes = sorted({s["code"] for s in signals})
+    quotes = fetch_quotes(codes) if codes else {}
+    rate = _hkd_cny_rate() if any(
+        (quotes.get(c) or {}).get("market") == "hk" for c in codes) else 1.0
+    now_prices = {}
+    for s in signals:
+        q = quotes.get(s["code"]) or {}
+        s["is_hk"] = q.get("market") == "hk"
+        px = q.get("price")
+        if isinstance(px, (int, float)) and px > 0:
+            now_prices[s["code"]] = px
+    advice_followup.evaluate(signals, now_prices, rate)
+    # detail 太大不外发；渲染需要的字段单独挑出来
+    out = []
+    for s in sorted(signals, key=lambda x: x.get("time") or "", reverse=True):
+        out.append({k: s.get(k) for k in (
+            "code", "name", "action", "dir", "date", "time", "price",
+            "suggest_shares", "followed", "trade_shares", "trade_price",
+            "eval_src", "eval_shares", "eval_price", "now_price",
+            "is_hk", "gain", "gain_cny", "rows", "why")})
+    return {
+        "summary": advice_followup.summarize(signals),
+        "signals": out,
+        "fx_hkd_cny": round(rate, 4) if rate != 1.0 else None,
+        "window_days": days,
+    }
+
+
+# ---------------- 账户级真实锚点（真实现金 / 总参考收益） ----------------
+# 账号在 2026-09-09 才开始进 sa_trades，之前的本金与盈亏没录入系统；
+# 这两个手填值是后续所有复盘的基准，未录入时为 None，绝不默认 0。
+
+class AccountAnchorIn(BaseModel):
+    cash_cny: float | None = Field(default=None, ge=0, description="当前真实现金，折 CNY")
+    reference_pnl_cny: float | None = Field(default=None, description="账号实际累计总盈亏，折 CNY，可负")
+    note: str = Field(default="", max_length=120)
+    asof_date: str = Field(default="", max_length=10,
+                           description="锚点基准日 YYYY-MM-DD，空=今天；此日之后的买卖自动联动")
+
+
+def _net_trade_flow_cny(asof: str, fx: float) -> float:
+    """asof 之后的实盘净现金流（Σ卖−Σ买，折 CNY）。港股 5 位码按汇率折算。"""
+    if not asof:
+        return 0.0
+    total = 0.0
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT side, shares, price, code FROM sa_trades WHERE trade_date > %s",
+                    (asof,))
+        for side, shares, price, code in cur.fetchall():
+            amt = float(shares) * float(price)
+            if len(str(code)) == 5:      # 港股 5 位码（02513），A 股 6 位
+                amt *= fx
+            total += amt if side == "sell" else -amt
+    return round(total, 2)
+
+
+def _account_view() -> dict:
+    """锚点 + 系统推算值对齐（持仓市值 / 系统累计盈亏取同一套 /api/holdings 口径）。
+
+    2026-11-14 起：锚点带基准日(asof_date)，基准日之后的 sa_trades 净现金流与
+    broker_cash 出入金自动叠加——记一笔买入现金就少、卖出现金就多，
+    账号真实总资产与实时参考收益随每笔实盘买卖联动，锚点本身不用重录。
+    """
+    rows = _holdings_with_pnl(_derive_holdings())
+    mv = sum(p.get("market_value_cny") or 0 for p in rows)
+    sysp = sum(p.get("total_pnl_cny") or 0 for p in rows)
+    anchors = account_anchors.load_store()
+    fx, fx_source = _ts_fx()
+    flow = ext = 0.0
+    asof = anchors.get("asof_date")
+    if asof and anchors.get("cash_cny") is not None:
+        flow = _net_trade_flow_cny(asof, fx)
+        ext = broker_cash.net_in_range(broker_cash.list_flows(),
+                                       start=asof, fx=fx).get("net_cny", 0.0)
+    return {"anchors": anchors, "fx_hkd": round(fx, 4), "fx_source": fx_source,
+            "computed": account_anchors.compute(anchors, mv, sysp, flow, ext)}
+
+
+@app.get("/api/account-anchors")
+def account_anchors_get():
+    v = _account_view()
+    return {"ok": True, **v, "status": account_anchors.status(),
+            "hint": "账号在 9-9 之前没录入系统；真实现金与总参考收益是手填的账户级基准，"
+                    "未录入时相关字段为 null（不拿 0 冒充真实数据）。"}
+
+
+@app.put("/api/account-anchors")
+def account_anchors_put(body: AccountAnchorIn):
+    # 先取当前系统累计盈亏当快照：把「未覆盖缺口」钉死在录入时点，
+    # 之后新记的买卖/行情涨跌通过 (系统盈亏现在值 − 快照) 滚进实时参考收益。
+    rows = _holdings_with_pnl(_derive_holdings())
+    sysp = round(sum(p.get("total_pnl_cny") or 0 for p in rows), 2)
+    asof = body.asof_date.strip() or datetime.now().strftime("%Y-%m-%d")
+    try:
+        saved = account_anchors.save(body.cash_cny, body.reference_pnl_cny,
+                                     body.note, asof, sysp)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    v = _account_view()
+    return {"ok": True, "anchors": saved, "computed": v["computed"]}
 
 
 @app.get("/api/trades")
@@ -1942,9 +2125,65 @@ def trade_snapshots_report(date: str = ""):
     codes = {r["code"] for r in snap.get("positions", [])} | {t["code"] for t in after}
     prices = _ts_now_prices(codes)
     fx, fx_source = _ts_fx()
-    rep = trade_snapshot.build_report(snap, trades, prices, fx, _stock_names(sorted(codes)))
+    flows = broker_cash.load_store().get("flows", [])
+    rep = trade_snapshot.build_report(snap, trades, prices, fx,
+                                      _stock_names(sorted(codes)), cash_flows=flows)
     return {"ok": True, "report": rep, "fx_source": fx_source,
+            "external_flow_count": rep["totals"]["external_flow_count"],
+            "account": _account_view(),       # 真实现金/总参考收益锚点，供对账行使用
             "asof": datetime.now().isoformat(timespec="seconds")}
+
+
+# ---------------- 银证转账（银行 ↔ 券商）入金/出金台账 ----------------
+# 侧车 data/broker_cash_flows.json，不改 schema、不碰 sa_trades。
+# 用途：把 trade_snapshot 里那笔「按流水推算的虚拟现金」修正成真实资金流，
+# 让快照报告的「调整后账户资产」能和券商 App 对账。
+
+class CashFlowIn(BaseModel):
+    date: str = Field(default="", description="YYYY-MM-DD；留空=今天")
+    side: str = Field(default="in", description="in 入金 / out 出金")
+    amount: float = Field(default=0, gt=0, description="金额，原币")
+    currency: str = Field(default="CNY", description="CNY / HKD")
+    account: str = Field(default="", max_length=40)
+    note: str = Field(default="", max_length=120)
+
+
+@app.get("/api/cash-flows")
+def cash_flows_list(start: str = "", end: str = ""):
+    flows = broker_cash.list_flows(start=start.strip() or None, end=end.strip() or None)
+    fx, fx_source = _ts_fx()
+    return {"ok": True, "flows": flows, "status": broker_cash.store_status(),
+            "summary": broker_cash.summarize(flows, fx=fx),
+            "fx": round(fx, 4), "fx_source": fx_source,
+            "hint": "只记银行↔券商之间的入金/出金；账户内买卖股票由 sa_trades 负责，不要重复记。"}
+
+
+@app.post("/api/cash-flows")
+def cash_flows_add(body: CashFlowIn):
+    try:
+        flow = broker_cash.add_flow(
+            body.date.strip() or datetime.now().strftime("%Y-%m-%d"),
+            body.side, body.amount, body.currency, body.note, body.account)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True, "flow": flow}
+
+
+@app.delete("/api/cash-flows")
+def cash_flows_delete(id: str = ""):
+    if not id.strip():
+        raise HTTPException(400, "id 不能为空")
+    if not broker_cash.delete_flow(id.strip()):
+        raise HTTPException(404, f"没有这笔转账 #{id.strip()}")
+    return {"ok": True, "removed": id.strip()}
+
+
+@app.get("/api/cash-flows/summary")
+def cash_flows_summary(start: str = "", end: str = ""):
+    fx, fx_source = _ts_fx()
+    flows = broker_cash.list_flows(start=start.strip() or None, end=end.strip() or None)
+    return {"ok": True, "summary": broker_cash.summarize(flows, fx=fx),
+            "fx": round(fx, 4), "fx_source": fx_source}
 
 
 # ---------------- 加仓摊薄成本预估（买入前试算，不写库） ----------------
@@ -5770,6 +6009,7 @@ import t_trading
 import paper_anchor
 import market_data
 import trade_review
+import news_context
 import backtest
 import joinquant_source
 import strategy_crawler
@@ -5822,7 +6062,7 @@ def _paper_deps(conf: dict | None = None) -> dict:
         "tx_symbol_fn": _tx_symbol,
         "quote_fn": fetch_quotes,
         "conf": conf if conf is not None else _conf_section("paper"),
-        "news_fn": _paper_news_rows,
+        "news_fn": _curated_news_fn,  # 与实盘评审同一份消息面大脑（news_context）
         "events_fn": _paper_event_lines,
           # 解禁/禁售/锁定讨论 —— 单独一份名额，见 `_paper_event_rows` 的说明
           # （混在新闻块里必然被 LIMIT 挤掉，实测 12 条全在近 4 天）
@@ -5874,9 +6114,9 @@ def _paper_news_rows(code: str, limit: int = 10) -> list[dict]:
     try:
         with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                "SELECT title, media, source, sentiment, publish_time FROM ("
+                "SELECT title, media, source, sentiment, publish_time, title_vec FROM ("
                 "  SELECT DISTINCT ON (n.url) n.title, n.media, n.source, n.sentiment,"
-                "         n.publish_time"
+                "         n.publish_time, n.title_vec"
                 "    FROM sa_news n "
                 "    LEFT JOIN sa_news_related r ON r.url = n.url "
                 "   WHERE (n.code = %s OR r.code = %s) "
@@ -5899,6 +6139,116 @@ def _paper_news_rows(code: str, limit: int = 10) -> list[dict]:
             return [dict(r) for r in cur.fetchall()]
     except Exception:
         return []
+
+
+def _rating_news_rows(code: str, name: str, days: int = 14,
+                      limit: int = 4) -> list[dict]:
+    """该股**公司级**评级/目标价新闻 —— 供买卖评审优先占名额。
+
+    为什么单独查（2026-11-14 实测逮到）：智谱这种热点票一天能来 200+ 条
+    关联 AI 行业新闻，按时间倒序的任何 LIMIT 都会把前一天的「汇丰下调
+    智谱目标价」挤到 200 名开外 —— 而这恰恰是买卖决策最该看的一条。
+
+    判据：标题命中评级词（评级/目标价/下调/上调）**且**标题含股票名，
+    双条件把「投行下调英伟达目标价」这类行业噪音挡掉，只留公司级的。
+    再兜一层「机构名 + 看空/看多动词」（汇丰/大摩/小摩/高盛/花旗/中金/
+    瑞银/摩根大通/摩根士丹利 + 承压/看空/下调/砍/降/担忧/看多/上调/
+    维持）：实测「汇丰:智谱研发成本攀升兼利润率承压」这种描述性看空
+    标题不含「评级/目标价」字样，按第一层判据会漏（2026-11-14 逮到）。
+    窗口 14 天（比新闻的 7 天宽：评级变动的有效期比新闻长）。
+    其余闸门与 `_paper_news_rows` 一致：必须有 publish_time、未来上界、
+    DISTINCT ON 放子查询。
+    """
+    name = (name or "").strip()
+    if not name:
+        return []
+    try:
+        with get_conn() as conn, conn.cursor(
+                cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT title, media, source, sentiment, publish_time, title_vec FROM ("
+                "  SELECT DISTINCT ON (n.url) n.title, n.media, n.source,"
+                "         n.sentiment, n.publish_time, n.title_vec"
+                "    FROM sa_news n "
+                "    LEFT JOIN sa_news_related r ON r.url = n.url "
+                "   WHERE (n.code = %s OR r.code = %s) "
+                "     AND n.publish_time IS NOT NULL "
+                "     AND n.publish_time > now() - %s::int * interval '1 day' "
+                "     AND n.publish_time <= now() + interval '1 hour' "
+                "     AND n.title ILIKE %s "
+                "     AND (n.title LIKE '%%评级%%' OR n.title LIKE '%%目标价%%'"
+                "          OR n.title LIKE '%%下调%%' OR n.title LIKE '%%上调%%'"
+                "          OR n.title ~ '(汇丰|大摩|小摩|高盛|花旗|中金|瑞银|"
+                "摩根大通|摩根士丹利|富瑞|麦格理|杰富瑞|野村)'"
+                "          AND n.title ~ '(承压|看空|砍|降|担忧|维持|看多|"
+                "首次覆盖|给予)')"
+                "   ORDER BY n.url, n.publish_time DESC"
+                ") t ORDER BY publish_time DESC LIMIT %s",
+                (code, code, str(int(days)), f"%{name}%", limit))
+            return [dict(r) for r in cur.fetchall()]
+    except Exception:
+        return []
+
+
+def _watchlist_tokens(code: str, name: str = "") -> list[str]:
+    """该股的**相关性 token** —— 股票名 + 自选股配置的全部搜索词。
+
+    供 news_context.pick_news 做「公司级 vs 全市场要闻」分层：标题不含任何
+    token 的新闻（如「北京15日起正式供热」挂在智谱名下）只占 MACRO_QUOTA
+    个名额，不再挤占公司级新闻（2026-11-15 用户反馈「很多重复的消息占用
+    了预算」——实测智谱 10 个名额被 8 条互不重复但无关的全市场文吃掉）。
+
+    取不到配置（不在自选股/库异常）时返回 [name] 或 []，pick_news 对空
+    tokens 退化为不分层的旧行为 —— 缺配置不劣化。
+    """
+    toks: list[str] = [name] if (name or "").strip() else []
+    try:
+        with get_conn() as conn, conn.cursor(
+                cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT name, keywords, keywords_pos, keywords_neg "
+                        "FROM sa_watchlist WHERE code = %s", (code,))
+            r = cur.fetchone()
+            if r:
+                for v in (r["name"], r["keywords"], r["keywords_pos"],
+                          r["keywords_neg"]):
+                    for k in re.split(r"[,，]", str(v or "")):
+                        k = k.strip()
+                        if k and k not in toks:
+                            toks.append(k)
+    except Exception:
+        pass
+    return toks
+
+
+def _curated_news(code: str, name: str = "", quota: int = 10) -> list[dict]:
+    """**统一的消息面取数入口** —— 模拟盘与实盘买卖评审共用（2026-11-14
+    用户裁决「大脑应该是一样的，不要再搞特殊」）。
+
+    规则全在 news_context（纯模块），这里只负责 SQL 取数与拼装：
+      1. 通用新闻近 7 天 40 条（`_paper_news_rows`，与旧口径一致 + 解禁特例）；
+      2. 评级/目标价定向捞 14 天 4 条（`_rating_news_rows`）；
+      3. `news_context.pick_news`：评级优先占名额 + 相关性分层
+         （公司级优先，全市场要闻至多 MACRO_QUOTA 条）+ 全量去重 → quota 条。
+
+    两边注入的都是这份名单：实盘评审（/api/trade-review 的 ctx["news"]）
+    与模拟盘 LLM 交易员（paper deps 的 news_fn）。名字缺失时评级层自动
+    空转（`_rating_news_rows` 直接返回 []），名单退化为「通用 40 条去重」
+    —— 不会因为取不到名字而比旧口径更差。
+    """
+    try:
+        name = (name or "").strip() or _stock_names([code]).get(code, "")
+    except Exception:
+        name = ""
+    general = _paper_news_rows(code, limit=40)
+    rating = _rating_news_rows(code, name) if name else []
+    tokens = _watchlist_tokens(code, name)
+    return news_context.pick_news(general, rating, quota=quota, tokens=tokens)
+
+
+def _curated_news_fn(code: str, limit: int = 10) -> list[dict]:
+    """paper deps 的 news_fn 适配器：签名对齐 `news_fn(code, limit)`，
+    内部走 `_curated_news` —— 模拟盘与实盘评审由此共用同一份消息面名单。"""
+    return _curated_news(code, quota=max(1, min(int(limit or 10), 40)))
 
 
 def _paper_event_rows(code: str, limit: int = 6) -> list[dict]:
@@ -6187,6 +6537,18 @@ def trade_review_api(code: str, side: str = "", shares: int = 0,
             ctx["intraday"] = intraday
     except Exception as exc:                       # noqa: BLE001
         print("[trade-review] 取分时失败 %s: %s" % (code, exc))
+
+    # 10) 消息面：**与模拟盘同一份大脑**（2026-11-14 用户裁决「不要再搞特殊」）。
+    #     背景：用户发现「机构下调智谱评级」在库里、但买卖评审里根本没看新闻
+    #     —— 评审只看 K 线/趋势/资金，评级目标价这类先导信息进不了结论。
+    #     取数统一走 `_curated_news`：评级/目标价新闻优先占名额 + 全量去重，
+    #     模拟盘 LLM 交易员看到的也是这份名单（app 注入的 news_fn 同源）。
+    #     空列表 = 确实没新闻；异常时不写 ctx 键，trade_review 会记进 gaps
+    #     （「忘了取」和「没有」是两种语义）。
+    try:
+        ctx["news"] = _curated_news(code, name)
+    except Exception as exc:                       # noqa: BLE001
+        print("[trade-review] 取新闻失败 %s: %s" % (code, exc))
 
     # ⚠️ available_cash / portfolio_value / pos_value **故意不传** ——
     #    app.py 没有这三个数的真实来源。编一个会让评审算出「仓位超限/现金不足」
@@ -8928,16 +9290,179 @@ class ConfIn(BaseModel):
     channels: dict | None = None
 
 
+@app.get("/api/brain")
+def brain_map():
+    """系统大脑白盒 —— 前端「🧠 决策大脑」页的唯一数据源（2026-11-14 用户要求
+    「白盒化系统逻辑，页面是动的，介绍数据的流动，决策怎么来的」）。
+
+    **设计铁律：这里不做任何硬编码描述 —— 每个节点的开关、参数、说明都
+    在请求时从真实配置/真实模块常量里读**。用户改 config.yaml（开辩论、
+    调门槛）或改 news_context 常量，本端点返回的管道结构自动跟着变，
+    前端页面随之刷新 —— 「后续改动逻辑都要动态改动逻辑介绍页」由此成立：
+    改逻辑的人只需保证逻辑本身更新了它引用的常量/配置，这个页面就永远不会
+    与真实行为脱节。
+
+    返回结构：
+      sources[]   : 数据从哪来（采集渠道 + 各自的启停状态）
+      brain       : 消息面大脑（news_context）的实时规则常量与效果统计
+      pipelines[] : 三条决策管道（模拟盘 LLM+辩论 / 实盘买卖评审 / 实盘做T），
+                    每条是 stages[] 顺序流，每个 stage 带 enabled/params/desc；
+      stats       : 各管道近期的真实活动数据（轮次/条数），证明管道活着。
+    """
+    import news_context as NC
+    import debate as debate_mod
+
+    paper_conf = _conf_section("paper") or {}
+    debate_conf = debate_mod.load_debate_conf(paper_conf)
+    news_conf = _read_conf()
+    t_conf = paper_conf.get("t_trading") or {}
+
+    # ---- 数据源层：全部从真实配置读启停 ----
+    channels = []
+    for name, ch in (news_conf.get("channels") or {}).items():
+        if not isinstance(ch, dict):
+            continue
+        channels.append({"name": name, "enabled": bool(ch.get("enabled")),
+                         "desc": {"eastmoney": "东财快讯（按股票名抓）",
+                                  "bing": "Bing 新闻搜索（关键词轮）",
+                                  "searxng": "SearxNG 元搜索（关键词轮）",
+                                  "ak_em": "AKShare 东财频道",
+                                  }.get(name, name)})
+    sources = [
+        {"name": "行情/K线", "enabled": True,
+         "desc": "东财+腾讯双源：实时价、240日K、5分钟分时、港币汇率"},
+        {"name": "新闻采集", "enabled": any(c["enabled"] for c in channels),
+         "desc": "关键词轮（利好/利空词）+股票名轮，渠道 %d 个开着 %d 个" % (
+             len(channels), sum(1 for c in channels if c["enabled"]))},
+        {"name": "社媒信号", "enabled": bool((paper_conf.get("social") or {}).get("enabled", True)),
+         "desc": "公众号/B站/微博/X 采集，喂模拟盘决策上下文"},
+        {"name": "事件日历", "enabled": True,
+         "desc": "解禁/禁售/锁定讨论（180天窗）+财报预案窗口"},
+    ]
+
+    # ---- 消息面大脑：常量直接读模块（改 news_context 即改页面） ----
+    brain = {
+        "module": "news_context",
+        "rules": [
+            {"k": "评级词优先", "v": "、".join(NC.RATING_KW),
+             "d": "标题命中即优先占名额（SQL 再按「股票名+机构看空词」定向捞14天）"},
+            {"k": "转载合并", "v": "前12实义字（剥『快讯：』类前缀）",
+             "d": "同一件事多家报道合成一条，标 ×N家"},
+            {"k": "相关性分层", "v": "公司级优先，行业/宏观至多%d条" % NC.MACRO_QUOTA,
+             "d": "标题不含股票名/自选股搜索词的全市场要闻（策略文/无关快讯）"
+                  "尾部限流，不再挤占名额（2026-11-15：智谱10个名额被8条无关文吃掉）"},
+            {"k": "语义去重", "v": "标题向量余弦 ≥%.2f 合并" % NC.TITLE_SIM_TH,
+             "d": "bge-m3 标题向量（入库时算一次存 sa_news.title_vec），"
+                  "前缀规则抓不到的换标题转载由这层合并；向量缺失自动退回纯规则"},
+            {"k": "利空计分", "v": "%.0f分/条，封顶%.0f" % (NC.NEWS_NEG_W, NC.NEWS_NEG_CAP),
+             "d": "买入判 con、卖出判 pro（模拟盘喂LLM时同权重中性呈现）"},
+            {"k": "利好计分", "v": "%.0f分/条，封顶%.0f" % (NC.NEWS_POS_W, NC.NEWS_POS_CAP),
+             "d": "买入判 pro、卖出判 con"},
+        ],
+        "quota": NC.NEWS_QUOTA,
+        "shared_by": ["模拟盘 LLM 交易员", "实盘买卖评审", "新闻列表页去重"],
+    }
+
+    # ---- 三条决策管道：stage 的 enabled 全部来自真实配置 ----
+    paper_pipeline = {
+        "id": "paper", "name": "🧪 模拟盘（LLM 决策 + 辩论）",
+        "trigger": "盘中每30分钟一轮 + 15:35 收盘决策轮",
+        "stages": [
+            {"name": "① 上下文组装", "enabled": bool(paper_conf.get("enabled", True)),
+             "desc": "行情+60日K摘要+统一消息面(评级置顶/去重/判据块)+社媒+解禁事件+账户现状"},
+            {"name": "② LLM 分析师", "enabled": True,
+             "desc": "生成个股分析报告（模拟盘候选池=自选股）"},
+            {"name": "③ LLM 交易员第一轮", "enabled": True,
+             "desc": "输出 action/confidence/仓位，信心>=%d 才触发辩论" % debate_conf["min_confidence"]},
+            {"name": "④ 多空辩论", "enabled": bool(debate_conf["enabled"]),
+             "desc": "Bull→Bear→Research Manager 裁决，%d 轮，3次LLM/票；"
+                     "stabilize_rating=%s（翻面须引新证据）" % (
+                         debate_conf["max_rounds"],
+                         "开" if debate_conf["stabilize_rating"] else "关")},
+            {"name": "⑤ 评级否决", "enabled": bool(debate_conf["enforce_rating"]),
+             "desc": "Judge 强看空(Sell/Underweight)时否决 buy→hold，只拦反向新增风险"},
+            {"name": "⑥ 二轮决策+成交", "enabled": True,
+             "desc": "辩论结论注入后重决策；资金/持仓数/T+1/单票上限/同日反向闸门在代码层兜底"},
+        ]}
+
+    review_stages = []
+    review_pipeline = {
+        "id": "review", "name": "🛡 实盘买卖评审（只读护栏，你说『我要买X』时触发）",
+        "trigger": "对话/nanobot 调 /api/trade-review，秒级响应，零LLM",
+        "stages": [
+            {"name": "① 硬阻塞检查", "enabled": True,
+             "desc": "手数整数倍/超可卖/超资金 —— 任一命中直接 dissuade"},
+            {"name": "② 行情与K线判据", "enabled": True,
+             "desc": "240日K趋势(MA20/60)、追高闸门、分时止跌、做T方向(VWAP)"},
+            {"name": "③ 市场温度", "enabled": True, "desc": "A股/港股各自的温度计，>=70过热/<=30过冷"},
+            {"name": "④ 财报窗口", "enabled": True, "desc": "event_risk 预案，临近披露日风险提示"},
+            {"name": "⑤ 同日反向", "enabled": True, "desc": "今天已成交的反向腿，降权重提示"},
+            {"name": "⑥ 消息面", "enabled": True,
+             "desc": "统一大脑 news_context：评级置顶+去重+按条计分，与模拟盘同源"},
+            {"name": "⑦ 判决", "enabled": True,
+             "desc": "pro/con 净分：≥+25 support / ≤-35 dissuade / 其间 caution；缺口如实写进 gaps"},
+        ]}
+    review_stages = review_pipeline["stages"]
+
+    # ---- 活动统计：证明管道活着（异常不影响页面，返回 None 即可） ----
+    stats: dict = {"news_total": None, "last_trade_review": None,
+                   "last_paper_cycle": None, "t_recent": None}
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM sa_news")
+            stats["news_total"] = cur.fetchone()[0]
+            cur.execute("SELECT trade_date, kind, acted, planned FROM sa_paper_cycles "
+                        "ORDER BY id DESC LIMIT 1")
+            r = cur.fetchone()
+            if r:
+                stats["last_paper_cycle"] = {"date": str(r[0]), "kind": r[1],
+                                             "acted": r[2], "planned": r[3]}
+            cur.execute("SELECT count(*) FROM sa_t_advisory_log "
+                        "WHERE created_at > now() - interval '3 days'")
+            stats["t_recent"] = cur.fetchone()[0]
+    except Exception:
+        pass
+
+    t_pipeline = {
+        "id": "t", "name": "🔁 实盘做T（纯规则引擎）",
+        "trigger": "止损检查后定时扫描持仓",
+        "stages": [
+            {"name": "① 总开关", "enabled": bool(t_conf.get("enabled", False)),
+             "desc": "t_trading.enabled —— 决定是否**真实成交**。当前停用时，"
+                     "big_drop降本/spike异动减持/趋势减仓仍以**只建议不下单**"
+                     "模式运行（近3天已产出 %s 条建议）" % (stats["t_recent"] if stats["t_recent"] is not None else "—")},
+            {"name": "② 机动仓额度", "enabled": True,
+             "desc": "持仓×机动比例向下取整，不足一手不做"},
+            {"name": "③ 方向判定", "enabled": True,
+             "desc": "日线趋势×分时VWAP → bull/bear/flat；flat 一律不做（做反T比不做惨）"},
+            {"name": "④ 买回分支", "enabled": True,
+             "desc": "锚=上次T成交价；下行方向必须先止跌确认才接回"},
+            {"name": "⑤ 高抛分支", "enabled": True,
+             "desc": "四层基准锚任一层高出门槛（含真实往返成本×安全倍数）才卖"},
+            {"name": "⑥ 频次上限", "enabled": True, "desc": "单日高抛/补回次数封顶"},
+        ]}
+
+    return {
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "sources": sources, "brain": brain,
+        "pipelines": [paper_pipeline, review_pipeline, t_pipeline],
+        "stats": stats,
+    }
+
+
 @app.get("/api/news")
-def list_news(code: str = "", limit: int = 30):
+def list_news(code: str = "", limit: int = 30, q: str = ""):
     """读已抓取的新闻（可按股票过滤），新→旧。每条附 related：关联的全部自选股代码。
 
     code 过滤时同时匹配主 code 与关联表（sa_news_related），保证按股筛选不漏关联新闻。
+    q=关键词检索（2026-11-14 用户要求，与公众号检索同款）：扫标题/媒体/来源渠道；
+    sa_news 不存正文，所以只搜这三处。% 和 _ 转义，检索时 limit 上限放宽到 200。
 
     ⚠️ 只列**有发布时间**的新闻，且不回退 fetched_at（用户 2026-10-08 定）：
     没有发布时间的条目时效未知，列出来会让人当成新消息看。
     """
-    limit = max(1, min(limit, 200))
+    kw = (q or "").strip()
+    limit = max(1, min(limit, 200 if kw else limit))
     params: list = []
     # 未来时间上界：与 _paper_news_rows 同一道闸门（见那里的第四条），
     # 否则库里历史坏行（被当成 UTC 的北京时间）会永远占据最新列表。
@@ -8949,11 +9474,16 @@ def list_news(code: str = "", limit: int = 30):
         join = "LEFT JOIN sa_news_related r ON r.url = n.url "
         conds.insert(0, "(n.code = %s OR r.code = %s)")
         params += [target, target]
+    if kw:
+        esc = kw.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+        like = f"%{esc}%"
+        conds.append("(n.title ILIKE %s OR n.media ILIKE %s OR n.source ILIKE %s)")
+        params += [like] * 3
     # DISTINCT ON 要求 ORDER BY 以 url 打头，所以去重必须放子查询里；
     # 否则外层 LIMIT 取的是 url 序最靠前的 N 条而不是最新的 N 条。
-    sql = ("SELECT code, title, url, source, media, publish_time, fetched_at, sentiment FROM ("
+    sql = ("SELECT code, title, url, source, media, publish_time, fetched_at, sentiment, title_vec FROM ("
            "  SELECT DISTINCT ON (n.url) n.code, n.title, n.url, n.source, n.media, "
-           "         n.publish_time, n.fetched_at, n.sentiment FROM sa_news n "
+           "         n.publish_time, n.fetched_at, n.sentiment, n.title_vec FROM sa_news n "
            + join +
            "  WHERE " + " AND ".join(conds) +
            "  ORDER BY n.url, n.publish_time DESC"
@@ -8977,6 +9507,16 @@ def list_news(code: str = "", limit: int = 30):
     for r in rows:
         for key in ("publish_time", "fetched_at"):
             r[key] = r[key].isoformat(timespec="seconds") if r[key] else None
+    # 内容去重（2026-11-14 用户要求）：同一件事多家转载不重复占名额，
+    # 规则与实盘评审/模拟盘同一份（news_context.dedup_news，保留全部
+    # 字段 + 标 dup_count「×N 家」）。
+    try:
+        rows = news_context.dedup_news(rows)
+    except Exception:
+        # dedup 正常会剥离 title_vec（内部字段不进响应）；异常兜底也要剥，
+        # 否则 1024 维浮点数组会把响应撑爆。
+        for r in rows:
+            r.pop("title_vec", None)
     return rows
 
 
@@ -10442,7 +10982,7 @@ def _report_deps() -> dict:
         "events_fn": _advice_event_lines,
         "sector_fn": _advice_sector_lines,
         "calendar_fn": _report_calendar_lines,
-        "news_fn": _paper_news_rows,
+        "news_fn": _curated_news_fn,  # 与实盘评审同一份消息面大脑（news_context）
         "market_note_fn": _plan_market_note,
         "paper_fn": lambda: paper_trading.account_overview(_paper_deps()),
         "paper_decisions_fn": _report_paper_decisions,
@@ -11024,9 +11564,15 @@ def mp_source_del(sid: int):
 
 
 @app.get("/api/mp/articles")
-def mp_articles(source_id: int = 0, unread_only: bool = False, limit: int = 50):
+def mp_articles(source_id: int = 0, unread_only: bool = False, limit: int = 50,
+                q: str = ""):
+    # q=关键词检索（标题/摘要/正文/作者/公众号名，见 wechat_mp.list_articles）。
+    # 搜索时把 limit 上限放宽到 200：默认 60 对浏览够用，但检索目标是「找到那篇」，
+    # 命中分散时截太短会让人以为没搜到。
     return {"items": wechat_mp.list_articles(_mp_deps(), source_id or None,
-                                              unread_only, limit),
+                                              unread_only,
+                                              200 if (q or "").strip() else limit,
+                                              q),
             "unread": wechat_mp.unread_count(_mp_deps())}
 
 
@@ -11294,6 +11840,31 @@ def _x_loop():
                 time.sleep(300)
         except Exception as exc:
             print(f"[x] loop error: {exc}", flush=True)
+            time.sleep(300)
+
+
+def _zai_deps() -> dict:
+    return {"get_conn": get_conn, "notify_fn": notifier.notify}
+
+
+def _zai_loop():
+    """智谱动态守护线程：按 zai.interval_minutes（默认 60，0=关闭）拉一轮
+    GitHub releases + HuggingFace 上传 → sa_news（关联到 zai.code，默认 02513）。
+    纯公开 API 免反爬，失败只打日志不重试（下轮自然重拉）。"""
+    while True:
+        try:
+            conf = zai_watch.load_conf()
+            interval = int(conf.get("interval_minutes") or 0)
+            if conf.get("enabled", True) and interval > 0:
+                result = zai_watch.run_once(_zai_deps())
+                if result.get("inserted"):
+                    print(f"[zai] {result['inserted']} new items "
+                          f"(of {result.get('items')})", flush=True)
+                time.sleep(max(interval, 1) * 60)
+            else:
+                time.sleep(300)
+        except Exception as exc:
+            print(f"[zai] loop error: {exc}", flush=True)
             time.sleep(300)
 
 
@@ -11710,6 +12281,10 @@ _start_daemon(_wb_auto_loop, "sa_wb")
 
 # 小红书关键词舆情定时抓取后台线程（xhs.interval_minutes=0 时轮内直接跳过）
 _start_daemon(_xhs_auto_loop, "sa_xhs")
+
+# 智谱动态监控后台线程（GitHub releases + HuggingFace 上传 → sa_news；
+# zai.interval_minutes=0 时轮内直接跳过）
+_start_daemon(_zai_loop, "sa_zai")
 
 # 止盈策略监控后台线程（交易时段每 60s 扫一次，触发即通知）
 _start_daemon(_strategy_loop, "sa_strategy")

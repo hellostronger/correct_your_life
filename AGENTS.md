@@ -42,6 +42,40 @@
 
 ---
 
+### 🤖 智谱动态监控 `zai_watch.py`（2026-11-16，用户纠正口径后落地）
+
+用户要求监控智谱 X 动态 → 在 X 管线等上游期间问「还有别的办法吗」→ 提出替代渠道
+→ 落地 GitHub+HF watcher。**用户中途纠正口径：「监控的是是否有发布新模型的痕迹，
+而不是瞎监控」**——第一版把 ZCode 工具仓 release 也收了，被否。
+
+**口径（三道痕迹，全部按 `model_name_re`（默认 GLM 系命名）匹配 basename）**：
+① GLM* 模型仓新 release ② GLM* 新仓库上线（created_at ≤7 天，= 发布前兆）
+③ HuggingFace 新模型上传（**量化变体 -BF16/-FP8/-GGUF 按 base 名去重**——同一份
+权重重打包不是新发布，跨 URL 的去重需要状态侧车）。ZCode/feedback 等工具仓
+**不算**。落库走 `news_fetcher.save_to_db`，code='02513' → 直接进锚定票决策上下文。
+
+| 组件 | 要点 |
+|---|---|
+| `zai_watch.py` | org repos 拉一次共用（省配额）；状态侧车 `data/zai_watch_state.json`（锁+原子写，**落库失败不写**，下轮重试同批）；`_http_json` 直连失败走代理重试一次（真机实测 github.com 直连 OK、**huggingface.co 直连超时**；代理不常驻只做回退） |
+| app.py | `import zai_watch` + `_zai_deps`（notifier.notify）+ `_zai_loop` 守护（interval 60min）+ `_start_daemon(_zai_loop, "sa_zai")` |
+| config | schema `zai` 段 9 字段（github_org/hf_author/model_name_re/code/notify_new 默认 true/proxy…）+ example yaml + 生产 config.yaml（conf_util.set_section_key 逐键种入，不动注释） |
+
+**真机验证**：run_once `ok=True, items=10, inserted=0, 超过7天 10` —— 最近 7 天无新
+模型发布，一行噪音没进 = 口径正确的实证。离线 `zai_watch_test.py` **78/78**（口径闸门
+/ 变体归并 / 新仓库 7 天窗 / run_once 全链 / notify / 静态接线 / schema-DEFAULTS 一致）。
+
+**踩坑**：① `requests.exceptions.ConnectError` 是 **httpx 的命名**，requests 里是
+`ConnectionError`——真机第一轮 AttributeError 逮到；② 测试断言「不 import app」数子串
+撞 docstring 里的红线注释（paper_anchor 同款坑）→ 改 AST 级 import 断言；③ app.py 带
+BOM，`ast.parse` 要 `utf-8-sig`；④ 测试夹具又错两次：stub 对 4 个仓库各回一条导致
+计数断言错（用单仓库 conf）、pytest 只收 `test_*.py`。
+
+**遗留**：① 智谱公众号加源需用户在 WeRSS 管理页手动订阅（101:8001，上游警告
+「添加订阅频率过高容易封控」，不逆向 API 硬来），feed_id 给我后 mp 源列表补一行即可；
+② X 官方 API 按量计费（~$0.005/次读）可作为上游久拖不决时的兜底，未启用。
+
+---
+
 ### 🐦 X 源排障：三层叠加失败 + X 前端重构致 twscrape 管线失效（2026-11-15，用户问「DSA 的 X 怎么对接的」）
 
 对比 daily_stock_analysis 后排查自家 X 源（`x_monitor.py`，twscrape 路线），钉死失败链：

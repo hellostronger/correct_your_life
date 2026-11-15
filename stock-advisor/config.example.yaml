@@ -605,6 +605,21 @@ x:
   include_retweets: false
   wait_timeout: 25
 
+# 智谱动态监控（zai_watch.py）：只抓「新模型发布痕迹」→ sa_news（关联 code，默认 02513）。
+#   ① GLM* 模型仓新 release   ② GLM* 新仓库上线（发布前兆）   ③ HF 新模型上传
+# 量化变体（-BF16/-FP8/-GGUF）按 base 名去重 = 同一份权重不是新发布；
+# ZCode 等工具仓 release 不算（model_name_re 不匹配）。纯公开 API，无需任何 key。
+zai:
+  enabled: true
+  interval_minutes: 60
+  github_org: "zai-org"
+  hf_author: "zai-org"
+  model_name_re: "GLM[-_A-Za-z0-9.]*"
+  code: "02513"
+  notify_new: true
+  per_source_limit: 8
+  proxy: "http://127.0.0.1:6478"   # HF 本机直连超时 → 自动走代理重试一次（代理不常驻，只做回退）
+
 channels:
   enabled: false            # 默认关：依赖本机 PC 微信 + 管理员权限注入。
                             #   守护线程每 300s 重读本段，所以改这里免重启
