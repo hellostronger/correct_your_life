@@ -4,6 +4,44 @@
 
 ---
 
+### 🧰 nanobot MCP 工具层重建（第一步）：trading server + position-sizer（2026-11-15，用户选「路线 B」）
+
+对照 tradermonty/claude-trading-skills（77 个 Claude 技能，MIT）后，用户在
+「A=摘编成注入块 / B=给 nanobot 对话 agent 当 MCP 只读工具」中选了 **B**。这是
+「stock_mcp.py 丢失」后 MCP 层重建的第一步：先给 2 个纯计算/只读工具。
+
+#### 落地（`stock-advisor/mcp/` 新目录）
+
+| 文件 | 要点 |
+|---|---|
+| `mcp/position_sizer.py` | **vendor 自 tradermonty/claude-trading-skills**（MIT，`skills/position-sizer/scripts/`），算法零改动。固定比例/ATR/Kelly 三种风险预算仓位法 + 仓位/板块上限约束，纯标准库。入口 `calculate_position(SizingParameters)` |
+| `mcp/trading_mcp.py` | stdio MCP server（`mcp.server.fastmcp`，跑在 nanobot venv 下），3 个只读工具：`position_size`（纯计算）、`stock_positions`（GET 8686 /api/holdings）、`stock_watchlist`（/api/watchlist?with_quotes=1）。**红线照旧**：只读、不下单、不 import app；数据只经本机 8686 |
+| `~/.nanobot/config.json` | `tools.mcpServers.trading = {command: venv python, args: [trading_mcp.py], toolTimeout: 30}`（v0.4.1 的 MCPServerConfig 挂在 `tools.` 下，文档样例键名 camelCase） |
+
+#### 验证（全绿）
+
+- stdio 握手 + tools/list：3 工具注册 ✓；
+- 上游自带测试套件（154 项）对 vendored 副本 **154/154** —— 注意两个假失败教训：
+  ① 57 个「IndexError: 4」失败全是测试硬编码 `Path(__file__).parents[4]`（假设仓库层级），
+  打平目录跑必炸，按 `skills/position-sizer/scripts/tests` 层级重建后全过——
+  **上游测试的目录结构假设也算「夹具」，别当代码 bug**；
+  ② pytest 只收集 `test_*.py`，我下载时另存的 `ts_test.py` 导致「no tests ran」假象；
+- **E2E 闭环**：对话 agent（GLM-5.3-Flash）被问「账户 62.7 万、02513 现价 447.4、止损 420、
+  单笔风险 1%」→ serve 日志出现 `CallToolRequest`（真实调了 MCP 工具，不是心算）→
+  回答 **228 股 / 仓位 ¥102,007.2 / 风险 ¥6,247.2（1.0%）**，与独立验算
+  `floor(6270/27.4)=228` 逐项吻合（usage 12,935 tokens）。
+
+#### 边界与后续
+
+- `position_size` 的 note 里写明「风险预算参考，不是下单指令」——与「LLM 是交易员」
+  一脉；**没有**把它注入 `_decide_one`（那是路线 A，改决策口径，未做）。
+- 这是丢失的 13 个 stock_mcp 工具的重建起点：`stock_positions`/`stock_watchlist`
+  已按 AGENTS.md 10-31 记载的原端点契约恢复，其余（新闻/机构/做T日志…）待后续按需补。
+- MCP server 依赖：venv 里有 `mcp`（nanobot 依赖）+ `requests` ✓；stdio 由 nanobot
+  拉起，**不用 NO_PROXY**（只打 127.0.0.1）。
+
+---
+
 ### 🐦 X 源排障：三层叠加失败 + X 前端重构致 twscrape 管线失效（2026-11-15，用户问「DSA 的 X 怎么对接的」）
 
 对比 daily_stock_analysis 后排查自家 X 源（`x_monitor.py`，twscrape 路线），钉死失败链：
