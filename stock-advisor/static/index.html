@@ -53,6 +53,26 @@
          sans-serif; background: var(--bg); color: var(--text);
          transition: background .18s, color .18s; }
   .wrap { max-width: 900px; margin: 0 auto; padding: 0 16px 72px; }
+  /* 实盘告警条（全站最顶、tab 栏下方）：红底白字，颜色硬编码——
+     告警的意义就是刺眼，不随主题变柔和 */
+  #live-alert-bar {
+    background: #c92a2a; color: #fff; border-radius: 10px;
+    padding: 10px 14px; margin: 0 0 12px; font-size: 13px; line-height: 1.7;
+    box-shadow: 0 2px 10px rgba(201,42,42,.35);
+  }
+  #live-alert-bar .al-code { color: #ffe3e3; font-weight: 600; cursor: pointer;
+    text-decoration: underline dotted; }
+  #live-alert-bar .al-code:hover { color: #fff; }
+  #live-alert-bar .al-title { font-weight: 700; font-size: 13.5px; }
+  #live-alert-bar .al-item { margin-right: 14px; display: inline-block; }
+  #live-alert-bar .al-old { opacity: .75; font-size: 11px; }
+  /* 宽屏逐档放宽容器（2026-11-15 用户问「为什么左右留白那么多」）：
+     原来全站钉死 900px，1366 屏两侧各留 ~230px 白边，持仓表 13 列
+     被挤到 ~870px 里只能横向滚动。逐档放宽而不是一刀切 100%：
+     超宽屏（2K+）下无上限全宽会让新闻/文章类页面一行文字太长难读。 */
+  @media (min-width: 1180px) { .wrap { max-width: 1100px; } }
+  @media (min-width: 1400px) { .wrap { max-width: 1340px; } }
+  @media (min-width: 1680px) { .wrap { max-width: 1580px; } }
   h1 { font-size: 19px; letter-spacing: -.2px; }
   a { color: var(--accent); }
   code { font-family: var(--mono); font-size: .92em; background: var(--bg-2);
@@ -138,6 +158,22 @@
   .b-eastmoney { background: #ffe9d6; color: #b25f00; }
   .b-baidu      { background: #e2ecff; color: #2456b3; }
   .b-sina       { background: #ffe2e2; color: #b32424; }
+
+  /* ---------- 持仓表防溢出（2026-11-15 用户反馈截图：加「建议操作」列后
+     13 列全 nowrap，总宽超过卡片，最后几列溢出到卡片外面孤零零漂着）---------- */
+  /* 1) 滚动容器**常开**（2026-11-15 二次修复）：之前 ≥1280px 取消滚动容器，
+     但压缩后 1280~1500px 仍放不下 13 列，试算列溢出到卡片外漂着（用户截图
+     复现：表头只到「笔数」后面一块空白——那是空的 th，试算按钮在卡片外）。
+     代价：th 的 position:sticky 吸顶在滚动容器内失效——但其他 tab 的表格
+     全局就套着 .table-scroll（overflow-x:auto），sticky 本来就没生效过，
+     持仓表此前是特例，现在回归一致，无回退。 */
+  .tbl-scroll { overflow-x: auto; }
+  /* 2) 常规宽度下尽量不滚：持仓表专属紧凑样式（全局 th/td 是 7px 8px/13px） */
+  .hold-table th, .hold-table td { padding: 5px 6px; font-size: 12.3px; }
+  /* 允许换行的列（回本价本来就有小字副行，nowrap 是宽度大头）。
+     建议操作列**不**进这里：标签「持有/止损」被挤了会竖排（2026-11-15 截图），
+     保持 nowrap，小字副行是 div 自成一行不受影响。 */
+  .hold-table td.wrap, .hold-table th.wrap { white-space: normal; min-width: 64px; }
 
   /* ---------- 聚宽策略库 / 沙箱页 ---------- */
   /* 徽标变体。用 CSS 变量而不是硬编码色，这样深浅色主题都跟着变
@@ -243,6 +279,17 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
   .rel-code { display: inline-block; padding: 0 7px; border: 1px solid var(--border-2);
               border-radius: 20px; font-size: 11px; color: var(--text-2); cursor: pointer; }
   .rel-code:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* ---- 🧠 决策大脑白盒页：管道流程样式（动画=数据在流） ---- */
+  .brain-stage { flex: 1 1 150px; min-width: 150px; max-width: 260px; border: 1px solid var(--border-2);
+                 border-radius: 8px; padding: 8px 10px; background: var(--card-2, #fafafc); }
+  .brain-arrow { align-self: center; color: var(--accent); font-size: 13px; padding: 0 6px;
+                 animation: brainFlow 1.6s ease-in-out infinite; }
+  @keyframes brainFlow {
+    0%, 100% { opacity: .25; transform: translateX(-1px); }
+    50%      { opacity: 1;   transform: translateX(1px); } }
+  .brain-on  { color: var(--up); font-size: 10.5px; white-space: nowrap; }
+  .brain-off { color: var(--text-3, #999); font-size: 10.5px; white-space: nowrap; }
 
   /* ---------- 弹窗 ---------- */
   .modal-mask { position: fixed; inset: 0; z-index: 90; display: flex;
@@ -532,6 +579,7 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       <button data-tab="sector">🔄 板块轮动</button>
       <button data-tab="holdings">我的持仓</button>
       <button data-tab="snapshot">📸 快照/胜率</button>
+      <button data-tab="cashflow">💵 银证转账</button>
       <button data-tab="strategies">🎯 止盈策略<span id="strategy-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="plans">🏧 提款计划</button>
       <button data-tab="calendar">📅 财经日历</button>
@@ -543,6 +591,7 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       <button data-tab="x">🐦 X<span id="x-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="reports">分析报告</button>
       <button data-tab="paper">🧪 模拟交易</button>
+      <button data-tab="brain">🧠 决策大脑</button>
       <button data-tab="tdesk">🔁 做T<span id="t-tab-badge" class="tab-badge hide">0</span></button>
       <button data-tab="anchor">🎯 锚定</button>
       <button data-tab="jq">📚 策略库/沙箱<span id="jq-tab-badge" class="tab-badge hide">0</span></button>
@@ -554,6 +603,11 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       <button data-tab="schedule">⚙️ 调度</button>
     </div>
   </div>
+
+  <!-- 实盘告警条（2026-11-15 用户要求放最醒目位置）：
+       止损警示/异动减持/趋势减仓的最新引擎判断，全站所有 tab 顶部常驻。
+       点击代码跳持仓页。数据 /api/holdings 的 advice（最新一轮判断）。 -->
+  <div id="live-alert-bar" class="hide"></div>
 
   <!-- 自选行情 -->
   <section id="tab-market">
@@ -989,14 +1043,18 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
   <section id="tab-holdings" class="hide">
     <div class="card">
       <div class="row">
-        <input id="t-code" list="watchlist-datalist" placeholder="代码 A股6位/港股5位" maxlength="6" style="width:150px">
+        <input id="t-code" list="watchlist-datalist" placeholder="代码 A股6位/港股5位" maxlength="6" style="width:150px"
+               oninput="updateTradeCashHint()">
         <datalist id="watchlist-datalist"></datalist>
-        <select id="t-side" style="padding:8px 10px;border:1px solid var(--border);border-radius:7px">
+        <select id="t-side" style="padding:8px 10px;border:1px solid var(--border);border-radius:7px"
+                onchange="updateTradeCashHint()">
           <option value="buy">买入</option>
           <option value="sell">卖出</option>
         </select>
-        <input id="t-shares" placeholder="股数" type="number" min="1" style="width:90px">
-        <input id="t-price" placeholder="成交价" type="number" step="0.0001" min="0.0001" style="width:100px">
+        <input id="t-shares" placeholder="股数" type="number" min="1" style="width:90px"
+               oninput="updateTradeCashHint()">
+        <input id="t-price" placeholder="成交价" type="number" step="0.0001" min="0.0001" style="width:100px"
+               oninput="updateTradeCashHint()">
         <input id="t-date" placeholder="交易日期" style="width:130px"
                onfocus="this.type='date'" onblur="if(!this.value)this.type='text'">
         <select id="t-strategy" style="padding:8px 10px;border:1px solid var(--border);border-radius:7px;width:190px">
@@ -1005,9 +1063,30 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
         <input id="t-note" placeholder="备注（可选）" style="flex:1;min-width:120px">
         <button class="btn" id="add-trade-btn" onclick="addTrade()">记一笔</button>
       </div>
+      <div id="t-cash-hint" class="muted" style="margin-top:4px;font-size:12px"></div>
       <div class="muted" style="margin-top:6px">流水账模式：每笔买卖各记一条，持仓与盈亏自动推算
         （卖出按平均成本法计入已实现盈亏；日期不填默认今天）。
-        买入可关联止盈策略（先在「🎯 止盈策略」页创建），触发时微信/邮件通知。</div>
+        买入可关联止盈策略（先在「🎯 止盈策略」页创建），触发时微信/邮件通知。
+        基准日之后的买卖会自动联动「真实现金 / 总参考收益(实时)」。</div>
+    </div>
+    <!-- 建议 vs 实际操作统计（2026-11-15 用户需求）：聚合做T引擎信号，
+         与实盘成交匹配采纳情况，算照做/没照做的差额。数据来自 /api/advice-followup -->
+    <div class="card" id="advice-followup-card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <b>📋 建议 vs 实际操作</b>
+        <span class="muted" id="advice-fu-note" style="font-size:11.5px"></span>
+      </div>
+      <div id="advice-fu-summary" class="muted" style="margin:6px 0 2px">加载中…</div>
+      <div id="advice-fu-detail" class="hide" style="margin-top:8px">
+        <div class="muted" style="font-size:11.5px;margin-bottom:4px">
+          差额口径：已采纳按实际成交价、未采纳按信号价×建议股数，对照最新现价（卖向=卖出相对继续持有、买向=买入相对空仓）；负数=不理该建议反而是对的</div>
+        <div class="tbl-scroll"><table class="hold-table" id="advice-fu-table">
+          <thead><tr><th>信号日</th><th>代码</th><th>名称</th><th>建议</th><th>信号价</th>
+            <th>建议股数</th><th>采纳?</th><th>实际成交</th><th>现价</th><th>差额(¥)</th></tr></thead>
+          <tbody id="advice-fu-body"></tbody>
+        </table></div>
+      </div>
+      <button class="btn ghost sm" style="margin-top:6px" onclick="toggleAdviceFu()">展开明细 ▾</button>
     </div>
     <div class="card">
       <div class="pnl-summary" id="pnl-summary"></div>
@@ -1021,13 +1100,19 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
         </span>
         <button class="btn sm" onclick="openCostCalc('')" title="按拟买价与股数，预估加仓后摊薄成本">🧮 加仓试算</button>
       </div>
-      <table>
+      <div class="tbl-scroll">
+      <table class="hold-table">
         <thead><tr>
           <th>代码</th><th>名称</th><th>持股</th><th>摊薄成本</th><th>现价(¥)</th>
-          <th>市值(¥)</th><th>浮动盈亏(¥)</th><th>已实现盈亏(¥)</th><th>累计总盈亏(¥)</th><th>笔数</th><th></th>
+          <th>市值(¥)</th><th>浮动盈亏(¥)</th><th>已实现盈亏(¥)</th><th>累计总盈亏(¥)</th>
+          <th class="wrap" title="把已实现盈亏也摊进股价：涨到这个价，该股累计总盈亏（浮动+已实现）归零。已实现亏损会摊到剩余股数上，剩得越少这个价越高；港股下方标 HKD 原币价">累计回本价(¥)</th>
+          <th class="wrap" title="回到摊薄成本需要的涨幅 = 摊薄成本/现价 − 1（只看成本 vs 现价，不含已实现盈亏摊提——那是「累计回本价」列的口径）。同币种比值与汇率无关；现价已在成本上方显示「成本下方」">回摊薄需涨</th>
+          <th title="来自做T建议引擎（后台连续跑全持仓判断，与实盘做T判据同源）：高抛/买回/趋势减仓/止损警示等；hover 看完整理由与判断时间；灰字日期=非当天的旧判断">建议操作</th>
+          <th>笔数</th><th></th>
         </tr></thead>
         <tbody id="holdings-body"></tbody>
       </table>
+      </div>
       <div id="holdings-empty" class="empty hide">还没有交易记录，先「记一笔」买入吧</div>
     </div>
   </section>
@@ -1137,6 +1222,23 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
 
   <!-- 止盈策略 -->
   <!-- 实盘快照 / 操作胜率（trade_snapshot.py）：存某日收盘持仓，之后对比不动 vs 实际操作 -->
+  <section id="tab-brain" class="hide">
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <b style="font-size:13px">🧠 决策大脑 · 系统逻辑白盒</b>
+        <span class="row">
+          <span class="muted" id="brain-meta" style="font-size:12px"></span>
+          <button class="btn ghost" style="font-size:12px" onclick="loadBrain()">刷新</button>
+        </span>
+      </div>
+      <p class="muted" style="font-size:12px;margin:6px 0 10px">
+        本页由 <code>/api/brain</code> 在<b>每次请求时</b>从真实配置与模块常量渲染 ——
+        改 config.yaml（开关/门槛）或改 news_context 常量，刷新后页面自动跟着变，不维护第二份说明。
+      </p>
+      <div id="brain-body"><p class="muted">加载中…</p></div>
+    </div>
+  </section>
+
   <section id="tab-snapshot" class="hide">
     <div class="card">
       <div class="row" style="justify-content:space-between;align-items:center">
@@ -1183,6 +1285,38 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
     <div class="card">
       <b style="font-size:13px" id="snap-report-title">⚖️ 快照对照：躺平 vs 实际</b>
       <div id="snap-report" class="muted" style="font-size:12px;margin-top:6px">请先打一份快照</div>
+    </div>
+    <div class="card">
+      <b style="font-size:13px">🔍 差额归因：是哪些操作造成的</b>
+      <div class="faint" style="margin-top:2px">每笔操作相对「一动不动」的贡献，加总恒等于上方差额；红=加分，绿=拖累。</div>
+      <div id="snap-attrib" class="muted" style="font-size:12px;margin-top:6px">选中快照后自动显示</div>
+    </div>
+  </section>
+
+  <!-- 银证转账（broker_cash.py）：银行↔券商资金流，把快照里的虚拟现金修正成真实资产 -->
+  <section id="tab-cashflow" class="hide">
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <b style="font-size:13px">💵 银证转账 · 入金 / 出金</b>
+        <span class="row">
+          <span class="muted" id="cf-meta" style="font-size:12px"></span>
+          <button class="btn ghost" style="font-size:12px" onclick="loadCashFlows()">刷新</button>
+          <button class="btn" style="font-size:12px" onclick="cashFlowAdd()">➕ 记一笔</button>
+        </span>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:4px">
+        只记<b>银行 ↔ 券商</b>之间的资金转入转出；账户里买卖股票由交易流水负责，别重复记。
+        记下来之后，快照报告会用「推演组合价值 + 期间净出入金」算出<b>调整后账户资产</b>，
+        就能和券商 App 对账。数据只存本地 JSON，不写数据库；出入金<b>不影响</b>操作差额与胜率。
+      </div>
+    </div>
+    <div class="card">
+      <b style="font-size:13px">📊 资金汇总</b>
+      <div id="cf-summary" class="muted" style="font-size:12px;margin-top:6px">加载中…</div>
+    </div>
+    <div class="card">
+      <b style="font-size:13px">📋 转账流水</b>
+      <div id="cf-list" class="muted" style="font-size:12px;margin-top:6px">加载中…</div>
     </div>
   </section>
 
@@ -1414,6 +1548,14 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
       </div>
     </div>
     <div class="card">
+      <div class="row" style="margin-top:10px">
+        <input id="news-search" placeholder="🔍 检索新闻：标题 / 媒体 / 来源渠道，回车或点检索"
+               style="flex:1;min-width:220px" onkeydown="if(event.key==='Enter'){loadNews()}">
+        <button class="btn sm" onclick="loadNews()">检索</button>
+        <button class="btn ghost sm" onclick="newsClearSearch()"
+                title="清空关键词，回到最新列表">清除</button>
+      </div>
+      <div id="news-search-info" class="muted" style="font-size:12px;margin-top:4px"></div>
       <div id="news-list"></div>
       <div id="news-empty" class="empty hide">还没有新闻。点「立即抓取」从 4 个免费渠道抓取
         （东财公告/东财资讯/百度新闻/新浪财经/DuckDuckGo）。</div>
@@ -1620,6 +1762,16 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
           <button class="btn ghost sm" onclick="markAllMpRead()">全部已读</button>
           <button class="btn ghost sm" onclick="loadMpArticles()">刷新</button>
         </div>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <input id="mp-search" placeholder="🔍 检索文章：标题 / 摘要 / 正文 / 公众号名，回车或点检索"
+               style="flex:1;min-width:220px" onkeydown="if(event.key==='Enter'){loadMpArticles()}">
+        <button class="btn sm" onclick="loadMpArticles()">检索</button>
+        <button class="btn ghost sm" onclick="mpClearSearch()"
+                title="清空关键词，回到最新列表">清除</button>
+      </div>
+      <div class="row tight" style="margin-top:4px">
+        <span class="muted" id="mp-search-info" style="font-size:12px"></span>
       </div>
       <div id="mp-list"></div>
       <div id="mp-empty" class="empty hide">还没有文章。添加订阅源后点「立即拉取」。</div>
@@ -6401,6 +6553,7 @@ function chatKeydown(ev) {
 // 只读复盘。快照存在本地侧车 JSON；报告每次用最新行情重算，所以数字会随行情变。
 // 涨跌配色跟随主题变量：--up 红=赚，--down 绿=亏（A 股口径）。
 const _SNAP = { latest: null, reportDate: null };
+let _ACCOUNT = null;   // 账户级真实锚点：真实现金 / 总参考收益（9-9 之前没进系统的底子）
 
 function _snMoney(v, signed) {
   if (v === null || v === undefined || v === '') return '—';
@@ -6546,6 +6699,8 @@ async function loadSnapshotReport(date) {
     const rep = d.report || d;
     rep.asof = rep.asof || d.asof;              // 端点外层的计算时间，别丢
     rep.fx_source = rep.fx_source || d.fx_source;
+    if (d.account) { _ACCOUNT = d.account; rep.account = d.account; }
+    else if (_ACCOUNT) rep.account = _ACCOUNT;   // 账户真实基准，供对账行联动
     _SNAP.reportDate = date;
     const sel = $('snap-pick');
     if (sel) sel.value = date;                  // 列表里点「查看」也要同步下拉框
@@ -6560,19 +6715,58 @@ function renderSnapshotReport(r) {
   const box = $('snap-report');
   const t = r.totals || {}, sn = r.snapshot || {}, w = r.win_rate || {}, rz = r.realized || {};
   const delta = Number(t.delta_cny || 0);
+  const cc = r.by_currency || {}, cny = cc.CNY || {}, hkd = cc.HKD || {};
   const title = $('snap-report-title');
   if (title) title.textContent = `⚖️ ${sn.date || '—'} 的仓位不动到现在 vs 现在的实际操作`;
-  const better = delta >= 0 ? '实际操作更赚' : '不动更赚';
+  // 对账：推演组合价值 ≠ 券商账户总资产。后端新字段优先；旧服务没重启时用 by_code 自算兜底。
+  const hasDetail = t.holdings_market_value_cny != null;
+  const mv = hasDetail ? Number(t.holdings_market_value_cny)
+    : (r.by_code || []).reduce((s, x) => s + (x.shares_now || 0) * (x.price_now || 0)
+        * (x.currency === 'HKD' ? Number(r.fx) || 1 : 1), 0);
+  const implied = hasDetail ? Number(t.implied_cash_cny) : Number(t.real_end_cny || 0) - mv;
+  const mvA = hasDetail ? Number(cny.holdings_mv || 0) : null;
+  const mvH = hasDetail ? Number(hkd.holdings_mv || 0) * (Number(r.fx) || 1) : null;
+  const cashA = hasDetail ? Number(cny.implied_cash || 0) : null;
+  const cashH = hasDetail ? Number(hkd.implied_cash || 0) * (Number(r.fx) || 1) : null;
+  const better = delta >= 0 ? '实际操作更赚' : '按基准日不动更赚';
+  const gapWord = delta >= 0 ? '操作多赚' : '操作少赚';
+  const leadWord = delta >= 0 ? '领先' : '落后';
+  const pp = Math.abs(Number(t.delta_pct_point || 0)).toFixed(2);
+  const ext = Number(t.external_cash_cny || 0);
+  const extN = Number(t.external_flow_count || 0);
+  const adjusted = t.cash_adjusted_real_end_cny != null
+    ? Number(t.cash_adjusted_real_end_cny) : Number(t.real_end_cny || 0) + ext;
+  const ac = ((r.account || _ACCOUNT || {}).computed) || {};
+  const realLine = ac.real_assets_cny != null
+    ? `<div style="border-top:1px dashed var(--border);margin-top:6px;padding-top:6px">
+        账户真实口径（基准 + 交易联动）：真实现金 <b>${_snMoney(ac.cash_now_cny != null ? ac.cash_now_cny : ac.cash_cny)}</b>${ac.asof_date ? ` <span class="faint" style="font-size:11px">（锚点 ${_snMoney(ac.cash_cny)} ＋ 基准日 ${esc(ac.asof_date)} 后买卖/出入金联动）</span>` : ''} →
+        真实总资产 = 持仓市值 ${_snMoney(ac.holdings_mv_cny)} + 现金 = <b>${_snMoney(ac.real_assets_cny)}</b>；
+        总参考收益(实时) ${_snMoney(ac.real_pnl_now_cny != null ? ac.real_pnl_now_cny : ac.reference_pnl_cny, true)}，系统未覆盖缺口 ${_snMoney(ac.pnl_gap_cny, true)}。
+        上面的推演组合价值只用于算操作差额，<b>不代表账户资产</b>。</div>`
+    : '<div class="faint" style="margin-top:6px">还没录入真实现金：到「我的持仓」点「⚙ 设置账户基准」补齐，本行会同步显示账户真实总资产。</div>';
   const verdict = `<div style="background:var(--bg-2);border-radius:8px;padding:9px 11px;margin:6px 0 10px;font-size:12px;line-height:1.9">
-      <div>按 <b>${esc(sn.date || '')}</b> 的仓位<b>一动不动拿到现在</b>：期末资产 <b>${_snMoney(t.flat_end_cny)}</b>，
+      <div>按 <b>${esc(sn.date || '')}</b> 的仓位<b>一动不动拿到现在</b>：推演组合价值 <b>${_snMoney(t.flat_end_cny)}</b>，
         这段 <span style="color:${_snColor(t.flat_gain_cny)}">${_snMoney(t.flat_gain_cny, true)}（${_snPct(t.flat_pct)}）</span></div>
-      <div><b>实际操作到现在</b>：期末资产 <b>${_snMoney(t.real_end_cny)}</b>，
+      <div><b>实际操作到现在</b>：推演组合价值 <b>${_snMoney(t.real_end_cny)}</b>，
         这段 <span style="color:${_snColor(t.real_gain_cny)}">${_snMoney(t.real_gain_cny, true)}（${_snPct(t.real_pct)}）</span></div>
-      <div style="color:${_snColor(delta)}">→ <b>${better}</b>，${delta >= 0 ? '多' : '少'}赚 ${_snMoney(Math.abs(delta))}
-        （领先 ${_snPct(Math.abs(t.delta_pct_point || 0))} 个百分点）</div>
+      <div style="color:${_snColor(delta)}">→ <b>${better}</b>；${gapWord} ${_snMoney(Math.abs(delta))}
+        （${leadWord} ${pp} 个百分点）</div>
+      <div style="border-top:1px solid var(--border);margin-top:6px;padding-top:6px">
+        <b>和券商账户对账</b>：当前持仓市值 <b>${_snMoney(mv)}</b>
+        ${hasDetail ? `（A股 ${_snMoney(mvA)} ／ 港股折人民币 ${_snMoney(mvH)}）` : ''}
+        ＋ 按流水推算的净现金 <span style="color:${_snColor(implied)}">${_snMoney(implied, true)}</span>
+        ${hasDetail ? `（A股 ${_snMoney(cashA, true)} ／ 港股 ${_snMoney(cashH, true)}）` : ''}
+        ＋ 期间净出入金 <span style="color:${_snColor(ext)}">${_snMoney(ext, true)}</span>（${extN} 笔银证转账）
+        ＝ <b>调整后账户资产 ${_snMoney(adjusted)}</b>
+        ${extN ? '' : '<span class="faint">（还没记过出入金，所以等于推演值）</span>'}
+      </div>
+      <div style="color:var(--warn)">⚠ 推算的现金是「假设卖出所得一直留在账户、A/港股按固定汇率互转」的虚拟值，
+        <b>不是券商账户里的真实现金</b>；真实的入金/出金请到「💵 银证转账」tab 补记，补完这里就是
+        「当前持仓市值 + 真实资金流」口径。若调整后仍对不上券商 App，差的是基准日现金、
+        未记录的资金流或费用汇兑。下面的差额与胜率不受出入金影响。</div>
+      ${realLine}
       ${r.asof ? `<div class="faint">按 ${esc(r.asof)} 的最新收盘价计算；换一天再看数字会变</div>` : ''}
     </div>`;
-  const cc = r.by_currency || {}, cny = cc.CNY || {}, hkd = cc.HKD || {};
   const rows = (r.by_code || []).slice(0, 15).map(x => `<tr>
     <td>${esc(x.code)} <span class="faint">${esc(x.name || '')}</span></td>
     <td>${x.shares_base} → ${x.shares_now}</td>
@@ -6591,14 +6785,14 @@ function renderSnapshotReport(r) {
       <div class="jq-metric"><div class="jq-metric-v" style="color:${_snColor(t.real_gain_cny)}">${_snMoney(t.real_gain_cny, true)}</div>
         <div class="jq-metric-k">实际操作 ${_snPct(t.real_pct)}</div></div>
       <div class="jq-metric"><div class="jq-metric-v" style="color:${_snColor(delta)}">${_snMoney(delta, true)}</div>
-        <div class="jq-metric-k">${delta >= 0 ? '操作多赚' : '操作少赚'} ${_snPct(t.delta_pct_point)}</div></div>
+        <div class="jq-metric-k">${gapWord}（${leadWord} ${pp} 个百分点）</div></div>
       <div class="jq-metric"><div class="jq-metric-v" style="color:var(--accent)">${_snRate(w.win_rate)}</div>
         <div class="jq-metric-k">区间择时胜率 ${w.wins || 0}/${(w.wins || 0) + (w.losses || 0)}</div></div>
       <div class="jq-metric"><div class="jq-metric-v">${_snRate(rz.win_rate)}</div>
         <div class="jq-metric-k">已实现胜率 ${rz.wins || 0}/${rz.count || 0}</div></div>
     </div>
     <div class="faint" style="margin-bottom:8px">
-      期末资产：躺平 ${_snMoney(t.flat_end_cny)} / 实际 ${_snMoney(t.real_end_cny)}（持仓市值 + 卖出所得 − 买入支出）；
+      推演组合价值：躺平 ${_snMoney(t.flat_end_cny)} / 实际 ${_snMoney(t.real_end_cny)}（当前持仓市值 + 按流水推算的净现金，非券商账户总资产）；
       分币种差额：A股 ${_snMoney(cny.delta, true)} · 港股 ${_snHkd(hkd.delta)}；
       买入 ${_snWinLine(w.buy)} / 卖出 ${_snWinLine(w.sell)}
     </div>
@@ -6609,6 +6803,74 @@ function renderSnapshotReport(r) {
       </tr></thead><tbody>${rows}</tbody></table></div>`
       : '<div class="empty">该快照之后还没有交易流水</div>'}
     <div class="faint" style="margin-top:8px">${(r.caveats || []).map(esc).join('<br>')}</div>`;
+  renderSnapshotAttribution(r.attribution, r.account);
+}
+
+// ---------- 差额归因视觉（把一次性排查固化进报告） ----------
+// 数据由后端 build_report.attribution 算好，这里只负责画，不重算口径。
+function _snBar(label, value, max, color) {
+  const w = Math.max(2, Math.min(100, Math.abs(value) / max * 100));
+  return `<div style="display:flex;align-items:center;gap:8px;margin:3px 0">
+    <span style="width:96px;flex-shrink:0">${esc(label)}</span>
+    <div style="flex:1;background:var(--bg-2);border-radius:4px;height:12px;overflow:hidden">
+      <div style="width:${w.toFixed(1)}%;height:100%;background:${color}"></div></div>
+    <span style="width:96px;text-align:right;flex-shrink:0;font-variant-numeric:tabular-nums;color:${color}">${_snMoney(value, true)}</span>
+  </div>`;
+}
+function _snTradeBar(x, max, color) {
+  const label = `${x.date.slice(5)} ${x.side === 'buy' ? '买' : '卖'} ${x.code} ${x.shares}@${x.price}`;
+  const w = Math.max(2, Math.min(100, Math.abs(x.contribution_cny) / max * 100));
+  return `<div style="display:flex;align-items:center;gap:8px;margin:3px 0;font-size:11.5px">
+    <span style="width:235px;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+      title="${esc(label)}　现价 ${esc(x.price_now)}　${esc(x.name || '')}">${esc(label)}</span>
+    <div style="flex:1;background:var(--bg-2);border-radius:4px;height:10px;overflow:hidden">
+      <div style="width:${w.toFixed(1)}%;height:100%;background:${color}"></div></div>
+    <span style="width:88px;text-align:right;flex-shrink:0;font-variant-numeric:tabular-nums;color:${color}">${_snMoney(x.contribution_cny, true)}</span>
+  </div>`;
+}
+
+function renderSnapshotAttribution(a, account) {
+  const box = $('snap-attrib');
+  if (!box) return;
+  if (!a) { box.innerHTML = '<span class="muted">这份报告没有归因数据</span>'; return; }
+  const up = 'var(--up)', down = 'var(--down)';
+  const max = Math.max(Math.abs(a.buy_cny), Math.abs(a.sell_cny), Math.abs(a.delta_cny), 1);
+  const all = (a.top_losers || []).concat(a.top_winners || []);
+  const maxTrade = Math.max(1, ...all.map(x => Math.abs(x.contribution_cny)));
+  const ac = ((account || _ACCOUNT || {}).computed) || {};
+  const gapLine = ac.pnl_gap_cny != null
+    ? `<div class="faint" style="margin-top:4px">系统未覆盖收益缺口
+        <b>${_snMoney(ac.pnl_gap_cny, true)}</b>（总参考收益 ${_snMoney(ac.reference_pnl_cny, true)}
+        − 系统已录入累计盈亏 ${_snMoney(ac.system_total_pnl_cny, true)}）：账号 9-9 之前没进系统，
+        本归因只覆盖已录入流水，绝对金额请以账户真实基准为准。</div>` : '';
+  const head = `<div style="background:${a.delta_cny >= 0 ? 'var(--up-soft)' : 'var(--down-soft)'};
+      border-radius:8px;padding:8px 10px;margin:6px 0 10px;font-size:12px">
+      <b>${esc(a.verdict || '')}</b> · 择时胜率 ${a.win_rate == null ? '—' : a.win_rate + '%'}
+      · ${(a.buy_count || 0) + (a.sell_count || 0)} 笔操作${gapLine}</div>`;
+  const ends = `<div style="font-size:12px;margin-bottom:4px"><b>买卖两端</b></div>
+    ${_snBar('买入端', a.buy_cny, max, a.buy_cny >= 0 ? up : down)}
+    ${_snBar('卖出端', a.sell_cny, max, a.sell_cny >= 0 ? up : down)}
+    ${_snBar('净差额', a.delta_cny, max, a.delta_cny >= 0 ? up : down)}
+    <div class="faint" style="margin:4px 0 10px">卖对 ${_snMoney(a.sell_good_cny, true)} / 卖飞 ${_snMoney(a.sold_fly_cny, true)}；
+      买对 ${_snMoney(a.buy_good_cny, true)} / 买贵 ${_snMoney(a.bought_high_cny, true)}</div>`;
+  const losers = (a.top_losers || []).slice(0, 5);
+  const winners = (a.top_winners || []).slice(0, 5);
+  const tradesHtml = `<div style="font-size:12px;margin-bottom:4px"><b>最伤的 ${losers.length} 笔</b></div>
+    ${losers.map(x => _snTradeBar(x, maxTrade, down)).join('')}
+    <div style="font-size:12px;margin:10px 0 4px"><b>最赚的 ${winners.length} 笔</b></div>
+    ${winners.map(x => _snTradeBar(x, maxTrade, up)).join('')}`;
+  const days = (a.by_day || []).slice().sort((x, y) => Math.abs(y.contribution_cny) - Math.abs(x.contribution_cny)).slice(0, 6);
+  const dayMax = Math.max(1, ...days.map(x => Math.abs(x.contribution_cny)));
+  const daysHtml = `<details style="margin-top:10px"><summary class="faint" style="cursor:pointer">按交易日展开（最伤的 6 天）</summary>
+    <div style="margin-top:6px">${days.map(x => _snBar(x.date, x.contribution_cny, dayMax,
+      x.contribution_cny >= 0 ? up : down)).join('')}</div></details>`;
+  const tail = `<div style="border-top:1px solid var(--border);margin-top:10px;padding-top:8px;font-size:12px;line-height:1.9">
+    剔除最伤的 3 笔，差额变为 <b style="color:${a.excl_top3_cny >= 0 ? up : down}">${_snMoney(a.excl_top3_cny, true)}</b>；
+    剔除 5 笔变为 <b>${_snMoney(a.excl_top5_cny, true)}</b>。<br>
+    结构性：基准日之后新建仓/加仓的票拖累 <b>${_snMoney(a.new_position_drag_cny, true)}</b>，
+    老仓位操作合计 <b>${_snMoney(a.old_position_drag_cny, true)}</b>。
+    <span class="faint">（贡献 = 买 股数×(现价−买价) / 卖 股数×(卖价−现价)，港股折 CNY；现价变动会改写数字，这是归因不是投资建议）</span></div>`;
+  box.innerHTML = head + ends + tradesHtml + daysHtml + tail;
 }
 
 async function snapshotCreate() {
@@ -6639,9 +6901,203 @@ async function snapshotDelete(date) {
   } catch (e) { toastErr('删除失败: ' + (e.message || e)); }
 }
 
+// ---------- 银证转账（broker_cash.py，2026-11-13） ----------
+// 只记外部资金流；快照报告用「推演组合价值 + 期间净出入金」对齐券商账户资产。
+function _cfAmt(v) {
+  return (Number(v) || 0).toLocaleString('zh-CN', { maximumFractionDigits: 2 });
+}
+
+async function loadCashFlows() {
+  const box = $('cf-list');
+  if (!box) return;
+  box.innerHTML = '<span class="muted">加载中…</span>';
+  try {
+    const d = await api('/api/cash-flows');
+    if (d.status && d.status.error) {
+      box.innerHTML = `<span style="color:var(--up)">台账读取异常：${esc(d.status.error)}</span>`;
+      return;
+    }
+    $('cf-meta').textContent = `${d.flows.length} 笔 · HKD/CNY ${d.fx}${d.fx_source === 'fallback' ? '（兜底）' : ''}`;
+    renderCashFlowSummary(d.summary || {});
+    renderCashFlowList(d.flows || []);
+  } catch (e) {
+    box.innerHTML = `<span style="color:var(--up)">加载失败：${esc(e.message || e)}</span>`
+      + `<div class="faint" style="margin-top:4px">${esc(e.message || e)}</div>`;
+  }
+}
+
+function renderCashFlowSummary(s) {
+  const box = $('cf-summary');
+  if (!box) return;
+  const c = s.by_currency || {}, a = c.CNY || {}, h = c.HKD || {};
+  box.innerHTML = `
+    <div class="jq-metrics" style="margin:8px 0">
+      <div class="jq-metric"><div class="jq-metric-v" style="color:var(--up)">${_snMoney(s.total_in_cny)}</div><div class="jq-metric-k">累计入金（折 CNY）</div></div>
+      <div class="jq-metric"><div class="jq-metric-v" style="color:var(--down)">${_snMoney(s.total_out_cny)}</div><div class="jq-metric-k">累计出金（折 CNY）</div></div>
+      <div class="jq-metric"><div class="jq-metric-v" style="color:${_snColor(s.net_cny)}">${_snMoney(s.net_cny, true)}</div><div class="jq-metric-k">净入金 ${s.count || 0} 笔</div></div>
+    </div>
+    <div class="faint">分币种（原币）：CNY 入 ${_cfAmt(a.in)} / 出 ${_cfAmt(a.out)} / 净 ${_cfAmt(a.net)}；
+      HKD 入 ${_cfAmt(h.in)} / 出 ${_cfAmt(h.out)} / 净 ${_cfAmt(h.net)}。港币折 CNY 见上方汇总。</div>`;
+}
+
+function renderCashFlowList(flows) {
+  const box = $('cf-list');
+  if (!box) return;
+  if (!flows.length) {
+    box.innerHTML = '<div class="empty">还没记过银证转账。点右上「➕ 记一笔」把银行↔券商的入金/出金补上，快照报告就能和账户对账。</div>';
+    return;
+  }
+  const rows = flows.map(f => `<tr>
+    <td>${esc(f.date)}</td>
+    <td style="color:${f.side === 'in' ? 'var(--up)' : 'var(--down)'}">${f.side === 'in' ? '入金' : '出金'}</td>
+    <td>${_cfAmt(f.amount)} ${esc(f.currency)}</td>
+    <td>${esc(f.account || '')}</td><td>${esc(f.note || '')}</td>
+    <td><button class="btn ghost" style="font-size:11px;padding:2px 7px" onclick="cashFlowDelete('${esc(f.id)}')">删除</button></td>
+  </tr>`).join('');
+  box.innerHTML = `<div style="overflow-x:auto"><table class="tbl" style="width:100%"><thead><tr>
+    <th>日期</th><th>方向</th><th>金额(原币)</th><th>账户</th><th>备注</th><th>操作</th>
+    </tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+async function cashFlowAdd() {
+  const v = await formDlg('记一笔银证转账', [
+    { key: 'date', label: '日期', type: 'date', value: _snTodayStr(), required: true },
+    { key: 'side', label: '方向', type: 'select', options: ['入金', '出金'], value: '入金' },
+    { key: 'amount', label: '金额（原币）', type: 'number', step: '0.01', value: '', required: true,
+      hint: '只记银行↔券商之间的转账，不要记买股票/卖股票' },
+    { key: 'currency', label: '币种', type: 'select', options: ['CNY', 'HKD'], value: 'CNY' },
+    { key: 'account', label: '账户（可选）', value: '', placeholder: '如：A股 / 港股' },
+    { key: 'note', label: '备注（可选）', value: '', placeholder: '如：招行转银河' },
+  ], { okText: '保存' });
+  if (!v) return;
+  const amount = Number(v.amount);
+  if (!isFinite(amount) || amount <= 0) { toastErr('金额必须是正数'); return; }
+  try {
+    const r = await jsonPost('/api/cash-flows', {
+      date: v.date, side: v.side === '入金' ? 'in' : 'out', amount,
+      currency: v.currency, account: v.account, note: v.note });
+    toastOk(`已记 ${r.flow.date} ${v.side} ${_cfAmt(r.flow.amount)} ${r.flow.currency}`);
+    await loadCashFlows();
+    if (_SNAP.reportDate) await loadSnapshotReport(_SNAP.reportDate);
+  } catch (e) { toastErr('记账失败: ' + (e.message || e)); }
+}
+
+async function cashFlowDelete(id) {
+  if (!await confirmDlg('删除这笔银证转账？只删本地台账，不影响交易流水。',
+                        { title: '删除转账', okText: '删除', danger: true })) return;
+  try {
+    await api('/api/cash-flows?id=' + encodeURIComponent(id), { method: 'DELETE' });
+    toastOk('已删除');
+    await loadCashFlows();
+    if (_SNAP.reportDate) await loadSnapshotReport(_SNAP.reportDate);
+  } catch (e) { toastErr('删除失败: ' + (e.message || e)); }
+}
+
+// ---------- 账户真实基准（account_anchors.py） ----------
+// 账号 9-9 之前没进系统，真实现金与总参考收益靠手填；后续复盘都读 _ACCOUNT。
+async function editAccountAnchors() {
+  const c = (_ACCOUNT && _ACCOUNT.computed) || {};
+  const today = new Date().toISOString().slice(0, 10);
+  const v = await formDlg('设置账户真实基准', [
+    { key: 'cash', label: '当前真实现金（¥，折人民币）', type: 'number', step: '0.01',
+      value: c.cash_cny == null ? '' : String(c.cash_cny),
+      hint: '券商 App 当前可用现金；留空 = 未录入（绝不拿 0 冒充真实数据）' },
+    { key: 'ref', label: '总参考收益（¥，账号实际累计总盈亏，可负）', type: 'number', step: '0.01',
+      value: c.reference_pnl_cny == null ? '' : String(c.reference_pnl_cny),
+      hint: '含浮动、可填负数；系统只从 9-9 记账，之前的盈亏靠这个值补齐' },
+    { key: 'asof', label: '基准日期', type: 'date', value: c.asof_date || today,
+      hint: '两个数字按这一天的收盘填写；这天之后的每笔实盘买卖与出入金会自动叠加，不用重录' },
+    { key: 'note', label: '备注（可选）', value: c.note || '', placeholder: '如：券商 App 2026-11-13 收盘' },
+  ], { okText: '保存基准' });
+  if (!v) return;
+  const body = {
+    cash_cny: v.cash === '' ? null : Number(v.cash),
+    reference_pnl_cny: v.ref === '' ? null : Number(v.ref),
+    asof_date: v.asof || '',
+    note: v.note,
+  };
+  if ((body.cash_cny !== null && (!isFinite(body.cash_cny) || body.cash_cny < 0)) ||
+      (body.reference_pnl_cny !== null && !isFinite(body.reference_pnl_cny))) {
+    toastErr('请填有效数字（现金不能为负）'); return;
+  }
+  try {
+    const r = await jsonPut('/api/account-anchors', body);
+    _ACCOUNT = { ok: true, anchors: r.anchors, computed: r.computed };
+    toastOk('账户基准已保存');
+    await loadHoldings();
+    if (_SNAP.reportDate) await loadSnapshotReport(_SNAP.reportDate);
+  } catch (e) { toastErr('保存失败: ' + (e.message || e)); }
+}
+
 // ---- 标签页 ----
-const TABS = ['market', 'sector', 'holdings', 'snapshot', 'strategies', 'plans', 'calendar', 'news',
-              'bili', 'wb', 'xhs', 'mp', 'x', 'reports', 'paper', 'tdesk', 'anchor',
+// ---- 🧠 决策大脑白盒页：全部从 /api/brain 动态渲染，本页零硬编码逻辑 ----
+let _brainTimer = null;
+async function loadBrain() {
+  let d;
+  try { d = await api('/api/brain'); }
+  catch (e) { $('brain-body').innerHTML = '<p class="muted">加载失败：' + e.message + '</p>'; return; }
+  $('brain-meta').textContent = '更新于 ' + (d.updated_at || '').replace('T', ' ');
+  const on = (b, txt) => b
+    ? '<span class="brain-on">● ' + (txt || '启用') + '</span>'
+    : '<span class="brain-off">○ ' + (txt || '停用') + '</span>';
+
+  // 数据源层
+  let h = '<div style="margin-bottom:14px"><b style="font-size:13px">① 数据从哪来</b><div class="row" style="flex-wrap:wrap;gap:8px;margin-top:8px">';
+  for (const s of d.sources) {
+    h += '<div style="border:1px solid #d8d8e0;border-radius:8px;padding:8px 12px;min-width:220px">'
+       + '<div class="row" style="justify-content:space-between"><b style="font-size:12px">' + s.name + '</b>' + on(s.enabled) + '</div>'
+       + '<div class="muted" style="font-size:11px;margin-top:4px">' + s.desc + '</div></div>';
+  }
+  h += '</div></div>';
+
+  // 消息面大脑
+  const b = d.brain;
+  h += '<div style="margin-bottom:14px"><b style="font-size:13px">② 消息面大脑（唯一一份：' + b.module + '.py）</b>'
+     + '<div style="border:1px solid #cfe3ff;background:#f5f9ff;border-radius:8px;padding:10px 12px;margin-top:8px">'
+     + '<div class="row" style="flex-wrap:wrap;gap:8px">';
+  for (const r of b.rules) {
+    h += '<div style="flex:1;min-width:260px"><b style="font-size:12px">' + r.k + '</b>'
+       + '<span class="muted" style="font-size:11px"> — ' + r.v + '</span>'
+       + '<div class="muted" style="font-size:11px">' + r.d + '</div></div>';
+  }
+  h += '</div><div class="muted" style="font-size:11px;margin-top:6px">名额上限 ' + b.quota
+     + ' 条 · 共享方：' + b.shared_by.join(' / ') + '</div></div></div>';
+
+  // 三条管道 + 动画流向
+  h += '<div style="margin-bottom:8px"><b style="font-size:13px">③ 决策怎么来（管道实时状态）</b></div>';
+  for (const p of d.pipelines) {
+    h += '<div style="border:1px solid #d8d8e0;border-radius:10px;padding:10px 12px;margin-bottom:12px">'
+       + '<div class="row" style="justify-content:space-between;flex-wrap:wrap;gap:6px">'
+       + '<b style="font-size:12.5px">' + p.name + '</b>'
+       + '<span class="muted" style="font-size:11px">' + p.trigger + '</span></div>'
+       + '<div style="display:flex;flex-wrap:wrap;align-items:stretch;gap:0;margin-top:10px">';
+    p.stages.forEach((s, i) => {
+      const dead = !s.enabled;
+      h += (i > 0 ? '<div class="brain-arrow">▶</div>' : '')
+         + '<div class="brain-stage" style="' + (dead ? 'opacity:.45' : '') + '">'
+         + '<div class="row" style="justify-content:space-between;gap:4px">'
+         + '<b style="font-size:11.5px">' + s.name + '</b></div>'
+         + (dead ? '<span class="brain-off" style="font-size:10px">跳过</span>' : '')
+         + '<div class="muted" style="font-size:11px;margin-top:3px">' + s.desc + '</div></div>';
+    });
+    h += '</div></div>';
+  }
+
+  // 活动统计
+  const st = d.stats || {};
+  const srow = (k, v) => '<span class="muted" style="font-size:11.5px;margin-right:16px">' + k + '：<b>' + (v == null ? '—' : v) + '</b></span>';
+  h += '<div><b style="font-size:13px">④ 管道活着吗（真实活动）</b><div style="margin-top:6px">'
+     + srow('新闻库总量', st.news_total)
+     + srow('最近模拟盘轮次', st.last_paper_cycle ? (st.last_paper_cycle.date + ' ' + st.last_paper_cycle.kind + ' 计划' + st.last_paper_cycle.planned + '/执行' + st.last_paper_cycle.acted) : '—')
+     + srow('近3天做T建议', st.t_recent)
+     + '</div></div>';
+
+  $('brain-body').innerHTML = h;
+}
+function stopBrainTimer() { if (_brainTimer) { clearInterval(_brainTimer); _brainTimer = null; } }
+
+const TABS = ['market', 'sector', 'holdings', 'snapshot', 'cashflow', 'strategies', 'plans', 'calendar', 'news',
+              'bili', 'wb', 'xhs', 'mp', 'x', 'reports', 'paper', 'brain', 'tdesk', 'anchor',
               'notify', 'schedule',
               'jq', 'analysis', 'skills', 'research', 'chat'];
 const TAB_LOADERS = {
@@ -6655,6 +7111,7 @@ const TAB_LOADERS = {
   sector:    () => { loadSector(); loadIntraday(); startIntradayAuto(); },
   holdings:  () => { loadHoldings(); refreshTradeStrategyOptions(); },
   snapshot:  loadSnapshotTab,
+  cashflow:  loadCashFlows,
   strategies:() => { loadStrategies(); refreshTradeStrategyOptions(); },
   plans:     () => { loadPlans(); loadLlmConf(); },
   calendar:  () => { loadCalendar(); loadIpoStrategy(); },
@@ -6666,6 +7123,7 @@ const TAB_LOADERS = {
   x:         () => { loadXAccounts(); loadXWatch(); loadXTweets(); loadXStatus(); },
   reports:   loadReports,
   paper:     loadPaper,
+  brain:     loadBrain,
   tdesk:     loadTDesk,
   anchor:    loadAnchor,
   notify:    () => { loadNotifyConf(); loadNotifyMatrix(); refreshWxChat(); },
@@ -6687,6 +7145,46 @@ function switchTab(name) {
 document.querySelectorAll('.tabs button').forEach(btn => {
   btn.onclick = () => switchTab(btn.dataset.tab);
 });
+// hash 直达：/#holdings 打开页面直接落在持仓 tab（分享/排查截图用）
+window.addEventListener('DOMContentLoaded', () => {
+  const h = (location.hash || '').replace('#', '');
+  if (h && TABS.includes(h)) switchTab(h);
+  loadLiveAlerts();                       // 告警条：进页面就拉，不等开持仓页
+  setInterval(loadLiveAlerts, 5 * 60 * 1000);   // 5 分钟自刷
+});
+
+// ---- 实盘告警条（全站最顶）----
+// 只报「风险向」动作：止损警示 / 异动减持 / 趋势减仓。做T（高抛/买回）
+// 是机会提示不是风险，不进告警条（在持仓页看）。数据来自 /api/holdings
+// 的 advice（每票最新一轮引擎判断，后台连续刷）。非当日的旧判断照报但
+// 灰度标注日期——休市日的止损警示仍有参考价值，但要让用户知道不是实时的。
+async function loadLiveAlerts(cachedItems) {
+  const bar = $('live-alert-bar');
+  if (!bar) return;
+  try {
+    const items = cachedItems || await api('/api/holdings');
+    const ALERT_ACT = {
+      hard_stop:    ['🛑 止损警示', 'al-stop'],
+      spike_reduce: ['⚡ 异动减持', 'al-spike'],
+      trend_reduce: ['📉 趋势减仓', 'al-trend'],
+    };
+    const today = new Date().toISOString().slice(0, 10);
+    const hits = (items || []).filter(i => i.net_shares > 0 && i.advice
+      && ALERT_ACT[i.advice.action]);
+    if (!hits.length) { bar.classList.add('hide'); return; }
+    const parts = hits.map(i => {
+      const [label] = ALERT_ACT[i.advice.action];
+      const stale = i.advice.trade_date && i.advice.trade_date !== today;
+      const px = i.price != null ? `现价 ${fmtPx(i.price)}` : '';
+      return `<span class="al-item" title="${esc(i.advice.why || '')}">${label}
+        <span class="al-code" onclick="switchTab('holdings')">${i.code} ${esc(i.name || '')}</span>
+        ${px}${stale ? `<span class="al-old">（${i.advice.trade_date.slice(5)}判断）</span>` : ''}</span>`;
+    });
+    bar.innerHTML = `<span class="al-title">⚠️ 实盘告警</span>
+      <span class="muted" style="color:#ffd5d5;font-size:11.5px">（引擎最新判断，点代码看详情 · ${parts.length} 项）</span><br>` + parts.join('');
+    bar.classList.remove('hide');
+  } catch (e) { bar.classList.add('hide'); }   // 告警条失败静默：不挡正常使用
+}
 
 // ---- 盘中实时榜 ----
 let _intradayTimer = null, _prevIntradayPct = {};  // 上次采样涨幅，算「较上次采样」
@@ -7742,10 +8240,73 @@ let _openTradeCode = null;   // 当前展开流水的股票代码
 // ---- 持仓 ----
 let _holdingsCache = [];     // 供总计行与清账确认用
 let _holdSort = 'default';   // default=持仓在前 | loss=按浮动亏损 | gain=按浮动盈利
-async function loadHoldings() {
+let _adviceFuOpen = false;
+function toggleAdviceFu() {
+  _adviceFuOpen = !_adviceFuOpen;
+  $('advice-fu-detail').classList.toggle('hide', !_adviceFuOpen);
+  const btn = document.querySelector('#advice-followup-card > button');
+  if (btn) btn.textContent = _adviceFuOpen ? '收起明细 ▴' : '展开明细 ▾';
+}
+
+async function loadAdviceFollowup() {
   try {
-    const items = await api('/api/holdings');
+    const d = await api('/api/advice-followup');
+    if (!d || d.error || !d.summary) {
+      $('advice-fu-summary').textContent = d && d.error ? '⚠️ ' + d.error : '暂无建议记录';
+      return;
+    }
+    const s = d.summary;
+    const num = v => (Number(v) || 0).toLocaleString('zh-CN', {maximumFractionDigits: 0});
+    const signCls = v => v > 0 ? 'up' : (v < 0 ? 'down' : 'muted');
+    const byAct = (s.by_action || []).map(a =>
+      `${a.label} ${a.followed}/${a.total}`).join(' · ');
+    $('advice-fu-summary').innerHTML =
+      `近 ${d.window_days} 天 <b>${s.total}</b> 条动作建议：` +
+      `<b class="up">已照做 ${s.followed_n}</b> 条 / <b class="down">没照做 ${s.missed_n}</b> 条` +
+      (byAct ? `（${byAct}）<br>` : '<br>') +
+      `已照做的执行差额 <b class="${signCls(s.followed_gain_cny)}">${signed(s.followed_gain_cny)}</b>` +
+      `；没照做的若照做 <b class="${signCls(s.missed_gain_cny)}">${signed(s.missed_gain_cny)}</b>` +
+      ` → 全照做相对现状 <b class="${signCls(s.net_gap_cny)}">${signed(s.net_gap_cny)}</b>` +
+      (s.evaluated_n < s.total ? `（${s.total - s.evaluated_n} 条缺行情未计差额）` : '');
+    $('advice-fu-note').textContent = d.fx_hkd_cny ? `港股差额已按 ${d.fx_hkd_cny} 折CNY` : '';
+    const tb = $('advice-fu-body');
+    tb.innerHTML = (d.signals || []).map(x => {
+      const lab = {t_sell:'🔺高抛', t_buy:'🔻买回', trend_reduce:'📉减仓',
+                   hard_stop:'🛑止损', spike_reduce:'⚡减持'}[x.action] || x.action;
+      const hit = x.followed
+        ? '<b class="up">✓ 照做</b>'
+        : '<b class="down">✗ 未理</b>';
+      const tr = x.followed && x.trade_shares
+        ? `${fmt(x.trade_shares)}@${fmtPx(x.trade_price)}`
+        : '<span class="muted">—</span>';
+      const g = x.gain_cny;
+      const gCell = g == null ? '<span class="muted">—</span>'
+        : `<b class="${signCls(g)}">${signed(g)}</b>`;
+      return `<tr>
+        <td class="muted">${(x.date || '').slice(5)}</td>
+        <td class="mono">${x.code}</td>
+        <td>${esc(x.name || '')}</td>
+        <td>${lab}${x.rows > 1 ? `<span class="muted" style="font-size:10px">×${x.rows}轮</span>` : ''}</td>
+        <td class="num">${fmtPx(x.price)}${x.is_hk ? '<span class="muted" style="font-size:10px">HKD</span>' : ''}</td>
+        <td class="num">${fmt(x.suggest_shares || 0)}</td>
+        <td>${hit}</td>
+        <td class="num">${tr}</td>
+        <td class="num">${x.now_price != null ? fmtPx(x.now_price) : '<span class="muted">—</span>'}</td>
+        <td class="num" title="${esc(x.why || '')}">${gCell}</td>
+      </tr>`;
+    }).join('');
+  } catch (e) {
+    $('advice-fu-summary').textContent = '⚠️ 统计加载失败：' + (e.message || e);
+  }
+}
+
+async function loadHoldings() {
+  loadAdviceFollowup();   // fire-and-forget：统计卡慢不阻塞持仓渲染
+  try {
+    const [items, av] = await Promise.all([api('/api/holdings'), api('/api/account-anchors')]);
+    _ACCOUNT = av;
     _holdingsCache = items;
+    loadLiveAlerts(items);   // 告警条与持仓页同步（复用本次请求，不重复拉）
     const tbody = $('holdings-body');
     $('holdings-empty').classList.toggle('hide', items.length > 0);
     let mv = 0, floatPnl = 0, realized = 0, total = 0;   // 统一人民币口径（港股已折算）
@@ -7755,11 +8316,31 @@ async function loadHoldings() {
       realized += i.realized_pnl_cny ?? i.realized_pnl ?? 0;
       total += i.total_pnl_cny ?? i.total_pnl ?? 0;
     });
+    const ac = (av && av.computed) || {};
+    const num = v => (Number(v) || 0).toLocaleString('zh-CN', {maximumFractionDigits: 0});
+    // 2026-11-14：锚点带基准日，之后的实盘买卖/出入金自动叠加——
+    // cash_now_cny = 锚点现金 + 净交易现金流 + 净出入金；real_pnl_now_cny 随系统盈亏滚动。
+    // 旧数据无联动字段时退回手填值本身（兼容兜底，服务没重启也能显示）。
+    const cashNow = ac.cash_now_cny != null ? ac.cash_now_cny : ac.cash_cny;
+    const refNow = ac.real_pnl_now_cny != null ? ac.real_pnl_now_cny : ac.reference_pnl_cny;
+    const cashTip = ac.cash_now_cny != null
+      ? `锚点 ¥${num(ac.cash_cny)} ＋ 基准日(${ac.asof_date || '—'})后交易净现金流 ${signed(+(ac.net_trade_flow_cny || 0).toFixed(2))} ＋ 净出入金 ${signed(+(ac.ext_flow_cny || 0).toFixed(2))}；之后每记一笔买卖自动联动`
+      : '到「⚙ 设置账户基准」录入后，之后的实盘买卖会自动联动现金与收益';
+    const refTip = ac.real_pnl_now_cny != null
+      ? `锚点 ¥${signed(ac.reference_pnl_cny)} ＋ (系统盈亏现在 ${signed(ac.system_total_pnl_cny)} − 录入时 ${signed(ac.system_pnl_snapshot_cny)})；随行情与每笔买卖实时滚动`
+      : '手填的账号实际累计总盈亏';
     $('pnl-summary').innerHTML = items.length ? `
       <span class="muted">总市值(¥)</span><b>${mv.toLocaleString('zh-CN', {maximumFractionDigits: 2})}</b>
       <span class="muted">总浮动盈亏</span><b class="${cls(floatPnl)}">${signed(+floatPnl.toFixed(2))}</b>
       <span class="muted">总已实现盈亏</span><b class="${cls(realized)}">${signed(+realized.toFixed(2))}</b>
-      <span class="muted">累计总盈亏</span><b class="${cls(total)}">${signed(+total.toFixed(2))}</b>` : '';
+      <span class="muted">累计总盈亏(系统)</span><b class="${cls(total)}">${signed(+total.toFixed(2))}</b>
+      <span class="muted" title="${esc(cashTip)}">真实现金(¥)</span><b title="${esc(cashTip)}">${cashNow == null ? '<span class="muted">未录入</span>' : num(cashNow)}</b>
+      <span class="muted" title="${esc(refTip)}">总参考收益(实时)</span><b class="${cls(refNow)}" title="${esc(refTip)}">${refNow == null ? '—' : signed(refNow)}</b>
+      <span class="muted" title="${esc(cashTip)}">账户真实总资产</span><b title="${esc(cashTip)}">${ac.real_assets_cny == null ? '—' : num(ac.real_assets_cny)}</b>
+      <span class="muted" title="账号 9-9 之前没进系统的历史盈亏，钉死在录入基准时点，不随行情漂移">未覆盖缺口</span><b class="${cls(ac.pnl_gap_cny)}">${ac.pnl_gap_cny == null ? '—' : signed(ac.pnl_gap_cny)}</b>
+      <button class="btn ghost sm" onclick="event.stopPropagation();editAccountAnchors()"
+        title="手填券商账户真实现金与账号实际累计总盈亏，作为后续复盘的基准">⚙ 设置账户基准</button>` : '';
+    updateTradeCashHint();
     const held = items.filter(i => i.net_shares > 0), cleared = items.filter(i => i.net_shares === 0);
     if (_holdSort !== 'default') {
       held.sort((a, b) => (_holdSort === 'loss'
@@ -7774,10 +8355,52 @@ async function loadHoldings() {
       ? `港股已按 1 HKD ≈ ${fxItems[0].fx_rate} CNY 折算为人民币汇总（成本列 ₸ 标记=港币原币，个股行可看原 HKD 市值）` : '';
     tbody.innerHTML = shown.map(i => {
       const dim = i.net_shares === 0 ? ' style="opacity:.55"' : '';
-      const isHK = i.fx_rate;   // 有汇率标记=港股，金额列显示折算后人民币，悬浮看原币
+      const isHK = i.currency === 'HKD' || !!i.fx_rate;   // 按代码判币种，汇率没取到也照样标 HKD
       const hkTag = isHK ? '<span class="muted" style="font-size:10px"> ₸</span>' : '';
       const priceCell = i.net_shares === 0 ? '<td class="muted">—</td>'
         : `<td class="${cls(i.price)}">${fmtPx(i.price_cny ?? i.price)}${isHK ? `<div class="muted" style="font-size:10px">原${fmtPx(i.price)}HKD</div>` : ''}</td>`;
+      const beCny = i.breakeven_price_cny;
+      const beCell = (i.net_shares === 0 || beCny == null) ? '<td class="muted wrap">—</td>'
+        : `<td class="wrap">${fmtPx(beCny)}
+            ${isHK ? `<div class="muted" style="font-size:10px">原${fmtPx(i.breakeven_price)}HKD</div>` : ''}
+            <div class="muted" style="font-size:10px">${i.breakeven_pct == null ? ''
+              : (i.breakeven_pct > 100 ? '还需 +' + i.breakeven_pct + '%（剩 ' + fmt(i.net_shares) + ' 股摊）'
+                : i.breakeven_pct > 0 ? '还需 +' + i.breakeven_pct + '%' : '已回本')}</div></td>`;
+      // 回摊薄需涨：只看摊薄成本 vs 现价（不含已实现摊提——那是上面那列的口径）
+      const rec = i.recover_pct;
+      const recCell = (i.net_shares === 0 || rec == null) ? '<td class="muted">—</td>'
+        : (rec > 0
+          ? `<td style="color:var(--up)">+${rec.toFixed(2)}%</td>`
+          : `<td style="color:var(--down)">成本下方<span class="muted" style="font-size:10px"> ${rec.toFixed(2)}%</span></td>`);
+      // 建议操作：来自 /api/holdings 的 advice（sa_t_advisory_log 最新一条，
+      // 与实盘做T判据同源）。颜色跟方向走：买入类红、卖出类绿（A股习惯）、
+      // 止损警示橙、持有灰。stale=判断不是今天的（休市日/引擎停转），
+      // 日期点破免得把旧建议当现在的。标签用短词——这列是表格宽度大头。
+      const ADV = {
+        t_sell:      ['🔺 高抛', 'up'],   t_buy: ['🔻 买回', 'dn'],
+        hard_stop:   ['🛑 止损', 'warn'], trend_reduce: ['📉 减仓', 'dn'],
+        spike_reduce:['⚡ 异动减', 'dn'], trend_wait: ['⏳ 等趋势', 'mut'],
+        hold:        ['✋ 持有', 'mut'],  none: ['—', 'mut'],
+        error:       ['⚠️ 异常', 'warn'],
+      };
+      const av = i.advice;
+      let advCell = '<td class="muted">—</td>';
+      if (av && av.action) {
+        const [label, tone] = ADV[av.action] || [av.action, 'mut'];
+        const today = new Date().toISOString().slice(0, 10);
+        const stale = av.trade_date && av.trade_date !== today;
+        const color = { up: 'var(--up)', dn: 'var(--down)',
+                        warn: '#e8590c', mut: 'var(--text-2)' }[tone];
+        const tip = esc((av.why || '') + (av.why ? '\n' : '') +
+          `判断时间 ${av.time || '—'}${stale ? '（非今日）' : ''}`);
+        advCell = `<td title="${tip}">
+          <b style="color:${color}">${label}</b>
+          ${av.pending ? '<span class="muted" style="font-size:10px">待买回</span>' : ''}
+          ${av.edge_pct != null && (av.action === 't_sell' || av.action === 't_buy')
+            ? `<span class="muted" style="font-size:10px">差${av.edge_pct}%</span>` : ''}
+          ${stale ? `<div class="muted" style="font-size:10px">${(av.trade_date || '').slice(5)}</div>` : ''}
+        </td>`;
+      }
       const mvCny = i.market_value_cny ?? i.market_value;
       return `<tr${dim} onclick="toggleTrades('${i.code}')" title="点击查看交易流水">
         <td>${i.code}</td><td>${esc(i.name)}${(i.position_strategies || []).length
@@ -7788,6 +8411,9 @@ async function loadHoldings() {
         <td class="${cls(i.pnl)}">${signed(i.pnl_cny ?? i.pnl)}</td>
         <td class="${cls(i.realized_pnl)}">${signed(i.realized_pnl_cny ?? i.realized_pnl)}</td>
         <td class="${cls(i.total_pnl)}"><b>${signed(i.total_pnl_cny ?? i.total_pnl)}</b></td>
+        ${beCell}
+        ${recCell}
+        ${advCell}
         <td class="muted">${i.trade_count}</td>
         <td style="white-space:nowrap">
           <button class="link-btn" onclick="event.stopPropagation();openCostCalc('${i.code}')" title="按拟买价试算加仓后的摊薄成本">试算</button>
@@ -7974,8 +8600,35 @@ async function addTrade() {
     ['t-code', 't-shares', 't-price', 't-date', 't-note'].forEach(id => $(id).value = '');
     $('t-strategy').value = '';
     $('t-date').type = 'text';
-    toast(side === 'buy' ? '已记买入' : '已记卖出'); loadHoldings();
+    // 交易日期留空=今天：日期在锚点基准日之后时，这笔的现金流会自动叠加到
+    // 真实现金/实时参考收益上（account_anchors.compute 联动口径）。
+    toast(side === 'buy' ? '已记买入，真实现金已联动扣减' : '已记卖出，真实现金已联动增加');
+    loadHoldings();
   } catch (e) { toastErr('记账失败: ' + e.message); }
+}
+
+// ---- 交易表单的现金联动预览（2026-11-14） ----
+// 填代码/方向/股数/成交价时实时显示「当前真实现金 → 成交后现金」；
+// 港股按当前汇率折人民币（与后端 _ts_fx 同源，_ACCOUNT.fx_hkd 带 10 分钟缓存）。
+function updateTradeCashHint() {
+  const box = $('t-cash-hint');
+  if (!box) return;
+  const ac = (_ACCOUNT && _ACCOUNT.computed) || {};
+  const cash = ac.cash_now_cny != null ? ac.cash_now_cny : ac.cash_cny;
+  if (cash == null) { box.innerHTML = ''; return; }
+  const fmtC = v => Number(v).toLocaleString('zh-CN', {maximumFractionDigits: 0});
+  const shares = +$('t-shares').value || 0;
+  const price = +$('t-price').value || 0;
+  const base = `当前真实现金 <b>¥${fmtC(cash)}</b>`;
+  if (!shares || !price) { box.innerHTML = base + '<span class="faint"> · 填入股数和成交价可预览成交后现金</span>'; return; }
+  const isHK = /^\d{5}$/.test($('t-code').value.trim());
+  const fx = isHK ? ((_ACCOUNT && _ACCOUNT.fx_hkd) || 0.85) : 1;
+  const amt = shares * price * fx;
+  const side = $('t-side').value;
+  const after = cash + (side === 'buy' ? -amt : amt);
+  box.innerHTML = `${base} → 成交后 ≈ <b>¥${fmtC(after)}</b>`
+    + (isHK ? `<span class="faint">（${shares}×${price} HKD × ${fx}）</span>` : '')
+    + (after < 0 ? ' <span style="color:var(--warn)">⚠ 超过当前现金</span>' : '');
 }
 
 async function toggleTrades(code) {
@@ -10561,8 +11214,18 @@ const SOURCE_LABEL = { eastmoney: '东财', ak_em: '个股新闻', baidu: '百�
 async function loadNews() {
   try {
     const code = $('news-filter').value;
-    const items = await api('/api/news?limit=50' + (code ? '&code=' + code : ''));
+    const q = ($('news-search') && $('news-search').value || '').trim();
+    // 检索时后端把 limit 上限放宽到 200；浏览态仍 50 条。
+    const items = await api('/api/news?limit=50' + (code ? '&code=' + code : '')
+      + (q ? '&q=' + encodeURIComponent(q) : ''));
+    const info = $('news-search-info');
+    if (info) info.innerHTML = q
+      ? `关键词「<b>${esc(q)}</b>」命中 <b>${items.length}</b> 条${items.length >= 200 ? '（已达检索上限，可换更具体的关键词）' : ''} · <span class="faint">搜标题/媒体/来源渠道；新闻不存正文</span>${code ? ` · 已叠加股票 ${esc(code)} 筛选` : ''}`
+      : '';
     $('news-empty').classList.toggle('hide', items.length > 0);
+    $('news-empty').textContent = q
+      ? `没有命中「${q}」的新闻：换个关键词试试，或点「立即抓取」抓一轮最新消息。`
+      : '还没有新闻。点「立即抓取」从 4 个免费渠道抓取（东财公告/东财资讯/百度新闻/新浪财经/DuckDuckGo）。';
     $('news-list').innerHTML = items.map(n => {
       const rel = (n.related || []).map(c =>
         `<span class="rel-code" title="关联股票" onclick="filterByCode('${c}')">${c}</span>`).join('');
@@ -10589,6 +11252,13 @@ async function loadNews() {
 function filterByCode(code) {
   $('news-filter').value = code;
   switchTab('news');
+}
+
+function newsClearSearch() {
+  const box = $('news-search');
+  if (!box) return;
+  box.value = '';
+  loadNews();
 }
 
 // ---- 调度设置（config.yaml schedule 段 + 各模块抓取周期 + 币圈监控） ----
@@ -11408,12 +12078,20 @@ const _mpSel = new Set();
 async function loadMpArticles() {
   try {
     const unread = $('mp-unread-only').checked ? '&unread_only=true' : '';
-    const d = await api('/api/mp/articles?limit=60' + unread);
+    const q = ($('mp-search') && $('mp-search').value || '').trim();
+    // 检索时后端把 limit 放宽到 200（见 /api/mp/articles）；浏览态仍 60 篇。
+    const d = await api('/api/mp/articles?limit=60' + unread + (q ? '&q=' + encodeURIComponent(q) : ''));
     const items = d.items || [];
     _mpItems = items.map(a => ({ id: a.id, title: a.title || '' }));
     const alive = new Set(_mpItems.map(x => x.id));
     Array.from(_mpSel).forEach(id => { if (!alive.has(id)) _mpSel.delete(id); });
+    const info = $('mp-search-info');
+    if (info) info.innerHTML = q
+      ? `关键词「<b>${esc(q)}</b>」命中 <b>${items.length}</b> 篇${items.length >= 200 ? '（已达检索上限，可换更具体的关键词）' : ''} · <span class="faint">搜标题/摘要/正文/作者/公众号名</span>`
+      : '';
     $('mp-empty').classList.toggle('hide', items.length > 0);
+    $('mp-empty').textContent = q ? `没有命中「${q}」的文章：换个关键词试试（正文没抓到的文章搜不到正文内容）。`
+      : '还没有文章。添加订阅源后点「立即拉取」。';
     $('mp-list').innerHTML = items.map(a => {
       const ts = a.published_at || a.fetched_at || '';
       // ⚠️ 时区（2026-10-11 修）：接口给的是 ISO 带时区的串（如 2026-10-11T14:00+00:00），
@@ -11467,6 +12145,13 @@ async function loadMpArticles() {
 async function markMpReadOne(id, el) {
   try { await jsonPost('/api/mp/read', { ids: [id] }); el.closest('.dyn-item').classList.remove('unread'); }
   catch (e) { toastErr(e.message); }
+}
+
+function mpClearSearch() {
+  const box = $('mp-search');
+  if (!box) return;
+  box.value = '';
+  loadMpArticles();
 }
 
 // 正文 HTML 来自微信（外部内容）。实测 117 篇：script=0、on*=0、

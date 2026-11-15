@@ -1694,6 +1694,9 @@ def _holdings_with_pnl(positions: list[dict]) -> list[dict]:
         p["breakeven_price"] = be["price"]
         p["breakeven_price_cny"] = be["price_cny"]
         p["breakeven_pct"] = be["pct"]
+        # 回到摊薄成本需要的涨幅（只看成本 vs 现价，不含已实现摊提——那是上面的累计口径）
+        p["recover_pct"] = holding_metrics.recover_to_avg_cost(
+            p.get("avg_cost"), p.get("price"))
         p["price_cny"] = round(price * k, 4) if p.get("price") else p.get("price")
         p["market_value_cny"] = round(p["market_value"] * k, 2)
         p["cost_value_cny"] = round(p["cost_value"] * k, 2) if p.get("cost_value") is not None else None
