@@ -441,26 +441,16 @@ SCHEMAS: dict[str, dict[str, Any]] = {
              "label": "正文入库截断长度", "adv": True},
         ],
     },
-    # ---------------- 智谱动态（只抓新模型发布痕迹） ----------------
-    "zai": {
-        "label": "🤖 智谱动态（只抓新模型发布痕迹）",
-        "help": "zai-org 的「模型发布痕迹」→ sa_news（关联到下方股票代码）："
-                "①GLM* 模型仓新 release ②GLM* 新仓库上线（发布前兆）③HuggingFace 新模型"
-                "上传（量化变体按 base 去重）。ZCode 等工具仓 release 不算。"
-                "X 管线恢复前的稳定替代源，见 zai_watch.py。",
+    # ---------------- 模型发布监控（多主体，只抓新模型发布痕迹） ----------------
+    "model_watch": {
+        "label": "🧠 模型发布监控（全局）",
+        "help": "「新模型发布痕迹」→ sa_news：①模型仓新 release ②新仓库上线（前兆）"
+                "③HuggingFace 新模型上传（量化变体按 base 去重）。主体在 zai/minimax "
+                "两个段里配（org/pattern/code），见 model_watch.py。",
         "fields": [
             {"key": "enabled", "t": "bool", "d": True, "label": "启用"},
             {"key": "interval_minutes", "t": "int", "d": 60, "lo": 0, "hi": 1440,
              "label": "轮询周期(分钟)", "help": "0 = 关闭"},
-            {"key": "github_org", "t": "str", "d": "zai-org", "label": "GitHub org",
-             "help": "org 仓库发现 + 各模型仓 release，每轮共 ~N+1 次调用（免鉴权 60 次/时）"},
-            {"key": "hf_author", "t": "str", "d": "zai-org", "label": "HuggingFace 作者",
-             "help": "一次调用覆盖该作者全部模型上传"},
-            {"key": "model_name_re", "t": "str", "d": "GLM[-_A-Za-z0-9.]*",
-             "label": "模型命名 pattern", "help": "匹配 basename，大小写不敏感；"
-             "决定什么算「模型痕迹」——ZCode 等工具仓不匹配就不收"},
-            {"key": "code", "t": "str", "d": "02513", "label": "关联股票代码",
-             "help": "新闻落到哪只票的决策上下文（_paper_news_rows 按 code 关联）"},
             {"key": "notify_new", "t": "bool", "d": True, "label": "新痕迹推微信",
              "help": "过滤后剩下的都是高信号（新模型发布/前兆），默认推"},
             {"key": "per_source_limit", "t": "int", "d": 8, "lo": 1, "hi": 30,
@@ -468,6 +458,38 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             {"key": "proxy", "t": "url", "d": "http://127.0.0.1:6478",
              "label": "直连失败时的代理", "adv": True,
              "help": "HF 本机直连超时 → 自动走此代理重试一次；代理不常驻，只做回退"},
+        ],
+    },
+    "zai": {
+        "label": "🤖 主体：智谱（zai-org）",
+        "help": "痕迹落到 code 对应的股票决策上下文。pattern 匹配 basename；"
+                "exclude 排除工具仓（ZCode 靠 pattern 不匹配已排除）。",
+        "fields": [
+            {"key": "github_org", "t": "str", "d": "zai-org", "label": "GitHub org",
+             "help": "org 仓库发现 + 各模型仓 release（免鉴权 60 次/时）"},
+            {"key": "hf_author", "t": "str", "d": "zai-org", "label": "HuggingFace 作者",
+             "help": "一次调用覆盖该作者全部模型上传"},
+            {"key": "model_name_re", "t": "str", "d": "GLM[-_A-Za-z0-9.]*",
+             "label": "模型命名 pattern", "help": "匹配 basename，大小写不敏感；"
+             "ZCode 等工具仓不匹配就不收"},
+            {"key": "exclude_re", "t": "str", "d": "", "label": "排除 pattern",
+             "help": "include 命中但 exclude 也命中 → 排除（MiniMax 主体用它排工具仓）"},
+            {"key": "code", "t": "str", "d": "02513", "label": "关联股票代码",
+             "help": "新闻落到哪只票的决策上下文（_paper_news_rows 按 code 关联）"},
+        ],
+    },
+    "minimax": {
+        "label": "🎲 主体：MiniMax（MiniMax-AI）",
+        "help": "痕迹落到 00100 的决策上下文。MiniMax-Code-* 等工具仓靠 exclude 排除。",
+        "fields": [
+            {"key": "github_org", "t": "str", "d": "MiniMax-AI", "label": "GitHub org"},
+            {"key": "hf_author", "t": "str", "d": "MiniMaxAI", "label": "HuggingFace 作者"},
+            {"key": "model_name_re", "t": "str", "d": "MiniMax[-_A-Za-z0-9.]*",
+             "label": "模型命名 pattern"},
+            {"key": "exclude_re", "t": "str", "d": "MiniMax-Code[-_A-Za-z0-9.]*",
+             "label": "排除 pattern",
+             "help": "MiniMax-Code-* 是 agent 工具仓，release 不算模型发布痕迹"},
+            {"key": "code", "t": "str", "d": "00100", "label": "关联股票代码"},
         ],
     },
     # ---------------- 币圈 ----------------

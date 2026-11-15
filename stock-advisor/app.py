@@ -91,7 +91,7 @@ import wx_chat
 import wx_commands
 import wx_inbound
 import x_monitor
-import zai_watch
+import model_watch
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"          # 兼容保留：迁移前旧 JSON 数据所在目录
@@ -11843,28 +11843,28 @@ def _x_loop():
             time.sleep(300)
 
 
-def _zai_deps() -> dict:
+def _model_watch_deps() -> dict:
     return {"get_conn": get_conn, "notify_fn": notifier.notify}
 
 
-def _zai_loop():
-    """智谱动态守护线程：按 zai.interval_minutes（默认 60，0=关闭）拉一轮
-    GitHub releases + HuggingFace 上传 → sa_news（关联到 zai.code，默认 02513）。
+def _model_watch_loop():
+    """模型发布监控守护线程：按 model_watch.interval_minutes（默认 60，0=关闭）
+    逐主体拉一轮「新模型发布痕迹」→ sa_news（zai→02513、minimax→00100）。
     纯公开 API 免反爬，失败只打日志不重试（下轮自然重拉）。"""
     while True:
         try:
-            conf = zai_watch.load_conf()
-            interval = int(conf.get("interval_minutes") or 0)
-            if conf.get("enabled", True) and interval > 0:
-                result = zai_watch.run_once(_zai_deps())
+            conf = model_watch.load_conf()
+            interval = int(conf["global"].get("interval_minutes") or 0)
+            if conf["global"].get("enabled", True) and interval > 0:
+                result = model_watch.run_once(_model_watch_deps())
                 if result.get("inserted"):
-                    print(f"[zai] {result['inserted']} new items "
-                          f"(of {result.get('items')})", flush=True)
+                    print(f"[model-watch] {result['inserted']} new items "
+                          f"(subjects: {result.get('subjects')})", flush=True)
                 time.sleep(max(interval, 1) * 60)
             else:
                 time.sleep(300)
         except Exception as exc:
-            print(f"[zai] loop error: {exc}", flush=True)
+            print(f"[model-watch] loop error: {exc}", flush=True)
             time.sleep(300)
 
 
@@ -12282,9 +12282,9 @@ _start_daemon(_wb_auto_loop, "sa_wb")
 # 小红书关键词舆情定时抓取后台线程（xhs.interval_minutes=0 时轮内直接跳过）
 _start_daemon(_xhs_auto_loop, "sa_xhs")
 
-# 智谱动态监控后台线程（GitHub releases + HuggingFace 上传 → sa_news；
-# zai.interval_minutes=0 时轮内直接跳过）
-_start_daemon(_zai_loop, "sa_zai")
+# 模型发布监控后台线程（GitHub releases + HuggingFace 上传 → sa_news；
+# 多主体：zai→02513、minimax→00100；model_watch.interval_minutes=0 时轮内直接跳过）
+_start_daemon(_model_watch_loop, "sa_model_watch")
 
 # 止盈策略监控后台线程（交易时段每 60s 扫一次，触发即通知）
 _start_daemon(_strategy_loop, "sa_strategy")

@@ -76,6 +76,42 @@ BOM，`ast.parse` 要 `utf-8-sig`；④ 测试夹具又错两次：stub 对 4 �
 
 ---
 
+### 🧠 监控扩到 MiniMax：zai_watch → model_watch 多主体（2026-11-16，用户要求）
+
+用户：「minimax的也加上监控」→ 监控对象从智谱单主体泛化为多主体。
+
+| 主体 | GitHub org | HF author | 股票 | pattern | exclude |
+|---|---|---|---|---|---|
+| zai | zai-org | zai-org | 02513 | GLM* | — |
+| minimax | MiniMax-AI | MiniMaxAI | 00100 | MiniMax* | MiniMax-Code-*（工具仓）|
+
+- **实测预检**：MiniMax-AI/MiniMaxAI 都活着，且 HF 上就有 `MiniMax-M3-MXFP8`（base
+  归并样例）与 `MiniMax-M3.1-Flash`（独立模型线）——量化后缀表补了 **MXFP4/MXFP8/NVFP4**。
+- **文件改名**：`zai_watch.py → model_watch.py`（模块/测试/接线/守护线程
+  `sa_model_watch` 全部跟进；状态侧车 → `data/model_watch_state.json`，按主体分桶）。
+- **config 拆三段**：`model_watch`（全局 enabled/interval/notify/per_source_limit/proxy）
+  + `zai` / `minimax`（主体字段 github_org/hf_author/model_name_re/exclude_re/code）。
+  生产 config.yaml 用 `replace_or_append_section` 迁移；主体继承全局 proxy（第一版漏了
+  → HF 直连超时）。
+- **配额纪律（真机 403 逮到）**：免鉴权 GitHub 60 次/时/IP，zai-org 的 GLM* 仓库比
+  预想多（GLM-4/5/TTS/ASR/Image/OCR/skills…）。两道闸：①只轮询 pushed_at ≤90 天的
+  仓库（新 release 必伴随 push）；②403 rate-limit 走代理 = 换 IP 配额（救回整轮）。
+  `_http_json` 重写为「直连→代理」两段式（403 换 IP、网络错换代理、HTTP 4xx 不重试）。
+- **真机实证**：首轮 `zai items=10 inserted=0（全 >7 天，口径正常）`、
+  `minimax items=8 inserted=2 notified=2` —— 入库两条恰是 00100 的 7 天内痕迹：
+  `[GitHub] MiniMax 新模型仓库上线：MiniMax-H3-Image（发布前兆）`（11-10）+
+  `[HuggingFace] 新模型：MiniMaxAI/MiniMax-H3-Image-PE`（11-08），并已推微信。
+- **坑**：①测试桩 `_fake_save` 忘了模拟 URL 去重 → 第二轮去重断言假失败（真库
+  ON CONFLICT 行为必须进桩）；②失败轮断言用「已存在的桶」判「未更新」必然假失败，
+  改用**全新 base（MiniMax-M4）不进状态**来验证；③ heredoc 在 Git Bash 里被截断，
+  长测试文件用 Write 工具；④ 一次重启后 app 卡在 import（CPU 0.015s）且旧进程
+  41376 占着 PG 连接——PowerShell 全杀 app.py 进程后干净重启恢复。启动要等
+  Uvicorn running（这轮 >6 分钟，波动上限比 AGENTS.md 记的 236s 还高）。
+
+---
+
+---
+
 ### 🐦 X 源排障：三层叠加失败 + X 前端重构致 twscrape 管线失效（2026-11-15，用户问「DSA 的 X 怎么对接的」）
 
 对比 daily_stock_analysis 后排查自家 X 源（`x_monitor.py`，twscrape 路线），钉死失败链：
