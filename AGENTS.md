@@ -4,6 +4,40 @@
 
 ---
 
+### 📊 RSI 落地 + 技法生效影响审计（2026-11-17，用户问「技法生效有什么影响/做到RSI了吗」）
+
+**技法生效影响（审计结论）**：技法（sa_analysis_techniques，active 1136/pending 140）
+经 `_anal_tech_block` → `_report_deps.anal_tech_fn` → **daily_reports.py:381** 注入
+**盘前/盘后日报正文末段**（「补充检查清单」，limit 12 / 2600 字符，按 hits 轮换，
+bump_hits 计数落库）。**不影响模拟盘决策**（_decide_one 零引用技法）。hits=95 的
+「异构双模型交叉验算」是 10-08 审计点名的跑题条目仍霸榜首。RSI 全项目原本
+**零数值计算**（只有词表 + 1 条文字技法）。
+
+**RSI 落地（用户要求「做到RSI」）**：
+
+| 组件 | 要点 |
+|---|---|
+| `tech_ind.py` | Wilder RSI 纯函数（`rsi_series`/`rsi_state`），预热位 None 不编造；区间 <30 超卖/30-45 偏弱/45-55 中性/55-70 偏强/≥70 超买 |
+| t_trading advisory 循环 | `it["rsi"]` 结构化 + **why 尾部注记**（放 trend 覆盖**之后**——放前面会被 trend 的 why 盖掉）；只注记不改 decide 口径 |
+| paper_trading `_build_context` | 决策上下文 RSI 行（`paper.rsi_inject` 默认 True，提示类），文案钉死「仅参考状态非交易信号」；schema 1 字段 |
+| 真机 | advisory 28 行全带 RSI（000158 RSI14=40.9 偏弱 delta −2.4）；决策上下文离线验证 RSI 行出现/开关消失 |
+
+**验证**：`tech_ind_test.py` **17/17**（Wilder 手算 period=3 种子 66.67 与递推、
+连涨100/连跌0/全平50、**Wilder 记忆效应精确值 34.9**——先涨10再跌10不是回中性，
+平滑常数决定回落速度，第一版断言「应回 45~55」是预期错）；回归 `_t_log_test` exit 0、
+holding_metrics 43/43。
+
+**另**：对话评测（100 题）真机抽测 32 题已收 31 份结果：**26/31 通过**，失败家族
+「做T/持仓类不调工具」根因 = **nanobot serve 端 api.timeout=120s**（GLM-5.3-Flash
+工具循环超 120s → 504 → 静默回退单轮 LLM 指令表口吻）。已修：serve 端 api.timeout
+600 + wx_chat.agent_timeout 420 + AGENT_STYLE 路由硬规则 + 评测跑批加墙钟看门狗
+（K01 挂起 21023s 实测）。复测遗留：A02/C01/C05/C09/K01 五题待网关稳定后重跑
+（`python chat_eval_run.py --ids A02,C01,C05,C09,K01`）。
+
+---
+
+---
+
 ### 🧰 nanobot MCP 工具层重建（第一步）：trading server + position-sizer（2026-11-15，用户选「路线 B」）
 
 对照 tradermonty/claude-trading-skills（77 个 Claude 技能，MIT）后，用户在

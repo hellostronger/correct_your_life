@@ -1050,6 +1050,21 @@ def _build_context(stock: dict, quote: dict, bars: list[dict],
         f"总市值 {quote.get('market_cap') or '—'}亿",
         f"【近60日K线摘要】{_kline_summary(bars)}",
     ]
+    # RSI 状态（2026-11-16 用户要求「做到RSI」）：Wilder RSI(14) 纯注记，
+    # 提示类默认开（paper.rsi_inject）。只给 LLM 交易员一个可核的数值状态，
+    # 不给结论——结论仍由 LLM 自己下。
+    if conf.get("rsi_inject", True):
+        try:
+            import tech_ind
+            _rs = tech_ind.rsi_state(bars)
+            if _rs.get("rsi") is not None:
+                d = _rs.get("delta")
+                ctx.append(
+                    f"【RSI{_rs['period']}】{_rs['rsi']:.1f}（{_rs['label']}"
+                    + (f"；较前一交易日 {d:+.1f}" if d is not None else "")
+                    + "；≥70 超买、≤30 超卖，仅参考状态非交易信号）")
+        except Exception as exc:                    # noqa: BLE001
+            print(f"[paper] RSI 注入失败（跳过）: {exc}", flush=True)
     if market_note:
         ctx.append(f"【大盘量能概况】{market_note}")
     if news:

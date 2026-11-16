@@ -1124,6 +1124,15 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
         <b id="trades-modal-title" style="font-size:14px">交易流水</b>
         <button class="modal-close" onclick="hideTrades()" title="关闭（Esc）">×</button>
       </div>
+      <div id="trades-filter" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;padding:6px 14px;border-bottom:1px solid rgba(0,0,0,.06)">
+        <span class="muted" style="font-size:12px">日期筛选</span>
+        <input type="date" id="trade-start" style="width:auto" title="开始日期（含）">
+        <span class="muted">~</span>
+        <input type="date" id="trade-end" style="width:auto" title="结束日期（含）">
+        <button class="btn" style="font-size:12px;padding:3px 10px" onclick="applyTradeFilter()">查询</button>
+        <button class="btn" style="font-size:12px;padding:3px 10px" onclick="resetTradeFilter()">重置</button>
+        <span id="trade-filter-hint" class="muted" style="font-size:12px"></span>
+      </div>
       <div class="modal-body" id="trades-detail"></div>
     </div>
   </div>
@@ -8237,6 +8246,48 @@ async function delWatch(code) {
 // ---- 持仓（流水账） ----
 let _openTradeCode = null;   // 当前展开流水的股票代码
 
+// ---- 实盘交易流水的日期筛选（只读查询，不改任何写入/盈亏口径） ----
+// 状态必须是模块级的：toggleTrades / delTrade / 挂解策略 / 持仓重载都会重新走
+// showTrades(_openTradeCode)，若把筛选存在 DOM 里就会被这些刷新清掉。只有「重置」能清空。
+let _tradeFilter = { start: '', end: '' };
+
+function _tradeFilterQuery(code) {
+  let q = '/api/trades?code=' + encodeURIComponent(code);
+  if (_tradeFilter.start) q += '&start=' + encodeURIComponent(_tradeFilter.start);
+  if (_tradeFilter.end) q += '&end=' + encodeURIComponent(_tradeFilter.end);
+  return q;
+}
+
+function _syncTradeFilterUI(rows) {
+  const s = $('trade-start'), e = $('trade-end'), hint = $('trade-filter-hint');
+  // 回填输入框（比较后再赋值，避免无谓写 DOM）
+  if (s && s.value !== _tradeFilter.start) s.value = _tradeFilter.start;
+  if (e && e.value !== _tradeFilter.end) e.value = _tradeFilter.end;
+  if (!hint) return;
+  const n = (rows || []).length;
+  const buys = (rows || []).filter(t => t.side === 'buy').length;
+  const tally = `共 ${n} 笔（买 ${buys} / 卖 ${n - buys}）`;
+  hint.textContent = (_tradeFilter.start || _tradeFilter.end)
+    ? `${_tradeFilter.start || '…'} ~ ${_tradeFilter.end || '…'} · ${tally}`
+    : `全部 ${tally}`;
+}
+
+function applyTradeFilter() {
+  const s = ($('trade-start')?.value || '').trim();
+  const e = ($('trade-end')?.value || '').trim();
+  if (s && e && s > e) { toastErr('开始日期不能晚于结束日期'); return; }
+  _tradeFilter = { start: s, end: e };
+  if (_openTradeCode) showTrades(_openTradeCode);
+}
+
+function resetTradeFilter() {
+  const s = $('trade-start'), e = $('trade-end');
+  if (s) s.value = '';
+  if (e) e.value = '';
+  _tradeFilter = { start: '', end: '' };
+  if (_openTradeCode) showTrades(_openTradeCode);
+}
+
 // ---- 持仓 ----
 let _holdingsCache = [];     // 供总计行与清账确认用
 let _holdSort = 'default';   // default=持仓在前 | loss=按浮动亏损 | gain=按浮动盈利
@@ -8640,10 +8691,15 @@ async function toggleTrades(code) {
 
 async function showTrades(code) {
   try {
-    const rows = await api('/api/trades?code=' + code);
+    const rows = await api(_tradeFilterQuery(code));
     const pos = (_holdingsCache || []).find(h => h.code === code);
+    _syncTradeFilterUI(rows);
+    // 区间文案：两端都空时与改动前逐字一致（避免老用户看到多余文字）
+    const _range = (_tradeFilter.start || _tradeFilter.end)
+      ? ` · ${esc(_tradeFilter.start || '…')} ~ ${esc(_tradeFilter.end || '…')}`
+      : '';
     $('trades-modal-title').innerHTML =
-      `${esc(pos?.name || '')} <span class="muted" style="font-weight:400">${code} · 交易流水（新→旧）</span>`;
+      `${esc(pos?.name || '')} <span class="muted" style="font-weight:400">${code} · 交易流水（新→旧）${_range}</span>`;
     const mask = $('trades-modal');
     if (mask.classList.contains('hide')) Modal.lockScroll(true);
     mask.classList.remove('hide');
@@ -8652,9 +8708,12 @@ async function showTrades(code) {
     // 实际港股代码恒为 5 位带前导零）。金额是录入原币 = 港元，必须写清楚，
     // 否则会被当成人民币读 —— 数值上港元≈0.85 人民币，差 15%（2026-11-08 用户报）。
     const isHK = /^\d{5}$/.test(code);
-    box.innerHTML = `<div id="pos-strat-${code}" style="margin-bottom:8px"></div>
+    const _n = rows.length, _nb = rows.filter(t => t.side === 'buy').length;
+    const _tally = `共 ${_n} 笔 · 买入 ${_nb} / 卖出 ${_n - _nb}`;
+    const _head = `<div id="pos-strat-${code}" style="margin-bottom:8px"></div>
       ${isHK ? `<div class="hint" style="margin-bottom:6px">💱 本股价格与金额均为<b>港币（HKD）</b>，未折算人民币；买入笔盈亏 = 现价 vs <b>该笔买入价</b>（单笔口径，加总=总浮动）</div>` : ''}
-      <table><tbody>${rows.map(t => {
+      <div class="muted" style="font-size:12px;margin-bottom:4px">${_tally}</div>`;
+    box.innerHTML = _head + (_n ? `<table><tbody>${rows.map(t => {
         // 每笔盈亏：卖出=已实现（vs 当时摊薄成本）；买入=现价对该笔买入价（2026-11-08 用户裁决）
         let pnlCell = '<span class="muted">—</span>';
         if (t.side === 'sell' && typeof t.lot_realized === 'number')
@@ -8679,7 +8738,8 @@ async function showTrades(code) {
         <td>${pnlCell}</td>
         <td class="muted">${esc(t.note || '')}${strat}</td>
         <td><button class="del" onclick="event.stopPropagation();delTrade(${t.id},'${code}')" title="删除该笔">×</button></td>
-      </tr>`;}).join('')}</tbody></table>`;
+      </tr>`;}).join('')}</tbody></table>`
+      : `<div class="muted" style="padding:12px 0">${(_tradeFilter.start || _tradeFilter.end) ? '该日期区间内没有交易记录' : '暂无交易记录'}</div>`);
     renderPosStrategies(code);
   } catch (e) { toastErr('加载流水失败: ' + e.message); }
 }

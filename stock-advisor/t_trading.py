@@ -1890,6 +1890,13 @@ def advisory(deps: dict, conf: dict, positions: dict, today: str = "",
         trend = trend_state(bars_daily)
         trend_adv = None
         if tr_on:
+            # RSI（2026-11-16 用户要求「做到RSI」）：Wilder RSI 纯注记，
+            # 不改 decide 口径（action/仓位一个字节不动）；tech_ind 纯函数无依赖。
+            try:
+                import tech_ind
+                it["rsi"] = tech_ind.rsi_state(bars_daily)
+            except Exception as exc:              # noqa: BLE001
+                print(f"[t] {code} RSI 计算失败（跳过）: {exc}", flush=True)
             trend_adv = trend_reduce_state(
                 bars_daily, tr, code=code, cost=cost, held=held,
                 sellable=sellable, price=price, first_date=first_date,
@@ -1987,6 +1994,14 @@ def advisory(deps: dict, conf: dict, positions: dict, today: str = "",
         it["ticket"] = _build_ticket(it, dec, c, fees_c, price)
         if it.get("ticket") and it.get("big_drop"):
             it["ticket"]["big_drop"] = it["big_drop"]
+        # RSI 注记放**最终 why**（trend 覆盖之后），否则会被 trend 的 why 盖掉。
+        # 只注记不改判：超买/超卖是参考状态，不是独立交易动作。
+        rs = it.get("rsi")
+        if rs and rs.get("rsi") is not None:
+            d = rs.get("delta")
+            it["why"] = ((it.get("why") or "") + (
+                f" RSI{rs.get('period')}={rs['rsi']:.1f}（{rs['label']}"
+                + (f"，较昨日 {d:+.1f}）" if d is not None else "）"))).strip()
 
         # 趋势规则**优先于做 T**：已经判「该减仓」的仓位，再拿其中一部分去
         # 高抛低吸是自相矛盾。这里只覆盖**建议与展示** —— decide / _execute_one

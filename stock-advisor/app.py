@@ -1542,14 +1542,22 @@ def _attach_lot_pnl(trades: list[dict], history: list[dict] | None = None) -> No
     - 卖出：已实现盈亏 = (卖价 - 卖出时点摊薄成本) * 股数，立即锁定
       （平均成本法的标准实现，与 calc_position.realized 一致）。
     现价取自实时行情；已清仓（回放净持股 = 0）或无行情时买入笔 pnl 为 None。
+
+    日期窗口（history）：调用方按日期筛出窗口行时，回放**必须**用完整流水
+    （history），否则卖出笔拿不到窗口之前的买入成本、已清仓判断也会失真。
+    回放结果按交易 id 桥回窗口行；history=None（默认）时以 trades 自身回放，
+    与加这个参数之前逐字节一致。
     """
     if not trades:
         return
     codes = {t["code"] for t in trades}
     quotes = fetch_quotes(sorted(codes))
+    source = history if history is not None else trades
     groups: dict[str, list[dict]] = {}
-    for t in trades:
-        groups.setdefault(t["code"], []).append(t)
+    for t in source:
+        if t["code"] in codes:
+            groups.setdefault(t["code"], []).append(t)
+    lot_results: dict[int, tuple] = {}
     final_net: dict[str, int] = {}
     for code, ts in groups.items():
         net = 0
@@ -1567,15 +1575,16 @@ def _attach_lot_pnl(trades: list[dict], history: list[dict] | None = None) -> No
                 # lot_cost = 该笔自己的买入价（2026-11-08 口径变更）。
                 # 摊薄成本(avg_cost)只服务于卖出行；若哪天要恢复旧口径，
                 # 这里改回 round(avg_cost, 4) 即可，回放逻辑不受影响。
-                t["lot_cost"] = round(price, 4)
-                t["lot_realized"] = None
+                lot_results[t["id"]] = (round(price, 4), None)
             else:
                 if n > net_replay:
-                    t["lot_cost"] = t["lot_realized"] = None
+                    lot_results[t["id"]] = (None, None)
                     continue
-                t["lot_cost"] = round(avg_cost, 4)
-                t["lot_realized"] = round((price - avg_cost) * n, 2)
+                lot_results[t["id"]] = (round(avg_cost, 4), round((price - avg_cost) * n, 2))
                 net_replay -= n
+    # 回放结果按 id 桥回展示行：窗口行里可能没有对应回放行（正常，缺就 None）
+    for t in trades:
+        t["lot_cost"], t["lot_realized"] = lot_results.get(t["id"], (None, None))
     for t in trades:
         q = quotes.get(t["code"], {})
         t["lot_price"] = q.get("price")
@@ -1903,17 +1912,57 @@ def account_anchors_put(body: AccountAnchorIn):
     return {"ok": True, "anchors": saved, "computed": v["computed"]}
 
 
+def _parse_trade_date(value: str, field: str = "日期") -> str | None:
+    """校验 YYYY-MM-DD，返回原串（空 → None）。
+
+    只做正则不够：2026-13-45 能过正则，但会在 SQL 里变成 DataError（500）。
+    所以再过一遍 strptime 做日历日校验。
+    """
+    v = (value or "").strip()
+    if not v:
+        return None
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+        raise HTTPException(400, f"{field}格式应为 YYYY-MM-DD（如 2026-11-11）")
+    try:
+        datetime.strptime(v, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(400, f"{field}不存在：{v}")
+    return v
+
+
+def _parse_date_range(date: str = "", start: str = "",
+                      end: str = "") -> tuple[str | None, str | None]:
+    """把 date / start / end 归一成闭区间；date 有值时优先（单日）。"""
+    day = _parse_trade_date(date, "日期")
+    if day:
+        return day, day
+    s = _parse_trade_date(start, "开始日期")
+    e = _parse_trade_date(end, "结束日期")
+    if s and e and s > e:
+        raise HTTPException(400, f"开始日期 {s} 晚于结束日期 {e}")
+    return s, e
+
+
 @app.get("/api/trades")
-def list_trades(code: str = "", limit: int = 200):
-    """交易流水（新→旧），可按股票筛选。每笔附带独立盈亏（lot_*）与关联策略。"""
+def list_trades(code: str = "", limit: int = 200, date: str = "",
+                start: str = "", end: str = ""):
+    """交易流水（新→旧），可按股票与日期区间筛选。每笔附带独立盈亏（lot_*）与关联策略。
+
+    date 给值时等价于 start=end=date；start/end 可只给一边（开区间）。
+    日期筛选必须落在 SQL 层（先截断再过滤会破坏 limit 语义）。
+    """
     code = code.strip()
     if code and not re.fullmatch(r"\d{4,6}", code):
         raise HTTPException(400, "代码格式：A股 6 位；港股 4-5 位")
     target = _normalize_code(code) if code else None
-    rows = _query_trades(target)
+    start, end = _parse_date_range(date, start, end)
+    rows = _query_trades(target, start, end)
     rows.sort(key=lambda t: (t["trade_date"], t["id"]), reverse=True)
     rows = rows[:max(1, min(limit, 500))]
-    _attach_lot_pnl(rows)
+    # 日期筛选时，窗口内卖出笔的摊薄成本、以及「该股是否仍持有」都取决于窗口之前的流水，
+    # 所以必须用完整流水回放（按 trade id 桥回展示行），不能拿子集自己回放。
+    history = _query_trades(target) if (start or end) else None
+    _attach_lot_pnl(rows, history)
     return rows
 
 

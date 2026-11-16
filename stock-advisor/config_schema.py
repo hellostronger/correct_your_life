@@ -747,6 +747,9 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                 "模拟成交遵守真实交易规则：A 股 T+1（当天买的当天不能卖）、港股与货币/债券/"
                 "黄金/跨境 ETF 为 T+0、科创板买入最少 200 股（主板 100 股整手）。",
         "fields": [
+            {"key": "rsi_inject", "t": "bool", "d": True, "label": "RSI 注入决策上下文",
+             "help": "Wilder RSI(14) 状态行（超买/超卖仅参考状态）进 LLM 交易员上下文，"
+                     "纯提示不下单（2026-11-16 用户要求做到 RSI）"},
             {"key": "enabled", "t": "bool", "d": True, "label": "启用",
              "help": "总开关。关掉后后台线程轮内直接跳过"},
             {"key": "interval_minutes", "t": "int", "d": 30, "lo": 1, "hi": 240,
