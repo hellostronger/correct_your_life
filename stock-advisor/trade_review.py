@@ -29,6 +29,11 @@ from datetime import date as _date_cls
 import paper_trading as PT
 import t_trading as T
 
+# 消息面大脑只有一份：news_context（2026-11-14 用户裁决「不要再搞特殊」）。
+# 挑选/去重/权重全部从那里来，模拟盘（paper_trading）与这里引用同一份，
+# 两边看到的消息面永远一致。本模块只做方向化呈现（face_rows → reasons）。
+import news_context as NC
+
 # ---------------- 结论口径 ----------------
 
 VERDICT_LABELS = {
@@ -196,6 +201,41 @@ def _market_temp(mt, group):
     return None, ""
 
 
+# ---------------- 消息面（大脑在 news_context，这里只做呈现） ----------------
+
+
+def _news_rows(v):
+    """清洗调用方传来的新闻行并去重 —— 规则全部来自 news_context。
+
+    sentiment 只认 'pos'/'neg'（news_fetcher 的口径），其余（空 = 按股票名
+    抓的，没过关键词轮）当「无标签」处理，保留但不参与计分。
+    """
+    out = []
+    for x in v if isinstance(v, list) else []:
+        if not isinstance(x, dict):
+            continue
+        title = _s(x.get("title"))
+        if not title:
+            continue
+        s = _s(x.get("sentiment")).lower()
+        out.append({
+            "title": _clip(title, NC.HEADLINE_CLIP),
+            "media": _s(x.get("media")),
+            "source": _s(x.get("source")),
+            "sentiment": s if s in ("pos", "neg") else "",
+            "publish_time": NC._norm_time(x.get("publish_time")),
+            "dup_count": _i(x.get("dup_count"), 1),
+        })
+    return NC.dedup_news(out)
+
+
+def _news_reasons(reasons, side, news):
+    """消息面判据 → reasons 格式。权重/封顶/文案全部来自 news_context.face_rows
+    （模拟盘喂 LLM 的 face_summary 出自同一组常量），这里只做格式转换。"""
+    for f in NC.face_rows(news, side):
+        _r(reasons, f["kind"], f["text"], f["weight"], f.get("inv") or "")
+
+
 # ---------------- 主入口 ----------------
 
 def review(ctx: dict | None) -> dict:
@@ -349,6 +389,13 @@ def review(ctx: dict | None) -> dict:
     if ep is None:
         gaps.append("没有该股的财报预案（event_risk），财报窗口未纳入")
 
+    # 消息面（2026-11-14 加）：调用方不传 news（键不存在）才算缺数据；
+    # 传空列表 = 确实没有近 7 天新闻，不是缺口。区分这两者，才能在
+    # 「调用方忘了取新闻」时不装作「消息面平静」。
+    news = _news_rows(c.get("news")) if "news" in c else None
+    if news is None:
+        gaps.append("没有近期新闻数据，消息面（评级/目标价变动）未纳入")
+
     # 趋势减仓：调用方给了就用，否则自己按同一份日K算（内部会清洗 bars）
     tr = c.get("trend_reduce") if isinstance(c.get("trend_reduce"), dict) else None
     if tr is None and bars:
@@ -383,6 +430,12 @@ def review(ctx: dict | None) -> dict:
                       shares=shares, cost=cost, sellable=sellable, tr=tr,
                       mt_temp=mt_temp, mt_label=mt_label, ep=ep, today=today,
                       filled_sides=filled_sides)
+
+    # 消息面判据（买卖两向共用）：机构评级/目标价变动、解禁减持这类
+    # 「没进 K 线的先导信息」在这里进评分。放在理由收集的最后一环，
+    # 与趋势/估值互相独立。
+    if news is not None:
+        _news_reasons(reasons, side, news)
 
     # ---- 判决 ----
     pro_sum = sum(r["weight"] for r in reasons if r["kind"] == "pro")
@@ -438,6 +491,7 @@ def review(ctx: dict | None) -> dict:
         "blockers": blockers,
         "invalidate": inval,
         "gaps": gaps,
+        "news": news if news is not None else [],
     }
     rv["text"] = render(rv)
     return rv
@@ -765,6 +819,25 @@ def render(rv: dict) -> str:
         lines.append("【%s】" % KIND_LABEL[kind])
         for x in items[:6]:
             lines.append("· " + _s(x.get("text")))
+
+    news = [x for x in (rv.get("news") or []) if isinstance(x, dict)]
+    if news:
+        lines.append("【近期消息面（前 5 条）】")
+        tags = {"neg": "利空", "pos": "利好", "": "未标注"}
+        for x in news[:5]:
+            t = _s(x.get("title"))
+            if not t:
+                continue
+            meta = [tags.get(_s(x.get("sentiment")), "未标注")]
+            if _s(x.get("publish_time")):
+                meta.append(_s(x.get("publish_time"))[:10])
+            m = _s(x.get("media")) or _s(x.get("source"))
+            if m:
+                meta.append(m)
+            n_dup = _i(x.get("dup_count"), 1)
+            if n_dup > 1:
+                meta.append("×%d 家" % n_dup)
+            lines.append("· [%s] %s" % ("/".join(meta), _clip(t, 80)))
 
     inval = [x for x in (rv.get("invalidate") or []) if _s(x)]
     if inval:

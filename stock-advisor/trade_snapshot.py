@@ -332,9 +332,79 @@ def score_trades(trades: list[dict], prices: dict[str, float], fx: float,
 
 # ---------------- 快照报告：躺平 vs 实际 ----------------
 
+def _build_attribution(score: dict, delta_cny: float, per_code: list[dict]) -> dict:
+    """把「操作 vs 不动」的差额拆成可展示的归因（纯计算，前端只管画）。
+
+    和 score_trades 同一口径：每笔 contribution_cny 加起来恒等于 delta_cny。
+    只统计有现价的笔（缺价那笔 contribution=0、priced=False）。
+    """
+    rows = [x for x in score.get("trades", []) if x.get("priced")]
+    buys = [x for x in rows if x["side"] == "buy"]
+    sells = [x for x in rows if x["side"] == "sell"]
+    buy_c = _r(sum(x["contribution_cny"] for x in buys))
+    sell_c = _r(sum(x["contribution_cny"] for x in sells))
+    losers = sorted(rows, key=lambda x: x["contribution_cny"])[:8]
+    winners = sorted(rows, key=lambda x: -x["contribution_cny"])[:8]
+    by_day: dict[str, float] = {}
+    for x in rows:
+        by_day[x["date"]] = by_day.get(x["date"], 0.0) + x["contribution_cny"]
+    day_rows = [{"date": d, "contribution_cny": _r(v)} for d, v in sorted(by_day.items())]
+    excl3 = _r(delta_cny - sum(x["contribution_cny"] for x in losers[:3]))
+    excl5 = _r(delta_cny - sum(x["contribution_cny"] for x in losers[:5]))
+    new_drag = _r(sum(x["delta_cny"] for x in per_code if x["shares_base"] == 0))
+    wr = score.get("win_rate", {})
+    rate = wr.get("win_rate")
+    verdict = ""
+    if rate is not None:
+        if rate >= 50 and delta_cny < 0:
+            verdict = "胜率过半却净亏：赚小钱、亏大钱，问题在单笔仓位与追高，不在方向"
+        elif rate < 50 and delta_cny > 0:
+            verdict = "胜率不到一半却净赚：靠少数几笔大赢家撑起来"
+        elif rate >= 50 and delta_cny > 0:
+            verdict = "胜率过半且净赚：赢面与赢额一致"
+        else:
+            verdict = "胜率不到一半且净亏：方向与仓位都值得复盘"
+    return {
+        "buy_cny": buy_c, "sell_cny": sell_c, "delta_cny": _r(delta_cny),
+        "buy_count": len(buys), "sell_count": len(sells),
+        "sell_good_cny": _r(sum(x["contribution_cny"] for x in sells if x["win"] is True)),
+        "sold_fly_cny": _r(sum(x["contribution_cny"] for x in sells if x["win"] is False)),
+        "buy_good_cny": _r(sum(x["contribution_cny"] for x in buys if x["win"] is True)),
+        "bought_high_cny": _r(sum(x["contribution_cny"] for x in buys if x["win"] is False)),
+        "win_rate": rate, "verdict": verdict,
+        "top_losers": losers, "top_winners": winners, "by_day": day_rows,
+        "excl_top3_cny": excl3, "excl_top5_cny": excl5,
+        "new_position_drag_cny": new_drag,
+        "old_position_drag_cny": _r(delta_cny - new_drag),
+    }
+
+
+def _external_cash_cny(flows, date: str, fx: float) -> tuple[float, int]:
+    """快照日之后（严格大于）的银证转账净额，折 CNY；入金正、出金负。
+
+    不 import broker_cash，保持本模块纯计算（离线测试可自己造 flows）。
+    """
+    total, count = 0.0, 0
+    for f in flows or []:
+        d = _date10(f.get("date"))
+        if not d or d <= date:
+            continue
+        c = str(f.get("currency", "CNY")).upper()
+        amt = _f(f.get("amount"))
+        sign = 1 if f.get("side") == "in" else -1
+        total += sign * amt * (fx if c == "HKD" else 1.0)
+        count += 1
+    return total, count
+
+
 def build_report(snapshot: dict, trades_all: list[dict], prices: dict[str, float],
-                 fx: float, names: dict | None = None) -> dict:
-    """对照某个快照：不动 vs 实际，外加这一区间的操作胜率。"""
+                 fx: float, names: dict | None = None,
+                 cash_flows: list[dict] | None = None) -> dict:
+    """对照某个快照：不动 vs 实际，外加这一区间的操作胜率。
+
+    cash_flows 为可选的银证转账流水（broker_cash 侧车）。外部资金流对两种情景
+    都一样，所以只影响「调整后账户资产」绝对值，**差额与胜率逐字节不变**。
+    """
     names = names or {}
     date = snapshot["date"]
     base = {r["code"]: r for r in snapshot.get("positions", [])}
@@ -375,13 +445,25 @@ def build_report(snapshot: dict, trades_all: list[dict], prices: dict[str, float
         per_code.append(item)
         for key, val in (("baseline", v0), ("flat_end", flat_end), ("real_end", real_end)):
             buckets[ccy][key] = buckets[ccy].get(key, 0.0) + val
+        if px is not None:
+            # 对账用：real_end 拆成「当前持仓市值」+「按流水推算的净现金」。
+            # 后者是虚拟的（假设卖出所得一直躺在账户、A/港股按固定汇率自由互转），
+            # 有出入金或两账户资金不互通时，它并不等于券商账户里的真实现金。
+            buckets[ccy]["holdings_mv"] = buckets[ccy].get("holdings_mv", 0.0) + sn * px
+            buckets[ccy]["implied_cash"] = buckets[ccy].get("implied_cash", 0.0) + cf
 
     def cny_total(key: str) -> float:
         return sum(buckets[ccy].get(key, 0.0) * (fx if ccy == "HKD" else 1.0)
                    for ccy in ("CNY", "HKD"))
 
     v0, flat, real = cny_total("baseline"), cny_total("flat_end"), cny_total("real_end")
+    mv_cny, cash_cny = cny_total("holdings_mv"), cny_total("implied_cash")
+    ext_cash, ext_count = _external_cash_cny(cash_flows, date, fx)
     totals = {"baseline_cny": _r(v0), "flat_end_cny": _r(flat), "real_end_cny": _r(real),
+              "holdings_market_value_cny": _r(mv_cny), "implied_cash_cny": _r(cash_cny),
+              "external_cash_cny": _r(ext_cash), "external_flow_count": ext_count,
+              "cash_adjusted_real_end_cny": _r(real + ext_cash),
+              "cash_adjusted_flat_end_cny": _r(flat + ext_cash),
               "flat_gain_cny": _r(flat - v0), "real_gain_cny": _r(real - v0),
               "flat_pct": _r((flat / v0 - 1) * 100) if v0 else None,
               "real_pct": _r((real / v0 - 1) * 100) if v0 else None,
@@ -392,6 +474,8 @@ def build_report(snapshot: dict, trades_all: list[dict], prices: dict[str, float
         by_ccy[ccy] = {"baseline": _r(b.get("baseline", 0.0)),
                        "flat_end": _r(b.get("flat_end", 0.0)),
                        "real_end": _r(b.get("real_end", 0.0)),
+                       "holdings_mv": _r(b.get("holdings_mv", 0.0)),
+                       "implied_cash": _r(b.get("implied_cash", 0.0)),
                        "delta": _r(b.get("real_end", 0.0) - b.get("flat_end", 0.0))}
 
     score = score_trades(after, prices, fx, names, since=None, all_trades=rows)
@@ -401,15 +485,18 @@ def build_report(snapshot: dict, trades_all: list[dict], prices: dict[str, float
                      ("date", "label", "created_at", "fx", "baseline_value_cny", "missing_prices")},
         "fx": _r(fx, 4), "totals": totals, "by_currency": by_ccy,
         "by_code": per_code, "win_rate": score["win_rate"], "realized": score["realized"],
+        "attribution": _build_attribution(score, totals["delta_cny"], per_code),
         "by_month": score["by_month"], "trade_count": len(after),
         "incomplete_count": sum(1 for r in per_code if not r["complete"]),
         "missing_prices": sorted(set(missing)),
         "winner_code": score["by_code"][0] if score["by_code"] else None,
         "loser_code": score["by_code"][-1] if score["by_code"] else None,
         "caveats": [
+            "「推演组合价值」不是券商账户总资产：它 = 当前持仓市值 + 按流水推算的净现金（卖出所得−买入支出）。有出入金、A/港股资金不互通、或流水只记持仓变动时，那笔推演现金并不真实存在，账户总资产请以「当前持仓市值 + 实际现金」为准。",
+            "「调整后账户资产」= 推演组合价值 + 期间净出入金（银证转账，入金为正、出金为负）；两种情景加同一笔钱，差额与胜率不变。若仍对不上券商总资产，差的是基准日现金、未记录的资金流或费用汇兑。",
+            "差额（操作 vs 不动）与胜率只用到成交价和现价，不受出入金、基准日现金影响，仍可用来评价操作好坏。",
             "现价为最新收盘/实时快照，报告随行情变动；快照价格只在建快照时取一次。",
-            "统一按当前 HKD/CNY 汇率折算两端，不含汇兑损益。",
-            "未计手续费、印花税、分红；卖出所得现金按零收益持有。",
+            "统一按当前 HKD/CNY 汇率折算两端，不含汇兑损益；未计手续费、印花税、分红。",
             "择时胜率以「不动」为对手盘，不等于券商 App 的已实现盈亏胜率（另列）。",
         ],
     }

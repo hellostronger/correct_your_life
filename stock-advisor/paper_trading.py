@@ -1053,10 +1053,23 @@ def _build_context(stock: dict, quote: dict, bars: list[dict],
     if market_note:
         ctx.append(f"【大盘量能概况】{market_note}")
     if news:
-        ctx.append("【近7日新闻（已标记利好/利空）】")
+        ctx.append("【近7日新闻（已标记利好/利空，评级/目标价类优先；"
+                   "×N家=多家报道同一事，已合并）】")
         for n in news[:10]:
             tag = {"pos": "利好", "neg": "利空"}.get(n.get("sentiment") or "", "中性")
-            ctx.append(f"- [{tag}] {n['title']}（{n.get('media') or n.get('source') or '媒体'}）")
+            dup = n.get("dup_count") or 1
+            when = str(n.get("publish_time") or "")[:10]
+            ctx.append(f"- [{tag}]{f'[{when}]' if when else ''} {n['title']}"
+                       f"（{n.get('media') or n.get('source') or '媒体'}"
+                       f"{f'，×{dup}家' if dup > 1 else ''}）")
+        # 消息面判据摘要：与实盘买卖评审（trade_review）**同一份大脑**
+        # （news_context，2026-11-14 用户裁决「不要再搞特殊」）—— 同一组
+        # 权重常量、同一份数数逻辑。给 LLM 看的是方向中性的「两个方向各值
+        # 多少分」，让它与实盘规则打分站在同一口径上，不是让它照抄结论。
+        import news_context as _NC
+        face = _NC.face_summary(news)
+        if face:
+            ctx.append(face)
     else:
         ctx.append("【近7日新闻】无相关新闻")
     # 解禁/禁售/锁定类**单独成块**，不与新闻抢 limit。

@@ -761,7 +761,7 @@ def remove_source(deps, sid: int) -> dict:
 
 
 def list_articles(deps, source_id: int | None = None, unread_only: bool = False,
-                  limit: int = 50) -> list[dict]:
+                  limit: int = 50, q: str = "") -> list[dict]:
     limit = max(1, min(limit, 200))
     where, params = [], []
     if source_id:
@@ -769,6 +769,16 @@ def list_articles(deps, source_id: int | None = None, unread_only: bool = False,
         params.append(source_id)
     if unread_only:
         where.append("NOT a.is_read")
+    # 关键词检索（2026-11-14 用户要求）。扫标题/摘要/纯文本正文/作者/公众号名/
+    # 订阅源名六处，ILIKE 大小写不敏感；% 和 _ 必须转义，否则搜 "100%" 之类的
+    # 关键词会变成通配符，返回结果对不上。
+    q = (q or "").strip()
+    if q:
+        esc = q.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+        like = f"%{esc}%"
+        where.append("(a.title ILIKE %s OR a.summary ILIKE %s OR a.content_text ILIKE %s "
+                     "OR a.author ILIKE %s OR a.mp_name ILIKE %s OR s.name ILIKE %s)")
+        params.extend([like] * 6)
     # 2026-10-02 加 content_text：原来列表只给 title + summary，而 summary
     # 有一个坑 —— **无正文的 66 篇 summary 100% 等于 title**，页面上是标题
     # 重复两遍、正文区一片空白（库里明明有 117 篇全文却一条都看不见）。

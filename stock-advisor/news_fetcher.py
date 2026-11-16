@@ -1998,6 +1998,37 @@ def classify_sentiment(title: str, pos_words: list[str] | None = None,
     return ""
 
 
+def _embed_new_titles(new_rows: list[tuple[str, str]]) -> int:
+    """给本轮新入库的新闻标题算 bge-m3 向量 → sa_news.title_vec（2026-11-15）。
+
+    供 news_context 语义去重用（「换标题转载」靠余弦 ≥0.90 合并）。
+    走 mp_retrieval.embed（16条/批 × 3 worker，网关安全参数）；标题向量
+    **入库时算一次**，决策时纯本地比对 —— 网关挂了只会让这批行暂时没有
+    向量（去重自动退回纯规则），绝不阻塞新闻入库。
+    """
+    if not new_rows:
+        return 0
+    try:
+        import mp_retrieval as mr
+        vecs = mr.embed([t for _, t in new_rows])
+        pairs = [(url, v) for (url, _), v in zip(new_rows, vecs) if v and any(v)]
+        if not pairs:
+            return 0
+        import json as _json
+        with _db() as conn, conn.cursor() as cur:
+            for url, v in pairs:
+                cur.execute(
+                    "UPDATE sa_news SET title_vec = %s WHERE url = %s "
+                    "AND title_vec IS NULL",
+                    (_json.dumps(v), url))
+            conn.commit()
+        return len(pairs)
+    except Exception as exc:                                   # noqa: BLE001
+        print("[news] 标题向量化失败（不影响入库，语义去重暂退回纯规则）: %s"
+              % str(exc)[:160], flush=True)
+        return 0
+
+
 def save_to_db(items: list[dict], related_map: dict[str, list[str]] | None = None,
                senti_words: dict | None = None) -> int:
     """新闻写云库 sa_news（URL 唯一去重），并按 URL 聚合关联股票。
@@ -2017,6 +2048,8 @@ def save_to_db(items: list[dict], related_map: dict[str, list[str]] | None = Non
     skipped_no_time = 0
     skipped_bad_time = 0
     skipped_too_old = 0
+    new_embed: list[tuple[str, str]] = []  # 本轮真正新入库的 (url, title)，
+    # 事务提交后统一算标题向量（避免在事务里调外部网关拖长锁窗口）
     now = _bj_now()
     max_age_days = 7  # 只保留最近 7 天的新闻，旧新闻对决策没有价值
     # ⚠️ 例外：**股份状态类**（解禁/禁售/锁定期/减持承诺，见 `_is_event_item`）
@@ -2071,11 +2104,17 @@ def save_to_db(items: list[dict], related_map: dict[str, list[str]] | None = Non
                 "VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (url) DO NOTHING",
                 (it["code"], it["title"], it["url"], it["source"], it["media"],
                  pub_iso, senti))
-            inserted += cur.rowcount
+            if cur.rowcount:
+                inserted += cur.rowcount
+                new_embed.append((it["url"], it["title"]))
             if senti == "neg":  # 已存在的旧新闻，利空标记仍要补上
                 cur.execute(
                     "UPDATE sa_news SET sentiment = 'neg' "
                     "WHERE url = %s AND sentiment <> 'neg'", (it["url"],))
+    _save_relations(related_map or {})
+    # 新入库的标题补向量（语义去重用；失败只影响这层，不影响入库本身）
+    if new_embed:
+        _embed_new_titles(new_embed)
     _save_relations(related_map or {})
     # 丢弃必须**可见**：静默丢一半新闻会让人以为「今天没新闻」，
     # 而实际是「抽不到发布时间的被丢了」—— 这正是原来查不出来的原因。

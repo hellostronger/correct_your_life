@@ -148,6 +148,12 @@ close(t["real_end_cny"], 2435.0, label="实际期末 2350+200-200+85")
 close(t["flat_gain_cny"], 300.0, label="躺平收益")
 close(t["delta_cny"], 135.0, label="差额")
 close(t["delta_cny"], after["win_rate"]["contribution_cny"], label="★差额恒等式 = Σ每笔贡献")
+close(t["holdings_market_value_cny"] + t["implied_cash_cny"], t["real_end_cny"],
+      label="★对账恒等式：当前持仓市值 + 按流水推算的净现金 = 推演组合价值")
+ck("holdings_mv" in rep["by_currency"]["CNY"] and "implied_cash" in rep["by_currency"]["HKD"],
+   "分币种也要能拆出现金流，方便查是A股还是港股差钱")
+ck(any("不是券商账户总资产" in c for c in rep["caveats"]),
+   "口径说明必须点明：推演值 ≠ 账户总资产")
 ck(t["flat_pct"] == 15.0 and t["real_pct"] is not None, "百分比口径")
 close(rep["by_currency"]["HKD"]["real_end"], 100.0, label="港币池不被混加")
 ck(rep["trade_count"] == 6, "区间流水笔数")
@@ -156,6 +162,24 @@ ck(rep["incomplete_count"] == 1 and "000003" in rep["missing_prices"],
 ck(all(r["complete"] for r in rep["by_code"] if r["code"] in ("000001", "000002", "02513")),
    "基准日无持仓的票 complete=True")
 ck(len(rep["caveats"]) >= 4, "口径说明不能省")
+
+# 差额归因区块（把一次性排查固化进报告）
+att = rep["attribution"]
+ck(att is not None, "报告必须带 attribution")
+close(att["buy_cny"] + att["sell_cny"], att["delta_cny"], label="★买卖两端加总 = 差额")
+close(att["sell_good_cny"] + att["sold_fly_cny"] + att["buy_good_cny"] + att["bought_high_cny"],
+      att["delta_cny"], label="四类拆分加总 = 差额")
+ck(att["top_losers"][0]["contribution_cny"] <= att["top_losers"][-1]["contribution_cny"],
+   "最伤按贡献升序")
+ck(att["top_winners"][0]["contribution_cny"] >= att["top_winners"][-1]["contribution_cny"],
+   "最赚按贡献降序")
+close(att["excl_top3_cny"], att["delta_cny"] - sum(x["contribution_cny"] for x in att["top_losers"][:3]),
+      label="剔除最伤 3 笔的敏感性")
+close(att["new_position_drag_cny"] + att["old_position_drag_cny"], att["delta_cny"],
+      label="新建仓 + 老仓位拖累 = 差额")
+ck(all(att["by_day"][i]["date"] <= att["by_day"][i + 1]["date"]
+       for i in range(len(att["by_day"]) - 1)), "按交易日升序")
+ck(att["verdict"], "归因结论非空")
 
 rep2 = TS.build_report(snap, [tx(9, "2026-12-31", "600406", "buy", 1, 20)], {}, 0.85)
 ck(rep2["totals"]["delta_cny"] != 0 or rep2["totals"]["flat_end_cny"] == 0,
@@ -168,6 +192,25 @@ ck(snap_bad["missing_prices"] == ["600406"], "建快照时缺价也不丢弃该�
 rep_bad = TS.build_report(snap_bad, trades[:1], prices, 0.85)
 ck(rep_bad["incomplete_count"] >= 1, "缺基准价标记 incomplete")
 p2.unlink(missing_ok=True)
+
+# 银证转账（出入金）接入：只动绝对资产，不动差额/胜率
+flows = [
+    {"date": "2026-10-29", "side": "in", "amount": 9999, "currency": "CNY"},   # 基准日前，不算
+    {"date": "2026-10-30", "side": "in", "amount": 10000, "currency": "CNY"},  # 基准日当天，不算
+    {"date": "2026-11-05", "side": "out", "amount": 5000, "currency": "CNY"},
+    {"date": "2026-11-06", "side": "in", "amount": 1000, "currency": "HKD"},
+]
+rep_cf = TS.build_report(snap, trades, prices, 0.85, cash_flows=flows)
+tcf = rep_cf["totals"]
+ck(tcf["external_flow_count"] == 2, "只统计快照日之后的银证转账")
+close(tcf["external_cash_cny"], -5000 + 1000 * 0.85, label="净出入金含港股折算")
+close(tcf["cash_adjusted_real_end_cny"], tcf["real_end_cny"] + tcf["external_cash_cny"],
+      label="调整后账户资产 = 推演值 + 净出入金")
+close(tcf["cash_adjusted_flat_end_cny"], tcf["flat_end_cny"] + tcf["external_cash_cny"],
+      label="躺平侧加同一笔外部资金")
+close(tcf["delta_cny"], t["delta_cny"], label="★出入金绝不改变操作差额")
+ck(rep_cf["win_rate"]["win_rate"] == rep["win_rate"]["win_rate"], "★出入金绝不改变胜率")
+ck(any("调整后账户资产" in c for c in rep_cf["caveats"]), "口径说明含调整后账户资产")
 
 # ---------------- 5. 静态接线（防止「后端落了盘前端没人读」） ----------------
 app_src = (BASE / "app.py").read_text(encoding="utf-8")
@@ -209,6 +252,22 @@ ck("/api/trade-snapshots/summary" in js_seg and "/api/trade-snapshots/report" in
    "前端真的调用两个只读端点")
 ck("一动不动拿到现在" in js_seg and "实际操作到现在" in js_seg,
    "报告结论条把「不动到现在 vs 现在」写清楚")
+ck("和券商账户对账" in js_seg and "不是券商账户里的真实现金" in js_seg,
+   "结论条要能把推演值拆成持仓市值 + 虚拟现金供对账")
+ck("期末资产" not in js_seg, "「期末资产」是误导标签，必须全部改掉")
+ck("${leadWord} ${pp} 个百分点" in js_seg and "% 个百分点" not in js_seg,
+   "百分点文案不再出现多余的百分号，也不再自相矛盾")
+ck("holdings_market_value_cny" in js_seg and "hasDetail" in js_seg,
+   "新后端字段有兼容兜底，服务没重启也能对账")
+ck('id="snap-attrib"' in html, "差额归因 card 的 DOM 容器")
+ck("renderSnapshotAttribution(r.attribution, r.account)" in js_seg,
+   "报告渲染时真的调用归因渲染（带账户锚点）")
+for fn in ("renderSnapshotAttribution", "_snBar", "_snTradeBar"):
+    ck(re.search(r"function\s+" + fn + r"\s*\(", js_seg) is not None, f"归因函数定义 {fn}")
+ck("买卖两端" in js_seg and "最伤的" in js_seg and "剔除最伤的 3 笔" in js_seg,
+   "归因视觉还原：买卖两端 / 最伤笔 / 剔除敏感性")
+ck("_build_attribution" in (BASE / "trade_snapshot.py").read_text(encoding="utf-8"),
+   "归因在后端算好，前端只画不重算")
 
 # ---------------- 6. 与 11 月一次性分析结果交叉校验 ----------------
 cross = BASE / "data" / "_nov_compare_result.json"

@@ -772,7 +772,9 @@ wx_chat:
   agent_enabled: true        # 闲聊走 nanobot；false = 全部走单轮 LLM（旧行为）
   agent_url: "http://127.0.0.1:8900"   # nanobot serve 的 OpenAI 兼容接口（不带 /v1）
   agent_model: ""            # 留空 = 自动问 {agent_url}/v1/models；nanobot 只认配置里那一个名字
-  agent_timeout: 180         # agent 一轮含多次工具调用，比单轮 LLM 慢得多
+  agent_timeout: 420         # agent 一轮含多次工具调用，比单轮 LLM 慢得多
+                             # （GLM-5.3-Flash 工具循环经常 >120s；nanobot serve 端
+                             #  api.timeout 也要同步调大，否则服务端先 504）
   merge_seconds: 60          # 同一用户 N 秒内的多条消息合并成一次调用（0=不合并）
   cooldown_seconds: 20       # 同一用户两次回复的最小间隔，防刷屏
   history_turns: 6           # 仅回退路径用；agent 自己按 session 存对话

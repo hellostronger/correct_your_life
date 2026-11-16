@@ -105,5 +105,115 @@ def stock_watchlist() -> str:
     return _cap(data)
 
 
+# ---------------- 数据查询类工具（全部只读 GET 8686） ----------------
+
+def _news_items(rows: list, limit: int) -> str:
+    """把 /api/news 行裁剪成 LLM 友好的精简列表（去 url 长串，保标题/来源/时间）。"""
+    out = []
+    for n in (rows or [])[:limit]:
+        out.append({"code": n.get("code"), "title": (n.get("title") or "")[:90],
+                    "source": n.get("source"), "media": n.get("media"),
+                    "publish_time": str(n.get("publish_time") or "")[:16],
+                    "sentiment": n.get("sentiment") or ""})
+    return _cap(out, 5000)
+
+
+@mcp.tool()
+def stock_news(q: str = "", code: str = "", limit: int = 10) -> str:
+    """查系统新闻库（只读）。支持关键词 q（如「降息」「智谱」「解禁」）、按持仓代码
+    code 过滤（如 02513 / 00100，5 位=港股 6 位=A股）。返回标题/来源/发布时间/情绪标记。
+    注意：只覆盖系统已抓取的新闻（财经媒体+公众号+模型发布动态），不是全网实时搜索。"""
+    limit = max(1, min(int(limit or 10), 20))
+    qs = []
+    if q.strip():
+        qs.append("q=" + requests.utils.quote(q.strip()))
+    if code.strip():
+        qs.append("code=" + code.strip())
+    qs.append(f"limit={limit}")
+    try:
+        rows = _get("/api/news?" + "&".join(qs))
+    except Exception as exc:
+        return json.dumps({"error": f"主应用 8686 不可达: {type(exc).__name__}"}, ensure_ascii=False)
+    if isinstance(rows, dict):
+        return _cap(rows)
+    return _news_items(rows, limit)
+
+
+@mcp.tool()
+def mp_articles(q: str = "", limit: int = 8) -> str:
+    """检索公众号文章库（只读）：关键词扫标题/正文/公众号名。适合查深度策略文、
+    公司分析长文（比新闻更厚）。返回标题/摘要片段/公众号/发布时间。"""
+    limit = max(1, min(int(limit or 8), 15))
+    qs = []
+    if q.strip():
+        qs.append("q=" + requests.utils.quote(q.strip()))
+    qs.append(f"limit={limit}")
+    try:
+        rows = _get("/api/mp/articles?" + "&".join(qs))
+    except Exception as exc:
+        return json.dumps({"error": f"主应用 8686 不可达: {type(exc).__name__}"}, ensure_ascii=False)
+    out = []
+    for a in (rows if isinstance(rows, list) else [])[:limit]:
+        out.append({"title": (a.get("title") or "")[:80],
+                    "account": a.get("author") or a.get("account"),
+                    "publish_time": str(a.get("publish_time") or "")[:16],
+                    "digest": (a.get("summary") or a.get("digest") or "")[:150]})
+    return _cap(out, 5000)
+
+
+@mcp.tool()
+def t_log(days: int = 1) -> str:
+    """查模拟盘做 T 执行日志（只读历史）：高抛/买回/减仓等操作的成交、盈亏与原因。
+    days 取 1~7（近 N 天）。这是「建议引擎执行了什么」的事实记录，不含未来建议。"""
+    days = max(1, min(int(days or 1), 7))
+    try:
+        data = _get(f"/api/t/log?days={days}")
+    except Exception as exc:
+        return json.dumps({"error": f"主应用 8686 不可达: {type(exc).__name__}"}, ensure_ascii=False)
+    return _cap(data, 5000)
+
+
+@mcp.tool()
+def account_summary() -> str:
+    """查账户真实锚点（只读）：真实现金、总参考收益、系统已录入累计盈亏与缺口。
+    这是「账号实际值」口径（用户手工锚定），与系统按流水推算的值不同。"""
+    try:
+        data = _get("/api/account-anchors")
+    except Exception as exc:
+        return json.dumps({"error": f"主应用 8686 不可达: {type(exc).__name__}"}, ensure_ascii=False)
+    return _cap(data, 3000)
+
+
+@mcp.tool()
+def trade_summary() -> str:
+    """查实盘操作胜率统计（只读）：择时胜率（对手盘=不动）、已实现胜率、按月分布。
+    口径：买入 n×(现价−买价)、卖出 n×(卖价−现价)，>0 赢。不含投资建议。"""
+    try:
+        data = _get("/api/trade-snapshots/summary")
+    except Exception as exc:
+        return json.dumps({"error": f"主应用 8686 不可达: {type(exc).__name__}"}, ensure_ascii=False)
+    # 胜率总览 + 最近 3 笔，防止全量 trades 撑爆上下文
+    slim = {k: v for k, v in (data or {}).items() if k != "trades"}
+    slim["recent_trades"] = (data.get("trades") or [])[:3]
+    return _cap(slim, 3500)
+
+
+@mcp.tool()
+def paper_status() -> str:
+    """查模拟盘运行状态（只读）：是否在跑/当前时段/下一轮/交易日判定/锚定策略状态。"""
+    try:
+        data = _get("/api/paper/status")
+        anchor = None
+        try:
+            anchor = _get("/api/paper/anchor")
+        except Exception:
+            pass
+        if isinstance(data, dict) and anchor:
+            data["anchor"] = anchor
+    except Exception as exc:
+        return json.dumps({"error": f"主应用 8686 不可达: {type(exc).__name__}"}, ensure_ascii=False)
+    return _cap(data, 2500)
+
+
 if __name__ == "__main__":
     mcp.run()
