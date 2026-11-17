@@ -49,3 +49,5 @@ stock-advisor/_app.js
 stock-advisor/_dirty_backup_*.json
 stock-advisor/_p1600.json
 stock-advisor/_run1600.json
+# 一次性运行输出（0 字节 stderr 重定向文件）
+stock-advisor/_review_err.txt
