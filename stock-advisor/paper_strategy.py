@@ -412,14 +412,17 @@ def _record(cur, bid, sid, code, today, slot, price, base, shares, ratio, reason
 
     cur 是调用方持有的游标：整轮共用一个连接，别在循环里另开（远程库每次建连约 200ms）。
     """
+    import paper_trading as PT
     pnl_pct = (price / base - 1) * 100 if base else 0.0
     amount = shares * (price - base) * ratio
+    # 2026-11-20 时间戳升级：exit_date 由 date+slot 确定性推导（带秒），
+    # 重跑同轮得到同一时间戳，窗口查询语义稳定。
     cur.execute(
         "INSERT INTO sa_paper_strategy_exits (binding_id, strategy_id, code, exit_date, "
         "exit_slot, price, base_cost, shares, ratio, pnl_pct, pnl_amount, reason) "
         "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-        (bid, sid, code, today, slot or "", price, base, shares, ratio,
-         pnl_pct, amount, reason))
+        (bid, sid, code, PT.slot_ts(today, slot or ""), slot or "", price, base,
+         shares, ratio, pnl_pct, amount, reason))
     return {"binding_id": bid, "strategy_id": sid, "code": code, "date": today,
             "price": price, "base": base, "shares": shares, "ratio": ratio,
             "pnl_pct": round(pnl_pct, 2), "pnl_amount": round(amount, 2),
@@ -764,7 +767,8 @@ def scorecard(cur, days: int = 30) -> dict:
             "exits": n, "wins": w,
             "win_rate": round(w / n * 100, 1) if n else None,
             "shadow_pnl": round(float(r.get("shadow_pnl") or 0), 2),
-            "last_exit": str(r.get("last_exit"))[:10] if r.get("last_exit") else None,
+            # 2026-11-20 时间戳升级：exit_date 已带时刻，[:19] 输出全串（截掉可能的微秒）
+            "last_exit": str(r.get("last_exit"))[:19] if r.get("last_exit") else None,
         })
     out["sell_strategies"] = sell
 
@@ -782,7 +786,7 @@ def scorecard(cur, days: int = 30) -> dict:
         "  SELECT min(tt.trade_date) AS sell_date FROM sa_paper_trades tt "
         "  WHERE tt.code = e.code AND tt.side = 'sell' "
         "    AND COALESCE(tt.status, '') <> 'skipped' "
-        "    AND tt.trade_date >= e.exit_date AND tt.trade_date <= e.exit_date + 7"
+        "    AND tt.trade_date >= e.exit_date AND tt.trade_date <= e.exit_date + interval '7 days'"
         ") t ON true "
         "WHERE e.exit_date >= %s "
         "ORDER BY e.exit_date DESC, e.id DESC LIMIT 80",

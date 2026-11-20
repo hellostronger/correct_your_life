@@ -1278,7 +1278,7 @@ def run_decisions(deps: dict, slot: str = "", only: set | None = None,
                       flush=True)
         # 幂等守卫：**本 slot** 已决策过的股票集合（任何 side 都算）
         cur.execute("SELECT DISTINCT code FROM sa_paper_trades "
-                    "WHERE trade_date = %s AND slot = %s", (today, slot))
+                    "WHERE trade_date::date = %s::date AND slot = %s", (today, slot))
         done = {r["code"] for r in cur.fetchall()}
     if only is not None:
         stocks = [s for s in stocks if s["code"] in only]
@@ -1416,7 +1416,7 @@ def _same_day_fills(deps, today: str) -> dict:
             cur.execute(
                 "SELECT code, side, COALESCE(reasoning, '') AS why "
                 "FROM sa_paper_trades "
-                "WHERE trade_date = %s AND side IN ('buy', 'sell') "
+                "WHERE trade_date::date = %s::date AND side IN ('buy', 'sell') "
                 "  AND COALESCE(status, '') <> 'skipped'",
                 (today,))
             rows = cur.fetchall() or []
@@ -1659,7 +1659,7 @@ def _prev_judge_rating(cur, code: str, today: str, slot: str = "") -> str:
     try:
         cur.execute(
             "SELECT decision_raw FROM sa_paper_trades "
-            "WHERE trade_date = %s AND code = %s AND slot <> %s "
+            "WHERE trade_date::date = %s::date AND code = %s AND slot <> %s "
             "  AND decision_raw IS NOT NULL "
             "  AND COALESCE(status, '') <> 'skipped' "
             "ORDER BY id DESC LIMIT 1",
@@ -2227,6 +2227,10 @@ def _execute_decision(deps, conf, stock, today, decision, quote,
     code = stock["code"]
     price = float(quote["price"])
     action = decision["action"]
+    # 2026-11-20 时间戳升级：sa_paper_trades.trade_date 存**完整成交时刻**；
+    # `today` 保持日粒度字符串，供 T+1（sellable_shares）/ 同日闸门 / alpha 窗口
+    # 的「日相等」比较使用 —— 两个粒度不能混用。
+    now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     # 滑点（2026-10-11）。默认 0 —— 不改变任何现有行为。
     # 为什么必须显式建模：模拟盘原来用 `quote["price"]` 一分不差地成交，
     # 而做 T 的每次往返都在为「必然存在的成交价差」付钱。没有滑点时，
@@ -2246,7 +2250,8 @@ def _execute_decision(deps, conf, stock, today, decision, quote,
         # 同日买+卖双开导致持仓推导=0 但两笔都待结算、账目语义错乱。
         # 改为按 slot 判定：同一轮里仍只允许一个方向，但**不同轮次可以各自决策**，
         # 这正是「每 30 分钟判断一次」需要的语义。
-        cur.execute("SELECT 1 FROM sa_paper_trades WHERE trade_date = %s AND slot = %s "
+        # 2026-11-20 时间戳升级：trade_date 变 timestamp，防重粒度仍是「日+slot」。
+        cur.execute("SELECT 1 FROM sa_paper_trades WHERE trade_date::date = %s::date AND slot = %s "
                     "AND code = %s AND status <> 'skipped' LIMIT 1", (today, slot, code))
         if cur.fetchone():
             return False, "该股本轮已有决策，跳过"
@@ -2275,7 +2280,7 @@ def _execute_decision(deps, conf, stock, today, decision, quote,
             if not me and limit["full"] and code != anchor_code:
                 cur.execute(
                     _insert_trade_sql(),
-                    (code, stock["name"], today, slot, "buy", 0, price, 0,
+                    (code, stock["name"], now_ts, slot, "buy", 0, price, 0,
                      decision["confidence"], decision["stop_loss_pct"],
                      decision["reasoning"], decision.get("report", ""),
                      json.dumps({"decision": decision}, ensure_ascii=False),
@@ -2297,7 +2302,7 @@ def _execute_decision(deps, conf, stock, today, decision, quote,
                 if _chase:
                     cur.execute(
                         _insert_trade_sql(),
-                        (code, stock["name"], today, slot, "buy", 0, price, 0,
+                        (code, stock["name"], now_ts, slot, "buy", 0, price, 0,
                          decision["confidence"], decision["stop_loss_pct"],
                          decision["reasoning"], decision.get("report", ""),
                          json.dumps({"decision": decision, "veto": "chase"},
@@ -2324,7 +2329,7 @@ def _execute_decision(deps, conf, stock, today, decision, quote,
             if shares < 1:
                 cur.execute(
                     _insert_trade_sql(),
-                    (code, stock["name"], today, slot, "buy", 0, price, 0,
+                    (code, stock["name"], now_ts, slot, "buy", 0, price, 0,
                      decision["confidence"], decision["stop_loss_pct"],
                      decision["reasoning"], decision.get("report", ""),
                      json.dumps({"decision": decision, "raw": decision.get("raw", "")},
@@ -2345,7 +2350,7 @@ def _execute_decision(deps, conf, stock, today, decision, quote,
             if shares < 1:
                 cur.execute(
                     _insert_trade_sql(),
-                    (code, stock["name"], today, slot, "buy", 0, price, 0,
+                    (code, stock["name"], now_ts, slot, "buy", 0, price, 0,
                      decision["confidence"], decision["stop_loss_pct"],
                      decision["reasoning"], decision.get("report", ""),
                      json.dumps({"decision": decision}, ensure_ascii=False),
@@ -2353,7 +2358,7 @@ def _execute_decision(deps, conf, stock, today, decision, quote,
                 conn.commit()
                 return False, "现金不足以支付成交额与手续费，未成交（记为 skipped）"
             cur.execute(_insert_trade_sql(),
-                        (code, stock["name"], today, slot, "buy", shares, price, value,
+                        (code, stock["name"], now_ts, slot, "buy", shares, price, value,
                          decision["confidence"], decision["stop_loss_pct"],
                          decision["reasoning"], decision.get("report", ""),
                          json.dumps({"decision": decision}, ensure_ascii=False), "open",
@@ -2369,7 +2374,7 @@ def _execute_decision(deps, conf, stock, today, decision, quote,
             if not me:
                 cur.execute(
                     _insert_trade_sql(),
-                    (code, stock["name"], today, slot, "sell", 0, price, 0,
+                    (code, stock["name"], now_ts, slot, "sell", 0, price, 0,
                      decision["confidence"], None, decision["reasoning"],
                      decision.get("report", ""),
                      json.dumps({"decision": decision}, ensure_ascii=False),
@@ -2383,7 +2388,7 @@ def _execute_decision(deps, conf, stock, today, decision, quote,
                 if free < 1:
                     cur.execute(
                         _insert_trade_sql(),
-                        (code, stock["name"], today, slot, "sell", 0, price, 0,
+                        (code, stock["name"], now_ts, slot, "sell", 0, price, 0,
                          decision["confidence"], None, decision["reasoning"],
                          decision.get("report", ""),
                          json.dumps({"decision": decision, "rule": rule_note},
@@ -2402,7 +2407,7 @@ def _execute_decision(deps, conf, stock, today, decision, quote,
             value = shares * price
             fee = trade_fees(code, stock.get("name", ""), "sell", value, fees_c)
             cur.execute(_insert_trade_sql(),
-                        (code, stock["name"], today, slot, "sell", shares, price, value,
+                        (code, stock["name"], now_ts, slot, "sell", shares, price, value,
                          decision["confidence"], None, decision["reasoning"],
                          decision.get("report", ""),
                          json.dumps({"decision": decision}, ensure_ascii=False), "open",
@@ -2423,13 +2428,14 @@ def _execute_decision(deps, conf, stock, today, decision, quote,
             # 导致 4 笔已结算全是 NULL，SUM(CASE WHEN alpha>0) 恒为 NULL，
             # 页面胜率恒显 0%（2026-09-29 实测）。
             _alpha, _bench = _alpha_for_round(cur, code, me, price, today, deps)
-            _settle_buy_rows(cur, code, shares, price, today,
+            # settle_date 传 now_ts（卖出成交时刻，带秒）；today 只给 alpha 的日K窗口用
+            _settle_buy_rows(cur, code, shares, price, now_ts,
                              decision.get("report", ""), _alpha, _bench)
             cur.execute("UPDATE sa_paper_trades SET status = 'closed', settle_date = %s, "
                         "settle_price = %s WHERE id = "
-                        "(SELECT id FROM sa_paper_trades WHERE code=%s AND trade_date=%s "
+                        "(SELECT id FROM sa_paper_trades WHERE code=%s AND trade_date::date=%s::date "
                         " AND slot=%s AND side='sell' AND status='open' ORDER BY id DESC LIMIT 1)",
-                        (today, price, code, today, slot))
+                        (now_ts, price, code, today, slot))
             # 净回款 = 成交额 - 费用
             cur.execute("UPDATE sa_paper_account SET cash = cash + %s, updated_at = now() "
                         "WHERE id = 1", (value - fee["total"],))
@@ -2443,7 +2449,7 @@ def _execute_decision(deps, conf, stock, today, decision, quote,
         # 「持有中」，和同一行 side 显示的「观望」自相矛盾（2026-09-28 实测
         # 335 行里 308 行是这种）。
         cur.execute(_insert_trade_sql(),
-                    (code, stock["name"], today, slot, "hold", 0, None, None,
+                    (code, stock["name"], now_ts, slot, "hold", 0, None, None,
                      decision["confidence"], None, decision["reasoning"],
                      decision.get("report", ""),
                      json.dumps({"decision": decision}, ensure_ascii=False), "none",
@@ -2457,6 +2463,33 @@ def _insert_trade_sql() -> str:
             "(code, name, trade_date, slot, side, shares, price, value, confidence, "
             " stop_loss_pct, reasoning, report, decision_raw, status, fee_total, fee_detail) "
             "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)")
+
+
+def _ts_str(v) -> str:
+    """date/datetime/str → 'YYYY-MM-DD HH:MM:SS'（2026-11-20 时间戳升级）。
+
+    datetime（迁移后的 trade_date）带秒输出；旧 date 对象/字符串原样透传，
+    绝不编造时刻。"""
+    if hasattr(v, "hour"):
+        return v.isoformat(sep=" ", timespec="seconds")
+    return str(v or "")
+
+
+def slot_ts(cycle_date, slot: str) -> str:
+    """date + slot('HH:MM'/'HH:MM#N'/'HH:MM-m') → 'YYYY-MM-DD HH:MM:00'。
+
+    **确定性推导**（不用 now()）：sa_paper_cycles 以 (trade_date, slot) 为
+    ON CONFLICT 键，同一轮重跑必须得到同一个时间戳，否则幂等失效。
+    解析不出时刻的 slot 落 00:00:00。"""
+    base = str(cycle_date or "")[:10]
+    if not base:
+        return ""
+    m = re.match(r"^(\d{1,2}):([0-5]\d)", str(slot or "").strip())
+    hh = int(m.group(1)) if m else 0
+    if not (0 <= hh <= 23):
+        hh = 0
+    mm = m.group(2) if m else "00"
+    return f"{base} {hh:02d}:{mm}:00"
 
 
 def _weighted_date(d1, shares1, d2, shares2):
@@ -2850,7 +2883,7 @@ def record_cycle(deps: dict, cycle_date: str, slot: str, kind: str = "intraday",
                 " acted=EXCLUDED.acted, holds=EXCLUDED.holds, skipped=EXCLUDED.skipped, "
                 " elapsed_ms=EXCLUDED.elapsed_ms, error=EXCLUDED.error, "
                 " note=EXCLUDED.note, created_at=now()",
-                (cycle_date, slot, kind, trigger, planned, acted, holds, skipped,
+                (slot_ts(cycle_date, slot), slot, kind, trigger, planned, acted, holds, skipped,
                  elapsed_ms, error[:2000], note[:2000]))
             conn.commit()
     except Exception as exc:
@@ -2951,7 +2984,7 @@ def _settle_and_reflect_locked(deps: dict) -> dict:
         cur = conn.cursor(cursor_factory=_real_dict_cursor(deps))
         cur.execute(
             "SELECT * FROM sa_paper_trades WHERE status = 'open' "
-            "AND side IN ('buy','sell') AND trade_date < %s ORDER BY id", (today,))
+            "AND side IN ('buy','sell') AND trade_date::date < %s::date ORDER BY id", (today,))
         opens = [dict(r) for r in cur.fetchall()]
     for t in opens:
         try:
@@ -3553,8 +3586,16 @@ def rounds(deps: dict, code: str = "", only_closed: bool = False,
     only_closed / only_open 可分别只看已平仓 / 持有中。
     """
     get_conn = deps["get_conn"]
+    # 2026-11-20 懒加载：列表接口不再回传 reasoning/report/decision_raw 全文。
+    # decision_raw 是 jsonb 大文本（实测 200 行 1.7MB，跨公网回传 13~18s），
+    # 曾把 /api/paper/rounds 拖到 42s、前端 Promise.all 整体超时 —— 用户看到
+    # 的就是「模拟持仓为空」。这里只传 160 字预览 + 长度；全文由
+    # GET /api/paper/trade-text?ids= 按用户展开的那一行取（trade_texts）。
     sql = ("SELECT id, code, name, trade_date, slot, side, shares, price, value, "
-           "fee_total, confidence, stop_loss_pct, reasoning, report, decision_raw, "
+           "fee_total, confidence, stop_loss_pct, "
+           "left(COALESCE(reasoning, ''), 160) AS reasoning_head, "
+           "COALESCE(char_length(reasoning), 0) AS reasoning_len, "
+           "COALESCE(char_length(report), 0) AS report_len, "
            "status, auto_closed, settle_date, settle_price, raw_return, "
            "alpha_return, benchmark, created_at "
            "FROM sa_paper_trades WHERE side IN ('buy','sell') "
@@ -3616,7 +3657,8 @@ def _fifo_rounds(rows: list[dict]) -> list[dict]:
             closed.append({
                 "code": r["code"], "name": r["name"] or lot["name"],
                 "entry": {
-                    "id": lot["id"], "date": str(lot["trade_date"])[:10],
+                    # 2026-11-20 时间戳升级：trade_date 已带成交时刻，全串输出
+                    "id": lot["id"], "date": _ts_str(lot["trade_date"]),
                     "slot": lot["slot"] or "",
                     # decided_at = 这一条决策**实际产出**的时刻（2026-10-08 加）。
                     # 不能拿 slot 当决策时间：slot 是轮次开始时刻，而行是决策跑完
@@ -3630,16 +3672,16 @@ def _fifo_rounds(rows: list[dict]) -> list[dict]:
                     "confidence": lot["confidence"],
                     "stop_loss_pct": (float(lot["stop_loss_pct"])
                                       if lot["stop_loss_pct"] is not None else None),
-                    "reasoning": lot["reasoning"] or "",
-                    # **不能截断**（2026-10-11 修）：原来写死 [:1200]，而库里
-                    # report 最长 4136 字符 —— 页面上「展开 LLM 原始分析报告」
-                    # 永远只显示前 1200 字，且**不带任何截断标记**，看起来
-                    # 就是「LLM 就写了这么多」。展示层不该有能力悄悄弄丢数据。
-                    "report": lot["report"] or "",
-                    "report_len": len(lot["report"] or ""),
+                    # 2026-11-20 懒加载：列表只带 160 字预览 + 长度，全文经
+                    # GET /api/paper/trade-text?ids={id} 按需取。列表截断但
+                    # **不悄悄弄丢**——按钮永远标注「全文 N 字」，点开即取全文
+                    # （沿用 2026-10-11 的原则：展示层不得静默丢数据）。
+                    "reasoning_head": lot["reasoning_head"] or "",
+                    "reasoning_len": int(lot["reasoning_len"] or 0),
+                    "report_len": int(lot["report_len"] or 0),
                 },
                 "exit": {
-                    "id": r["id"], "date": str(r["trade_date"])[:10],
+                    "id": r["id"], "date": _ts_str(r["trade_date"]),
                     "slot": r["slot"] or "",
                     "decided_at": (r["created_at"].isoformat()
                                    if r.get("created_at") else ""),
@@ -3647,12 +3689,12 @@ def _fifo_rounds(rows: list[dict]) -> list[dict]:
                     "shares": take, "fee": round(s_out, 2),
                     "net_out": round(net_out, 2),
                     "confidence": r["confidence"],
-                    "reasoning": r["reasoning"] or "",
-                    # 卖出侧同样给全文。止损卖出是**免 LLM** 的，本来就没有
-                    # 分析师报告（report 为空串），前端据此显示「免 LLM 自动
-                    # 止损，无分析报告」而不是空白。
-                    "report": r["report"] or "",
-                    "report_len": len(r["report"] or ""),
+                    # 卖出侧同买入侧：预览 + 长度，全文懒加载。report_len=0
+                    # 表示**免 LLM**（盘中止损本来就没有报告），前端据此显示
+                    # 「免 LLM 自动执行，无分析报告」而不是空白。
+                    "reasoning_head": r["reasoning_head"] or "",
+                    "reasoning_len": int(r["reasoning_len"] or 0),
+                    "report_len": int(r["report_len"] or 0),
                 },
                 "pnl": round(net_out - net_in, 2),
                 "pnl_pct": round((net_out / net_in - 1) * 100, 2) if net_in else None,
@@ -3691,9 +3733,10 @@ def _fifo_rounds(rows: list[dict]) -> list[dict]:
                 "confidence": lot["confidence"],
                 "stop_loss_pct": (float(lot["stop_loss_pct"])
                                   if lot["stop_loss_pct"] is not None else None),
-                "reasoning": lot["reasoning"] or "",
-                "report": lot["report"] or "",
-                "report_len": len(lot["report"] or ""),
+                # 懒加载口径与已平仓回合一致（2026-11-20）
+                "reasoning_head": lot["reasoning_head"] or "",
+                "reasoning_len": int(lot["reasoning_len"] or 0),
+                "report_len": int(lot["report_len"] or 0),
             },
             "exit": None,
             "pnl": None, "pnl_pct": None,
@@ -3734,6 +3777,39 @@ def _tdays(d1: str, d2: str) -> int:
         return max(0, (b - a).days)
     except (ValueError, TypeError):
         return None
+
+
+def trade_texts(deps: dict, ids) -> list[dict]:
+    """按 sa_paper_trades.id 取决策理由 / LLM 报告**全文**（懒加载出口）。
+
+    列表接口（rounds / paper_trades）只传 160 字预览 + 长度，用户展开某一行
+    时前端才带 id 调这里 —— 一次只取一两行的全文（几 KB），替代原来整包
+    回传 1.7MB jsonb 的 42s 卡死。ids 非法项静默跳过，最多 100 个。
+    """
+    clean: list[int] = []
+    for v in (ids or []):
+        try:
+            n = int(str(v).strip())
+        except (TypeError, ValueError):
+            continue
+        if n > 0 and n not in clean:
+            clean.append(n)
+        if len(clean) >= 100:
+            break
+    if not clean:
+        return []
+    with deps["get_conn"]() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, reasoning, report FROM sa_paper_trades "
+                    "WHERE id = ANY(%s)", (clean,))
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    for r in rows:
+        r["reasoning"] = r["reasoning"] or ""
+        r["report"] = r["report"] or ""
+        r["report_len"] = len(r["report"])
+    rows.sort(key=lambda r: clean.index(r["id"]))
+    return rows
 
 
 def today() -> date:

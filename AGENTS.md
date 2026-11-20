@@ -4,6 +4,162 @@
 
 ---
 
+### 📥 券商成交全历史导入 sa_trades（2026-11-20，用户提供 19 张长截图）
+
+**数据源**：券商 App「成交」页长截图 19 张（1260px 宽、最高 4 万 px 拼接图）：
+沪深京 1~11 月整月页 + 全区间页 + 港股通 5 页 + 港股通全区间页。
+**方法**：PIL 切片（1440px 步进/60px 重叠）→ 逐片视觉转录（含并行代理）→ 每笔
+|price×qty−amount| 数学闸门 → 同日同向同价 ≤120s 连续笔合并（拆单 7 组）→
+与手动行对账 → 时间序落库。国债逆回购（205001 报价回购）全部剔除。
+
+**落库动作**：删 09-09 种子行 30（被期初+真实流水取代）；新增期初行 13
+（2026-01-09 09:30，成本用种子估价并注明「期初持仓外推」——512710 64700、
+001979 7400、600839 7500、000158 2800、601238 3900 等）；矫正手动行 93
+（补真实时刻 91 + 纠价 2：301382 32.82→32.77、02513 442.00→442.60；纠日期 1：
+603366 卖出 09-11→09-10）；插入真实成交 ~150 笔。**库里 0 行 00:00:00**。
+
+**复核（用户点名「9 月前没手动录过，错了很危险」）**：
+① 全表 234 行逐代码重放 **0 负持仓**；② **09-09 种子交叉验证 29/29 全吻合**——
+1-8 月几十笔加减后精确回到用户 3 个月前手记的持仓（003035 2300+2000=4300 ✓、
+600406 900+800+300−700=1300 ✓、512710 0期初+58000−29000+64700−46800=46900 ✓），
+读错任何一笔都会破坏等式，这是转录准确性的最强独立证据；③ 持仓页已按真实
+流水重放（00136 84000 股确认正确：11-19 手工 80000 = 券商 4 笔拆单
+36000+4000+24000+16000 @1.295 同秒 ✓）。
+
+**补录 8 月完整页（用户指出「卖出算少了」后补拍）**：8 月沪深京页首版截图
+顶部从回购行中间截起、底部停在「加载更多」= 不完整。完整页 651/1260px 两版
+（30355px）补出 19 笔，含关键卖出：**08-05 科力远卖 36000**（36300 买−36000=300
+=种子 ✓）、**08-03 港股科技ETF卖 70000**（70100−70000=100 ✓）、**08-04 黄金股ETF
+卖 53000**（53400−53000=400 ✓）——之前反推出的「错误种子」全部证伪，种子行
+本来就是对的，缺的是 8 月卖出。同时补出 512710 08-17 买 64700（期初 64700
+实为这笔，撤销）、麦格米特 08-07/11/19 三笔买 1100（对上 08-21 卖 1100）、
+好当家/德科立 08-13 买 ↔ 08-28/08-18 卖、招商蛇口 08-10 买 7400（期初 7400
+撤销）、阳光电源 08-10 买 200、摩尔线程 08-05 买 307@597.00（=种子 ✓）、
+德明利 08-11 买 100（两笔=种子 200 ✓）、600839 08-05 买 3600（期初 7500→3900）。
+**7 行多余期初删除**（001309/001979/300274/301217/301308/512710/688795），
+期初只剩 5 行：000158 2800、000723 900、000858 200、159329 3000、601238 3900。
+
+**坑**：① 逐笔 API 插入会因「中间态」被 calc_position 拒（DB 已有未来日期的
+卖出、先行买入未插）——buy-first 也不够（累计买入 < 卖出时仍拒），最终对这类
+行走直接 SQL + 离线全表重放兜底；② 去重键必须含价格（00100 09-24 三笔 40 股、
+02513 11-06 418.4 与 418.6 同分钟同数量，不含价格会误吞）；③ heredoc 长内容
+会被截断，长列表用 python 写文件；④ 代理转录有一处日期头跨片归属错误
+（11-06 三笔智谱标成 11-09），靠手动行交叉对账逮到修正；⑤ LIKE 字面量 % 带
+params 必须 %%（AGENTS.md 第 N 次撞）。**备份**：sa_trades_bak_20261120_import
+（导入前全表）。**未做**：2-27 之前若有 2025 年成交未截图，期初行的成本只是估值。
+
+---
+
+### ⏱ 全系统时间升级为带时分秒的时间戳（2026-11-20，用户裁决「日期列也整体改时间戳」）
+
+**背景**：银证转账 47 笔录入时时刻只能塞备注（date 字段日粒度）。摸底：存储层大部分
+本就带秒（TIMESTAMPTZ），缺时刻的是手工台账（broker_cash、sa_trades）；前端约 40 处
+显示截掉秒、其中 8 处直截 UTC 串（8 小时时区坑）。用户两题裁决：① sa_trades 加成交
+时刻（合并实现=折叠进 timestamp 主列，不建独立 trade_time）；② **日期列整体升级
+timestamp**（已知风险，接受）。
+
+**口径总表（勿重开）**：升级 5 列 = sa_trades.trade_date、sa_paper_trades.trade_date/
+settle_date、sa_paper_cycles.trade_date、sa_paper_strategy_exits.exit_date → TIMESTAMP；
+broker_cash 侧车 date 升级全串。**保持日粒度**：基准日（asof_date/快照 date）、日频表
+（K线/估值/宏观/ETF流/指数成分/paper_equity）、calendar event_date（已有 time_hint）、
+上市日/报告期/提款截止日、slot 轮次标签。**保护模式**：所有「日相等/日边界」比较统一
+`trade_date::date = %s::date`（SQL）/ `str(v)[:10]`（Python），语义与升级前逐字节一致。
+
+| 组件 | 要点 |
+|---|---|
+| broker_cash | `_norm_flow_ts` 接受 `YYYY-MM-DD [HH:MM(:SS)]` 归一带秒；`norm_ts` 公开别名给 app 复用（不写两份规则）；list_flows 排序改全串时间序（旧键同日按 uuid 打乱）；`migrate_note_times()` 从备注尾部解析时刻回填（幂等，备注原文保留）——真实侧车 54/54 已回填（备份 .bak_20261120） |
+| web_chat | `normalize_transfer_rows` 从原始 date 串/备注提取 `HH:MM(:SS)` 拼进 date；查重升维（两侧都带时刻才比时刻）——同日不同时刻两笔不再误判重复 |
+| sa_trades | DDL→TIMESTAMP；POST /api/trades 与 /api/t/record 收完整时间戳（前端 #t-time 时刻输入）；`_query_trades` 窗口 `::date` + 输出带秒；净变现曲线 `GROUP BY trade_date::date`；`_net_trade_flow_cny`（锚点现金）严格大于基准「日」口径钉死 |
+| 模拟盘 | 写入侧 `_execute_decision` 加 `now_ts`，9 处 INSERT 全部写成交时刻（`today` 保持日粒度供 T+1/同日闸门）；record_cycle 用 `slot_ts(date,slot)` **确定性**推导 `HH:MM:00`（保 ON CONFLICT 幂等）；settle_date 卖出执行写 now_ts、日K结算仍按日（→00:00:00） |
+| ::date 修复清单 | sellable_shares/_weighted_date [:10] 天然兼容（datetime 是 date 子类）；会破的逐处改：两处 slot 幂等守卫、辩论查询、同日反向闸门、卖出回填子查询、结算队列 `trade_date::date < %s::date`、t_trading×3、app 盘后决策日报/当日反向、advice_followup 窗口、self_evolution 到期扫描、cycles 日期参数查询、快照 report 的 after 边界（[:10]） |
+| paper_strategy | `_record` exit_date 用 `PT.slot_ts`（确定性）；scorecard LATERAL 窗口 `+ interval '7 days'`——**timestamp + integer 会直接 SQL 报错** |
+| 启动迁移 | `_migrate_ts_columns()`（app.py init_db post-DDL）：information_schema 查 data_type，仅 date 列 ALTER，影子表 `*_bak_20261120` 先建；回填口径 sa_paper_trades 用 `created_at AT TIME ZONE 'Asia/Shanghai'`（**服务器 Etc/UTC 实测，直接 ::time 偏 8 小时**）；失败不阻断（::date 对 DATE 列同样成立，下次启动补迁） |
+| 前端 | `fmtTs(v, mode)` 统一入口（full/short/date）：带时区尾巴走 Date 本地换算（修 8 处 UTC 坑）、无时区原样归一；收编 ~40 处 slice/replace 内联；fmtLocalTs 退化为兼容出口；快照列表显示 created_at、报告显示 asof 带秒；**基准日/快照日显示必须传 'date' 模式**（避免补 00:00:00 假时刻） |
+
+**验证**：离线 broker_cash_test **78/78**（新增时刻排序/迁移幂等/回填用例）、
+trade_snapshot_test **126/126**（含 11 月差额 +18,128 锚值交叉校验——数学不变的硬证据）、
+_t_log_test **83/83**、chat_transfer_test **62/62**（种子改带时刻形态）、
+test_ts_upgrade **63/63**（新增：norm_ts 各形态、slot_ts 确定性、sellable_shares 对
+datetime 行的 T+1 桩测、**::date 修复点源码级断言**、旧 UTC 截断模式清零）、
+paper_deposit/paper_anchor/_lot_pnl/account_anchors 70/70/advice_followup/tech_ind 17/17/
+_gate/_cost_estimate/_feasibility/test_cash_baseline/trade_review 11/11 全过；
+JS 两 script 块 node --check OK。真机：重启 35s，`[ts-migrate]` 5 列全迁、
+影子表 4 张就位；information_schema 全 timestamp；sa_paper_trades 回填时刻与
+created_at 上海墙钟吻合（06:52 UTC→14:52，与 slot 14:30+决策延迟一致）；
+/api/cash-flows 54 条全带秒、汇总 net 1,027,396.11 逐分不变；/api/paper/rounds
+的 date 已带时刻；持仓市值 256,846.56 与 /api/holdings 逐分一致、attribution
+恒等式成立。**注意**：09-10 快照报告 delta 已不再是 −70,496.69 —— 那是 11-13
+收盘价时点值；本周有新成交（11-18 卖 00100/02513、11-19 买 00136）+价格在动
+（00100 152.4→114.8），差额按「现在」计价本来就该变，勿当回归。
+
+**坑**：① `python -I` 不带脚本目录进 sys.path，跑仓库内测试文件不要加 -I；
+② psycopg2 的 TIMESTAMPTZ `AT TIME ZONE` 必须显式换算（服务器 UTC，JS 侧
+paperDecisionAt 早就注释过这个坑，本次在 SQL 侧同样踩到）；③ PG 里
+`timestamp + 7`（integer）不存在，只有 `+ interval`——LATERAL 窗口原样升级会炸；
+④ `datetime.now().date()` 参数对 timestamp 列只匹配午夜行（盘后决策日报）；
+⑤ 测试夹具两处按旧格式断言（date-only/种子）→ 全是夹具错不是代码错，第 N 次；
+⑥ Write 工具长文件写一半截断过一次（test_ts_upgrade 首版），重写修复。
+
+---
+
+### 🔴 模拟盘 tab 卡死「持仓展示为空」= 大文本跨公网整包回传（2026-11-20，用户报，懒加载修复）
+
+**症状**：模拟盘 tab 持仓表空白（`#paper-positions` 零行、空提示也不出现）。数据层全好
+（真库 4 只持仓、离线 `_derive_paper_positions` 正常、`/api/paper/overview` 200 全量返回）。
+
+**根因链（分段计时钉死，别再从渲染层猜）**：`loadPaper` 六个请求走 `Promise.all`，
+任何一个挂/超时 → 整个函数中断 → 持仓表永远不渲染。元凶是 **`/api/paper/rounds` 42s**
+（`/api/paper/trades` 4.7s 次之）。分段计时：get_conn 0.2s / SQL execute **24.6s** /
+fetchall 0.011s / Python 配对+排序+序列化 **共 0.005s** → 慢在 SQL。
+
+**关键事实（改结论三次，最终钉死）**：① PG 根本不在本机 —— `DB_CONF.host=
+101.43.25.101`（172.18.0.7 是 VPS 容器内网地址）；实测链路 ~150KB/s。② 全表聚合读
+`decision_raw`（857 行 6.3MB 解压）只要 **0.18s**，但「200 行回传客户端」要 12~18s
+—— **瓶颈是跨公网传输，不是 TOAST/解压/计算**。③ `decision_raw` 是 jsonb 大文本
+（200 行 1.7MB），而 `rounds()` 的输出**根本不用它**（只用 reasoning/report）——
+纯浪费。④ `report+reasoning` 共 ~600KB，也远超列表页需要。
+
+**修法（用户裁决「太慢的地方引入懒加载」）**：列表接口只传 160 字预览 + 长度：
+`left(COALESCE(reasoning,''),160) AS reasoning_head` + `char_length` 服务端算长度；
+`rounds()` SQL **删掉 decision_raw**（输出未用）。新端点 `GET /api/paper/trade-text?
+ids=`（`paper_trading.trade_texts`：`id = ANY(%s)`，清洗非法/重复 id、保请求顺序、
+上限 100、空参不碰库）按用户展开的那一行取全文。前端：`reasonCell` 预览+「展开全文(N字)」
+按钮（`lazyReasonBtn`/`expandPaperReason`，按 `reasoning_len > head.length` 判）、
+`reportBlock` 改 `openPaperReportLazy`（report_len=0 = 免 LLM 不发请求；取回后
+`putPaperReport`→`showPaperReport`，按钮文本恢复）、决策流水 `<details>` 理由同款；
+`_paperTextCache` 缓存已取行。原则不破：列表截断但**不静默丢数据**——按钮永远标注
+全文 N 字，点开即全文（沿用 2026-10-11 判例）。
+
+**验证**：`/api/paper/rounds` **42.4s → 0.44s**、`/api/paper/trades` 4.7s → 1.75s、
+payload 415KB→151KB；离线 `paper_lazy_test.py` **36/36**（Fake tuple 游标：rounds SQL
+无 decision_raw、_fifo_rounds 三分支键形状、trade_texts 清洗/排序/上限/不碰库、
+app+前端静态接线、两 script 块 node --check）；回归 test_ts_upgrade 63/63、
+_t_log_test 105/105、paper_anchor_test、_lot_pnl_test 12/12 全过；重启 35s。
+浏览器 E2E：模拟盘 tab 持仓表 **4 行全渲染**（510310/600036/159329/09896）、
+展开全文 326→325（按钮替换为全文）、报告弹窗「600406 买入 LLM 原始分析报告（536 字）」
+按需取回、按钮文本恢复。
+
+**本次坑**：① `it.reasoning`/`it.report` 会被 `t\.reasoning` 正则误伤 —— 源码级
+「清零断言」必须加 `\b` 词边界；② FakeConn 传 dict 行 → `rounds()` 按 tuple zip 列名
+拼出「key=key」的假行（AGENTS.md FakeCur 坑第 N 次，夹具要 tuple 行）；③ 手数
+「卖出报告全文」=6 字写成 7（心算不可信）；④ PowerShell 5.1 读 .ps1 按 ANSI，
+中文注释直接炸解析 —— 重启脚本纯 ASCII；⑤ Git Bash 里 PowerShell `$_` 会被 shell
+吞掉，复杂命令一律落 .ps1 文件执行。
+
+---
+
+### 📅 银证转账按月统计（2026-11-20，用户要求「看哪个月入金最多」）
+
+后端 `broker_cash.summarize().by_month` 本就有（折 CNY、HKD 按 fx），只是前端没画。
+「💵 银证转账」tab 新增「📅 按月统计」卡：`renderCashFlowMonthly(byMonth)` 月份倒序表
+（入金/出金/净额/笔数），**入金最多月份整行高底色 + ⭐ 入金最多徽标**，卡片顶部一句话
+结论（并列最高全列）；空台账有引导文案。无后端改动（by_month 升序由前端 reverse）。
+验证：broker_cash_test 78→**83**（cf-monthly 容器/渲染函数/loadCashFlows 调用点/
+高亮断言/后端 by_month 持续输出）；浏览器实测：⭐ 2026-08 ¥784,708（14 笔），
+2025 补录的月份（10 月 1 万/9 月 10 万/3 月 3 千）都在表里。
+
+---
+
 ### 📊 RSI 落地 + 技法生效影响审计（2026-11-17，用户问「技法生效有什么影响/做到RSI了吗」）
 
 **技法生效影响（审计结论）**：技法（sa_analysis_techniques，active 1136/pending 140）
@@ -479,6 +635,13 @@ JS 两 script 块 `node --check` 通过；真机重启 8686 后 5 端点验证�
 真机 09-10 报告 `buy −162,435 + sell 91,938.31 = delta −70,496.69`、
 `excl3 +35,340.11`、`new_drag −61,314.6 / old_drag −9,182.09`，与一次性排查逐项吻合。
 
+**2026-11-20 追加（用户「改一下默认显示全量的呀」）**：报告股票表默认**全量显示**
+（原前端 `.slice(0, 15)` 只截前 15 行——01-31 快照 50 只里 红利低波 −9,529 /
+煤炭 515220 −49 正好被截掉，用户以为快照没算它们）；表头标
+「股票（全部 N 只，按差额大小排序）」（后端 `score_trades` 本就按 |delta| 倒序）。
+纯前端一处改动；浏览器实测 01-31 报告 **50 行全渲染**。注意 515220 显示名为
+代码本身（名册无该 ETF 名），属既有后端行为非本次回归。
+
 ### 💵 银证转账入金/出金 `stock-advisor/broker_cash.py`（2026-11-13 用户要求）
 
 接着上一节：既然差的是「真实资金流」，就把银行↔券商的入金/出金记下来，让快照报告
@@ -509,6 +672,16 @@ JS 两 script 块 `node --check` 通过；真机重启 8686 后 5 端点验证�
 2. 真机自检**绝不替用户记虚构金额**：只用 100 元带「API 自检，稍后删除」备注，
    验证完立即删掉；「若记一笔 78,700 出金就能对上 63w」只在回复里做数学演示，不落盘。
 3. 侧车在 `stock-advisor/data/`，已被 .gitignore 忽略，个人资金流水不会进 git。
+
+**2026-11-20 追加：2025 年历史转账补录（用户截图）**：补录 2025 全年**成功**入金 7 笔
+（01-16 6000 / 01-17 26000 / 01-24 30000 / 03-17 3000 / 09-22 50000 / 09-25 50000 /
+10-27 10000，全 CNY 银行转证券，备注「截图导入 2025年人民币 银行转证券 成功」），
+合计 **175,000** 与券商 App 2025 年「净转入 175000.00」逐分一致（口径对上的硬证据）。
+截图里 5 笔「失败」行（03-17 20000 / 09-18 50000 / 09-25 50000+30000 / 10-27 20000）
+**没实际到账，不录**——录了总数就对不上券商 App。台账 54→61 笔，summary 净额
+1,027,396.11→1,202,396.11（差值恰 175,000）。验证：2025 流水**不进** 2026-09-10
+快照报告区间（`net_in_range` 严格大于基准日，报告 ext_flow_count=7 / ext_cash
+−68,839.77 与录入前逐分相同，全为 2026 年既有流水）——历史补录不影响既有快照差额。
 
 ### 🎯 个股锚定模式 `stock-advisor/paper_anchor.py`（2026-11-08，用户要求）
 

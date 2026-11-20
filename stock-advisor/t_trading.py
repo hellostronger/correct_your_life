@@ -1217,7 +1217,7 @@ def real_sellable_shares(cur, code: str, held: int, today: str,
         # 必须给聚合列起 `AS shares`：RealDictCursor 下无别名的列名是 `coalesce`，
         # `_r(r, 1, "shares")` 取不到 → bought 恒 0 → 把 T+1 锁定的份额当成可卖。
         cur.execute("""SELECT side, COALESCE(SUM(shares),0) AS shares FROM sa_trades
-                       WHERE code=%s AND trade_date=%s GROUP BY side""",
+                       WHERE code=%s AND trade_date::date=%s::date GROUP BY side""",
                     (code, today))
         rows = cur.fetchall()
     except Exception:                      # noqa: BLE001
@@ -1678,7 +1678,7 @@ def _judge_one(deps, c, code, today, em_kline_fn, tx_symbol_fn, fees_c) -> dict:
             return {"code": code, "name": name, "action": "hold", "why": "无持仓"}
         anchor_info = t_anchor(cur, code)
         cur.execute("""SELECT side FROM sa_paper_trades
-                       WHERE code=%s AND trade_date=%s AND side IN ('buy','sell')
+                       WHERE code=%s AND trade_date::date=%s::date AND side IN ('buy','sell')
                          AND status<>'skipped'""", (code, today))
         today_t = [r[0] for r in cur.fetchall()]
         # 连接马上要关，先把还要用的数取出来
@@ -1861,7 +1861,7 @@ def advisory(deps: dict, conf: dict, positions: dict, today: str = "",
                 cur = conn.cursor()
                 anchor_info = real_anchor(cur, code)
                 cur.execute("""SELECT side FROM sa_trades
-                               WHERE code=%s AND trade_date=%s
+                               WHERE code=%s AND trade_date::date=%s::date
                                  AND note LIKE %s""", (code, today, T_TAG + "%"))
                 today_t = [r[0] for r in cur.fetchall()]
                 if tr_on:

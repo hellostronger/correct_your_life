@@ -244,7 +244,7 @@ def stranded_rows(cur) -> list[dict]:
             FROM sa_paper_trades
             WHERE side = 'buy' AND status = 'open'
         ) t
-        WHERE trade_date < %s
+        WHERE trade_date::date < %s::date
         ORDER BY trade_date, id""", (date.today(),))
     rows = cur.fetchall()
     out = []

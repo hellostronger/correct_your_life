@@ -1057,6 +1057,7 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
                oninput="updateTradeCashHint()">
         <input id="t-date" placeholder="交易日期" style="width:130px"
                onfocus="this.type='date'" onblur="if(!this.value)this.type='text'">
+        <input id="t-time" type="time" step="1" title="成交时刻（可选，缺省按现在）" style="width:120px">
         <select id="t-strategy" style="padding:8px 10px;border:1px solid var(--border);border-radius:7px;width:190px">
           <option value="">止盈策略：不设</option>
         </select>
@@ -1317,11 +1318,16 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
         只记<b>银行 ↔ 券商</b>之间的资金转入转出；账户里买卖股票由交易流水负责，别重复记。
         记下来之后，快照报告会用「推演组合价值 + 期间净出入金」算出<b>调整后账户资产</b>，
         就能和券商 App 对账。数据只存本地 JSON，不写数据库；出入金<b>不影响</b>操作差额与胜率。
+        记错了在下方流水点<b>「修改」</b>直接改，不用删了重记；改完对账数字会自动重算。
       </div>
     </div>
     <div class="card">
       <b style="font-size:13px">📊 资金汇总</b>
       <div id="cf-summary" class="muted" style="font-size:12px;margin-top:6px">加载中…</div>
+    </div>
+    <div class="card">
+      <b style="font-size:13px">📅 按月统计</b>
+      <div id="cf-monthly" class="muted" style="font-size:12px;margin-top:6px">加载中…</div>
     </div>
     <div class="card">
       <b style="font-size:13px">📋 转账流水</b>
@@ -2371,6 +2377,8 @@ tr > td[colspan="13"] b { color: var(--text-2); font-weight: 600; }
           <div class="chat-stream" id="chat-stream">
             <div class="chat-welcome muted">左侧选会话，或点「＋ 新开会话」。<br>
               可直接发文字，也可点 🖼 附一张图片让 agent 先看图。<br>
+              📷 附上<b>银证转账截图</b>并说「录入银证转账记录」，会先列出可核对的待确认表，<br>
+              你点「确认录入」后才会写进转账台账（识别过程不入库）。<br>
               问行情、持仓、做T判断、财报预案都可以——agent 用的是系统全文数据。</div>
           </div>
           <div class="chat-inputbar">
@@ -3168,7 +3176,9 @@ function paperDecisionAt(t) {
     // 对 UTC+8 的用户会**系统性偏早 8 小时**（实测 15:54 显示成 07:54）。
     const d = new Date(iso);
     if (isFinite(d.getTime())) {
-      return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+      // 2026-11-20 时间戳升级：带秒
+      return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0')
+        + ':' + String(d.getSeconds()).padStart(2, '0');
     }
   }
   const slot = String(t.slot == null ? '' : t.slot).trim();
@@ -3490,7 +3500,8 @@ function formDlg(title, fields, { okText = '保存', wide = false } = {}) {
           ).join('')}</select>`
         : `<input ${common} value="${esc(f.value || '')}"
              ${f.type ? `type="${f.type}"` : ''}
-             ${f.type === 'number' ? `min="0" step="${f.step || '1'}"` : ''}>`;
+             ${f.type === 'number' ? `min="0" step="${f.step || '1'}"` : ''}
+             ${f.type === 'time' && f.step ? `step="${f.step}"` : ''}>`;
     return `<div class="field"><label for="${id}">${esc(f.label)}</label>${ctrl}
       ${f.hint ? `<div class="faint" style="margin-top:3px">${esc(f.hint)}</div>` : ''}</div>`;
   }).join('');
@@ -3778,8 +3789,8 @@ function _analRow(t) {
       inds.map(i => `<span class="rel-code">${esc(i)}</span>`).join('')}</div>` : ''}
     <div class="anal-ev">📎 ${esc(t.evidence || '')}</div>
     <div class="muted" style="font-size:11px;margin-top:5px">
-      来源：${src} · 学到于 ${esc(String(t.learned_at || '').slice(0, 16))}
-      ${t.reviewed_at ? ` · 审于 ${esc(String(t.reviewed_at).slice(0, 16))}` : ''}
+      来源：${src} · 学到于 ${esc(fmtTs(t.learned_at))}
+      ${t.reviewed_at ? ` · 审于 ${esc(fmtTs(t.reviewed_at))}` : ''}
       ${t.mode === 'ai' ? ' · AI 抽取' : t.mode === 'manual' ? ' · 人工改动过' : ''}
     </div>
     ${t.review_note ? `<div class="muted" style="font-size:11px;margin-top:3px">
@@ -4206,12 +4217,12 @@ function _sdPaintState(st) {
   }
   if (!el) return;
   if (st.running) {
-    el.innerHTML = `⏳ 正在跑（开始于 ${jqEsc(fmtLocalTs(st.started_at))}）`
+    el.innerHTML = `⏳ 正在跑（开始于 ${jqEsc(fmtTs(st.started_at))}）`
       + ' —— 真跑一轮约 6 分钟，页面每 10 秒自动刷新。';
     return;
   }
   const parts = [];
-  if (st.finished_at) parts.push('上次结束 ' + fmtLocalTs(st.finished_at));
+  if (st.finished_at) parts.push('上次结束 ' + fmtTs(st.finished_at));
   const res = st.result || null;
   if (res && res.skipped) parts.push('跳过：' + (res.reason || ''));
   else if (res && res.ok === false) parts.push('失败：' + (res.reason || st.error || ''));
@@ -4354,7 +4365,7 @@ async function loadStrategyDaily(silent) {
     $('sd-runs').innerHTML = runs.map(r => `<tr>
       <td class="jq-code" style="background:none;border:none;padding:0;max-height:none">${
         jqEsc(r.run_id || '—')}</td>
-      <td>${r.started_at ? jqEsc(fmtLocalTs(r.started_at)) : '<span class="muted">—</span>'}</td>
+      <td>${r.started_at ? jqEsc(fmtTs(r.started_at)) : '<span class="muted">—</span>'}</td>
       <td>${r.trade_date ? jqEsc(r.trade_date) : '<span class="muted">—</span>'}</td>
       <td>${fmt(r.n_total)}</td>
       <td><span class="badge b-ok">${fmt(r.n_ok)}</span> /
@@ -4731,7 +4742,7 @@ async function openJqArticle(pid) {
         <div class="muted" style="font-size:11px;margin-top:2px">
           ${jqEsc(a.author || '匿名')} · 浏览 ${a.view_count ?? '—'} · 点赞 ${a.like_count ?? '—'}
           · 回复 ${a.reply_count ?? '—'} · 克隆 ${a.clone_count ?? '—'}
-          · 发布 ${jqEsc((a.published_at || '').slice(0, 10))}
+          · 发布 ${jqEsc(fmtTs(a.published_at))}
         </div>
         <div style="margin-top:4px">
           ${(a.tags || []).map(t => `<span class="badge">${jqEsc(t)}</span>`).join(' ')}
@@ -4985,7 +4996,7 @@ async function jqCompare(btn) {
           <td class="down mono">${r.max_drawdown != null ? r.max_drawdown.toFixed(2) + '%' : '—'}</td>
           <td class="mono">${r.sharpe ?? '—'}</td>
           <td class="mono">${r.n_trades ?? '—'}</td>
-          <td class="mono muted" style="font-size:11px">${jqEsc((r.created_at || '').slice(5, 16).replace('T', ' '))}</td>
+          <td class="mono muted" style="font-size:11px">${esc(fmtTs(r.created_at, 'short'))}</td>
         </tr>`).join('') + '</tbody></table>';
     } catch (e) {
       $('jq-run-out').innerHTML =
@@ -5449,10 +5460,7 @@ async function loadSkillRuns(quiet) {
     $('skills-runs-meta').textContent = rows.length ? `最近 ${rows.length} 条` : '';
     $('skills-runs-empty').classList.toggle('hide', rows.length > 0);
     body.innerHTML = rows.map(r => {
-      const t = r.started_at ? new Date(r.started_at) : null;
-      const ts = t && isFinite(t.getTime())
-        ? t.toLocaleString('zh-CN', { hour12: false })
-        : (r.started_at || '—');
+      const ts = r.started_at ? fmtTs(r.started_at) : '—';
       const ok = r.ok === true;
       const err = r.error_code
         ? esc(r.error_code) + (r.error_code === 'exit_nonzero' && r.exit_code != null
@@ -5719,7 +5727,7 @@ function renderFactorSnapMulti(s, st) {
         <span class="skill-cap">${esc(d.as_of || '—')}</span>
         <span class="skill-cap">${esc(d.run_id || '')}</span>
         <span style="flex:1"></span>
-        <span class="muted" style="font-size:11px">${esc(fmtLocalTs(d.created_at))}</span>
+        <span class="muted" style="font-size:11px">${esc(fmtTs(d.created_at))}</span>
       </div>
       ${_fxRowTables(rows, d.market_label || '')}
     </div>`;
@@ -5760,7 +5768,7 @@ function renderFactorSnap(s, st) {
         ? `<span class="badge b-warn">行情滞后 ${stale} 天</span>` : ''}
       <span style="flex:1"></span>
       <span class="muted" style="font-size:11px">${esc(s.run_id || '')} · ${
-        esc(fmtLocalTs(s.created_at))}</span>
+        esc(fmtTs(s.created_at))}</span>
     </div>
     <div class="muted" style="font-size:12px;margin-top:6px">
       面板 <b>${fmt(panel.codes || s.n_codes)}</b> 只 × <b>${fmt(panel.days || s.n_days)}</b>
@@ -6333,6 +6341,8 @@ let chatImg = '';          // 已上传待发送的附件名（POST /api/chat/up
 let chatURL = '';          // 待发送附件的预览 url
 let chatDemo = false;      // status.enabled=false 时的降级提示，避免重复写
 let chatSending = false;
+let chatTransferRows = []; // 最近一次截图识别出的候选行（与表格 data-row 下标对应）
+let chatTransferDone = false;  // 确认表是否已提交，防连点重复入账
 
 function loadChat() {
   loadChatStatus();
@@ -6444,7 +6454,7 @@ function chatMsgHTML(m) {
     inner += `<img class="chat-img" alt="附件" src="${u}" data-img="${u}">`;
   }
   if (!user && m.src === 'llm') inner += '<div class="chat-src">（agent 不可用，单轮 LLM 回答）</div>';
-  if (m.created_at) inner += '<div class="chat-src">' + fmtLocalTs(m.created_at) + '</div>';
+  if (m.created_at) inner += '<div class="chat-src">' + fmtTs(m.created_at) + '</div>';
   return `<div class="chat-msg ${user ? 'user' : 'ai'}" data-msg="1">
     <div class="chat-bubble">${inner}</div>
   </div>`;
@@ -6541,6 +6551,7 @@ async function chatSend() {
     stream.querySelectorAll('img.chat-img').forEach(im => {
       im.onclick = () => window.open(im.dataset.img);
     });
+    if (r.mode === 'transfer_confirm') renderChatTransferConfirm(r);
     stream.scrollTop = stream.scrollHeight;
     loadChatSessions();
   } catch (e) {
@@ -6556,6 +6567,130 @@ async function chatSend() {
 
 function chatKeydown(ev) {
   if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); chatSend(); }
+}
+
+// ---- 📷 银证转账截图 → 待确认表 → 入账（2026-11-19） ----
+// /api/chat/send 命中「有图 + 录入银证转账」意图时返回 mode=transfer_confirm，
+// 只给候选行、**不写库**；这里渲染可编辑表格，用户点确认才调 transfer-commit。
+// 关键：识别结果一律先过人眼，重复/撤单/看不清的行默认不勾选。
+
+function chatTransferStatus(r) {
+  if (r.skip) return '<span style="color:var(--down)">跳过：' + esc(r.status || '看不清') + '</span>';
+  if (r.duplicate) return '<span style="color:var(--up)">疑似已录入</span>';
+  if (r.issues && r.issues.length) return '<span style="color:var(--up)">' + esc(r.issues.join('、')) + '</span>';
+  return '<span class="muted">可录入</span>';
+}
+
+function renderChatTransferConfirm(r) {
+  chatTransferRows = r.rows || [];
+  chatTransferDone = false;
+  const stream = $('chat-stream');
+  if (!chatTransferRows.length) {
+    stream.insertAdjacentHTML('beforeend',
+      '<div class="chat-msg ai" data-msg="1"><div class="chat-bubble">'
+      + esc(r.hint || '没有识别到转账明细，未写入任何数据。') + '</div></div>');
+    return;
+  }
+  const rows = chatTransferRows.map((x, i) => {
+    const checked = (!x.skip && !(x.issues || []).length) ? 'checked' : '';
+    const ccys = ['CNY', 'HKD', 'USD'].map(c =>
+      `<option value="${c}" ${x.currency === c ? 'selected' : ''}>${c}</option>`).join('');
+    return `<tr data-row="${i}" data-dup="${x.duplicate ? '1' : '0'}" data-account="${esc(x.account || '')}">
+      <td><input type="checkbox" id="ct-chk-${i}" ${checked} onchange="chatTransferCount()"></td>
+      <td><input id="ct-date-${i}" value="${esc(x.date || '')}" style="width:98px" placeholder="YYYY-MM-DD"></td>
+      <td><select id="ct-side-${i}">
+        <option value="in" ${x.side === 'in' ? 'selected' : ''}>入金</option>
+        <option value="out" ${x.side === 'out' ? 'selected' : ''}>出金</option>
+        <option value="" ${!x.side ? 'selected' : ''}>未定</option></select></td>
+      <td><input id="ct-amt-${i}" value="${x.amount || ''}" style="width:108px" inputmode="decimal"></td>
+      <td><select id="ct-ccy-${i}">${ccys}</select></td>
+      <td><input id="ct-note-${i}" value="${esc(x.note || '')}" style="width:150px"></td>
+      <td style="font-size:11px">${chatTransferStatus(x)}</td>
+      <td><button class="btn ghost" style="font-size:11px;padding:2px 7px" onclick="chatTransferRemove(${i})">✕</button></td>
+    </tr>`;
+  }).join('');
+  stream.insertAdjacentHTML('beforeend', `
+    <div class="chat-msg ai" data-msg="1" id="chat-transfer-card">
+      <div class="chat-bubble" style="max-width:660px">
+        <div style="font-weight:500;margin-bottom:6px">📷 银证转账识别结果 · 待确认</div>
+        <div class="muted" style="font-size:12px;margin-bottom:10px">
+          ${esc(r.hint || '')}<br>可逐格修改；重复行默认不勾，标「跳过」的行不会入账。</div>
+        <div style="overflow-x:auto"><table class="tbl" style="width:100%;font-size:12px">
+          <thead><tr><th>选</th><th>日期</th><th>方向</th><th>金额</th><th>币种</th><th>备注</th><th>状态</th><th></th></tr></thead>
+          <tbody>${rows}</tbody></table></div>
+        <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button class="btn" id="ct-commit" onclick="chatTransferCommit()">确认录入 <span id="ct-n">0</span> 笔</button>
+          <button class="btn ghost" onclick="chatTransferCancel()">取消</button>
+          <span class="muted" id="ct-msg" style="font-size:12px"></span>
+        </div>
+      </div>
+    </div>`);
+  chatTransferCount();
+  stream.scrollTop = stream.scrollHeight;
+}
+
+function chatTransferCollect() {
+  const out = [];
+  const card = $('chat-transfer-card');
+  if (!card) return out;
+  card.querySelectorAll('tbody tr').forEach(tr => {
+    const i = tr.dataset.row;
+    const chk = $('ct-chk-' + i);
+    if (!chk || !chk.checked) return;
+    out.push({
+      date: ($('ct-date-' + i).value || '').trim(),
+      side: $('ct-side-' + i).value,
+      amount: Number($('ct-amt-' + i).value),
+      currency: $('ct-ccy-' + i).value,
+      account: tr.dataset.account || '',
+      note: ($('ct-note-' + i).value || '').trim(),
+      force: tr.dataset.dup === '1'
+    });
+  });
+  return out;
+}
+
+function chatTransferCount() {
+  const n = chatTransferCollect().length;
+  const el = $('ct-n');
+  if (el) el.textContent = n;
+  return n;
+}
+
+function chatTransferRemove(i) {
+  const tr = document.querySelector('#chat-transfer-card tbody tr[data-row="' + i + '"]');
+  if (tr) tr.remove();
+  chatTransferCount();
+}
+
+function chatTransferCancel() {
+  const c = $('chat-transfer-card');
+  if (c) c.remove();
+  chatTransferRows = [];
+}
+
+async function chatTransferCommit() {
+  if (chatTransferDone) return;
+  const rows = chatTransferCollect();
+  if (!rows.length) { toast('没有勾选任何行', 'err'); return; }
+  const btn = $('ct-commit'), msg = $('ct-msg');
+  if (btn) btn.disabled = true;
+  if (msg) msg.textContent = '写入中…';
+  try {
+    const r = await jsonPost('/api/chat/transfer-commit', { sid: chatSid, rows });
+    chatTransferDone = true;
+    const why = [...(r.rejected || []), ...(r.failed || [])].map(x => x.why);
+    let detail = r.message || '已录入';
+    if (why.length) detail += '｜跳过：' + why.join('；');
+    if (msg) { msg.textContent = detail; msg.style.color = 'var(--up)'; }
+    if (btn) btn.textContent = '已提交';
+    toast(r.message || '已录入', 'ok');
+    try { await loadCashFlows(); } catch (e) { }
+  } catch (e) {
+    if (btn) btn.disabled = false;
+    if (msg) msg.textContent = '录入失败：' + e.message;
+    toastErr('录入失败：' + e.message);
+  }
 }
 
 // ---------- 实盘快照 / 操作胜率（trade_snapshot.py，2026-11-11） ----------
@@ -6645,7 +6780,7 @@ async function loadSnapshotSummary() {
         <div class="jq-metric"><div class="jq-metric-v">${w.total || 0}</div><div class="jq-metric-k">流水笔数</div></div>
       </div>
       <div>买入 <b>${_snWinLine(b)}</b>　·　卖出 <b>${_snWinLine(s)}</b>
-        　<span class="faint">（现价 ${esc(d.asof || '')}；HKD/CNY ${d.fx}${d.fx_source === 'fallback' ? ' 兜底' : ''}）</span></div>
+        　<span class="faint">（现价 ${esc(fmtTs(d.asof))}；HKD/CNY ${d.fx}${d.fx_source === 'fallback' ? ' 兜底' : ''}）</span></div>
       ${(d.missing_prices || []).length ? `<div style="color:var(--warn);margin-top:4px">⚠ 缺现价、未计胜率：${esc((d.missing_prices || []).join(', '))}</div>` : ''}
       ${tops(d.top_winners, '最赚的几笔')}${tops(d.top_losers, '最亏的几笔')}
       ${months ? `<div style="overflow-x:auto;margin-top:8px"><table class="tbl" style="width:100%"><thead><tr>
@@ -6774,9 +6909,10 @@ function renderSnapshotReport(r) {
         「当前持仓市值 + 真实资金流」口径。若调整后仍对不上券商 App，差的是基准日现金、
         未记录的资金流或费用汇兑。下面的差额与胜率不受出入金影响。</div>
       ${realLine}
-      ${r.asof ? `<div class="faint">按 ${esc(r.asof)} 的最新收盘价计算；换一天再看数字会变</div>` : ''}
+      ${r.asof ? `<div class="faint">按 ${esc(fmtTs(r.asof))} 的最新收盘价计算；换一天再看数字会变</div>` : ''}
     </div>`;
-  const rows = (r.by_code || []).slice(0, 15).map(x => `<tr>
+  // 全量显示（默认不再截 15 行）；后端已按差额绝对值倒序，最伤的排最前
+  const rows = (r.by_code || []).map(x => `<tr>
     <td>${esc(x.code)} <span class="faint">${esc(x.name || '')}</span></td>
     <td>${x.shares_base} → ${x.shares_now}</td>
     <td>${fmtPx(x.price_base)} → ${fmtPx(x.price_now)}</td>
@@ -6808,7 +6944,7 @@ function renderSnapshotReport(r) {
     ${(r.missing_prices || []).length || r.incomplete_count
       ? `<div style="color:var(--warn);margin-bottom:6px">⚠ ${r.incomplete_count || 0} 只票价格不全（${esc((r.missing_prices || []).join(', '))}），相关金额按可得价格计算，未编造 0 价。</div>` : ''}
     ${rows ? `<div style="overflow-x:auto"><table class="tbl" style="width:100%"><thead><tr>
-      <th>股票</th><th>股数 基准→现在</th><th>价格 基准→现在</th><th>躺平收益</th><th>实际收益</th><th>差额</th>
+      <th>股票（全部 ${(r.by_code || []).length} 只，按差额大小排序）</th><th>股数 基准→现在</th><th>价格 基准→现在</th><th>躺平收益</th><th>实际收益</th><th>差额</th>
       </tr></thead><tbody>${rows}</tbody></table></div>`
       : '<div class="empty">该快照之后还没有交易流水</div>'}
     <div class="faint" style="margin-top:8px">${(r.caveats || []).map(esc).join('<br>')}</div>`;
@@ -6928,6 +7064,7 @@ async function loadCashFlows() {
     }
     $('cf-meta').textContent = `${d.flows.length} 笔 · HKD/CNY ${d.fx}${d.fx_source === 'fallback' ? '（兜底）' : ''}`;
     renderCashFlowSummary(d.summary || {});
+    renderCashFlowMonthly((d.summary || {}).by_month || []);
     renderCashFlowList(d.flows || []);
   } catch (e) {
     box.innerHTML = `<span style="color:var(--up)">加载失败：${esc(e.message || e)}</span>`
@@ -6949,28 +7086,74 @@ function renderCashFlowSummary(s) {
       HKD 入 ${_cfAmt(h.in)} / 出 ${_cfAmt(h.out)} / 净 ${_cfAmt(h.net)}。港币折 CNY 见上方汇总。</div>`;
 }
 
+// 按月统计（2026-11-20 用户要求：方便看哪个月入金最多）。
+// 数据来自后端 summarize().by_month（已是折 CNY 口径，HKD 按 fx 折算）；
+// 这里只做展示：最近月份在上，入金最多的月份整行高亮 + 徽标。
+function renderCashFlowMonthly(byMonth) {
+  const box = $('cf-monthly');
+  if (!box) return;
+  const rows = (byMonth || []).slice().reverse();   // 后端按月升序 → 展示倒序
+  if (!rows.length) {
+    box.innerHTML = '<div class="empty">还没有按月数据。记一笔就有了。</div>';
+    return;
+  }
+  const maxIn = Math.max(...rows.map(r => Number(r.in_cny) || 0));
+  const top = rows.filter(r => (Number(r.in_cny) || 0) > 0 && (Number(r.in_cny) || 0) === maxIn);
+  const topKeys = new Set(top.map(r => r.month));
+  const take = top.length
+    ? `<div class="faint" style="margin-top:6px">⭐ 入金最多的月份：<b>${esc(top.map(r => r.month).join('、'))}</b>
+         ${_snMoney(maxIn)}${top.length === 1 && top[0].count ? `（${top[0].count} 笔）` : ''}</div>`
+    : '';
+  const body = rows.map(r => {
+    const inV = Number(r.in_cny) || 0, outV = Number(r.out_cny) || 0, netV = Number(r.net_cny) || 0;
+    const isTop = topKeys.has(r.month);
+    return `<tr${isTop ? ' style="background:rgba(255,214,0,.10)"' : ''}>
+      <td><b>${esc(r.month)}</b>${isTop ? ' <span class="badge" style="background:#fff3c4;color:#8a6d00">⭐ 入金最多</span>' : ''}</td>
+      <td style="color:${inV > 0 ? 'var(--up)' : 'inherit'}">${_snMoney(inV)}</td>
+      <td style="color:${outV > 0 ? 'var(--down)' : 'inherit'}">${_snMoney(outV)}</td>
+      <td style="color:${_snColor(netV)}">${_snMoney(netV, true)}</td>
+      <td class="muted">${r.count || 0}</td>
+    </tr>`;
+  }).join('');
+  box.innerHTML = `${take}
+    <div style="overflow-x:auto"><table class="tbl" style="width:100%"><thead><tr>
+      <th>月份</th><th>入金(折CNY)</th><th>出金(折CNY)</th><th>净额</th><th>笔数</th>
+      </tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+// 当前流水的本地快照：编辑弹窗按 id 从这里取原值，不把整条记录塞进 onclick
+let _CF_ROWS = [];
+
 function renderCashFlowList(flows) {
   const box = $('cf-list');
   if (!box) return;
-  if (!flows.length) {
+  _CF_ROWS = flows || [];
+  if (!_CF_ROWS.length) {
     box.innerHTML = '<div class="empty">还没记过银证转账。点右上「➕ 记一笔」把银行↔券商的入金/出金补上，快照报告就能和账户对账。</div>';
     return;
   }
-  const rows = flows.map(f => `<tr>
-    <td>${esc(f.date)}</td>
+  const rows = _CF_ROWS.map(f => `<tr>
+    <td>${esc(fmtTs(f.date))}</td>
     <td style="color:${f.side === 'in' ? 'var(--up)' : 'var(--down)'}">${f.side === 'in' ? '入金' : '出金'}</td>
     <td>${_cfAmt(f.amount)} ${esc(f.currency)}</td>
     <td>${esc(f.account || '')}</td><td>${esc(f.note || '')}</td>
-    <td><button class="btn ghost" style="font-size:11px;padding:2px 7px" onclick="cashFlowDelete('${esc(f.id)}')">删除</button></td>
+    <td style="white-space:nowrap">
+      <button class="btn ghost" style="font-size:11px;padding:2px 7px" onclick="cashFlowEdit('${esc(f.id)}')">修改</button>
+      <button class="btn ghost" style="font-size:11px;padding:2px 7px;margin-left:4px" onclick="cashFlowDelete('${esc(f.id)}')">删除</button>
+    </td>
   </tr>`).join('');
   box.innerHTML = `<div style="overflow-x:auto"><table class="tbl" style="width:100%"><thead><tr>
-    <th>日期</th><th>方向</th><th>金额(原币)</th><th>账户</th><th>备注</th><th>操作</th>
+    <th>时间</th><th>方向</th><th>金额(原币)</th><th>账户</th><th>备注</th><th>操作</th>
     </tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
 async function cashFlowAdd() {
+  const _n = new Date(), _p = n => String(n).padStart(2, '0');
   const v = await formDlg('记一笔银证转账', [
     { key: 'date', label: '日期', type: 'date', value: _snTodayStr(), required: true },
+    { key: 'time', label: '时刻', type: 'time', step: '1',
+      value: `${_p(_n.getHours())}:${_p(_n.getMinutes())}:${_p(_n.getSeconds())}`,
+      hint: '转账发生的时分秒；对账按日归属，时刻用于同日多笔排序' },
     { key: 'side', label: '方向', type: 'select', options: ['入金', '出金'], value: '入金' },
     { key: 'amount', label: '金额（原币）', type: 'number', step: '0.01', value: '', required: true,
       hint: '只记银行↔券商之间的转账，不要记买股票/卖股票' },
@@ -6983,12 +7166,47 @@ async function cashFlowAdd() {
   if (!isFinite(amount) || amount <= 0) { toastErr('金额必须是正数'); return; }
   try {
     const r = await jsonPost('/api/cash-flows', {
-      date: v.date, side: v.side === '入金' ? 'in' : 'out', amount,
+      date: v.time ? `${v.date} ${v.time}` : v.date,
+      side: v.side === '入金' ? 'in' : 'out', amount,
       currency: v.currency, account: v.account, note: v.note });
     toastOk(`已记 ${r.flow.date} ${v.side} ${_cfAmt(r.flow.amount)} ${r.flow.currency}`);
     await loadCashFlows();
     if (_SNAP.reportDate) await loadSnapshotReport(_SNAP.reportDate);
   } catch (e) { toastErr('记账失败: ' + (e.message || e)); }
+}
+
+// 2026-11-19：转账流水支持修改。走 PUT 全量回填（服务端保留原 id / created_at），
+// 改完刷新流水和已加载的快照报告 —— 期间净出入金、账户真实现金都是实时读台账算的。
+async function cashFlowEdit(id) {
+  const f = (_CF_ROWS || []).find(x => x.id === id);
+  if (!f) { toastErr('找不到这笔转账，点「刷新」后重试'); return; }
+  const v = await formDlg('修改银证转账', [
+    { key: 'date', label: '日期', type: 'date', value: (f.date || '').slice(0, 10), required: true,
+      hint: '改日期会同步改变快照报告里「期间净出入金」的计入区间' },
+    { key: 'time', label: '时刻', type: 'time', step: '1',
+      value: (f.date || '').length > 10 ? (f.date || '').slice(11) : '',
+      hint: '同日多笔转账按时刻排序' },
+    { key: 'side', label: '方向', type: 'select', options: ['入金', '出金'],
+      value: f.side === 'in' ? '入金' : '出金' },
+    { key: 'amount', label: '金额（原币）', type: 'number', step: '0.01',
+      value: String(f.amount), required: true,
+      hint: '只记银行↔券商之间的转账，不要记买股票/卖股票' },
+    { key: 'currency', label: '币种', type: 'select', options: ['CNY', 'HKD'], value: f.currency },
+    { key: 'account', label: '账户（可选）', value: f.account || '', placeholder: '如：A股 / 港股' },
+    { key: 'note', label: '备注（可选）', value: f.note || '', placeholder: '如：招行转银河' },
+  ], { okText: '保存修改' });
+  if (!v) return;
+  const amount = Number(v.amount);
+  if (!isFinite(amount) || amount <= 0) { toastErr('金额必须是正数'); return; }
+  try {
+    const r = await jsonPut('/api/cash-flows', {
+      id, date: v.time ? `${v.date} ${v.time}` : v.date,
+      side: v.side === '入金' ? 'in' : 'out', amount,
+      currency: v.currency, account: v.account, note: v.note });
+    toastOk(`已修改 ${r.flow.date} ${v.side} ${_cfAmt(r.flow.amount)} ${r.flow.currency}`);
+    await loadCashFlows();
+    if (_SNAP.reportDate) await loadSnapshotReport(_SNAP.reportDate);
+  } catch (e) { toastErr('修改失败: ' + (e.message || e)); }
 }
 
 async function cashFlowDelete(id) {
@@ -7045,7 +7263,7 @@ async function loadBrain() {
   let d;
   try { d = await api('/api/brain'); }
   catch (e) { $('brain-body').innerHTML = '<p class="muted">加载失败：' + e.message + '</p>'; return; }
-  $('brain-meta').textContent = '更新于 ' + (d.updated_at || '').replace('T', ' ');
+  $('brain-meta').textContent = '更新于 ' + fmtTs(d.updated_at);
   const on = (b, txt) => b
     ? '<span class="brain-on">● ' + (txt || '启用') + '</span>'
     : '<span class="brain-off">○ ' + (txt || '停用') + '</span>';
@@ -7187,7 +7405,7 @@ async function loadLiveAlerts(cachedItems) {
       const px = i.price != null ? `现价 ${fmtPx(i.price)}` : '';
       return `<span class="al-item" title="${esc(i.advice.why || '')}">${label}
         <span class="al-code" onclick="switchTab('holdings')">${i.code} ${esc(i.name || '')}</span>
-        ${px}${stale ? `<span class="al-old">（${i.advice.trade_date.slice(5)}判断）</span>` : ''}</span>`;
+        ${px}${stale ? `<span class="al-old">（${fmtTs(i.advice.trade_date, 'short')}判断）</span>` : ''}</span>`;
     });
     bar.innerHTML = `<span class="al-title">⚠️ 实盘告警</span>
       <span class="muted" style="color:#ffd5d5;font-size:11.5px">（引擎最新判断，点代码看详情 · ${parts.length} 项）</span><br>` + parts.join('');
@@ -7211,7 +7429,7 @@ async function loadIntraday(fetchFresh = false) {
     const staleness = d.in_session ? '' :
       (d.updated_at ? '（非交易时段，显示最后采样）' : '');
     $('intraday-meta').textContent =
-      (d.updated_at ? `采样 ${d.updated_at.replace('T', ' ').slice(5, 16)}` : '')
+      (d.updated_at ? `采样 ${fmtTs(d.updated_at, 'short')}` : '')
       + (d.quote_ts ? ` · 行情 ${d.quote_ts.replace('T', ' ').slice(11, 16)}` : '')
       + staleness;
     $('intraday-body').innerHTML = (d.boards || []).map(b => {
@@ -7952,7 +8170,7 @@ async function loadMarketVolIntraday() {
       ? `<b class="${_volColorOf(d.ratio)}">大盘 ${d.label || '—'} ${d.ratio}x</b>　` : '';
     const alert = d.last_alert ? `　<span class="muted">最近告警：${d.last_alert.label}（${(d.last_alert.time || '').slice(11, 16)}）</span>` : '';
     box.innerHTML = overall + parts.join('　') +
-      `<span class="muted">　实时量比 · ${d.updated_at ? d.updated_at.slice(11, 16) : ''} 采样</span>` + alert;
+      `<span class="muted">　实时量比 · ${d.updated_at ? fmtTs(d.updated_at).slice(11) : ''} 采样</span>` + alert;
   } catch { /* 静默 */ }
 }
 const _volColorOf = r => r == null ? 'muted' : (r >= 1.15 ? 'up' : r <= 0.9 ? 'down' : 'muted');
@@ -8334,7 +8552,7 @@ async function loadAdviceFollowup() {
       const gCell = g == null ? '<span class="muted">—</span>'
         : `<b class="${signCls(g)}">${signed(g)}</b>`;
       return `<tr>
-        <td class="muted">${(x.date || '').slice(5)}</td>
+        <td class="muted">${fmtTs(x.date, 'short')}</td>
         <td class="mono">${x.code}</td>
         <td>${esc(x.name || '')}</td>
         <td>${lab}${x.rows > 1 ? `<span class="muted" style="font-size:10px">×${x.rows}轮</span>` : ''}</td>
@@ -8449,7 +8667,7 @@ async function loadHoldings() {
           ${av.pending ? '<span class="muted" style="font-size:10px">待买回</span>' : ''}
           ${av.edge_pct != null && (av.action === 't_sell' || av.action === 't_buy')
             ? `<span class="muted" style="font-size:10px">差${av.edge_pct}%</span>` : ''}
-          ${stale ? `<div class="muted" style="font-size:10px">${(av.trade_date || '').slice(5)}</div>` : ''}
+          ${stale ? `<div class="muted" style="font-size:10px">${fmtTs(av.trade_date, 'short')}</div>` : ''}
         </td>`;
       }
       const mvCny = i.market_value_cny ?? i.market_value;
@@ -8636,19 +8854,21 @@ async function addTrade() {
   if (!shares || +shares < 1) { toast('请输入股数（≥1）'); return; }
   if (!price || +price <= 0) { toast('请输入成交价（>0）'); return; }
   const strategyId = $('t-strategy').value;
+  // 2026-11-20 时间戳升级：日期+时刻合并成完整时间戳；日期留空按今天
+  const _d = $('t-date').value || _snTodayStr(), _tm = $('t-time').value;
   const body = {
     code,
     side,
     shares: +shares,
     price: +price,
-    trade_date: $('t-date').value,
+    trade_date: _tm ? `${_d} ${_tm}` : _d,
     note: $('t-note').value.trim(),
   };
   if (strategyId) body.strategy_id = +strategyId;
   try {
     await api('/api/trades', { method: 'POST',
       headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    ['t-code', 't-shares', 't-price', 't-date', 't-note'].forEach(id => $(id).value = '');
+    ['t-code', 't-shares', 't-price', 't-date', 't-time', 't-note'].forEach(id => $(id).value = '');
     $('t-strategy').value = '';
     $('t-date').type = 'text';
     // 交易日期留空=今天：日期在锚点基准日之后时，这笔的现金流会自动叠加到
@@ -8730,7 +8950,7 @@ async function showTrades(code) {
                     ? ` 已到${t.strategy_ladder_step}档` : ''))) + '</span>'
           : '';
         return `<tr>
-        <td class="muted">${t.trade_date}</td>
+        <td class="muted">${fmtTs(t.trade_date)}${t.created_at ? `<div style="font-size:10px">录 ${fmtTs(t.created_at)}</div>` : ''}</td>
         <td class="${t.side === 'buy' ? 'up' : 'down'}" style="font-weight:600">${t.side === 'buy' ? '买入' : '卖出'}</td>
         <td>${fmt(t.shares)} 股</td>
         <td>@ ${fmtPx(t.price)}</td>
@@ -8906,7 +9126,7 @@ async function loadStrategies() {
         <td>${s.used_count}</td>
         <td>${s.pos_count ? `<span title="整仓策略关联数">🏦${s.pos_count}</span>` : '0'}</td>
         <td>${s.triggered_count ? `<b class="up">${s.triggered_count}</b>` : '0'}</td>
-        <td class="muted">${(s.created_at || '').replace('T', ' ').slice(0, 16)}</td>
+        <td class="muted">${fmtTs(s.created_at)}</td>
         <td>${(s.used_count + (s.pos_count || 0)) === 0
           ? `<button class="del" onclick="delStrategy(${s.id})" title="删除策略">×</button>` : ''}</td>
       </tr>`).join('');
@@ -9065,7 +9285,7 @@ async function showAdviceHistory(id) {
       box.innerHTML = '<div class="muted">还没有历史建议</div>';
     } else {
       box.innerHTML = rows.map(r => `<details style="margin:3px 0">
-        <summary style="cursor:pointer">${esc(r.created_at.replace('T', ' '))}
+        <summary style="cursor:pointer">${esc(fmtTs(r.created_at))}
           · ${esc(r.model || '')} · ${r.auto ? '自动' : '手动'} · #${r.id}</summary>
         <div style="white-space:pre-wrap;word-break:break-word;color:var(--text-2);
              padding:4px 0 4px 10px;border-left:2px solid var(--border)">${esc(r.brief || '')}…</div>
@@ -9100,7 +9320,7 @@ async function genPlanAdvice(id) {
     if (box) {
       box.classList.remove('hide');
       box.innerHTML = `<b style="font-size:12px">🤖 AI 建议（${esc(r.model)} · `
-        + `${(r.created_at || '').replace('T', ' ')} · 手动）</b>\n` + esc(r.content);
+        + `${fmtTs(r.created_at)} · 手动）</b>\n` + esc(r.content);
     }
     toast('AI 建议已生成');
   } catch (e) {
@@ -9435,7 +9655,7 @@ async function loadCalendar() {
     const sy = d.sync || {};
     const es = d.earn_sync || {};
     const sline = $('calendar-sync-line');
-    const ts16 = v => String(v || '').replace('T', ' ').slice(0, 16);
+    const ts16 = v => fmtTs(v);
     const parts = [];
     parts.push(sy.last_synced_at
       ? `CPI 自动同步：${ts16(sy.last_synced_at)} · 排期 ${sy.event_count} 条`
@@ -9732,6 +9952,58 @@ function showPaperReport(key) {
   });
 }
 
+// ---- 决策理由 / LLM 报告懒加载（2026-11-20）----
+// 列表接口（/api/paper/rounds、/api/paper/trades）只传 160 字预览 + 全文长度；
+// 点开才按 sa_paper_trades.id 取全文（GET /api/paper/trade-text）。
+// 根因：decision_raw 是 jsonb 大文本（200 行 1.7MB），整包回传跨公网 13~18s，
+// 把模拟盘 tab 的 Promise.all 拖死 → 持仓表永远渲染不出来。
+// 已取过的行缓存在这里，内联展开与弹窗共用。
+const _paperTextCache = {};
+async function fetchPaperText(id) {
+  if (_paperTextCache[id]) return _paperTextCache[id];
+  const d = await api('/api/paper/trade-text?ids=' + encodeURIComponent(id));
+  const it = (d.items || [])[0];
+  if (!it) throw new Error('没有取到该行全文');
+  _paperTextCache[id] = it;
+  return it;
+}
+// 超出预览长度才给「展开全文」按钮；无 id（异常行）不渲染按钮
+function lazyReasonBtn(t) {
+  const head = (t && t.reasoning_head) || '';
+  const n = (t && t.reasoning_len) || 0;
+  if (!t || !t.id || n <= head.length) return '';
+  return `… <button class="link-btn" style="font-size:12px" onclick="expandPaperReason(this, ${t.id})">展开全文(${n}字)</button>`;
+}
+async function expandPaperReason(btn, id) {
+  try {
+    btn.disabled = true; btn.textContent = '加载中…';
+    const it = await fetchPaperText(id);
+    btn.parentElement.innerHTML = esc(it.reasoning || '（无）');
+  } catch (e) {
+    btn.disabled = false; btn.textContent = '展开全文(重试)';
+    toastErr(e.message || String(e));
+  }
+}
+async function openPaperReportLazy(btn, id, side, label, code) {
+  try {
+    btn.disabled = true; btn.textContent = '报告加载中…';
+    const it = await fetchPaperText(id);
+    const txt = (it.report || '').trim();
+    if (!txt) {
+      btn.parentElement.insertAdjacentHTML('beforeend',
+        `<div class="muted" style="font-size:11px;margin-top:4px">${esc(label)}：免 LLM 自动执行，无分析报告</div>`);
+      btn.remove();
+      return;
+    }
+    showPaperReport(putPaperReport(code, side, txt, label));
+    btn.disabled = false;
+    btn.textContent = `📄 ${label}（全文 ${txt.length} 字）`;
+  } catch (e) {
+    btn.disabled = false; btn.textContent = '📄 加载失败，点重试';
+    toastErr(e.message || String(e));
+  }
+}
+
 function renderPaperRounds() {
   const all = window.__paperRounds || [];
   const box = $('paper-rounds');
@@ -9762,10 +10034,11 @@ function renderPaperRounds() {
         : '<span class="badge" style="background:#eee;color:#666">已平仓</span>');
     const exitCell = x
       ? `<div><b>${x.price}</b> × ${fmt(x.shares)}</div>
-         <div class="muted">${x.date}${x.slot ? ' ' + x.slot : ''} · 费 ${x.fee}</div>`
+         <div class="muted">${fmtTs(x.date)}${x.slot ? ' ' + esc(x.slot) : ''} · 费 ${x.fee}</div>`
       : '<span class="muted">尚未卖出</span>';
     // 理由单元格带上决策时刻 + 「多久之前」（2026-10-08）。
     // 时刻取不到就只显示理由本身，不显示破折号占位（那看着像 bug）。
+    // 2026-11-20 懒加载：t.reasoning_head 是 160 字预览，超出给「展开全文」。
     const reasonCell = (t, label) => {
       if (!t) return '<span class="muted">（无）</span>';
       const at = paperDecisionAt(t), day = paperDecisionDay(t), age = paperDecisionAge(t);
@@ -9773,8 +10046,8 @@ function renderPaperRounds() {
         ? `<div class="muted" style="font-size:11px;line-height:1.4">
              ${esc(label || '决策')} ${esc(day)}${at ? ' ' + esc(at) : ''}${age ? ' · ' + esc(age) : ''}
            </div>` : '';
-      const body = t.reasoning
-        ? `<div style="font-size:12px;line-height:1.5">${esc(t.reasoning)}</div>`
+      const body = t.reasoning_head
+        ? `<div style="font-size:12px;line-height:1.5">${esc(t.reasoning_head)}${lazyReasonBtn(t)}</div>`
         : '<span class="muted">（无理由）</span>';
       return stamp + body;
     };
@@ -9783,16 +10056,16 @@ function renderPaperRounds() {
     // 整张回合卡片撑成一大坨、把下面的行顶出屏幕；弹窗限高滚动更稳。
     // 卖出侧以前根本没有这个框 —— 卖出也是跑过分析师的（只有**免 LLM 的盘中止损**
     // 没有报告），于是「为什么卖」永远只能看一行 reasoning 摘要。
+    // 2026-11-20 懒加载：列表只带 report_len，点按钮才取全文（fetchPaperText
+    // → putPaperReport → showPaperReport）；report_len=0 = 免 LLM，不发请求。
     const reportBlock = (t, side, label) => {
       if (!t) return '';
-      const txt = (t.report || '').trim();
-      if (!txt) {
+      const n = t.report_len || 0;
+      if (!n) {
         return `<div class="muted" style="font-size:11px;margin-top:4px">${esc(label)}：免 LLM 自动执行，无分析报告</div>`;
       }
-      const n = t.report_len || txt.length;
-      const key = putPaperReport(r.code, side, txt, label);
       return `<button class="link-btn" style="margin-top:6px;font-size:12px"
-        onclick="showPaperReport('${esc(key)}')">📄 ${esc(label)}（全文 ${n} 字）</button>`;
+        onclick="openPaperReportLazy(this, ${t.id}, '${esc(side)}', '${esc(label)}', '${esc(r.code || '')}')">📄 ${esc(label)}（全文 ${n} 字）</button>`;
     };
     return `<div class="card" style="margin:8px 0;padding:10px 12px">
       <div class="row" style="justify-content:space-between;align-items:center;gap:8px">
@@ -9828,7 +10101,7 @@ function renderPaperRounds() {
               <td><span class="badge" style="background:#e5f3e2;color:#1e7d32">卖出</span></td>
               <td><b>${x.price}</b></td><td>${fmt(x.shares)}</td>
               <td>${money(x.net_out)}<div class="muted">扣费 ${x.fee}</div></td>
-              <td class="muted">${x.date}${x.slot ? ' ' + x.slot : ''}</td>
+              <td class="muted">${fmtTs(x.date)}${x.slot ? ' ' + esc(x.slot) : ''}</td>
               <td>${x.confidence != null ? x.confidence : '—'}</td>
               <td class="muted">—</td>
               <td style="white-space:normal;min-width:260px">${reasonCell(x, '卖出决策')}</td>
@@ -10444,7 +10717,7 @@ function renderAnchorRecent(rows) {
     const tag = isT ? ' <span class="badge b-info">做T</span>'
       : isSeed ? ' <span class="badge b-info">镜像</span>' : '';
     return `<tr>
-      <td>${esc(r.trade_date)}</td><td class="muted">${esc(r.slot) || '—'}</td>
+      <td>${esc(fmtTs(r.trade_date))}</td><td class="muted">${esc(r.slot) || '—'}</td>
       <td>${side}${tag}</td><td>${fmt(r.shares)}</td><td>${fmtPx(r.price)}</td>
       <td>${fmt(r.value)}</td>
       <td>${r.status === 'open' ? '<span class="badge b-ok">持仓</span>'
@@ -10753,7 +11026,7 @@ function renderTLog() {
       <td class="num">${tInt(c.total)}</td>
       <td class="num" title="高抛/${tInt(c.t_sell)} 接回/${tInt(c.t_buy)} · 趋势减仓/${tInt(c.trend_reduce)} 止损/${tInt(c.hard_stop)} 深亏提示/${tInt(c.trend_wait)} 不做/${tInt(c.hold)}"
         >${tInt(c.t_sell)}/${tInt(c.t_buy)} · ${tInt(c.trend_reduce)}/${tInt(c.hard_stop)}/${tInt(c.trend_wait)}/${tInt(c.hold)}</td>
-      <td class="muted" style="font-size:12px">${esc(String(c.last_created_at || '').replace('T', ' ').slice(5, 16))}</td>
+      <td class="muted" style="font-size:12px">${esc(fmtTs(c.last_created_at, 'short'))}</td>
       <td><span class="badge ${a.c}">${a.t}</span> <span class="badge ${b.c}">${b.t}</span></td>
       <td class="num">${tPx(c.last_price)}</td>
       <td class="num ${cls(c.last_edge_pct)}">${tPct(c.last_edge_pct)}</td>
@@ -10784,7 +11057,7 @@ async function tLogOpenHist(code) {
     const b = T_BIAS[h.bias] || T_BIAS.flat;
     const a = T_ACT[h.action] || T_ACT.hold;
     return `<tr>
-      <td class="mono" style="font-size:12px">${esc(String(h.created_at || '').replace('T', ' ').slice(5, 19))}</td>
+      <td class="mono" style="font-size:12px">${esc(fmtTs(h.created_at, 'short'))}</td>
       <td class="muted">${esc(h.run_type === 'bg' ? '后台' : (h.run_type === 'api' ? '页面' : (h.run_type || '')))}</td>
       <td><span class="badge ${a.c}">${a.t}</span></td>
       <td><span class="badge ${b.c}">${b.t}</span></td>
@@ -10910,6 +11183,9 @@ function openTRecord(code, side) {
     { key: 'shares', label: '股数', type: 'number', value: '' },
     { key: 'price', label: '成交价', type: 'number', step: '0.0001', value: '' },
     { key: 'date', label: '日期', type: 'date', value: today },
+    { key: 'time', label: '时刻', type: 'time', step: '1',
+      value: `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`,
+      hint: '成交发生的时分秒（2026-11-20 起台账带时刻）' },
     { key: 'note', label: '备注', value: '', placeholder: '可选' },
   ], { okText: '记入台账', wide: true });
   Promise.resolve(v).then(async val => {
@@ -10920,7 +11196,7 @@ function openTRecord(code, side) {
         side: val.side,
         shares: parseInt(val.shares, 10),
         price: parseFloat(val.price),
-        trade_date: val.date || '',
+        trade_date: val.time ? `${val.date} ${val.time}` : (val.date || ''),
         note: (val.note || '').trim(),
       };
       if (!body.code) throw new Error('请填代码');
@@ -11027,7 +11303,9 @@ async function loadPaper() {
             ${(day || at) ? `<div class="muted" style="font-size:11px;margin-bottom:4px">
               ${esc(whenVerb)}于 ${esc(day)}${at ? ' ' + esc(at) : ''}${age ? ' · ' + esc(age) : ''}
             </div>` : ''}
-            <div style="line-height:1.5">${esc(t.reasoning || '（无）')}</div>
+            <div style="line-height:1.5">${t.reasoning_head
+              ? esc(t.reasoning_head) + lazyReasonBtn(t)
+              : '<span class="muted">（无）</span>'}</div>
           </div>
         </details></td>
       </tr>`;
@@ -11174,7 +11452,7 @@ async function loadPaperCycles() {
       const skipped = String(c.note || '').startsWith('⏭');
       const running = !!c.note && !c.planned && !(c.breakdown || []).length && !skipped;
       return `<tr${running ? ' style="background:var(--bg2)"' : ''}>
-        <td class="tabular-nums">${esc((c.trade_date || '').slice(5))} ${esc(c.slot)}</td>
+        <td class="tabular-nums">${esc(fmtTs(c.trade_date, 'short'))} ${esc(c.slot)}</td>
         <td>${KIND[c.kind] || esc(c.kind)}</td>
         <td class="muted">${esc(c.trigger || '')}</td>
         <td class="tabular-nums">${plannedCell}</td>
@@ -11304,7 +11582,7 @@ async function loadNews() {
           ${rel ? `<span style="margin-left:4px">${rel}</span>` : ''}
         </span>
         <span class="badge b-${n.source}">${SOURCE_LABEL[n.source] || n.source}</span>
-        <span class="muted">${(n.publish_time || n.fetched_at || '').replace('T', ' ').slice(0, 16)}</span>
+        <span class="muted">${fmtTs(n.publish_time || n.fetched_at)}</span>
       </div>`;
     }).join('');
   } catch (e) { toastErr('加载新闻失败: ' + e.message); }
@@ -11460,11 +11738,35 @@ let _cryptoLinks = {};   // contract -> {stock_code,label,quote,stats}
 // ISO 时间串 → 本地时区 'YYYY-MM-DD HH:mm'。⚠️ 直接 slice(0,16) 拿的是 UTC 墙钟，
 // 对 UTC+8 会整整偏早 8 小时（公众号/模拟盘流水都踩过这个坑）。
 function fmtLocalTs(ts) {
+  // 2026-11-20 起统一走 fmtTs（带秒）；本函数保留为分钟粒度兼容出口。
   if (!ts) return '';
-  const d = new Date(ts);
-  if (isNaN(d)) return String(ts);
+  return fmtTs(ts).slice(0, 16);
+}
+
+// 2026-11-20 全系统时间戳升级：所有时间统一显示带时分秒。
+//   fmtTs(v)          → 'YYYY-MM-DD HH:MM:SS'
+//   fmtTs(v,'short')  → 'MM-DD HH:MM:SS'（紧凑表格）
+//   fmtTs(v,'date')   → 'YYYY-MM-DD'（日粒度字段：基准日/快照日）
+// 带时区尾巴（Z / ±HH:MM）的串经 Date 换算成本地墙钟；无时区的串视为本地
+// 墙钟原样归一（绝不 slice 直截 UTC 串 —— 偏 8 小时的坑踩过很多次）。
+// 日粒度字段（asof_date / 快照日）请传 'date'，避免补出 00:00:00 假时刻。
+function fmtTs(v, mode = 'full') {
+  if (v == null || v === '') return '';
+  const raw = String(v).trim().replace('T', ' ');
   const p = n => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  if (/(?:Z|z|[+-]\d{2}:?\d{2})$/.test(raw)) {
+    const d = new Date(raw);
+    if (isNaN(d)) return String(v);
+    const s = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    return mode === 'date' ? s.slice(0, 10) : (mode === 'short' ? s.slice(5) : s);
+  }
+  const m = raw.match(/^(\d{4})-(\d{2})-(\d{2})(?: (\d{2}):(\d{2})(?::(\d{2}))?)?/);
+  if (!m) return String(v);
+  const day = `${m[1]}-${m[2]}-${m[3]}`;
+  const tm = `${p(m[4] || 0)}:${p(m[5] || 0)}:${p(m[6] || 0)}`;
+  if (mode === 'date') return day;
+  if (mode === 'short') return `${day.slice(5)} ${tm}`;
+  return `${day} ${tm}`;
 }
 
 async function loadFutures() {
@@ -11480,9 +11782,9 @@ async function loadFutures() {
       <td class="muted num">${fmtPx(i.high)}</td>
       <td class="muted num">${fmtPx(i.low)}</td>
       <td class="muted num">${i.vol != null ? Number(i.vol).toFixed(0) : '—'}</td>
-      <td class="muted">${esc(fmtLocalTs(i.ts))}</td>
+      <td class="muted">${esc(fmtTs(i.ts))}</td>
     </tr>`).join('');
-    $('futures-meta').textContent = d.updated_at ? '更新于 ' + fmtLocalTs(d.updated_at) : '';
+    $('futures-meta').textContent = d.updated_at ? '更新于 ' + fmtTs(d.updated_at) : '';
   } catch (e) { $('futures-meta').textContent = '加载失败: ' + e.message; }
 }
 
@@ -11501,9 +11803,9 @@ async function loadFx() {
       <td class="muted num">${fmtPx(i.bid)}</td>
       <td class="muted num">${fmtPx(i.ask)}</td>
       <td class="muted num">${fmtPx(i.prev_close)}</td>
-      <td class="muted">${esc(fmtLocalTs(i.ts))}</td>
+      <td class="muted">${esc(fmtTs(i.ts))}</td>
     </tr>`).join('');
-    $('fx-meta').textContent = d.updated_at ? '更新于 ' + fmtLocalTs(d.updated_at) : '';
+    $('fx-meta').textContent = d.updated_at ? '更新于 ' + fmtTs(d.updated_at) : '';
   } catch (e) { $('fx-meta').textContent = '加载失败: ' + e.message; }
 }
 
@@ -11769,7 +12071,7 @@ async function loadCrypto(force = false) {
         <td class="muted"><button class="btn ghost sm" onclick="delCrypto('${esc(i.contract)}')">移除</button></td>
       </tr>`;
     }).join('');
-    $('crypto-meta').textContent = d.updated_at ? '更新于 ' + d.updated_at.replace('T', ' ') : '';
+    $('crypto-meta').textContent = d.updated_at ? '更新于 ' + fmtTs(d.updated_at) : '';
   } catch (e) { $('crypto-meta').textContent = '加载失败: ' + e.message; }
 }
 
@@ -12081,7 +12383,7 @@ async function loadMpSources() {
             title="${esc(s.url)}${s.feed_id ? ' · feed=' + esc(s.feed_id) : ''}">${esc(s.url)}${s.feed_id && s.feed_id !== 'all' ? ' · ' + esc(s.feed_id) : ''}</td>
         <td>${fresh}</td>
         <td>${s.unread ? `<b class="up">${s.unread}</b>` : '<span class="faint">0</span>'}</td>
-        <td class="muted">${s.last_run ? s.last_run.replace('T', ' ').slice(5, 16) : '—'}
+        <td class="muted">${s.last_run ? fmtTs(s.last_run, 'short') : '—'}
           ${s.last_count ? `<span class="faint">(${s.last_count})</span>` : ''}</td>
         <td><span class="badge ${st[0]}" title="${esc(s.last_error || '')}">${st[1]}</span>
           ${s.has_auth ? '<span class="badge b-mute" title="该源或全局配了鉴权">🔒</span>' : ''}</td>
@@ -12155,15 +12457,9 @@ async function loadMpArticles() {
     $('mp-list').innerHTML = items.map(a => {
       const ts = a.published_at || a.fetched_at || '';
       // ⚠️ 时区（2026-10-11 修）：接口给的是 ISO 带时区的串（如 2026-10-11T14:00+00:00），
-      // 服务器 TimeZone 是 Etc/UTC。**用 slice(0,16) 截字符串拿到的是 UTC 墙钟**，
-      // 对 UTC+8 的用户整整偏早 8 小时 —— 和模拟盘流水那个坑是同一类。
-      // 必须 new Date(ts) 走本地时区再格式化。
-      const when = ts ? new Date(ts) : null;
-      const tsText = when && !isNaN(when)
-        ? `${when.getFullYear()}-${String(when.getMonth()+1).padStart(2,'0')}-`
-          + `${String(when.getDate()).padStart(2,'0')} `
-          + `${String(when.getHours()).padStart(2,'0')}:${String(when.getMinutes()).padStart(2,'0')}`
-        : '';
+      // 服务器 TimeZone 是 Etc/UTC。**用 slice 截字符串拿到的是 UTC 墙钟**，
+      // 对 UTC+8 的用户整整偏早 8 小时 —— 统一走 fmtTs（带时区走 Date 换算），2026-11-20 起带秒。
+      const tsText = fmtTs(ts);
       // 时间来源标注：WeRSS 给的 published_at 是它自己的入库时刻（实测最大偏 32 小时），
       // 不标注的话看的人会当成发布时间。
       const srcMark = { wx: ['', '微信原文时间'],
@@ -12395,7 +12691,7 @@ async function loadMpStatus() {
     const s = await api('/api/mp/status');
     const el = $('mp-status');
     el.textContent = s.sources
-      ? `${s.sources} 个启用源${s.last_run ? ' · 上次 ' + s.last_run.replace('T', ' ').slice(5, 16) : ''}`
+      ? `${s.sources} 个启用源${s.last_run ? ' · 上次 ' + fmtTs(s.last_run, 'short') : ''}`
       : '暂无启用的订阅源';
   } catch { /* 静默 */ }
 }
@@ -12464,7 +12760,7 @@ function mprRenderHits(hits) {
   if (!hits || !hits.length) return '<div class="empty">没有命中</div>';
   return hits.map((h, i) => `<div class="card" style="margin:6px 0">
     <div><b>${i + 1}. ${esc(h.mp_name || '公众号')}</b>
-      <span class="muted">｜${esc((h.published_at || '').slice(0, 10))}</span>
+      <span class="muted">｜${esc(fmtTs(h.published_at))}</span>
       <span class="muted">｜${esc(h.title || '')}</span></div>
     <div class="muted" style="margin-top:4px">${esc((h.text || '').slice(0, 400))}</div>
     ${h.url ? `<div class="muted" style="margin-top:4px"><a href="${esc(h.url)}"
@@ -12512,7 +12808,7 @@ async function loadXStatus() {
       return;
     }
     el.textContent = `${s.accounts} 个账号 · 监听 ${s.watching} 人`
-      + (s.last_run ? ` · 上次 ${s.last_run.replace('T', ' ').slice(5, 16)}` : '');
+      + (s.last_run ? ` · 上次 ${fmtTs(s.last_run, 'short')}` : '');
   } catch { /* 静默 */ }
 }
 async function loadXAccounts() {
@@ -12622,7 +12918,7 @@ async function loadXTweets() {
           ${tags}
           <a href="${esc(t.url)}" target="_blank" rel="noopener"
              class="muted" style="font-size:12px">原文 ↗</a>
-          <span class="muted" style="margin-left:auto;font-size:12px">${ts.replace('T', ' ').slice(0, 16)}</span>
+          <span class="muted" style="margin-left:auto;font-size:12px">${fmtTs(ts)}</span>
         </div>
         <div class="dyn-text" style="cursor:pointer"
              onclick="markXReadOne(${t.id}, this)">${esc(t.text)}</div>
@@ -12811,7 +13107,7 @@ async function triggerFetch() {
 function renderNewsProgress(st) {
   const el = $('news-status');
   if (!st.fetching) {
-    el.textContent = st.last_run ? '上次抓取: ' + st.last_run.replace('T', ' ') : '';
+    el.textContent = st.last_run ? '上次抓取: ' + fmtTs(st.last_run) : '';
     el.title = healthTip(st.health);
     return;
   }
@@ -12941,7 +13237,7 @@ async function loadBiliDynamics() {
     $('bili-list').innerHTML = items.map(d => {
       const st = d.stats || {};
       const kind = DYN_TYPE_LABEL[d.dtype] || '动态';
-      const ts = (d.pub_ts || '').replace('T', ' ').slice(0, 16);
+      const ts = fmtTs(d.pub_ts);
       const title = d.title ? `<div class="dyn-text" style="font-weight:600">${esc(d.title)}</div>` : '';
       const text = d.text ? `<div class="dyn-text">${esc(d.text)}</div>` : '';
       const link = d.bvid ? `https://www.bilibili.com/video/${d.bvid}` : `https://t.bilibili.com/${d.dynamic_id}`;
@@ -12974,7 +13270,7 @@ async function toggleBiliComments(dynamicId, toggleEl, hintCount = 0) {
     box.innerHTML = rows.length ? rows.map(c => `
       <div class="dyn-cmt-item">
         <b>${esc(c.author || '匿名')}</b>
-        <span class="muted">· ${(c.pub_ts || '').replace('T', ' ').slice(5, 16)}</span>
+        <span class="muted">· ${fmtTs(c.pub_ts, 'short')}</span>
         <span class="muted" style="float:right">👍 ${fmt(c.like_count)}</span>
         <div>${esc(c.content)}</div>
       </div>`).join('')
@@ -13002,7 +13298,7 @@ async function loadBiliStatus() {
     const el = $('bili-status');
     if (st.fetching) { el.textContent = '抓取中…'; $('bili-fetch-btn').disabled = true; pollBiliStatus(); }
     else {
-      el.textContent = st.last_run ? '上次抓取: ' + st.last_run.replace('T', ' ') : '';
+      el.textContent = st.last_run ? '上次抓取: ' + fmtTs(st.last_run) : '';
       const r = st.last_result;
       if (r && r.error) el.textContent += ' · 上轮错误: ' + r.error.slice(0, 60);
       $('bili-fetch-btn').disabled = false;
@@ -13024,7 +13320,7 @@ function pollBiliStatus() {
     try {
       const st = await api('/api/bili/status');
       $('bili-status').textContent = st.fetching ? '抓取中…' :
-        (st.last_run ? '上次抓取: ' + st.last_run.replace('T', ' ') : '');
+        (st.last_run ? '上次抓取: ' + fmtTs(st.last_run) : '');
       if (!st.fetching) {
         clearInterval(timer);
         $('bili-fetch-btn').disabled = false;
@@ -13083,7 +13379,7 @@ async function loadWbPosts() {
     $('wb-empty').classList.toggle('hide', items.length > 0);
     $('wb-list').innerHTML = items.map(d => {
       const st = d.stats || {};
-      const ts = (d.pub_ts || '').replace('T', ' ').slice(0, 16);
+      const ts = fmtTs(d.pub_ts);
       const text = d.text ? `<div class="dyn-text">${esc(d.text)}</div>` : '';
       const link = `https://m.weibo.cn/detail/${d.note_id}`;
       return `
@@ -13114,7 +13410,7 @@ async function toggleWbComments(noteId, toggleEl, hintCount = 0) {
     box.innerHTML = rows.length ? rows.map(c => `
       <div class="dyn-cmt-item">
         <b>${esc(c.author || '匿名')}</b>
-        <span class="muted">· ${(c.pub_ts || '').replace('T', ' ').slice(5, 16)}</span>
+        <span class="muted">· ${fmtTs(c.pub_ts, 'short')}</span>
         <span class="muted" style="float:right">👍 ${fmt(c.like_count)}</span>
         <div>${esc(c.content)}</div>
       </div>`).join('')
@@ -13142,7 +13438,7 @@ async function loadWbStatus() {
     const el = $('wb-status');
     if (st.fetching) { el.textContent = '抓取中…'; $('wb-fetch-btn').disabled = true; pollWbStatus(); }
     else {
-      el.textContent = st.last_run ? '上次抓取: ' + st.last_run.replace('T', ' ') : '';
+      el.textContent = st.last_run ? '上次抓取: ' + fmtTs(st.last_run) : '';
       const r = st.last_result;
       if (r && r.error) el.textContent += ' · 上轮错误: ' + r.error.slice(0, 60);
       $('wb-fetch-btn').disabled = false;
@@ -13164,7 +13460,7 @@ function pollWbStatus() {
     try {
       const st = await api('/api/wb/status');
       $('wb-status').textContent = st.fetching ? '抓取中…' :
-        (st.last_run ? '上次抓取: ' + st.last_run.replace('T', ' ') : '');
+        (st.last_run ? '上次抓取: ' + fmtTs(st.last_run) : '');
       if (!st.fetching) {
         clearInterval(timer);
         $('wb-fetch-btn').disabled = false;
@@ -13197,7 +13493,7 @@ async function loadXhsNotes() {
     $('xhs-empty').classList.toggle('hide', items.length > 0);
     $('xhs-list').innerHTML = items.map(d => {
       const st = d.stats || {};
-      const ts = (d.pub_ts || '').replace('T', ' ').slice(0, 16);
+      const ts = fmtTs(d.pub_ts);
       const body = d.desc || '';
       const link = d.note_url || `https://www.xiaohongshu.com/explore/${d.note_id}`;
       return `
@@ -13229,7 +13525,7 @@ async function toggleXhsComments(noteId, toggleEl, hintCount = 0) {
     box.innerHTML = rows.length ? rows.map(c => `
       <div class="dyn-cmt-item">
         <b>${esc(c.author || '匿名')}</b>
-        <span class="muted">· ${(c.pub_ts || '').replace('T', ' ').slice(5, 16)}</span>
+        <span class="muted">· ${fmtTs(c.pub_ts, 'short')}</span>
         <span class="muted" style="float:right">❤️ ${fmt(c.like_count)}</span>
         <div>${esc(c.content)}</div>
       </div>`).join('')
@@ -13257,7 +13553,7 @@ async function loadXhsStatus() {
     const el = $('xhs-status');
     if (st.fetching) { el.textContent = '抓取中…'; $('xhs-fetch-btn').disabled = true; pollXhsStatus(); }
     else {
-      el.textContent = st.last_run ? '上次抓取: ' + st.last_run.replace('T', ' ') : '';
+      el.textContent = st.last_run ? '上次抓取: ' + fmtTs(st.last_run) : '';
       const r = st.last_result;
       if (r && r.error) el.textContent += ' · 上轮错误: ' + r.error.slice(0, 60);
       else if (r && r.warning) el.textContent += ' · ' + r.warning.slice(0, 60);
@@ -13361,7 +13657,7 @@ function pollXhsStatus() {
     try {
       const st = await api('/api/xhs/status');
       $('xhs-status').textContent = st.fetching ? '抓取中…' :
-        (st.last_run ? '上次抓取: ' + st.last_run.replace('T', ' ') : '');
+        (st.last_run ? '上次抓取: ' + fmtTs(st.last_run) : '');
       if (!st.fetching) {
         clearInterval(timer);
         $('xhs-fetch-btn').disabled = false;
@@ -13592,7 +13888,7 @@ async function refreshWxChat() {
     box.innerHTML = items.map(m => `<div class="mood-entry">
       <div class="mood-meta">
         <span class="badge ${m.direction === 'in' ? 'b-info' : 'b-ok'}">${m.direction === 'in' ? '收到' : '回复'}</span>
-        <span class="mono">${esc(String(m.created_at).slice(5, 16).replace('T',' '))}</span>
+        <span class="mono">${esc(fmtTs(m.created_at, 'short'))}</span>
         ${m.merged > 1 ? `<span class="faint">合并 ${m.merged} 条</span>` : ''}
         <span class="faint">${esc(String(m.user_id).slice(0, 22))}</span>
       </div>

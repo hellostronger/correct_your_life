@@ -238,7 +238,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS sa_trades (
         id          BIGSERIAL PRIMARY KEY,
         code        VARCHAR(8) NOT NULL,
-        trade_date  DATE NOT NULL,
+        trade_date  TIMESTAMP NOT NULL,
         side        VARCHAR(4) NOT NULL CHECK (side IN ('buy', 'sell')),
         shares      INTEGER NOT NULL CHECK (shares > 0),
         price       NUMERIC(12,4) NOT NULL CHECK (price > 0),
@@ -527,7 +527,7 @@ def init_db():
         binding_id   BIGINT      NOT NULL REFERENCES sa_paper_strategy_bindings(id) ON DELETE CASCADE,
         strategy_id  BIGINT      NOT NULL,
         code         VARCHAR(8)  NOT NULL,
-        exit_date    DATE        NOT NULL,
+        exit_date    TIMESTAMP   NOT NULL,
         exit_slot    VARCHAR(8)  NOT NULL DEFAULT '',
         price        NUMERIC(12,4)   NOT NULL,
         base_cost    NUMERIC(12,4)   NOT NULL,
@@ -576,7 +576,7 @@ def init_db():
         id            BIGSERIAL PRIMARY KEY,
         code          VARCHAR(8) NOT NULL,
         name          VARCHAR(64) NOT NULL DEFAULT '',
-        trade_date    DATE NOT NULL,
+        trade_date    TIMESTAMP NOT NULL,           -- 2026-11-20 起带成交时刻
         side          VARCHAR(8) NOT NULL CHECK (side IN ('buy','sell','hold')),
         shares        INTEGER NOT NULL DEFAULT 0,
         price         NUMERIC(12,4),
@@ -589,7 +589,7 @@ def init_db():
         status        VARCHAR(10) NOT NULL DEFAULT 'open'
                       CHECK (status IN ('open','resolved','skipped')),
         auto_closed   BOOLEAN NOT NULL DEFAULT FALSE,
-        settle_date   DATE,
+        settle_date   TIMESTAMP,                    -- 2026-11-20 起带结算时刻
         settle_price  NUMERIC(12,4),
         raw_return    NUMERIC(10,6),
         alpha_return  NUMERIC(10,6),
@@ -642,7 +642,7 @@ def init_db():
     -- 盘中每 30 分钟一轮的决策周期台账（原来只有盘后单点，没有过程可查）
     CREATE TABLE IF NOT EXISTS sa_paper_cycles (
         id          BIGSERIAL PRIMARY KEY,
-        trade_date  DATE NOT NULL,
+        trade_date  TIMESTAMP NOT NULL,           -- 2026-11-20 起由 date+slot 确定性推导
         slot        VARCHAR(16) NOT NULL,         -- 'HH:MM'，做 T 时可带子序号 '10:30#2'
         kind        VARCHAR(12) NOT NULL DEFAULT 'intraday',  -- intraday|catchup|manual
         trigger     VARCHAR(16) NOT NULL DEFAULT '',        -- 触发原因（stoploss/interval…）
@@ -811,6 +811,7 @@ def init_db():
         with get_conn() as conn, conn.cursor() as cur:
             _alter_column_widths(cur)
         _migrate_json_if_any()
+        _migrate_ts_columns()
         # 预置三套止盈/止损策略（保守/标准/激进）。sa_strategies 原本是空的 ——
         # 策略系统建好了但一条策略都没定义过，不预置的话「探索策略」无从下手。
         # 注意必须另开连接：上面 _alter_column_widths 用的 with 块已关闭。
@@ -826,6 +827,57 @@ def init_db():
         print(f"[init_db] post-DDL step failed (non-fatal): {exc}", flush=True)
     _init_analysis_learn_tables()
     return
+
+
+# ---------------- 2026-11-20 全系统时间戳升级：DATE → TIMESTAMP 幂等迁移 ----------------
+# 口径（用户裁决「日期列整体改时间戳」）：
+#   sa_trades.trade_date        → 原日期 00:00:00（历史手工录入没记成交时刻，不编造）
+#   sa_paper_trades.trade_date  → 原日期 + created_at 的上海墙钟时刻（= 决策实际产出时刻；
+#                                 created_at 是 TIMESTAMPTZ 存 UTC，必须 AT TIME ZONE 换算，
+#                                 直接取 ::time 会整体偏 8 小时）
+#   sa_paper_trades.settle_date → 原日期 00:00:00（旧行按日K判定结算，没单记时刻）
+#   sa_paper_cycles.trade_date  → 原日期 + slot('HH:MM') 时刻（确定性，保 ON CONFLICT 幂等）
+#   sa_paper_strategy_exits.exit_date → 原日期 + exit_slot 时刻
+# 幂等：information_schema 查到列已是 timestamp 就跳过；影子表 *_bak_20261120 只建一次。
+# 迁移失败不阻断启动：新代码的 ::date 比较对 DATE 列同样成立，写入的完整时刻会被
+# DATE 列静默截成日期（PG 容忍 'YYYY-MM-DD HH:MM:SS' 文本 → date），下次启动自动补迁移。
+_TS_MIGRATIONS = (
+    ("sa_trades", "trade_date", "trade_date::timestamp"),
+    ("sa_paper_trades", "trade_date",
+     "trade_date::timestamp + COALESCE((created_at AT TIME ZONE 'Asia/Shanghai')::time, time '00:00:00')"),
+    ("sa_paper_trades", "settle_date", "settle_date::timestamp"),
+    ("sa_paper_cycles", "trade_date",
+     "trade_date::timestamp + COALESCE(CASE WHEN slot ~ '^\\d{1,2}:\\d{2}' "
+     "THEN left(slot, 5)::time END, time '00:00:00')"),
+    ("sa_paper_strategy_exits", "exit_date",
+     "exit_date::timestamp + COALESCE(CASE WHEN exit_slot ~ '^\\d{1,2}:\\d{2}' "
+     "THEN left(exit_slot, 5)::time END, time '00:00:00')"),
+)
+
+
+def _migrate_ts_columns() -> None:
+    """DATE → TIMESTAMP 一次性迁移（2026-11-20），启动时执行、可重复跑。"""
+    try:
+        done = []
+        with get_conn() as conn, conn.cursor() as cur:
+            for table, col, using in _TS_MIGRATIONS:
+                cur.execute("SELECT data_type FROM information_schema.columns "
+                            "WHERE table_name = %s AND column_name = %s", (table, col))
+                row = cur.fetchone()
+                if not row or row[0] != "date":
+                    continue
+                bak = f"{table}_bak_20261120"
+                cur.execute("SELECT to_regclass(%s)", (bak,))
+                if not cur.fetchone()[0]:
+                    cur.execute(f"CREATE TABLE {bak} AS SELECT * FROM {table}")
+                cur.execute(f"ALTER TABLE {table} ALTER COLUMN {col} TYPE timestamp "
+                            f"USING {using}")
+                done.append(f"{table}.{col}")
+            conn.commit()
+        if done:
+            print(f"[ts-migrate] DATE→TIMESTAMP 完成: {', '.join(done)}", flush=True)
+    except Exception as exc:                    # noqa: BLE001
+        print(f"[ts-migrate] 迁移失败（非致命，下次启动重试）: {exc}", flush=True)
 
 
 def _init_analysis_learn_tables() -> None:
@@ -1452,7 +1504,7 @@ class TradeIn(BaseModel):
     side: str = Field(description="buy=买入 / sell=卖出")
     shares: int = Field(gt=0, description="股数")
     price: float = Field(gt=0, description="每股成交价")
-    trade_date: str = Field(default="", description="交易日期 YYYY-MM-DD，空=今天")
+    trade_date: str = Field(default="", description="交易时间 YYYY-MM-DD [HH:MM:SS]，空=现在")
     note: str = Field(default="", max_length=255)
     strategy_id: int | None = Field(default=None, description="关联止盈策略 id（可空）")
 
@@ -1503,11 +1555,13 @@ def _query_trades(code: str | None = None, start: str | None = None,
     if code:
         conds.append("t.code = %s")
         params.append(code)
+    # 2026-11-20 时间戳升级：trade_date 变 timestamp 后，窗口筛选仍按「日」口径
+    # （::date 截断），语义与纯日期时代一致。
     if start:
-        conds.append("t.trade_date >= %s::date")
+        conds.append("t.trade_date::date >= %s::date")
         params.append(start)
     if end:
-        conds.append("t.trade_date <= %s::date")
+        conds.append("t.trade_date::date <= %s::date")
         params.append(end)
     if conds:
         sql += " WHERE " + " AND ".join(conds)
@@ -1517,7 +1571,10 @@ def _query_trades(code: str | None = None, start: str | None = None,
         rows = [dict(r) for r in cur.fetchall()]
     for r in rows:
         r["price"] = float(r["price"])
-        r["trade_date"] = r["trade_date"].isoformat()
+        # 2026-11-20 时间戳升级：datetime → 'YYYY-MM-DD HH:MM:SS'；
+        # 兼容迁移前的 date 对象（无 hour 属性）
+        r["trade_date"] = (r["trade_date"].isoformat(sep=" ", timespec="seconds")
+                           if hasattr(r["trade_date"], "hour") else r["trade_date"].isoformat())
         r["created_at"] = r["created_at"].isoformat(timespec="seconds")
         if r.get("strategy_triggered_at"):
             r["strategy_triggered_at"] = r["strategy_triggered_at"].isoformat(timespec="seconds")
@@ -1801,7 +1858,7 @@ def advice_followup_report(days: int = 60):
             adv_rows = [dict(r) for r in cur.fetchall()]
             cur.execute("""SELECT code, side, shares, price, trade_date
                              FROM sa_trades
-                            WHERE trade_date > current_date - %s
+                            WHERE trade_date::date > current_date - %s
                             ORDER BY trade_date, id""", (days + 10,))
             trades = [dict(r) for r in cur.fetchall()]
     except Exception as exc:                       # noqa: BLE001
@@ -1856,7 +1913,9 @@ def _net_trade_flow_cny(asof: str, fx: float) -> float:
         return 0.0
     total = 0.0
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT side, shares, price, code FROM sa_trades WHERE trade_date > %s",
+        # 2026-11-20 时间戳升级：严格大于基准「日」的口径不变（::date 截断）。
+        # 不加 ::date 的话基准日当天的盘中流水会被多算进「基准日之后」。
+        cur.execute("SELECT side, shares, price, code FROM sa_trades WHERE trade_date::date > %s::date",
                     (asof,))
         for side, shares, price, code in cur.fetchall():
             amt = float(shares) * float(price)
@@ -1972,9 +2031,12 @@ def add_trade(trade: TradeIn):
     side = trade.side.strip().lower()
     if side not in ("buy", "sell"):
         raise HTTPException(400, "side 应为 buy（买入）或 sell（卖出）")
-    trade_date = trade.trade_date.strip() or datetime.now().strftime("%Y-%m-%d")
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", trade_date):
-        raise HTTPException(400, "交易日期格式应为 YYYY-MM-DD")
+    # 2026-11-20 时间戳升级：接受 YYYY-MM-DD [HH:MM(:SS)]，归一带秒全串
+    try:
+        trade_date = broker_cash.norm_ts(
+            trade.trade_date.strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
 
     with LOCK:
         existing = _query_trades(code)
@@ -2173,7 +2235,10 @@ def trade_snapshots_report(date: str = ""):
     if not snap:
         raise HTTPException(404, "没有快照，请先打一份（可补打历史日期）")
     trades = _query_trades()
-    after = [t for t in trades if t["trade_date"] > snap["date"]]
+    # 2026-11-20 时间戳升级：_query_trades 的 trade_date 已带时刻，
+    # 必须按「日」与快照基准日比较（[:10]），否则基准日当天的盘中流水
+    # 会被误判成「基准日之后」。
+    after = [t for t in trades if str(t["trade_date"])[:10] > snap["date"]]
     codes = {r["code"] for r in snap.get("positions", [])} | {t["code"] for t in after}
     prices = _ts_now_prices(codes)
     fx, fx_source = _ts_fx()
@@ -2192,12 +2257,23 @@ def trade_snapshots_report(date: str = ""):
 # 让快照报告的「调整后账户资产」能和券商 App 对账。
 
 class CashFlowIn(BaseModel):
-    date: str = Field(default="", description="YYYY-MM-DD；留空=今天")
+    date: str = Field(default="", description="YYYY-MM-DD [HH:MM:SS]；留空=现在")
     side: str = Field(default="in", description="in 入金 / out 出金")
     amount: float = Field(default=0, gt=0, description="金额，原币")
     currency: str = Field(default="CNY", description="CNY / HKD")
     account: str = Field(default="", max_length=40)
     note: str = Field(default="", max_length=120)
+
+
+class CashFlowUpdate(BaseModel):
+    """2026-11-19：转账流水支持修改。id 必填，其余只传要改的字段。"""
+    id: str
+    date: str | None = Field(default=None, description="YYYY-MM-DD")
+    side: str | None = Field(default=None, description="in 入金 / out 出金")
+    amount: float | None = Field(default=None, gt=0, description="金额，原币")
+    currency: str | None = Field(default=None, description="CNY / HKD")
+    account: str | None = Field(default=None, max_length=40)
+    note: str | None = Field(default=None, max_length=120)
 
 
 @app.get("/api/cash-flows")
@@ -2214,10 +2290,32 @@ def cash_flows_list(start: str = "", end: str = ""):
 def cash_flows_add(body: CashFlowIn):
     try:
         flow = broker_cash.add_flow(
-            body.date.strip() or datetime.now().strftime("%Y-%m-%d"),
+            body.date.strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             body.side, body.amount, body.currency, body.note, body.account)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
+    return {"ok": True, "flow": flow}
+
+
+@app.put("/api/cash-flows")
+def cash_flows_update(body: CashFlowUpdate):
+    """改一笔转账：保留原 id / created_at，只覆盖真正传了的字段。
+
+    显式传 null 也视为「不修改」；要清空备注/账户请传空串。日期改到锚点基准日
+    的前后会自动改变净出入金计入区间 —— 下游都是实时读侧车算的，无需额外重算。
+    """
+    fid = body.id.strip()
+    if not fid:
+        raise HTTPException(400, "id 不能为空")
+    changes = {k: v for k, v in
+               body.model_dump(exclude_unset=True, exclude={"id"}).items()
+               if v is not None}
+    try:
+        flow = broker_cash.update_flow(fid, changes)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if flow is None:
+        raise HTTPException(404, f"没有这笔转账 #{fid}")
     return {"ok": True, "flow": flow}
 
 
@@ -3021,10 +3119,10 @@ def _net_cash_curve() -> tuple[list[tuple[str, float]], float]:
     """
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT trade_date::text, "
+            "SELECT trade_date::date::text, "
             "COALESCE(SUM(CASE WHEN side = 'sell' THEN shares * price "
             "                  ELSE -(shares * price) END), 0) "
-            "FROM sa_trades GROUP BY trade_date ORDER BY trade_date")
+            "FROM sa_trades GROUP BY trade_date::date ORDER BY trade_date::date")
         rows = cur.fetchall()
     curve = [(d, float(a)) for d, a in rows]
     return curve, sum(a for _, a in curve if a > 0)
@@ -6568,7 +6666,7 @@ def trade_review_api(code: str, side: str = "", shares: int = 0,
     try:
         with get_conn() as conn, conn.cursor(
                 cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT code, side FROM sa_trades WHERE trade_date = %s",
+            cur.execute("SELECT code, side FROM sa_trades WHERE trade_date::date = %s::date",
                         (today,))
             rows = cur.fetchall() or []
         sides: dict = {}
@@ -6630,9 +6728,10 @@ def t_record(rec: TRecordIn):
     """
     if not re.fullmatch(r"[0-9a-zA-Z]{5,8}", rec.code or ""):
         raise HTTPException(400, "代码格式不对（5~8 位数字/字母）")
-    d = (rec.trade_date or datetime.now().strftime("%Y-%m-%d"))
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
-        raise HTTPException(400, "日期格式应为 YYYY-MM-DD")
+    try:
+        d = broker_cash.norm_ts(rec.trade_date or datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     note = (t_trading.T_TAG + " " + (rec.note or "手动做T")).strip()[:255]
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT name FROM sa_trades WHERE code=%s ORDER BY id DESC LIMIT 1",
@@ -6640,7 +6739,7 @@ def t_record(rec: TRecordIn):
         r = cur.fetchone()
         name = (r[0] if r else "") or rec.code
         cur.execute("""INSERT INTO sa_trades (code, trade_date, side, shares, price, note)
-                       VALUES (%s,%s::date,%s,%s,%s,%s) RETURNING id""",
+                       VALUES (%s,%s,%s,%s,%s,%s) RETURNING id""",
                     (rec.code, d, rec.side, int(rec.shares), float(rec.price), note))
         tid = cur.fetchone()[0]
         conn.commit()
@@ -6731,8 +6830,13 @@ def paper_trades(code: str = "", limit: int = 100):
     （2026-10-08 加）。
     """
     limit = max(1, min(limit, 500))
+    # 2026-11-20 懒加载：reasoning 全文不再随列表回传（200 行全文跨公网 4~5s），
+    # 只传 160 字预览 + 长度；全文走 GET /api/paper/trade-text（与 rounds 同款）。
     sql = ("SELECT id, code, name, trade_date, slot, side, shares, price, value, "
-           "confidence, stop_loss_pct, reasoning, status, auto_closed, settle_date, settle_price, "
+           "confidence, stop_loss_pct, "
+           "left(COALESCE(reasoning, ''), 160) AS reasoning_head, "
+           "COALESCE(char_length(reasoning), 0) AS reasoning_len, "
+           "status, auto_closed, settle_date, settle_price, "
            "raw_return, alpha_return, benchmark, created_at FROM sa_paper_trades ")
     params: list = []
     if re.fullmatch(r"\d{4,6}", code or ""):
@@ -6763,6 +6867,19 @@ def paper_rounds(code: str = "", only_closed: bool = False,
     return {"items": paper_trading.rounds(
         _paper_deps(), code=code, only_closed=only_closed,
         only_open=only_open)[:max(1, min(limit, 1000))]}
+
+
+@app.get("/api/paper/trade-text")
+def paper_trade_text(ids: str = ""):
+    """决策理由 / LLM 分析报告全文（懒加载，2026-11-20）。
+
+    列表接口（/api/paper/rounds、/api/paper/trades）只传 160 字预览 + 长度；
+    用户展开某一行时前端才带 sa_paper_trades.id 调这里。实测列表整包回传
+    1.7MB jsonb（decision_raw）跨公网要 13~18s，曾把模拟盘 tab 整体拖死。
+    """
+    items = paper_trading.trade_texts(
+        _paper_deps(), [s.strip() for s in (ids or "").split(",")])
+    return {"items": items}
 
 
 @app.get("/api/paper/lessons")
@@ -7266,7 +7383,8 @@ def paper_cycles(trade_date: str = "", limit: int = 40):
     with get_conn() as conn:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         if trade_date:
-            cur.execute("SELECT * FROM sa_paper_cycles WHERE trade_date = %s "
+            # 2026-11-20 时间戳升级：查询参数仍是日粒度，按 ::date 截断匹配
+            cur.execute("SELECT * FROM sa_paper_cycles WHERE trade_date::date = %s::date "
                         "ORDER BY slot LIMIT %s", (trade_date, n))
         else:
             cur.execute("SELECT * FROM sa_paper_cycles "
@@ -10233,6 +10351,45 @@ def chat_img(name: str):
     return FileResponse(p, media_type=_IMG_MIME.get(ext, "application/octet-stream"))
 
 
+def _chat_transfer_prepare(body: "ChatSendIn", text: str,
+                           conf: dict, deps: dict) -> dict:
+    """「上传转账截图 + 说录入银证转账」→ 只解析成待确认表，**绝不写库**。
+
+    刻意与通用对话分支隔离：不调 agent（nanobot 那侧的工具是只读的）、
+    不走单轮 LLM 兜底、不生成「已记账」这类话术。解析结果只是候选行，
+    真正落台账在 /api/chat/transfer-commit，且必须用户点过确认。
+    """
+    p = web_chat.upload_path(body.img_name)
+    if p is None:
+        raise HTTPException(404, f"图片不存在：{body.img_name}")
+    try:
+        raw = p.read_bytes()
+    except OSError as exc:
+        raise HTTPException(502, f"图片读取失败：{exc}")
+    existing = broker_cash.list_flows()
+    rows, model = web_chat.prepare_transfer_rows(raw, conf, existing=existing)
+    clean = sum(1 for r in rows if not r["skip"] and not r["issues"])
+    if rows:
+        hint = (f"已从截图识别出 {len(rows)} 行，其中 {clean} 行可直接录入"
+                f"（视觉模型 {model or '未知'}）。请核对下表再点「确认录入」——"
+                f"在此之前没有写入任何数据。")
+    else:
+        hint = ("这次没能从图片里读出转账明细（视觉模型失败或返回不可解析），"
+                "没有写入任何数据。可以重发一张更清晰的截图再试。")
+    u_text = text or f"[图片：{body.img_name}]"
+    try:
+        web_chat.save_message(deps, body.sid, "user", u_text, body.img_name)
+        web_chat.save_message(deps, body.sid, "assistant", hint, "", "agent")
+    except Exception as exc:
+        print(f"[web-chat] 转账确认落库失败: {type(exc).__name__}: {exc}", flush=True)
+    return {"mode": "transfer_confirm", "rows": rows, "model": model,
+            "img_name": body.img_name, "hint": hint,
+            "user_message": {"role": "user", "text": u_text,
+                             "img_name": body.img_name, "created_at": None},
+            "assistant_message": {"role": "assistant", "text": hint,
+                                  "src": "agent", "created_at": None}}
+
+
 @app.post("/api/chat/send")
 def chat_send(body: ChatSendIn):
     """网页对话主链路（同步返回，前端在等待时显示 typing）：
@@ -10250,6 +10407,11 @@ def chat_send(body: ChatSendIn):
     text = (body.text or "").strip()[:2000]
     if not text and not body.img_name:
         raise HTTPException(400, "输入为空——写点什么，或先上传图片")
+
+    # 0) 银证转账截图录入意图：本地结构化解析 → 待确认表，不经过 agent、不写库。
+    #    必须「有图 + 命中意图」才走；普通聊天与「帮我看看这张图」行为逐字不变。
+    if body.img_name and web_chat.is_transfer_intent(text):
+        return _chat_transfer_prepare(body, text, conf, {"get_conn": get_conn})
 
     deps = {"get_conn": get_conn}
     # agent_text = 拼了图片描述后的完整输入；user_text = 界面上显示的原文。
@@ -10322,6 +10484,52 @@ def chat_send(body: ChatSendIn):
     asst = [m for m in hist if m.get("role") == "assistant"][-1:]
     return {"user_message": ums[0] if ums else None,
             "assistant_message": asst[0] if asst else None}
+
+
+class TransferCommitIn(BaseModel):
+    sid: str = Field(default="", description="会话 id（可选，仅用于留一条页面记录）")
+    rows: list[dict] = Field(default_factory=list, description="确认表里勾选的行")
+
+
+@app.post("/api/chat/transfer-commit")
+def chat_transfer_commit(body: TransferCommitIn):
+    """把确认表里的行写进银证转账台账（broker_cash 侧车），逐条校验、逐条反馈。
+
+    安全边界：
+    - 前端传来的值一律不可信，重新跑 validate_transfer_rows 归一化 + 查重；
+    - 只写侧车台账，**不碰 sa_trades**；账户锚点不用改，下游实时读侧车重算；
+    - 重复行默认拦下（force=True 才放行，因为同额同日两笔是合法的真实流水）；
+    - 单条写失败不影响其它行，失败原因逐行返回给前端。
+    """
+    if not body.rows:
+        raise HTTPException(400, "没有勾选任何行")
+    existing = broker_cash.list_flows()
+    accepted, rejected = web_chat.validate_transfer_rows(body.rows, existing=existing)
+    added, failed, seen = [], [], set()
+    for r in accepted:
+        key = (r["date"], r["side"], r["amount"], r["currency"])
+        if key in seen and not r["force"]:
+            failed.append({"row": r, "why": "本批次内重复，已跳过"})
+            continue
+        try:
+            flow = broker_cash.add_flow(r["date"], r["side"], r["amount"],
+                                        r["currency"], r["note"], r["account"])
+            added.append({"id": flow["id"], "date": flow["date"],
+                          "side": flow["side"], "amount": flow["amount"],
+                          "currency": flow["currency"]})
+            seen.add(key)
+        except (ValueError, OSError) as exc:
+            failed.append({"row": r, "why": str(exc)})
+    skipped = len(rejected) + len(failed)
+    msg = f"已录入 {len(added)} 笔银证转账" + (f"，{skipped} 笔跳过" if skipped else "")
+    if web_chat.check_sid(body.sid):
+        try:
+            web_chat.save_message({"get_conn": get_conn}, body.sid,
+                                  "assistant", msg, "", "agent")
+        except Exception as exc:
+            print(f"[web-chat] 转账结果落库失败: {type(exc).__name__}: {exc}", flush=True)
+    return {"ok": True, "added": added, "failed": failed,
+            "rejected": rejected, "message": msg}
 
 
 @app.get("/api/chat/history")
@@ -11008,7 +11216,8 @@ def _report_paper_decisions() -> list[str]:
     try:
         with get_conn() as conn, conn.cursor() as cur:
             cur.execute("SELECT name, code, side, shares, price, confidence, reasoning "
-                        "FROM sa_paper_trades WHERE trade_date = %s ORDER BY id", (datetime.now().date(),))
+                        "FROM sa_paper_trades WHERE trade_date::date = %s::date ORDER BY id",
+                        (datetime.now().date(),))
             rows = cur.fetchall()
     except Exception:
         return []
